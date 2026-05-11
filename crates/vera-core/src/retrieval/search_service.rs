@@ -7,7 +7,7 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use tracing::warn;
 
 use crate::chunk_text::file_name;
@@ -22,7 +22,11 @@ use crate::retrieval::query_utils::{
 use crate::retrieval::ranking::{
     RankingStage, apply_query_ranking_with_filters, is_path_weighted_query,
 };
-use crate::retrieval::{apply_filters, search_bm25, search_hybrid, search_hybrid_reranked};
+use crate::retrieval::{
+    apply_filters, search_bm25_with_stores, search_hybrid, search_hybrid_reranked,
+};
+use crate::storage::bm25::Bm25Index;
+use crate::storage::metadata::MetadataStore;
 use crate::types::{Chunk, SearchFilters, SearchResult, SymbolType};
 
 /// Timing data for each stage of the search pipeline.
@@ -345,11 +349,20 @@ fn run_bm25_only(
     total_start: Instant,
 ) -> Result<(Vec<SearchResult>, SearchTimings)> {
     let bm25_start = Instant::now();
-    let results = search_bm25(index_dir, query, fetch_limit)?;
+    let bm25_index =
+        Bm25Index::open(&index_dir.join("bm25")).context("failed to open BM25 index for search")?;
+    let metadata_store = MetadataStore::open(&index_dir.join("metadata.db"))
+        .context("failed to open metadata store for search")?;
+    let results = search_bm25_with_stores(&bm25_index, &metadata_store, query, fetch_limit)?;
     let bm25_elapsed = bm25_start.elapsed();
     let aug_start = Instant::now();
-    let results =
-        augment_exact_match_candidates(index_dir, query, results, RankingStage::Initial, filters)?;
+    let results = augment_exact_match_candidates_with_store(
+        &metadata_store,
+        query,
+        results,
+        RankingStage::Initial,
+        filters,
+    )?;
     let timings = SearchTimings {
         bm25: Some(bm25_elapsed),
         augmentation: Some(aug_start.elapsed()),
@@ -367,13 +380,22 @@ fn augment_exact_match_candidates(
     filters: &SearchFilters,
 ) -> Result<Vec<SearchResult>> {
     let metadata_path = index_dir.join("metadata.db");
-    let Ok(store) = crate::storage::metadata::MetadataStore::open(&metadata_path) else {
+    let Ok(store) = MetadataStore::open(&metadata_path) else {
         return Ok(apply_query_ranking_with_filters(
             query, results, stage, filters,
         ));
     };
-    let supplemental = collect_exact_match_candidates(&store, query, 0)?;
+    augment_exact_match_candidates_with_store(&store, query, results, stage, filters)
+}
 
+fn augment_exact_match_candidates_with_store(
+    store: &MetadataStore,
+    query: &str,
+    results: Vec<SearchResult>,
+    stage: RankingStage,
+    filters: &SearchFilters,
+) -> Result<Vec<SearchResult>> {
+    let supplemental = collect_exact_match_candidates(store, query, 0)?;
     if supplemental.is_empty() {
         return Ok(apply_query_ranking_with_filters(
             query, results, stage, filters,

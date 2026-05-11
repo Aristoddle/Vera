@@ -88,6 +88,17 @@ pub fn parse_file_with_diagnostics(
             ParseDiagnostics::default(),
         ));
     }
+    if uses_indexing_tier0_fallback(language) {
+        let chunks = chunker::tier0_line_chunks(source, file_path, language);
+        return Ok((
+            chunker::split_oversized_chunks(chunks, config.max_chunk_bytes),
+            Vec::new(),
+            ParseDiagnostics {
+                used_tier0_fallback: true,
+                ..ParseDiagnostics::default()
+            },
+        ));
+    }
 
     let grammar = match languages::tree_sitter_grammar(language) {
         Some(g) => g,
@@ -135,6 +146,10 @@ pub fn parse_file_with_diagnostics(
             used_tier0_fallback,
         },
     ))
+}
+
+fn uses_indexing_tier0_fallback(language: Language) -> bool {
+    matches!(language, Language::Haskell)
 }
 
 /// Parse a source file and produce chunks (without references).

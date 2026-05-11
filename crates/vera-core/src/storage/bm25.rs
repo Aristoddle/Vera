@@ -174,13 +174,7 @@ impl Bm25Index {
 
         // Sanitize query for tantivy: strip characters that the query parser
         // interprets as operators (e.g. `:` as field separator, `(`, `)`, etc.).
-        let sanitized: String = query_text
-            .chars()
-            .map(|c| match c {
-                ':' | '(' | ')' | '[' | ']' | '{' | '}' | '^' | '~' | '!' => ' ',
-                _ => c,
-            })
-            .collect();
+        let sanitized = sanitize_query(query_text);
         let query = query_parser
             .parse_query(&sanitized)
             .with_context(|| format!("failed to parse BM25 query: {query_text}"))?;
@@ -311,6 +305,16 @@ fn build_schema() -> Bm25Schema {
         symbol_name,
         language,
     }
+}
+
+fn sanitize_query(query_text: &str) -> String {
+    query_text
+        .chars()
+        .map(|c| match c {
+            ':' | '(' | ')' | '[' | ']' | '{' | '}' | '^' | '~' | '!' | '\'' | '"' | '`' => ' ',
+            _ => c,
+        })
+        .collect()
 }
 
 fn looks_path_weighted(query_text: &str) -> bool {
@@ -546,6 +550,14 @@ mod tests {
         assert!(
             !results.is_empty(),
             "stemming should match 'dependency' to 'dependencies'"
+        );
+    }
+
+    #[test]
+    fn sanitize_query_strips_possessive_apostrophes() {
+        assert_eq!(
+            sanitize_query("how pandoc's app module orchestrates"),
+            "how pandoc s app module orchestrates"
         );
     }
 }

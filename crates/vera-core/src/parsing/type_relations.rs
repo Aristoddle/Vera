@@ -66,6 +66,10 @@ pub fn extract_type_relations(chunks: &[Chunk]) -> Vec<RawTypeRelation> {
 }
 
 fn extract_chunk_relations(chunk: &Chunk) -> Vec<RawTypeRelation> {
+    if chunk.symbol_type == Some(SymbolType::Block) && chunk.symbol_name.is_none() {
+        return Vec::new();
+    }
+
     let header = relation_header(chunk);
     if header.is_empty() {
         return Vec::new();
@@ -615,6 +619,22 @@ mod tests {
         assert_eq!(relations[0].owner, "User");
         assert_eq!(relations[0].target, "Display");
         assert_eq!(relations[0].kind, TypeRelationKind::Conforms);
+    }
+
+    #[test]
+    fn tier0_blocks_do_not_extract_type_relations() {
+        let chunk = Chunk {
+            id: "test:0".to_string(),
+            file_path: "Data/Point.hs".to_string(),
+            line_start: 1,
+            line_end: 2,
+            content: "data Point = Point Float Float\nadd x y = x + y\n".to_string(),
+            language: Language::Haskell,
+            symbol_type: Some(SymbolType::Block),
+            symbol_name: None,
+        };
+
+        assert!(extract_type_relations(&[chunk]).is_empty());
     }
 
     #[test]

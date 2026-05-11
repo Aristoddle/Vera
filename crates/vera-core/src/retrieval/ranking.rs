@@ -348,6 +348,8 @@ fn score_prior(
             }
         } else if file_stem(&result_filename).eq_ignore_ascii_case(identifier) {
             bonus += stage_weight * 0.35;
+        } else if file_stem_prefix_matches_identifier(file_stem(&result_filename), identifier) {
+            bonus += stage_weight * 0.28;
         } else if identifier_matches_parent_dir(identifier, &file_path) {
             bonus += stage_weight * 0.22;
         }
@@ -741,6 +743,19 @@ fn file_stem(filename: &str) -> &str {
         .rsplit_once('.')
         .map(|(stem, _)| stem)
         .unwrap_or(filename)
+}
+
+/// Check if a file stem shares a 6+ char prefix with an identifier.
+/// Strips namespace prefixes (e.g. "sinatra::showexceptions" → "showexceptions")
+/// so that "format" matches "formatter" but "sinatra" doesn't match "sinatra::ShowExceptions".
+fn file_stem_prefix_matches_identifier(stem: &str, identifier: &str) -> bool {
+    let stem_lower = stem.to_ascii_lowercase();
+    let ident_lower = identifier.to_ascii_lowercase();
+    let bare_ident = ident_lower
+        .rsplit_once("::")
+        .map(|(_, name)| name)
+        .unwrap_or(&ident_lower);
+    common_prefix_len(&stem_lower, bare_ident) >= 6
 }
 
 fn identifier_matches_parent_dir(identifier: &str, path: &str) -> bool {
@@ -1374,6 +1389,15 @@ mod tests {
         );
 
         assert_eq!(ranked[0].file_path, "src/flask/templating.py");
+    }
+
+    #[test]
+    fn file_stem_prefix_match_ignores_namespace_prefixes() {
+        assert!(file_stem_prefix_matches_identifier("format", "formatter"));
+        assert!(!file_stem_prefix_matches_identifier(
+            "sinatra",
+            "sinatra::showexceptions"
+        ));
     }
 
     #[test]

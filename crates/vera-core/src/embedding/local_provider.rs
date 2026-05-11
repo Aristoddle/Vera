@@ -293,7 +293,7 @@ impl LocalEmbeddingProvider {
                 .cached_asset_paths()
                 .ok()
                 .and_then(|p| fs::metadata(&p.onnx_path).ok())
-                .map(|m| m.len() / (1024 * 1024))
+                .map(|m| effective_model_size_for_adaptive_batching(ep, m.len() / (1024 * 1024)))
                 .unwrap_or(0);
             Some(Arc::new(PersistedAdaptiveBatchScaler::load_or_new(
                 config.max_length,
@@ -740,6 +740,20 @@ fn persisted_batch_margin(batch_len: usize) -> usize {
     batch_len.saturating_sub(margin).max(1)
 }
 
+// The model-size dampener protects discrete GPU backends from VRAM cold-start
+// overestimates. CoreML runs on unified memory, so file size is not a useful
+// proxy and can make Apple Silicon indexing start at batch 1 for long chunks.
+fn effective_model_size_for_adaptive_batching(
+    ep: OnnxExecutionProvider,
+    model_size_mb: u64,
+) -> u64 {
+    if ep == OnnxExecutionProvider::CoreMl {
+        0
+    } else {
+        model_size_mb
+    }
+}
+
 fn batch_max_len(encodings: &[Encoding]) -> usize {
     encodings
         .iter()
@@ -991,6 +1005,20 @@ mod tests {
         );
         // 400MB is 4x reference (100MB), so batch should be ~1/4 of 32 = 8.
         assert_eq!(large_batch, 8);
+    }
+
+    #[test]
+    fn coreml_adaptive_batching_ignores_model_size_cold_start_dampening() {
+        let cuda_size =
+            effective_model_size_for_adaptive_batching(OnnxExecutionProvider::Cuda, 400);
+        let coreml_size =
+            effective_model_size_for_adaptive_batching(OnnxExecutionProvider::CoreMl, 400);
+
+        let cuda = AdaptiveBatchScaler::new(512, cuda_size);
+        let coreml = AdaptiveBatchScaler::new(512, coreml_size);
+
+        assert_eq!(cuda.recommend_batch_len(16, 512), 1);
+        assert_eq!(coreml.recommend_batch_len(16, 512), 4);
     }
 
     #[test]

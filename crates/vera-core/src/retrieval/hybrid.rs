@@ -12,15 +12,18 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use tracing::{debug, info, warn};
 
 use crate::embedding::EmbeddingProvider;
-use crate::retrieval::bm25::search_bm25;
+use crate::retrieval::bm25::search_bm25_with_stores;
 use crate::retrieval::query_classifier::{QueryType, classify_query, params_for_query_type};
 use crate::retrieval::ranking::is_path_weighted_query;
 use crate::retrieval::reranker::{Reranker, rerank_results};
-use crate::retrieval::vector::search_vector;
+use crate::retrieval::vector::{VectorSearchError, search_vector_with_stores};
+use crate::storage::bm25::Bm25Index;
+use crate::storage::metadata::MetadataStore;
+use crate::storage::vector::VectorStore;
 use crate::types::SearchResult;
 
 /// Errors specific to hybrid search.
@@ -90,13 +93,42 @@ pub async fn search_hybrid(
     let bm25_candidates = compute_bm25_candidates(query, limit);
     let mut timings = HybridTimings::default();
 
+    let metadata_path = index_dir.join("metadata.db");
+    let metadata_store = match MetadataStore::open(&metadata_path)
+        .context("failed to open metadata store for search")
+    {
+        Ok(store) => store,
+        Err(err) => {
+            let message = format!("{err:#}");
+            return Err(HybridSearchError::BothFailed {
+                bm25_error: message.clone(),
+                vector_error: message,
+            });
+        }
+    };
+
     let bm25_start = Instant::now();
-    let bm25_results = search_bm25(index_dir, query, bm25_candidates);
+    let bm25_results = Bm25Index::open(&index_dir.join("bm25"))
+        .context("failed to open BM25 index for search")
+        .and_then(|index| search_bm25_with_stores(&index, &metadata_store, query, bm25_candidates));
     timings.bm25 = Some(bm25_start.elapsed());
 
     let embed_start = Instant::now();
-    let vector_results =
-        search_vector(index_dir, provider, query, vector_candidates, stored_dim).await;
+    let vector_results = match VectorStore::open(&index_dir.join("vectors.db"), stored_dim) {
+        Ok(vector_store) => {
+            search_vector_with_stores(
+                &vector_store,
+                &metadata_store,
+                provider,
+                query,
+                vector_candidates,
+            )
+            .await
+        }
+        Err(err) => Err(VectorSearchError::StorageError(
+            err.context("failed to open vector store"),
+        )),
+    };
     let vector_elapsed = embed_start.elapsed();
     timings.embedding = Some(vector_elapsed);
     timings.vector = Some(vector_elapsed);

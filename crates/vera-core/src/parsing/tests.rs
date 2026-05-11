@@ -4,7 +4,7 @@
 //! Tier 0 fallback, large symbol splitting, and edge cases.
 
 use crate::config::IndexingConfig;
-use crate::parsing::parse_and_chunk;
+use crate::parsing::{parse_and_chunk, parse_file_with_diagnostics};
 use crate::types::{Language, SymbolType};
 
 fn default_config() -> IndexingConfig {
@@ -433,6 +433,25 @@ fn unknown_language_uses_tier0() {
     assert!(!chunks.is_empty(), "tier0 should produce chunks");
     assert_eq!(chunks[0].language, Language::Unknown);
     assert_eq!(chunks[0].symbol_type, Some(SymbolType::Block));
+}
+
+#[test]
+fn haskell_indexing_uses_tier0_fallback() {
+    let source = "data Point = Point Float Float\nadd x y = x + y\n";
+    let (chunks, refs, diagnostics) = parse_file_with_diagnostics(
+        source,
+        "Data/Point.hs",
+        Language::Haskell,
+        &default_config(),
+    )
+    .unwrap();
+
+    assert!(!chunks.is_empty(), "tier0 should produce Haskell chunks");
+    assert!(
+        refs.is_empty(),
+        "tier0 fallback should not extract references"
+    );
+    assert!(diagnostics.used_tier0_fallback);
 }
 
 #[test]
