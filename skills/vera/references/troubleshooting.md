@@ -57,19 +57,19 @@ On constrained GPUs, pass `--low-vram` to `vera index` to force conservative bat
 
 ## API Mode Fails
 
-Check:
+Re-run setup and enter the endpoint URL, model ID, and API key:
+
+```sh
+vera setup --api
+```
+
+For non-interactive setup, check these variables before running `vera setup --api --yes`:
 
 - `EMBEDDING_MODEL_BASE_URL`
 - `EMBEDDING_MODEL_ID`
 - `EMBEDDING_MODEL_API_KEY`
 
-Optional reranker values must either all be present or all be absent.
-
-Persist a working shell configuration with:
-
-```sh
-vera setup --api
-```
+Optional reranker values must either all be present or all be absent in non-interactive setup.
 
 ## Too Much Noise
 

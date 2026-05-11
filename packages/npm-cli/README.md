@@ -20,7 +20,7 @@ vera index .
 vera search "authentication logic"
 ```
 
-`vera setup` with no flags runs an interactive wizard. `vera agent install` manages skill files for your coding agents and can update `AGENTS.md` / `CLAUDE.md` style project instructions.
+`vera setup` with no flags runs an interactive wizard. `vera setup --api` prompts for an OpenAI-compatible endpoint and key; use `--yes` with `EMBEDDING_MODEL_*` variables for non-interactive setup. `vera agent install` manages skill files for your coding agents and can update `AGENTS.md` / `CLAUDE.md` style project instructions.
 
 ## Common Tasks
 
@@ -28,7 +28,7 @@ vera search "authentication logic"
 |------|---------|
 | Use the interactive setup wizard | `vera setup` |
 | Use CPU-only local mode | `vera setup --potion-code` |
-| Use API mode | `vera setup --api` |
+| Configure API mode | `vera setup --api` |
 | Use a local NVIDIA backend | `vera setup --onnx-jina-cuda` |
 | Search semantically | `vera search "authentication middleware"` |
 | Search only changed files | `vera search "authentication middleware" --changed` |

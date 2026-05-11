@@ -60,6 +60,8 @@ llama-server \
 
 ### Option A: Environment Variables
 
+Run commands directly from this shell, or persist the config with `vera setup --api --yes` after exporting the variables.
+
 ```bash
 # Embedding (required)
 export EMBEDDING_MODEL_BASE_URL="http://localhost:8059/v1"
@@ -80,6 +82,9 @@ export VERA_COMPLETION_TIMEOUT_SECS="120"
 
 # Skip update checks in offline environments
 export VERA_NO_UPDATE_CHECK="1"
+
+# Optional: persist the embedding and reranker endpoints in Vera config
+vera setup --api --yes
 ```
 
 ### Option B: Interactive Setup

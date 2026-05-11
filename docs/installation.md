@@ -61,7 +61,7 @@ Many providers offer free tiers or generous trial credits. Any OpenAI-compatible
 | [Voyage AI](https://www.voyageai.com/) | Free tier available | Code-optimized models |
 | [Cohere](https://cohere.com/) | Trial key | `embed-english-v3.0` |
 
-You can also set the environment variables directly instead of using the wizard:
+For non-interactive setup, set the environment variables directly and add `--yes`:
 
 ```bash
 export EMBEDDING_MODEL_BASE_URL=https://api.jina.ai/v1
@@ -73,7 +73,7 @@ export RERANKER_MODEL_BASE_URL=https://api.jina.ai/v1
 export RERANKER_MODEL_ID=jina-reranker-v2-base-multilingual
 export RERANKER_MODEL_API_KEY=your-key
 
-vera setup --api
+vera setup --api --yes
 ```
 
 Only model calls leave your machine. Indexing, storage, and search remain local.

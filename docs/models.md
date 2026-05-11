@@ -110,6 +110,14 @@ Potion Code is the CPU local option. Use Jina ONNX with CUDA, ROCm, CoreML, Dire
 
 ## API Mode
 
+Interactive setup prompts for the endpoint URL, model ID, API key, and optional reranker:
+
+```bash
+vera setup --api
+```
+
+For non-interactive setup, export the API values first and add `--yes`:
+
 ```bash
 export EMBEDDING_MODEL_BASE_URL=https://your-embedding-api/v1
 export EMBEDDING_MODEL_ID=your-embedding-model
@@ -120,7 +128,7 @@ export RERANKER_MODEL_BASE_URL=https://your-reranker-api/v1
 export RERANKER_MODEL_ID=your-reranker-model
 export RERANKER_MODEL_API_KEY=your-api-key
 
-vera setup --api
+vera setup --api --yes
 ```
 
 Only model calls leave your machine. Indexing, storage, and search remain local.

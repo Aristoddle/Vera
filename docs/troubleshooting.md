@@ -47,19 +47,19 @@ If Vera now fails fast with a message like `CUDA backend selected, but required 
 
 ## API mode isn't working
 
-Check that all three environment variables are set:
+Re-run setup and enter the endpoint URL, model ID, and API key when prompted:
+
+```bash
+vera setup --api
+```
+
+For non-interactive setup, check that all three environment variables are set before running `vera setup --api --yes`:
 
 - `EMBEDDING_MODEL_BASE_URL`
 - `EMBEDDING_MODEL_ID`
 - `EMBEDDING_MODEL_API_KEY`
 
-If you're using a reranker, its three variables (`RERANKER_MODEL_BASE_URL`, `RERANKER_MODEL_ID`, `RERANKER_MODEL_API_KEY`) must either all be set or all be absent. Partial configuration will fail.
-
-Re-run setup to persist a working configuration:
-
-```bash
-vera setup --api
-```
+If you're using a reranker in non-interactive setup, its three variables (`RERANKER_MODEL_BASE_URL`, `RERANKER_MODEL_ID`, `RERANKER_MODEL_API_KEY`) must either all be set or all be absent. Partial configuration will fail.
 
 If the provider returns a batch-size error such as `at most 100 requests can be in one batch`, lower the embedding batch size:
 
