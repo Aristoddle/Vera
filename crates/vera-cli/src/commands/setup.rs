@@ -63,6 +63,7 @@ pub fn run(
         .transpose()?;
 
     if !yes
+        && !json_output
         && !confirm(
             &effective_backend,
             local_embedding_model.as_ref(),
@@ -75,12 +76,17 @@ pub fn run(
         return Ok(());
     }
 
-    configure_backend(
+    let api_setup = should_prompt_api_config(effective_backend, json_output, yes)
+        .then(prompt_api_setup)
+        .transpose()?;
+
+    configure_backend_with_api_setup(
         effective_backend,
         local_embedding_model,
         index_path,
-        false,
+        json_output,
         "Vera setup complete.",
+        api_setup,
     )
 }
 
@@ -147,6 +153,24 @@ pub(crate) fn configure_backend(
     json_output: bool,
     success_header: &str,
 ) -> anyhow::Result<()> {
+    configure_backend_with_api_setup(
+        effective_backend,
+        local_embedding_model,
+        index_path,
+        json_output,
+        success_header,
+        None,
+    )
+}
+
+fn configure_backend_with_api_setup(
+    effective_backend: InferenceBackend,
+    local_embedding_model: Option<LocalEmbeddingModelConfig>,
+    index_path: Option<String>,
+    json_output: bool,
+    success_header: &str,
+    api_setup: Option<(ApiSetupInput, Option<ApiSetupInput>)>,
+) -> anyhow::Result<()> {
     let use_local = effective_backend.is_local();
     let mut models_prefetched = 0usize;
     let onnx_runtime_ready;
@@ -186,16 +210,21 @@ pub(crate) fn configure_backend(
                 Some(vera_core::local_models::potion_code_model_name().to_string());
         }
         InferenceBackend::Api => {
-            let embedding = read_required_api_env(
-                "EMBEDDING_MODEL_BASE_URL",
-                "EMBEDDING_MODEL_ID",
-                "EMBEDDING_MODEL_API_KEY",
-            )?;
-            let reranker = read_optional_api_env(
-                "RERANKER_MODEL_BASE_URL",
-                "RERANKER_MODEL_ID",
-                "RERANKER_MODEL_API_KEY",
-            )?;
+            let (embedding, reranker) = match api_setup {
+                Some((embedding, reranker)) => (embedding, reranker),
+                None => (
+                    read_required_api_env(
+                        "EMBEDDING_MODEL_BASE_URL",
+                        "EMBEDDING_MODEL_ID",
+                        "EMBEDDING_MODEL_API_KEY",
+                    )?,
+                    read_optional_api_env(
+                        "RERANKER_MODEL_BASE_URL",
+                        "RERANKER_MODEL_ID",
+                        "RERANKER_MODEL_API_KEY",
+                    )?,
+                ),
+            };
             state::save_api_setup(&embedding, reranker.as_ref())?;
             state::apply_saved_env_force()?;
             onnx_runtime_ready = None;
@@ -262,6 +291,14 @@ pub(crate) fn configure_backend(
     }
 
     Ok(())
+}
+
+fn should_prompt_api_config(
+    effective_backend: InferenceBackend,
+    json_output: bool,
+    yes: bool,
+) -> bool {
+    effective_backend == InferenceBackend::Api && !json_output && !yes
 }
 
 /// Probe the system for a usable GPU and return the best local backend.
@@ -465,6 +502,27 @@ fn confirm(
 /// Interactive API configuration for the setup wizard.
 /// Offers common provider presets and prompts for credentials.
 fn configure_api_interactive() -> anyhow::Result<()> {
+    let (embedding, reranker) = prompt_api_setup()?;
+
+    state::save_backend(InferenceBackend::Api)?;
+    state::save_api_setup(&embedding, reranker.as_ref())?;
+    state::apply_saved_env_force()?;
+
+    if state::load_saved_config()?.install_method.is_none() {
+        if let Some(install_method) = crate::update_check::resolve_install_method().install_method {
+            state::save_install_method(Some(&install_method))?;
+        }
+    }
+
+    cliclack::log::success("API backend configured.")?;
+    cliclack::log::info(
+        "Your credentials are saved in Vera's config directory. You can remove any \
+         EMBEDDING_MODEL_* / RERANKER_MODEL_* env vars from your shell.",
+    )?;
+    Ok(())
+}
+
+fn prompt_api_setup() -> anyhow::Result<(ApiSetupInput, Option<ApiSetupInput>)> {
     #[derive(Clone)]
     struct ApiPreset {
         label: &'static str,
@@ -518,27 +576,18 @@ fn configure_api_interactive() -> anyhow::Result<()> {
     let preset = &presets[choice];
 
     // Embedding base URL
-    let embedding_base_url: String = if preset.embedding_base_url.is_empty() {
-        cliclack::input("Embedding API base URL")
-            .placeholder("https://api.openai.com/v1")
-            .interact()?
-    } else {
-        let url: String = cliclack::input("Embedding API base URL")
-            .default_input(preset.embedding_base_url)
-            .interact()?;
-        url
-    };
+    let embedding_base_url = prompt_required_input(
+        "Embedding API base URL",
+        (!preset.embedding_base_url.is_empty()).then_some(preset.embedding_base_url),
+        "https://api.openai.com/v1",
+    )?;
 
     // Embedding model
-    let embedding_model: String = if preset.embedding_model.is_empty() {
-        cliclack::input("Embedding model ID")
-            .placeholder("text-embedding-3-small")
-            .interact()?
-    } else {
-        cliclack::input("Embedding model ID")
-            .default_input(preset.embedding_model)
-            .interact()?
-    };
+    let embedding_model = prompt_required_input(
+        "Embedding model ID",
+        (!preset.embedding_model.is_empty()).then_some(preset.embedding_model),
+        "text-embedding-3-small",
+    )?;
 
     // Embedding API key
     let embedding_api_key: String = cliclack::password("Embedding API key")
@@ -561,25 +610,17 @@ fn configure_api_interactive() -> anyhow::Result<()> {
             .interact()?;
 
     let reranker = if setup_reranker {
-        let reranker_base_url: String = if preset.reranker_base_url.is_empty() {
-            cliclack::input("Reranker API base URL")
-                .placeholder("https://api.jina.ai/v1")
-                .interact()?
-        } else {
-            cliclack::input("Reranker API base URL")
-                .default_input(preset.reranker_base_url)
-                .interact()?
-        };
+        let reranker_base_url = prompt_required_input(
+            "Reranker API base URL",
+            (!preset.reranker_base_url.is_empty()).then_some(preset.reranker_base_url),
+            "https://api.jina.ai/v1",
+        )?;
 
-        let reranker_model: String = if preset.reranker_model.is_empty() {
-            cliclack::input("Reranker model ID")
-                .placeholder("jina-reranker-v2-base-multilingual")
-                .interact()?
-        } else {
-            cliclack::input("Reranker model ID")
-                .default_input(preset.reranker_model)
-                .interact()?
-        };
+        let reranker_model = prompt_required_input(
+            "Reranker model ID",
+            (!preset.reranker_model.is_empty()).then_some(preset.reranker_model),
+            "jina-reranker-v2-base-multilingual",
+        )?;
 
         let reranker_api_key: String =
             cliclack::password("Reranker API key (Enter to reuse embedding key)")
@@ -600,22 +641,24 @@ fn configure_api_interactive() -> anyhow::Result<()> {
         None
     };
 
-    state::save_backend(InferenceBackend::Api)?;
-    state::save_api_setup(&embedding, reranker.as_ref())?;
-    state::apply_saved_env_force()?;
+    Ok((embedding, reranker))
+}
 
-    if state::load_saved_config()?.install_method.is_none() {
-        if let Some(install_method) = crate::update_check::resolve_install_method().install_method {
-            state::save_install_method(Some(&install_method))?;
-        }
+fn prompt_required_input(
+    label: &str,
+    default: Option<&str>,
+    placeholder: &str,
+) -> anyhow::Result<String> {
+    let value: String = if let Some(default) = default {
+        cliclack::input(label).default_input(default).interact()?
+    } else {
+        cliclack::input(label).placeholder(placeholder).interact()?
+    };
+    let value = value.trim().to_string();
+    if value.is_empty() {
+        bail!("{} is required", label.to_ascii_lowercase());
     }
-
-    cliclack::log::success("API backend configured.")?;
-    cliclack::log::info(
-        "Your credentials are saved in Vera's config directory. You can remove any \
-         EMBEDDING_MODEL_* / RERANKER_MODEL_* env vars from your shell.",
-    )?;
-    Ok(())
+    Ok(value)
 }
 
 fn read_required_api_env(
@@ -652,5 +695,38 @@ fn read_optional_api_env(
         _ => bail!(
             "reranker config is incomplete. Set all of {base_key}, {model_key}, and {api_key_key}, or leave all three unset."
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn explicit_interactive_api_setup_prompts_for_config() {
+        assert!(should_prompt_api_config(
+            InferenceBackend::Api,
+            false,
+            false
+        ));
+    }
+
+    #[test]
+    fn noninteractive_api_setup_uses_environment_config() {
+        assert!(!should_prompt_api_config(
+            InferenceBackend::Api,
+            true,
+            false
+        ));
+        assert!(!should_prompt_api_config(
+            InferenceBackend::Api,
+            false,
+            true
+        ));
+        assert!(!should_prompt_api_config(
+            InferenceBackend::PotionCode,
+            false,
+            false
+        ));
     }
 }
