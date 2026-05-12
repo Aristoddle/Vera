@@ -115,7 +115,7 @@ fn cmd_run(
 
     eprintln!("Loaded {} benchmark tasks", tasks.len());
 
-    let report = run_report(&tasks, corpus_path, tool_name)?;
+    let report = run_report(tasks, corpus_path, tool_name)?;
 
     // Output JSON
     if let Some(path) = output_path {
@@ -204,49 +204,50 @@ fn load_verified_corpus(corpus_path: &Path) -> Result<VerifiedCorpus> {
     })
 }
 
-fn ensure_task_repos_known(
-    tasks: &[types::BenchmarkTask],
+/// Filter tasks to only those whose repos are in the corpus manifest.
+///
+/// When using a subset corpus, tasks for missing repos are silently dropped
+/// so the eval harness can run against any corpus subset.
+fn filter_tasks_to_corpus(
+    tasks: Vec<types::BenchmarkTask>,
     repo_paths: &HashMap<String, String>,
-) -> Result<()> {
-    let mut missing = tasks
-        .iter()
-        .filter(|task| !repo_paths.contains_key(&task.repo))
-        .map(|task| task.repo.clone())
-        .collect::<Vec<_>>();
-    missing.sort();
-    missing.dedup();
-
-    if missing.is_empty() {
-        Ok(())
-    } else {
-        anyhow::bail!(
-            "Tasks reference repos missing from the corpus manifest: {}",
-            missing.join(", ")
-        )
+) -> Vec<types::BenchmarkTask> {
+    let before = tasks.len();
+    let filtered: Vec<_> = tasks
+        .into_iter()
+        .filter(|task| repo_paths.contains_key(&task.repo))
+        .collect();
+    let skipped = before - filtered.len();
+    if skipped > 0 {
+        eprintln!(
+            "Skipped {skipped} tasks referencing repos not in corpus ({} tasks remaining)",
+            filtered.len()
+        );
     }
+    filtered
 }
 
 fn run_report(
-    tasks: &[types::BenchmarkTask],
+    tasks: Vec<types::BenchmarkTask>,
     corpus_path: &Path,
     tool_name: &str,
 ) -> Result<types::EvalReport> {
     Ok(match tool_name {
         "mock-perfect" => {
             let mock = runner::MockAdapter::perfect();
-            runner::run_benchmark_with_mock(&mock, tasks)
+            runner::run_benchmark_with_mock(&mock, &tasks)
         }
         "mock-partial" => {
             let mock = runner::MockAdapter::partial(0.7);
-            runner::run_benchmark_with_mock(&mock, tasks)
+            runner::run_benchmark_with_mock(&mock, &tasks)
         }
         "vera-bm25" => {
             let corpus = load_verified_corpus(corpus_path)?;
-            ensure_task_repos_known(tasks, &corpus.repo_paths)?;
+            let tasks = filter_tasks_to_corpus(tasks, &corpus.repo_paths);
             let vera = vera_adapter::VeraBm25Adapter::new()?;
             runner::run_benchmark_scoped(
                 &vera,
-                tasks,
+                &tasks,
                 &corpus.repo_paths,
                 &corpus.repo_shas,
                 &corpus.benchmark_roots,
@@ -254,14 +255,14 @@ fn run_report(
         }
         "vera-cuda" => {
             let corpus = load_verified_corpus(corpus_path)?;
-            ensure_task_repos_known(tasks, &corpus.repo_paths)?;
+            let tasks = filter_tasks_to_corpus(tasks, &corpus.repo_paths);
             let backend = vera_core::config::InferenceBackend::OnnxJina(
                 vera_core::config::OnnxExecutionProvider::Cuda,
             );
             let vera = vera_adapter::VeraFullAdapter::new(backend)?;
             runner::run_benchmark_scoped(
                 &vera,
-                tasks,
+                &tasks,
                 &corpus.repo_paths,
                 &corpus.repo_shas,
                 &corpus.benchmark_roots,
@@ -269,14 +270,14 @@ fn run_report(
         }
         "vera-cpu" => {
             let corpus = load_verified_corpus(corpus_path)?;
-            ensure_task_repos_known(tasks, &corpus.repo_paths)?;
+            let tasks = filter_tasks_to_corpus(tasks, &corpus.repo_paths);
             let backend = vera_core::config::InferenceBackend::OnnxJina(
                 vera_core::config::OnnxExecutionProvider::Cpu,
             );
             let vera = vera_adapter::VeraFullAdapter::new(backend)?;
             runner::run_benchmark_scoped(
                 &vera,
-                tasks,
+                &tasks,
                 &corpus.repo_paths,
                 &corpus.repo_shas,
                 &corpus.benchmark_roots,
@@ -284,13 +285,13 @@ fn run_report(
         }
         "vera-potion" => {
             let corpus = load_verified_corpus(corpus_path)?;
-            ensure_task_repos_known(tasks, &corpus.repo_paths)?;
+            let tasks = filter_tasks_to_corpus(tasks, &corpus.repo_paths);
             let vera = vera_adapter::VeraFullAdapter::new(
                 vera_core::config::InferenceBackend::PotionCode,
             )?;
             runner::run_benchmark_scoped(
                 &vera,
-                tasks,
+                &tasks,
                 &corpus.repo_paths,
                 &corpus.repo_shas,
                 &corpus.benchmark_roots,
@@ -331,14 +332,14 @@ fn cmd_stability(
     );
 
     // Run 1
-    let report1 = run_report(&tasks, corpus_path, tool_name)?;
+    let report1 = run_report(tasks.clone(), corpus_path, tool_name)?;
     eprintln!(
         "  Run 1 complete: {} tasks evaluated",
         report1.per_task.len()
     );
 
     // Run 2
-    let report2 = run_report(&tasks, corpus_path, tool_name)?;
+    let report2 = run_report(tasks, corpus_path, tool_name)?;
     eprintln!(
         "  Run 2 complete: {} tasks evaluated",
         report2.per_task.len()
