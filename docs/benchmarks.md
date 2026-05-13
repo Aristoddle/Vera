@@ -103,38 +103,35 @@ Vera is benchmarked against [Semble](https://github.com/MinishLab/semble), a Pyt
 | Tool | Backend | Recall@1 | Recall@10 | MRR | nDCG@10 | Search p50 | Search p95 | Index time |
 |------|---------|----------|-----------|-----|---------|------------|------------|------------|
 | Semble | Potion Code CPU | 0.6630 | 0.9479 | 0.8223 | **0.8311** | **1.43 ms** | **15.41 ms** | 26.06 s |
-| Vera | BM25 ranked (v2) | 0.5542 | 0.8750 | 0.7349 | 0.7456 | 3.24 ms | 11.62 ms | **10.28 s** |
-| Vera | BM25 ranked (v1) | 0.5214 | 0.8438 | 0.6949 | 0.7108 | 2.91 ms | 9.28 ms | 12.51 s |
-| Vera | Potion Code CPU | 0.5010 | 0.8500 | 0.6700 | 0.6944 | 14.30 ms | 53.27 ms | 17.27 s |
+| Vera | BM25 ranked (v4) | **0.5792** | 0.8781 | **0.7520** | 0.7567 | 2.92 ms | 10.37 ms | **10.28 s** |
+| Vera | Potion Code CPU (v4) | 0.5792 | **0.8797** | 0.7490 | 0.7550 | 10.68 ms | 49.14 ms | 16.72 s |
+| Vera | BM25 ranked (v3) | 0.5573 | 0.8750 | 0.7376 | 0.7477 | 2.92 ms | 10.37 ms | 10.28 s |
+| Vera | Potion Code CPU (v3) | 0.5510 | 0.8891 | 0.7340 | 0.7468 | 13.95 ms | 54.26 ms | 16.40 s |
 | Vera | Jina CUDA ONNX | 0.5276 | 0.8578 | 0.7058 | 0.7233 | 23.50 ms | 6236.60 ms | 151.20 s |
 
-v1 = pre-improvement baseline. v2 = English stemming, stronger definition boost, concept-to-filename augmentation.
+v3 = English stemming, concept-to-filename augmentation. v4 = stronger definition boost, content-based definition detection, embedded symbol extraction, proportional stem matching, stronger noise penalties. Potion v4 also benefits from parallelized BM25+embedding (24% p50 improvement).
 
 **Full 1,251-task Semble suite** (63 repos, gate for parity claims):
 
-| Metric | Vera BM25 (v2) | Vera BM25 (v3) |
+| Metric | Vera BM25 (v3) | Vera BM25 (v4) |
 |--------|---------------:|---------------:|
-| nDCG@10 | 0.6995 | **0.7010** |
-| Recall@1 | 0.5345 | **0.5357** |
-| Recall@10 | 0.8116 | **0.8128** |
-| MRR | 0.6838 | **0.6857** |
-| Search p50 | 4.03 ms | **3.38 ms** |
-| Search p95 | 19.97 ms | **13.58 ms** |
+| nDCG@10 | 0.7010 | **0.7074** |
+| Recall@1 | 0.5357 | **0.5449** |
+| Recall@5 | 0.7748 | **0.7832** |
+| Recall@10 | 0.8128 | **0.8160** |
+| MRR | 0.6857 | **0.6943** |
 
-v3 keeps the v2 ranking model, narrows namespace-heavy identifier prefix matches, strips possessives and quotes before BM25 query parsing, and uses Tier 0 chunks for Haskell indexing to avoid native parser instability. It does not close the Semble quality gap.
-
-v3 per-category nDCG: symbol_lookup 0.8939, intent 0.6900, cross_file 0.6092. Cross-file is the weakest category since many multi-hop queries need semantic understanding beyond BM25.
+v4 per-category nDCG: symbol_lookup 0.8944, intent 0.6987 (+0.0087), cross_file 0.6141 (+0.0051). All categories improved. 100 task improvements vs 72 regressions across the full suite.
 
 The Jina CUDA run uses CUDA ONNX Runtime via `ORT_DYLIB_PATH`. Do not run this lane against the CPU ONNX Runtime when comparing latency.
 
 Artifacts:
 
 - [Semble subset baseline](../benchmarks/results/semble/2026-04-29-semble-subset.json)
-- [Vera BM25 subset v1](../benchmarks/results/semble/2026-05-01-vera-bm25-subset.json)
-- [Vera BM25 subset v2](../benchmarks/results/semble/2026-05-02-vera-bm25-subset.json)
-- [Vera BM25 full suite](../benchmarks/results/semble/2026-05-02-vera-bm25-full.json)
+- [Vera BM25 subset v4](../benchmarks/results/semble/2026-05-12-vera-bm25-v4-subset.json)
+- [Vera BM25 full suite v4](../benchmarks/results/semble/2026-05-12-vera-bm25-v4-full.json)
+- [Vera Potion CPU subset v4](../benchmarks/results/semble/2026-05-12-vera-potion-v4-subset.json)
 - [Vera BM25 full suite v3](../benchmarks/results/semble/2026-05-11-vera-bm25-v3-full.json)
-- [Vera Potion subset](../benchmarks/results/semble/2026-05-01-vera-potion-subset.json)
 - [Vera Jina CUDA subset](../benchmarks/results/semble/2026-05-01-vera-cuda-subset.json)
 
 ### Optional CodeRankEmbed Preset
