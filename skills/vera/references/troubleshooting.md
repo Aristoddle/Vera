@@ -40,6 +40,7 @@ Common causes:
 - ONNX Runtime auto-download failed (check network, or set `ORT_DYLIB_PATH`)
 - local model assets have not been downloaded yet
 - GPU backend missing drivers (CUDA 12+ for `--onnx-jina-cuda`, ROCm for `--onnx-jina-rocm`, DirectX 12 for `--onnx-jina-directml`, macOS Apple Silicon for `--onnx-jina-coreml`)
+- non-CPU ONNX session loading failed after dependency checks passed; Vera retries runtime embedding and reranker setup on CPU and logs a warning
 
 Helpful commands:
 

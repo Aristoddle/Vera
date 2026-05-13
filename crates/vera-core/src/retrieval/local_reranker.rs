@@ -38,44 +38,33 @@ impl LocalReranker {
             }
         })?;
 
-        let onnx_path = ensure_model_file(
-            RERANKER_REPO,
-            crate::local_models::reranker_onnx_file_for_ep(ep),
-        )
-        .await
-        .map_err(|e| RerankerError::ApiError {
-            status: 500,
-            message: format!("Failed to download ONNX model: {}", e),
-        })?;
-
-        let tokenizer_path = ensure_model_file(RERANKER_REPO, TOKENIZER_FILE)
-            .await
-            .map_err(|e| RerankerError::ApiError {
-                status: 500,
-                message: format!("Failed to download tokenizer: {}", e),
-            })?;
-
-        let tokenizer = task::spawn_blocking(move || load_tokenizer(tokenizer_path))
-            .await
-            .map_err(|e| RerankerError::ApiError {
-                status: 500,
-                message: e.to_string(),
-            })?
-            .map_err(|e| RerankerError::ApiError {
-                status: 500,
-                message: e.to_string(),
-            })?;
-
-        let session = task::spawn_blocking(move || build_session(ep, onnx_path))
-            .await
-            .map_err(|e| RerankerError::ApiError {
-                status: 500,
-                message: e.to_string(),
-            })?
-            .map_err(|e| RerankerError::ApiError {
-                status: 500,
-                message: crate::local_models::wrap_ort_error(e),
-            })?;
+        let components = load_reranker_components(ep).await;
+        let (session, tokenizer) = match components {
+            Ok(components) => components,
+            Err(error) if ep != OnnxExecutionProvider::Cpu => {
+                tracing::warn!(
+                    backend = %ep,
+                    error = %error,
+                    "selected ONNX execution provider failed; retrying reranker session on CPU"
+                );
+                load_reranker_components(OnnxExecutionProvider::Cpu)
+                    .await
+                    .map_err(|fallback_error| RerankerError::ApiError {
+                        status: 500,
+                        message: format!(
+                            "{}\nCPU fallback also failed: {}",
+                            crate::local_models::wrap_ort_error(error),
+                            crate::local_models::wrap_ort_error(fallback_error)
+                        ),
+                    })?
+            }
+            Err(error) => {
+                return Err(RerankerError::ApiError {
+                    status: 500,
+                    message: crate::local_models::wrap_ort_error(error),
+                });
+            }
+        };
 
         Ok(Self {
             session: Arc::new(Mutex::new(session)),
@@ -211,6 +200,29 @@ impl LocalReranker {
         });
         Ok(combined)
     }
+}
+
+async fn load_reranker_components(ep: OnnxExecutionProvider) -> Result<(Session, Tokenizer)> {
+    let onnx_path = ensure_model_file(
+        RERANKER_REPO,
+        crate::local_models::reranker_onnx_file_for_ep(ep),
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "Failed to download ONNX model: {}",
+            crate::local_models::reranker_onnx_file_for_ep(ep)
+        )
+    })?;
+
+    let tokenizer_path = ensure_model_file(RERANKER_REPO, TOKENIZER_FILE)
+        .await
+        .context("Failed to download tokenizer")?;
+
+    let tokenizer = task::spawn_blocking(move || load_tokenizer(tokenizer_path)).await??;
+    let session = task::spawn_blocking(move || build_session(ep, onnx_path)).await??;
+
+    Ok((session, tokenizer))
 }
 
 fn default_asset_paths(

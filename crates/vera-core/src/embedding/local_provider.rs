@@ -270,13 +270,14 @@ impl LocalEmbeddingProvider {
         ep: OnnxExecutionProvider,
         gpu_mem_limit_mb: u64,
     ) -> Result<Self, EmbeddingError> {
-        let mut config =
+        let base_config =
             LocalEmbeddingModelConfig::from_env().map_err(|e| EmbeddingError::ApiError {
                 status: 500,
                 message: e.to_string(),
             })?;
+        let mut config = base_config.clone();
         config.adjust_for_gpu(ep);
-        let batch_scaler = if ep == OnnxExecutionProvider::Cpu {
+        let mut batch_scaler = if ep == OnnxExecutionProvider::Cpu {
             None
         } else {
             let persistence = match build_batch_scaler_persistence_target(ep, &config) {
@@ -319,38 +320,35 @@ impl LocalEmbeddingProvider {
                 message: e.to_string(),
             }
         })?;
-        let asset_paths = crate::local_models::ensure_local_embedding_assets(&config)
-            .await
-            .map_err(|e| EmbeddingError::ApiError {
-                status: 500,
-                message: e.to_string(),
-            })?;
-        let onnx_path = asset_paths.onnx_path;
-        let tokenizer_path = asset_paths.tokenizer_path;
-
-        let tokenizer_max_length = config.max_length;
-        let tokenizer =
-            task::spawn_blocking(move || load_tokenizer(tokenizer_path, tokenizer_max_length))
-                .await
-                .map_err(|e| EmbeddingError::ApiError {
+        let components = load_embedding_components(ep, &config, gpu_mem_limit_mb).await;
+        let (session, tokenizer) = match components {
+            Ok(components) => components,
+            Err(error) if ep != OnnxExecutionProvider::Cpu => {
+                tracing::warn!(
+                    backend = %ep,
+                    error = %error,
+                    "selected ONNX execution provider failed; retrying embedding session on CPU"
+                );
+                config = base_config;
+                batch_scaler = None;
+                load_embedding_components(OnnxExecutionProvider::Cpu, &config, 0)
+                    .await
+                    .map_err(|fallback_error| EmbeddingError::ApiError {
+                        status: 500,
+                        message: format!(
+                            "{}\nCPU fallback also failed: {}",
+                            crate::local_models::wrap_ort_error(error),
+                            crate::local_models::wrap_ort_error(fallback_error)
+                        ),
+                    })?
+            }
+            Err(error) => {
+                return Err(EmbeddingError::ApiError {
                     status: 500,
-                    message: e.to_string(),
-                })?
-                .map_err(|e| EmbeddingError::ApiError {
-                    status: 500,
-                    message: e.to_string(),
-                })?;
-
-        let session = task::spawn_blocking(move || build_session(ep, onnx_path, gpu_mem_limit_mb))
-            .await
-            .map_err(|e| EmbeddingError::ApiError {
-                status: 500,
-                message: e.to_string(),
-            })?
-            .map_err(|e| EmbeddingError::ApiError {
-                status: 500,
-                message: crate::local_models::wrap_ort_error(e),
-            })?;
+                    message: crate::local_models::wrap_ort_error(error),
+                });
+            }
+        };
 
         Ok(Self {
             session: Arc::new(Mutex::new(session)),
@@ -597,6 +595,25 @@ impl LocalEmbeddingProvider {
             scaler.note_failure(batch_max_len(encodings), encodings.len());
         }
     }
+}
+
+async fn load_embedding_components(
+    ep: OnnxExecutionProvider,
+    config: &LocalEmbeddingModelConfig,
+    gpu_mem_limit_mb: u64,
+) -> Result<(Session, Tokenizer)> {
+    let asset_paths = crate::local_models::ensure_local_embedding_assets(config).await?;
+    let onnx_path = asset_paths.onnx_path;
+    let tokenizer_path = asset_paths.tokenizer_path;
+    let tokenizer_max_length = config.max_length;
+
+    let tokenizer =
+        task::spawn_blocking(move || load_tokenizer(tokenizer_path, tokenizer_max_length))
+            .await??;
+    let session =
+        task::spawn_blocking(move || build_session(ep, onnx_path, gpu_mem_limit_mb)).await??;
+
+    Ok((session, tokenizer))
 }
 
 fn build_batch_scaler_persistence_target(

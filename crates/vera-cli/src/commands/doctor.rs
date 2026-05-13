@@ -289,13 +289,31 @@ fn probe_local_backend(
     let provider_ok = matches!(provider_stage.status, CheckStatus::Ok);
     checks.push(provider_stage);
 
-    let embedding_session_stage = if ort_ok && provider_ok {
+    let dependencies_stage = if ep == vera_core::config::OnnxExecutionProvider::Cpu {
+        skipped_check(
+            "probe-dependencies",
+            "skipped for the CPU backend because provider-specific shared-library checks are not needed",
+        )
+    } else if ort_ok {
+        dependency_probe_check(ep, runtime_path)
+    } else {
+        skipped_check(
+            "probe-dependencies",
+            "skipped because ONNX Runtime could not be initialized",
+        )
+    };
+    let dependencies_ok = !matches!(dependencies_stage.status, CheckStatus::Fail);
+    checks.push(dependencies_stage);
+
+    let embedding_session_stage = if ort_ok && provider_ok && dependencies_ok {
         let missing = missing_assets(model_assets, &["embedding-onnx", "embedding-onnx-data"]);
         if missing.is_empty() {
             result_check(
                 "probe-embedding-session",
                 "embedding session created".to_string(),
-                vera_core::embedding::local_provider::LocalEmbeddingProvider::probe_session(ep),
+                wrap_onnx_session_probe(
+                    vera_core::embedding::local_provider::LocalEmbeddingProvider::probe_session(ep),
+                ),
             )
         } else {
             skipped_check(
@@ -306,18 +324,20 @@ fn probe_local_backend(
     } else {
         skipped_check(
             "probe-embedding-session",
-            "skipped because provider registration failed",
+            "skipped because provider registration or dependencies failed",
         )
     };
     checks.push(embedding_session_stage);
 
-    let reranker_session_stage = if ort_ok && provider_ok {
+    let reranker_session_stage = if ort_ok && provider_ok && dependencies_ok {
         let missing = missing_assets(model_assets, &["reranker-onnx"]);
         if missing.is_empty() {
             result_check(
                 "probe-reranker-session",
                 "reranker session created".to_string(),
-                vera_core::retrieval::local_reranker::LocalReranker::probe_session(ep),
+                wrap_onnx_session_probe(
+                    vera_core::retrieval::local_reranker::LocalReranker::probe_session(ep),
+                ),
             )
         } else {
             skipped_check(
@@ -328,12 +348,12 @@ fn probe_local_backend(
     } else {
         skipped_check(
             "probe-reranker-session",
-            "skipped because provider registration failed",
+            "skipped because provider registration or dependencies failed",
         )
     };
     checks.push(reranker_session_stage);
 
-    let tiny_inference_stage = if ort_ok && provider_ok {
+    let tiny_inference_stage = if ort_ok && provider_ok && dependencies_ok {
         let missing = missing_assets(
             model_assets,
             &[
@@ -366,7 +386,7 @@ fn probe_local_backend(
     } else {
         skipped_check(
             "probe-tiny-inference",
-            "skipped because provider registration failed",
+            "skipped because provider registration or dependencies failed",
         )
     };
     let tiny_inference_ok = matches!(tiny_inference_stage.status, CheckStatus::Ok);
@@ -387,14 +407,6 @@ fn probe_local_backend(
         });
     }
 
-    checks.push(if ep == vera_core::config::OnnxExecutionProvider::Cpu {
-        skipped_check(
-            "probe-dependencies",
-            "skipped for the CPU backend because provider-specific shared-library checks are not needed",
-        )
-    } else {
-        dependency_probe_check(runtime_path)
-    });
     Ok(checks)
 }
 
@@ -441,7 +453,10 @@ fn skipped_check(name: &'static str, detail: impl Into<String>) -> DoctorCheck {
     }
 }
 
-fn dependency_probe_check(runtime_path: &std::path::Path) -> DoctorCheck {
+fn dependency_probe_check(
+    ep: vera_core::config::OnnxExecutionProvider,
+    runtime_path: &std::path::Path,
+) -> DoctorCheck {
     if !runtime_path.exists() {
         return skipped_check(
             "probe-dependencies",
@@ -449,7 +464,7 @@ fn dependency_probe_check(runtime_path: &std::path::Path) -> DoctorCheck {
         );
     }
 
-    match vera_core::local_models::inspect_shared_library_deps(runtime_path) {
+    match vera_core::local_models::inspect_provider_dependencies(ep, runtime_path) {
         Ok(Some(status)) => {
             if status.missing_details.is_empty() {
                 DoctorCheck {
@@ -478,6 +493,10 @@ fn dependency_probe_check(runtime_path: &std::path::Path) -> DoctorCheck {
             detail: one_line_error(&err),
         },
     }
+}
+
+fn wrap_onnx_session_probe(result: anyhow::Result<()>) -> anyhow::Result<()> {
+    result.map_err(|err| anyhow::anyhow!(vera_core::local_models::wrap_ort_error(err)))
 }
 
 fn version_check(status: &update_check::BinaryVersionStatus) -> DoctorCheck {

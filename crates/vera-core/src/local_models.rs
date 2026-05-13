@@ -1603,22 +1603,11 @@ pub fn ensure_provider_dependencies(
         return Ok(());
     }
 
-    let Some(status) = inspect_shared_library_deps(runtime_path)? else {
+    let Some(status) = inspect_provider_dependencies(ep, runtime_path)? else {
         return Ok(());
     };
 
-    let mut missing_details = status.missing_details;
-    if matches!(ep, OnnxExecutionProvider::Cuda) {
-        // CUDA builds ship optional TensorRT provider libraries alongside the
-        // CUDA provider. Missing TensorRT does not block plain CUDA execution.
-        missing_details.retain(|detail| !detail.starts_with("libonnxruntime_providers_tensorrt"));
-    }
-
-    let mut missing_libraries: Vec<String> = missing_details
-        .iter()
-        .filter_map(|detail| detail.split(": ").nth(1))
-        .map(str::to_string)
-        .collect();
+    let mut missing_libraries = status.missing_libraries;
     missing_libraries.sort();
     missing_libraries.dedup();
 
@@ -1652,6 +1641,37 @@ pub fn inspect_shared_library_deps(
     runtime_path: &std::path::Path,
 ) -> Result<Option<SharedLibraryDependencyStatus>> {
     inspect_shared_library_deps_impl(runtime_path)
+}
+
+pub fn inspect_provider_dependencies(
+    ep: OnnxExecutionProvider,
+    runtime_path: &std::path::Path,
+) -> Result<Option<SharedLibraryDependencyStatus>> {
+    Ok(inspect_shared_library_deps(runtime_path)?
+        .map(|status| required_dependency_status(ep, status)))
+}
+
+fn required_dependency_status(
+    ep: OnnxExecutionProvider,
+    mut status: SharedLibraryDependencyStatus,
+) -> SharedLibraryDependencyStatus {
+    if matches!(ep, OnnxExecutionProvider::Cuda) {
+        // CUDA ORT archives also ship a TensorRT provider. TensorRT is optional
+        // for Vera's CUDA path, so missing TensorRT libraries must not make the
+        // CUDA backend look broken.
+        status
+            .missing_details
+            .retain(|detail| !detail.starts_with("libonnxruntime_providers_tensorrt"));
+        status.missing_libraries = status
+            .missing_details
+            .iter()
+            .filter_map(|detail| detail.split(": ").nth(1))
+            .map(str::to_string)
+            .collect();
+        status.missing_libraries.sort();
+        status.missing_libraries.dedup();
+    }
+    status
 }
 
 #[cfg(target_os = "linux")]
@@ -2766,6 +2786,31 @@ mod tests {
         for (ep, expected) in cases {
             assert_eq!(reranker_onnx_file_for_ep(ep), expected);
         }
+    }
+
+    #[test]
+    fn required_dependency_status_ignores_optional_cuda_tensorrt_libraries() {
+        let status = SharedLibraryDependencyStatus {
+            inspected_files: Vec::new(),
+            missing_details: vec![
+                "libonnxruntime_providers_tensorrt.so: libnvinfer.so.10".to_string(),
+                "libonnxruntime_providers_tensorrt.so: libnvonnxparser.so.10".to_string(),
+                "libonnxruntime_providers_cuda.so: libcudnn.so.9".to_string(),
+            ],
+            missing_libraries: vec![
+                "libcudnn.so.9".to_string(),
+                "libnvinfer.so.10".to_string(),
+                "libnvonnxparser.so.10".to_string(),
+            ],
+        };
+
+        let filtered = required_dependency_status(OnnxExecutionProvider::Cuda, status);
+
+        assert_eq!(
+            filtered.missing_details,
+            vec!["libonnxruntime_providers_cuda.so: libcudnn.so.9"]
+        );
+        assert_eq!(filtered.missing_libraries, vec!["libcudnn.so.9"]);
     }
 
     #[tokio::test]
