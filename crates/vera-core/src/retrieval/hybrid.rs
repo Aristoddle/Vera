@@ -76,8 +76,10 @@ pub struct HybridTimings {
 
 /// Perform hybrid search combining BM25 and vector retrieval via RRF fusion.
 ///
-/// Runs BM25 and vector search, merges results using Reciprocal Rank Fusion,
-/// and returns the top results. If vector search fails (e.g., embedding API
+/// Runs BM25 and vector search concurrently, then merges the results using
+/// Reciprocal Rank Fusion (RRF). BM25 runs in a blocking task with its own
+/// database connections while vector search (embedding + nearest-neighbor)
+/// runs on the async runtime. If vector search fails (e.g., embedding API
 /// unavailable), falls back to BM25-only results with a warning.
 pub async fn search_hybrid(
     index_dir: &Path,
@@ -93,37 +95,43 @@ pub async fn search_hybrid(
     let bm25_candidates = compute_bm25_candidates(query, limit);
     let mut timings = HybridTimings::default();
 
+    // Spawn BM25 search in a blocking task with its own database connections.
+    // This runs concurrently with vector search (embedding + nearest-neighbor).
+    let bm25_dir = index_dir.join("bm25");
     let metadata_path = index_dir.join("metadata.db");
-    let metadata_store = match MetadataStore::open(&metadata_path)
-        .context("failed to open metadata store for search")
-    {
-        Ok(store) => store,
-        Err(err) => {
-            let message = format!("{err:#}");
-            return Err(HybridSearchError::BothFailed {
-                bm25_error: message.clone(),
-                vector_error: message,
+    let bm25_query = query.to_string();
+    let bm25_handle = tokio::task::spawn_blocking(move || {
+        let start = Instant::now();
+        let result = Bm25Index::open(&bm25_dir)
+            .context("failed to open BM25 index for search")
+            .and_then(|index| {
+                let store = MetadataStore::open(&metadata_path)
+                    .context("failed to open metadata store for BM25 search")?;
+                search_bm25_with_stores(&index, &store, &bm25_query, bm25_candidates)
             });
-        }
-    };
+        (result, start.elapsed())
+    });
 
-    let bm25_start = Instant::now();
-    let bm25_results = Bm25Index::open(&index_dir.join("bm25"))
-        .context("failed to open BM25 index for search")
-        .and_then(|index| search_bm25_with_stores(&index, &metadata_store, query, bm25_candidates));
-    timings.bm25 = Some(bm25_start.elapsed());
-
+    // Run vector search concurrently on the async runtime.
+    let vector_metadata_path = index_dir.join("metadata.db");
     let embed_start = Instant::now();
     let vector_results = match VectorStore::open(&index_dir.join("vectors.db"), stored_dim) {
         Ok(vector_store) => {
-            search_vector_with_stores(
-                &vector_store,
-                &metadata_store,
-                provider,
-                query,
-                vector_candidates,
-            )
-            .await
+            let vector_store_result =
+                MetadataStore::open(&vector_metadata_path).context("failed to open metadata store");
+            match vector_store_result {
+                Ok(vector_metadata) => {
+                    search_vector_with_stores(
+                        &vector_store,
+                        &vector_metadata,
+                        provider,
+                        query,
+                        vector_candidates,
+                    )
+                    .await
+                }
+                Err(err) => Err(VectorSearchError::StorageError(err)),
+            }
         }
         Err(err) => Err(VectorSearchError::StorageError(
             err.context("failed to open vector store"),
@@ -132,6 +140,12 @@ pub async fn search_hybrid(
     let vector_elapsed = embed_start.elapsed();
     timings.embedding = Some(vector_elapsed);
     timings.vector = Some(vector_elapsed);
+
+    // Await the BM25 result (should already be done or nearly done).
+    let (bm25_results, bm25_elapsed) = bm25_handle.await.map_err(|e| {
+        HybridSearchError::PipelineError(anyhow::anyhow!("BM25 task panicked: {e}"))
+    })?;
+    timings.bm25 = Some(bm25_elapsed);
 
     match (bm25_results, vector_results) {
         (Ok(bm25), Ok(vector)) => {

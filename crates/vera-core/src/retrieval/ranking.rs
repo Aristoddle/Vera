@@ -28,6 +28,9 @@ struct QueryFeatures {
     exact_identifier_case: Option<String>,
     exact_identifier: Option<String>,
     keywords: Vec<String>,
+    /// CamelCase/snake_case identifiers embedded in NL queries.
+    /// E.g., "How does StateManager handle transitions" yields ["StateManager"].
+    embedded_symbols: Vec<String>,
     requested_symbol_types: Vec<SymbolType>,
     query_type: QueryType,
     wants_test_paths: bool,
@@ -99,6 +102,14 @@ impl QueryFeatures {
             .filter(|token| !token.is_empty())
             .collect();
         let requested_symbol_types = requested_symbol_types(&lower);
+
+        // Extract CamelCase/snake_case identifiers embedded in NL queries.
+        // "How does StateManager handle transitions" → ["statemanager"]
+        let embedded_symbols = if query_type == QueryType::NaturalLanguage {
+            extract_embedded_symbols(&raw_tokens, exact_identifier.as_deref())
+        } else {
+            Vec::new()
+        };
 
         Self {
             query_word_count: raw_tokens.len(),
@@ -172,6 +183,7 @@ impl QueryFeatures {
             exact_filename,
             exact_identifier,
             keywords,
+            embedded_symbols,
             requested_symbol_types,
             query_type,
         }
@@ -369,6 +381,30 @@ fn score_prior(
                 .any(|keyword| shares_keyword_stem(&normalized_stem, keyword))
         {
             bonus += stage_weight * 0.6;
+        } else {
+            // Proportional stem matching: split the file stem into sub-tokens
+            // and count how many query keywords match. Scale bonus by match ratio.
+            // "BeanDeserializer" → ["bean", "deserializer"], query "bean deserialization"
+            // matches 2/2 → full bonus. Require 4+ char parts to avoid noise
+            // from short stems like "mod", "run".
+            let stem_parts = identifier_stems(stem_overlap);
+            let long_parts: Vec<_> = stem_parts.iter().filter(|p| p.len() >= 4).collect();
+            if long_parts.len() >= 2 {
+                let matched = features
+                    .keywords
+                    .iter()
+                    .filter(|kw| {
+                        kw.len() >= 4
+                            && long_parts
+                                .iter()
+                                .any(|part| *part == kw.as_str() || shares_keyword_stem(part, kw))
+                    })
+                    .count();
+                if matched >= 2 {
+                    let ratio = matched as f64 / features.keywords.len().max(1) as f64;
+                    bonus += stage_weight * 0.6 * ratio.min(1.0);
+                }
+            }
         }
     }
 
@@ -421,31 +457,109 @@ fn score_prior(
     }
 
     // Boost definition chunks for NL queries when their symbol name overlaps
-    // query keywords. Definitions are more useful than incidental mentions.
+    // query keywords. Definitions are the canonical location for a concept;
+    // they should strongly outrank incidental mentions. Use a weaker boost
+    // for broad multi-keyword queries where the symbol match is partial.
     if features.query_type == QueryType::NaturalLanguage
         && is_definition_symbol(result.symbol_type)
         && result.symbol_name.is_some()
     {
         if let Some(symbol_name) = result.symbol_name.as_deref() {
             let sym_stems = identifier_stems(symbol_name);
-            let overlap = features.keywords.iter().any(|kw| {
-                sym_stems
+            // Count keyword overlaps where the keyword is non-trivial (5+ chars)
+            // to avoid short keywords like "file", "type", "list" causing false boosts.
+            let overlap_count = features
+                .keywords
+                .iter()
+                .filter(|kw| {
+                    kw.len() >= 5
+                        && sym_stems
+                            .iter()
+                            .any(|s| s == kw.as_str() || shares_keyword_stem(s, kw))
+                })
+                .count();
+            if overlap_count > 0 {
+                // Scale by overlap ratio: single keyword match in a 5-word query
+                // gets a modest boost; full overlap gets the maximum.
+                let long_keywords = features
+                    .keywords
                     .iter()
-                    .any(|s| s == kw || shares_keyword_stem(s, kw))
+                    .filter(|k| k.len() >= 5)
+                    .count()
+                    .max(1);
+                let ratio = (overlap_count as f64 / long_keywords as f64).min(1.0);
+
+                // Extra boost when the file stem also matches the symbol.
+                let stem = file_stem(&result_filename);
+                let stem_aligns = file_stem(&result_filename).eq_ignore_ascii_case(symbol_name)
+                    || sym_stems.iter().any(|s| {
+                        s == &normalize_token(stem)
+                            || shares_keyword_stem(s, &normalize_token(stem))
+                    });
+                let base_boost = if stem_aligns { 1.5 } else { 1.0 };
+                bonus += stage_weight * base_boost * ratio;
+            }
+        }
+    }
+
+    // Content-based definition detection: if the chunk's content defines
+    // a symbol matching query keywords (via language-agnostic prefix matching),
+    // boost it. This catches cases where symbol_type metadata is missing
+    // or too coarse. Skip when the user wants non-source content.
+    // Use a mild boost; the metadata-based definition boost above handles
+    // strong signals.
+    if features.query_type == QueryType::NaturalLanguage
+        && !features.keywords.is_empty()
+        && !features.wants_runtime_paths
+        && !features.wants_config_paths
+        && content_defines_query_keyword(&result.content, &features.keywords)
+    {
+        bonus += stage_weight * 0.3;
+    }
+
+    // Boost chunks whose symbol name matches an embedded CamelCase identifier
+    // in the query. "How does StateManager handle transitions" should boost
+    // chunks with symbol_name "StateManager" or file stem "state_manager".
+    if !features.embedded_symbols.is_empty() {
+        if let Some(symbol_name) = result.symbol_name.as_deref() {
+            let sym_lower = symbol_name.to_ascii_lowercase();
+            let matched = features
+                .embedded_symbols
+                .iter()
+                .any(|es| sym_lower == *es || sym_lower.contains(es.as_str()));
+            if matched {
+                let def_bonus = if is_definition_symbol(result.symbol_type) {
+                    1.0
+                } else {
+                    0.5
+                };
+                bonus += stage_weight * def_bonus;
+            }
+        }
+        // Also check file stem against embedded symbols.
+        let stem_lower = file_stem(&result_filename).to_ascii_lowercase();
+        if stem_lower.len() >= 4 {
+            let stem_matched = features.embedded_symbols.iter().any(|es| {
+                stem_lower == *es
+                    || es.starts_with(&stem_lower)
+                    || stem_lower.starts_with(es.as_str())
             });
-            if overlap {
-                bonus += stage_weight * 0.45;
+            if stem_matched {
+                bonus += stage_weight * 0.4;
             }
         }
     }
 
     if same_file_hits >= 2 && features.query_type == QueryType::NaturalLanguage {
-        let coherence = ((same_file_hits.min(5) - 1) as f64 * 0.12).min(0.48);
+        let coherence = ((same_file_hits.min(5) - 1) as f64 * 0.15).min(0.60);
         bonus += stage_weight * coherence;
     }
 
+    // --- Noise penalties ---
+    // These are strong enough that noisy content classes rarely outrank source.
+    // Penalties stack: a test file inside tests/ gets penalized twice.
     if !features.wants_test_paths && matches!(role, ContentClass::Test) {
-        bonus -= stage_weight * 0.8;
+        bonus -= stage_weight * 0.95;
     }
     if matches!(role, ContentClass::Archive) {
         bonus += if features.wants_archive_paths {
@@ -473,18 +587,18 @@ fn score_prior(
     }
     if !features.wants_example_paths && matches!(role, ContentClass::Example | ContentClass::Bench)
     {
-        bonus -= stage_weight * 0.38;
+        bonus -= stage_weight * 0.55;
     }
     if !features.wants_compat_paths && is_compat_path(&file_path) {
-        bonus -= stage_weight * 0.52;
+        bonus -= stage_weight * 0.65;
     } else if features.wants_compat_paths && is_compat_path(&file_path) {
         bonus += stage_weight * 0.32;
     }
     if !features.wants_type_declarations && is_typescript_declaration(&file_path) {
-        bonus -= stage_weight * 0.62;
+        bonus -= stage_weight * 0.82;
     }
     if is_reexport_barrel(result) && !features.mentions_definition {
-        bonus -= stage_weight * 0.85;
+        bonus -= stage_weight * 0.95;
     }
     bonus += stage_weight * version_path_bonus(features, &file_path);
     if matches!(role, ContentClass::Generated) {
@@ -1032,6 +1146,116 @@ fn structural_chunk_bias(result: &SearchResult) -> f64 {
 
 fn chunk_line_span(result: &SearchResult) -> u32 {
     result.line_end.saturating_sub(result.line_start) + 1
+}
+
+/// Extract CamelCase/camelCase identifiers embedded in NL queries.
+///
+/// "How does StateManager handle transitions" → ["statemanager"]
+/// "Where is the parseConfig function" → ["parseconfig"]
+///
+/// These are compound identifiers that contain mixed case transitions,
+/// indicating a specific code symbol the user is asking about.
+fn extract_embedded_symbols(raw_tokens: &[&str], exact_identifier: Option<&str>) -> Vec<String> {
+    let exact_lower = exact_identifier.map(|s| s.to_ascii_lowercase());
+    raw_tokens
+        .iter()
+        .filter_map(|token| {
+            let trimmed = trim_query_token(token);
+            if trimmed.len() < 4 {
+                return None;
+            }
+            // Must have a case transition (CamelCase or camelCase).
+            let has_case_transition = trimmed
+                .as_bytes()
+                .windows(2)
+                .any(|pair| pair[0].is_ascii_lowercase() && pair[1].is_ascii_uppercase());
+            if !has_case_transition {
+                return None;
+            }
+            let lower = trimmed.to_ascii_lowercase();
+            // Skip if this is already the exact_identifier (already boosted separately).
+            if exact_lower.as_deref() == Some(&lower) {
+                return None;
+            }
+            Some(lower)
+        })
+        .collect()
+}
+
+/// Check if chunk content defines a symbol using language-agnostic keyword matching.
+///
+/// Looks for definition keywords (class, struct, def, function, etc.) followed
+/// by a symbol name that matches query keywords. This is stronger than just
+/// checking symbol_type metadata because it confirms the chunk is the actual
+/// definition site, not just a reference.
+fn content_defines_query_keyword(content: &str, keywords: &[String]) -> bool {
+    static DEFINITION_PREFIXES: &[&str] = &[
+        "class ",
+        "struct ",
+        "enum ",
+        "trait ",
+        "interface ",
+        "type ",
+        "module ",
+        "def ",
+        "fn ",
+        "func ",
+        "function ",
+        "fun ",
+        "pub fn ",
+        "pub struct ",
+        "pub enum ",
+        "pub trait ",
+        "pub type ",
+        "pub mod ",
+        "export class ",
+        "export function ",
+        "export interface ",
+        "export type ",
+        "export enum ",
+        "export default class ",
+        "export default function ",
+        "abstract class ",
+        "data class ",
+        "object ",
+        "protocol ",
+        "record ",
+        "namespace ",
+        "package ",
+        "defmodule ",
+    ];
+
+    // Only consider keywords with 5+ chars to avoid false positives
+    // from common short words like "file", "type", "list".
+    let long_keywords: Vec<&String> = keywords.iter().filter(|k| k.len() >= 5).collect();
+    if long_keywords.is_empty() {
+        return false;
+    }
+
+    for line in content.lines().take(5) {
+        let trimmed = line.trim();
+        for prefix in DEFINITION_PREFIXES {
+            if let Some(rest) = trimmed.strip_prefix(prefix) {
+                // Extract the symbol name after the keyword.
+                let symbol: String = rest
+                    .chars()
+                    .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
+                    .collect();
+                if symbol.len() >= 3 {
+                    let sym_stems = identifier_stems(&symbol);
+                    let matches_keyword = long_keywords.iter().any(|kw| {
+                        sym_stems
+                            .iter()
+                            .any(|s| s == kw.as_str() || shares_keyword_stem(s, kw))
+                    });
+                    if matches_keyword {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
 }
 
 #[cfg(test)]
