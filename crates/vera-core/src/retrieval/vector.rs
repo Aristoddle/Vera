@@ -82,6 +82,10 @@ pub async fn search_vector_with_stores(
     query: &str,
     limit: usize,
 ) -> Result<Vec<SearchResult>, VectorSearchError> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+
     // 1. Generate query embedding.
     let query_embedding = generate_query_embedding(provider, query, vector_store.dim()).await?;
 
@@ -92,8 +96,9 @@ pub async fn search_vector_with_stores(
     );
 
     // 2. Search the vector store for nearest neighbors.
-    // Fetch more candidates than the limit to account for missing metadata.
-    let candidates = limit.saturating_mul(2).max(limit + 10);
+    // Fetch extra candidates to account for missing metadata without doubling
+    // large caller-selected candidate pools.
+    let candidates = limit.saturating_add(limit / 2).max(limit + 10);
 
     let vector_results = vector_store
         .search(&query_embedding, candidates)
@@ -505,6 +510,23 @@ mod tests {
                 .unwrap();
 
         assert!(results.len() <= 2, "results should respect the limit of 2");
+    }
+
+    #[tokio::test]
+    async fn search_zero_limit_skips_embedding() {
+        let dim = 8;
+        let vector_store = VectorStore::open_in_memory(dim).unwrap();
+        let metadata_store = MetadataStore::open_in_memory().unwrap();
+        let provider = MockProvider::failing(EmbeddingError::ConnectionError {
+            message: "should not be called".to_string(),
+        });
+
+        let results =
+            search_vector_with_stores(&vector_store, &metadata_store, &provider, "function", 0)
+                .await
+                .unwrap();
+
+        assert!(results.is_empty());
     }
 
     #[tokio::test]

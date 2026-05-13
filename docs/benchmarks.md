@@ -104,12 +104,13 @@ Vera is benchmarked against [Semble](https://github.com/MinishLab/semble), a Pyt
 |------|---------|----------|-----------|-----|---------|------------|------------|------------|
 | Semble | Potion Code CPU | 0.6630 | 0.9479 | 0.8223 | **0.8311** | **1.43 ms** | **15.41 ms** | 26.06 s |
 | Vera | BM25 ranked (v4) | **0.5792** | 0.8781 | **0.7520** | 0.7567 | 2.92 ms | 10.37 ms | **10.28 s** |
+| Vera | Potion Code CPU (v5) | 0.5792 | **0.8797** | 0.7490 | 0.7550 | 10.11 ms | 41.08 ms | 16.62 s |
 | Vera | Potion Code CPU (v4) | 0.5792 | **0.8797** | 0.7490 | 0.7550 | 10.68 ms | 49.14 ms | 16.72 s |
 | Vera | BM25 ranked (v3) | 0.5573 | 0.8750 | 0.7376 | 0.7477 | 2.92 ms | 10.37 ms | 10.28 s |
 | Vera | Potion Code CPU (v3) | 0.5510 | 0.8891 | 0.7340 | 0.7468 | 13.95 ms | 54.26 ms | 16.40 s |
 | Vera | Jina CUDA ONNX | 0.5276 | 0.8578 | 0.7058 | 0.7233 | 23.50 ms | 6236.60 ms | 151.20 s |
 
-v3 = English stemming, concept-to-filename augmentation. v4 = stronger definition boost, content-based definition detection, embedded symbol extraction, proportional stem matching, stronger noise penalties. Potion v4 also benefits from parallelized BM25+embedding (24% p50 improvement).
+v3 = English stemming, concept-to-filename augmentation. v4 = stronger definition boost, content-based definition detection, embedded symbol extraction, proportional stem matching, stronger noise penalties. Potion v4 also benefits from parallelized BM25+embedding (24% p50 improvement). Potion v5 keeps v4 retrieval metrics and lowers vector search overfetch from 2x to 1.5x of the requested candidate pool, which trims Potion CPU p95 latency on the subset.
 
 **Full 1,251-task Semble suite** (63 repos, gate for parity claims):
 
@@ -130,6 +131,7 @@ Artifacts:
 - [Semble subset baseline](../benchmarks/results/semble/2026-04-29-semble-subset.json)
 - [Vera BM25 subset v4](../benchmarks/results/semble/2026-05-12-vera-bm25-v4-subset.json)
 - [Vera BM25 full suite v4](../benchmarks/results/semble/2026-05-12-vera-bm25-v4-full.json)
+- [Vera Potion CPU subset v5](../benchmarks/results/semble/2026-05-13-vera-potion-v5-subset.json)
 - [Vera Potion CPU subset v4](../benchmarks/results/semble/2026-05-12-vera-potion-v4-subset.json)
 - [Vera BM25 full suite v3](../benchmarks/results/semble/2026-05-11-vera-bm25-v3-full.json)
 - [Vera Jina CUDA subset](../benchmarks/results/semble/2026-05-01-vera-cuda-subset.json)
