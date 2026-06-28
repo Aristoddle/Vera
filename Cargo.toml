@@ -3,6 +3,7 @@ members = [
     "crates/vera-core",
     "crates/vera-cli",
     "crates/vera-mcp",
+    "crates/vera-serve",
     "eval",
 ]
 resolver = "2"
