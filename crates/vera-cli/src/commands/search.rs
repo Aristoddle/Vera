@@ -182,7 +182,10 @@ fn apply_intent(query: &str, intent: Option<&str>) -> String {
         .map(|value| value.split_whitespace().collect::<Vec<_>>().join(" "))
         .filter(|value| !value.is_empty());
     match intent {
-        Some(intent) => format!("intent: {intent} | {query}"),
+        // Keep the intent in plain query text. Tantivy interprets `intent:` as
+        // a field query and fails BM25 parsing because Vera has no `intent`
+        // field in the search schema.
+        Some(intent) => format!("{query} {intent}"),
         None => query.to_string(),
     }
 }
@@ -231,5 +234,34 @@ fn print_timings(timings: &SearchTimings) {
         if duration.is_some() || *name == "total" {
             let _ = writeln!(err, "[timing] {name}: {}", fmt(*duration));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn apply_intent_appends_plain_text_without_tantivy_field_syntax() {
+        let query = apply_intent(
+            "config loading",
+            Some("find env based database connection setup"),
+        );
+
+        assert_eq!(
+            query,
+            "config loading find env based database connection setup"
+        );
+        assert!(!query.contains("intent:"));
+        assert!(!query.contains('|'));
+    }
+
+    #[test]
+    fn apply_intent_ignores_empty_intent() {
+        assert_eq!(
+            apply_intent("config loading", Some("   \n\t  ")),
+            "config loading"
+        );
+        assert_eq!(apply_intent("config loading", None), "config loading");
     }
 }
