@@ -183,8 +183,18 @@ pub async fn search_hybrid_reranked(
     )
     .await?;
 
-    if hybrid_results.is_empty() {
-        return Ok((hybrid_results, timings));
+    // Skip reranking when there are no surplus candidates beyond the requested
+    // limit. The reranker can only reorder existing candidates, so if every
+    // candidate would be returned anyway, calling it only adds latency.
+    if hybrid_results.len() <= limit {
+        debug!(
+            candidates = hybrid_results.len(),
+            limit = limit,
+            "no surplus candidates beyond requested limit, skipping reranking"
+        );
+        let mut results = hybrid_results;
+        results.truncate(limit);
+        return Ok((results, timings));
     }
 
     let rerank_start = Instant::now();
@@ -722,7 +732,7 @@ mod tests {
             &provider,
             &reranker,
             "authenticate",
-            5,
+            2,
             60.0,
             dim,
             10,
@@ -762,12 +772,12 @@ mod tests {
         });
 
         // Should NOT return an error — graceful degradation returns unreranked results.
-        let (results, _timings) = search_hybrid_reranked(
+        let (results, timings) = search_hybrid_reranked(
             &index_dir,
             &provider,
             &reranker,
             "authenticate",
-            5,
+            2,
             60.0,
             dim,
             10,
@@ -779,6 +789,48 @@ mod tests {
         assert!(
             !results.is_empty(),
             "should return unreranked results when reranker fails"
+        );
+        assert!(
+            timings.reranking.is_some(),
+            "reranker failure path should record reranking timing"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_hybrid_reranked_skips_reranker_without_surplus_candidates() {
+        use crate::embedding::test_helpers::MockProvider;
+        use crate::retrieval::reranker::RerankerError;
+        use crate::retrieval::reranker::test_helpers::MockReranker;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let (index_dir, dim) = setup_test_index(tmp.path()).await;
+
+        let provider = MockProvider::new(dim);
+        let reranker = MockReranker::failing(RerankerError::ConnectionError {
+            message: "reranker should not be called".to_string(),
+        });
+
+        let (results, timings) = search_hybrid_reranked(
+            &index_dir,
+            &provider,
+            &reranker,
+            "authenticate",
+            10,
+            60.0,
+            dim,
+            10,
+            50,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            !results.is_empty(),
+            "should still return hybrid results when reranking is skipped"
+        );
+        assert!(
+            timings.reranking.is_none(),
+            "reranking timing should stay unset when there are no surplus candidates"
         );
     }
 
