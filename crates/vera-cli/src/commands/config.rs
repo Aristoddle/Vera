@@ -138,6 +138,10 @@ fn print_human_config(config: &vera_core::config::VeraConfig) {
         "    max_stored_dim            {}",
         config.embedding.max_stored_dim
     );
+    println!(
+        "    model_aliases             {:?}",
+        config.embedding.model_aliases
+    );
 }
 
 /// Get a configuration value by dot-notation key.
@@ -181,6 +185,7 @@ pub fn get_config_value(
         "embedding.max_stored_dim" => Some(serde_json::Value::Number(
             config.embedding.max_stored_dim.into(),
         )),
+        "embedding.model_aliases" => serde_json::to_value(&config.embedding.model_aliases).ok(),
         _ => None,
     }
 }
@@ -231,6 +236,13 @@ fn set_config_value(
         }
         "embedding.max_stored_dim" => {
             config.embedding.max_stored_dim = parse_value(key, value)?;
+        }
+        "embedding.model_aliases" => {
+            config.embedding.model_aliases = serde_json::from_str(value).with_context(|| {
+                format!(
+                    "failed to parse {key} as JSON array of alias groups, e.g. [[\"model\", \"deployment-alias\"]]: {value}"
+                )
+            })?;
         }
         _ => bail!(
             "unknown configuration key: {key}\n\

@@ -117,7 +117,7 @@ Indexing shows a live progress bar with file discovery, parsing, and embedding g
 Indexing, storage, and search always stay on your machine. The backend choice only affects where embeddings and reranking run:
 
 - **Local mode**: `vera setup` downloads curated ONNX models. The full pipeline (BM25 + vector + rerank) runs without external calls.
-- **API mode**: Point at any OpenAI-compatible endpoint (remote APIs or local servers like llama.cpp). Only model calls leave your machine. Query prefixes for asymmetric embedding models (Qwen3, CodeRankEmbed, E5, BGE) are auto-detected from the model ID. Override with `EMBEDDING_QUERY_PREFIX` for unsupported models. See [llama-cpp-setup.md](llama-cpp-setup.md) for a step-by-step guide.
+- **API mode**: Point at any OpenAI-compatible endpoint (remote APIs or local servers like llama.cpp). Only model calls leave your machine. Query prefixes for asymmetric embedding models (Qwen3, CodeRankEmbed, E5, BGE) are auto-detected from the model ID. Override with `EMBEDDING_QUERY_PREFIX` for unsupported models. If a gateway uses deployment aliases for the same embedding model, set `embedding.model_aliases` or `VERA_EMBEDDING_MODEL_ALIASES` so existing indexes keep vector search enabled. See [llama-cpp-setup.md](llama-cpp-setup.md) for a step-by-step guide.
 
 ### Curated Local Models
 
