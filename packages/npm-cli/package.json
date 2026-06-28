@@ -1,16 +1,16 @@
 {
   "name": "@vera-ai/cli",
-  "version": "0.4.0",
+  "version": "0.12.14-aristoddle.1",
   "description": "Bootstrap installer and wrapper for the Vera CLI",
   "license": "MIT",
-  "homepage": "https://github.com/lemon07r/Vera#readme",
+  "homepage": "https://github.com/Aristoddle/Vera#readme",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/lemon07r/Vera.git",
+    "url": "git+https://github.com/Aristoddle/Vera.git",
     "directory": "packages/npm-cli"
   },
   "bugs": {
-    "url": "https://github.com/lemon07r/Vera/issues"
+    "url": "https://github.com/Aristoddle/Vera/issues"
   },
   "bin": "./bin/vera.js",
   "scripts": {
