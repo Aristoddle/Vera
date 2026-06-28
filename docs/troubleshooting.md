@@ -69,6 +69,27 @@ vera config set embedding.batch_size 100
 
 Current builds also clamp known provider limits automatically. Gemini embedding endpoints are capped at 100 inputs per request.
 
+If search falls back to BM25-only with a warning that the index model does not
+match the active model, first confirm the vector dimensions match. Some
+OpenAI-compatible gateways expose a deployment name while returning or storing a
+canonical upstream model name. If those names are genuinely the same embedding
+model and dimension, configure an alias group:
+
+```bash
+vera config set embedding.model_aliases '[["text-embedding-3-large","text-embedding-3-large-2"]]'
+```
+
+For one-off sessions, the same aliases can be supplied without changing saved
+configuration:
+
+```bash
+export VERA_EMBEDDING_MODEL_ALIASES='text-embedding-3-large,text-embedding-3-large-2'
+```
+
+Do not alias models that produce different embedding dimensions or unrelated
+vectors; Vera still checks dimensions, but semantic incompatibility cannot be
+detected automatically.
+
 If the provider returns `429` or `quota exceeded`, that is a provider-side limit. `embedding.max_concurrent_requests` only reduces how many requests Vera sends in parallel; it does not raise your API quota. Lower concurrency if you are hitting short burst limits, or wait for quota reset / enable billing if the project is out of quota.
 
 ## GPU runs out of memory during indexing

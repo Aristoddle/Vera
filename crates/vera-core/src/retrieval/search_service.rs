@@ -82,7 +82,11 @@ pub fn execute_search(
                 .get_index_meta("embedding_dim")
                 .unwrap_or(None),
         ) {
-            if !crate::config::model_names_match(&s_model, &model_name) {
+            if !crate::config::model_names_match_with_aliases(
+                &s_model,
+                &model_name,
+                &config.embedding.model_aliases,
+            ) {
                 warn!(
                     "Index model '{}' does not match active model '{}'; using BM25-only search",
                     s_model, model_name
