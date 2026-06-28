@@ -58,7 +58,11 @@ impl SearchContext {
         let (provider, model_name, provider_error) =
             match crate::embedding::create_dynamic_provider(config, backend).await {
                 Ok((provider, model_name)) => (
-                    Some(CachedEmbeddingProvider::new(provider, 512)),
+                    Some(CachedEmbeddingProvider::with_namespace(
+                        provider,
+                        512,
+                        &model_name,
+                    )),
                     Some(model_name),
                     None,
                 ),
