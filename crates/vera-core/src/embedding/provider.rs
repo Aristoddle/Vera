@@ -604,6 +604,7 @@ fn context_size_info(error: &EmbeddingError) -> Option<ContextSizeInfo> {
         && !lower.contains("\"n_ctx\"")
         && !lower.contains("too large to process")
         && !lower.contains("max allowed tokens per submitted batch")
+        && !lower.contains("maximum input length")
     {
         return None;
     }
@@ -615,6 +616,7 @@ fn context_size_info(error: &EmbeddingError) -> Option<ContextSizeInfo> {
     static N_PROMPT_RE: OnceLock<Regex> = OnceLock::new();
     static MAX_BATCH_TOKENS_RE: OnceLock<Regex> = OnceLock::new();
     static BATCH_TOKENS_RE: OnceLock<Regex> = OnceLock::new();
+    static OPENAI_MAX_INPUT_RE: OnceLock<Regex> = OnceLock::new();
     let n_ctx_re = N_CTX_RE.get_or_init(|| Regex::new(r#""n_ctx"\s*:\s*(\d+)"#).unwrap());
     let max_context_re =
         MAX_CONTEXT_RE.get_or_init(|| Regex::new(r"max context size \((\d+)").unwrap());
@@ -627,6 +629,8 @@ fn context_size_info(error: &EmbeddingError) -> Option<ContextSizeInfo> {
         .get_or_init(|| Regex::new(r"max allowed tokens per submitted batch is (\d+)").unwrap());
     let batch_tokens_re =
         BATCH_TOKENS_RE.get_or_init(|| Regex::new(r"your batch has (\d+) tokens?").unwrap());
+    let openai_max_input_re = OPENAI_MAX_INPUT_RE
+        .get_or_init(|| Regex::new(r"maximum input length is (\d+) tokens?").unwrap());
 
     let max_tokens = n_ctx_re
         .captures(&lower)
@@ -635,6 +639,11 @@ fn context_size_info(error: &EmbeddingError) -> Option<ContextSizeInfo> {
         .or_else(|| batch_size_re.captures(&lower).and_then(|caps| caps.get(1)))
         .or_else(|| {
             max_batch_tokens_re
+                .captures(&lower)
+                .and_then(|caps| caps.get(1))
+        })
+        .or_else(|| {
+            openai_max_input_re
                 .captures(&lower)
                 .and_then(|caps| caps.get(1))
         })
@@ -1262,6 +1271,18 @@ mod tests {
         let info = context_size_info(&err).expect("should recognize voyage batch token error");
         assert_eq!(info.max_tokens, 120000);
         assert_eq!(info.input_tokens, Some(124417));
+        assert!(is_context_size_error(&err));
+    }
+
+    #[test]
+    fn context_size_info_parses_openai_maximum_input_length_error() {
+        let err = EmbeddingError::ApiError {
+            status: 400,
+            message: r#"{"error":{"message":"Invalid 'input[3]': maximum input length is 8192 tokens.","type":"invalid_request_error","param":null,"code":null}}"#.to_string(),
+        };
+        let info = context_size_info(&err).expect("should recognize OpenAI max input length error");
+        assert_eq!(info.max_tokens, 8192);
+        assert_eq!(info.input_tokens, None);
         assert!(is_context_size_error(&err));
     }
 }
