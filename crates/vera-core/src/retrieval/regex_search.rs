@@ -239,7 +239,10 @@ fn clamp_char_boundary(content: &str, mut idx: usize) -> usize {
 }
 
 fn byte_to_line(content: &str, byte_idx: usize) -> u32 {
-    content[..byte_idx.min(content.len())]
+    // Clamp to a char boundary before slicing to avoid a panic when byte_idx
+    // falls inside a multi-byte Unicode code point (e.g. CJK content, emoji).
+    let safe_idx = clamp_char_boundary(content, byte_idx.min(content.len()));
+    content[..safe_idx]
         .bytes()
         .filter(|byte| *byte == b'\n')
         .count() as u32
@@ -590,5 +593,24 @@ mod tests {
                 .all(|result| result.symbol_name.as_deref() == Some("build_token"))
         );
         assert_eq!(results[0].file_path, "src/lib.rs");
+    }
+
+    #[test]
+    fn grep_unicode_boundary_no_panic() {
+        // Regression: byte_to_line must not panic when match positions land
+        // near multi-byte Unicode code points (CJK, emoji, etc.).
+        // Previously, content[..byte_idx] would panic if byte_idx was not a
+        // char boundary; now clamp_char_boundary is applied first.
+        let unicode_content = "# 機械学習\n\nfn train() { /* 🚀 */ }\n";
+        let result = clamp_char_boundary(unicode_content, 3);
+        // 3 is inside the 3-byte UTF-8 sequence for 機 (0xe6 0xa9 0x9f).
+        // clamp_char_boundary must return a valid boundary (<= 3).
+        assert!(unicode_content.is_char_boundary(result));
+        assert!(result <= 3);
+
+        // byte_to_line must not panic on any byte index in Unicode content.
+        for i in 0..=unicode_content.len() {
+            let _ = byte_to_line(unicode_content, i);
+        }
     }
 }
