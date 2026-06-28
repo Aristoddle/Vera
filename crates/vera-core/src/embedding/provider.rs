@@ -421,6 +421,10 @@ impl EmbeddingProvider for OpenAiProvider {
 pub struct CachedEmbeddingProvider<P> {
     inner: P,
     cache: Mutex<LruCache>,
+    /// Namespace prefix for cache keys (typically the model id or provider URL).
+    /// Prevents cross-model cache poisoning when the same query text is embedded
+    /// by different models producing incompatible vectors.
+    namespace: String,
 }
 
 /// Simple bounded cache with insertion-order eviction.
@@ -477,16 +481,42 @@ impl<P: EmbeddingProvider> CachedEmbeddingProvider<P> {
     ///
     /// `max_entries` controls the maximum number of cached embeddings.
     /// A reasonable default for interactive use is 256–1024.
+    ///
+    /// `namespace` is a stable identifier for the embedding model (e.g.,
+    /// model name, provider URL, or config key). It prefixes every cache key
+    /// so that switching models invalidates the cache instead of silently
+    /// returning vectors from the wrong model.
     pub fn new(inner: P, max_entries: usize) -> Self {
         Self {
             inner,
             cache: Mutex::new(LruCache::new(max_entries)),
+            namespace: String::new(),
+        }
+    }
+
+    /// Create a cached provider with an explicit namespace for cache key isolation.
+    pub fn with_namespace(inner: P, max_entries: usize, namespace: impl Into<String>) -> Self {
+        Self {
+            inner,
+            cache: Mutex::new(LruCache::new(max_entries)),
+            namespace: namespace.into(),
         }
     }
 
     /// Return the number of currently cached entries.
     pub fn cache_size(&self) -> usize {
         self.cache.lock().unwrap().len()
+    }
+
+    /// Build a cache key that includes the namespace (model identity) so that
+    /// switching embedding models invalidates the cache rather than silently
+    /// returning vectors from a different model.
+    fn make_cache_key(&self, query: &str) -> String {
+        if self.namespace.is_empty() {
+            query.to_string()
+        } else {
+            format!("{}\0{}", self.namespace, query)
+        }
     }
 }
 
@@ -498,8 +528,8 @@ impl<P: EmbeddingProvider> EmbeddingProvider for CachedEmbeddingProvider<P> {
 
         // For single-text batches (query embedding), check cache first.
         if texts.len() == 1 {
-            let key = &texts[0];
-            if let Some(cached) = self.cache.lock().unwrap().get(key) {
+            let key = self.make_cache_key(&texts[0]);
+            if let Some(cached) = self.cache.lock().unwrap().get(&key) {
                 debug!("embedding cache hit for query");
                 return Ok(vec![cached.clone()]);
             }
@@ -510,7 +540,7 @@ impl<P: EmbeddingProvider> EmbeddingProvider for CachedEmbeddingProvider<P> {
 
         // Cache single-text results (query embeddings).
         if texts.len() == 1 && vectors.len() == 1 {
-            let key = texts[0].clone();
+            let key = self.make_cache_key(&texts[0]);
             let vector = vectors[0].clone();
             self.cache.lock().unwrap().insert(key, vector);
             debug!("embedding cached for query");
