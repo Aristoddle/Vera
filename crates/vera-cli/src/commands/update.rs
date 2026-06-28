@@ -53,7 +53,11 @@ pub fn run(
                 .get_index_meta("embedding_dim")
                 .unwrap_or(None),
         ) {
-            if !vera_core::config::model_names_match(&s_model, &model_name) {
+            if !vera_core::config::model_names_match_with_aliases(
+                &s_model,
+                &model_name,
+                &config.embedding.model_aliases,
+            ) {
                 bail!(
                     "Index was created with model '{}' ({} dimensions), but you are using model '{}'. Please re-index with matching provider.",
                     s_model,

@@ -153,7 +153,11 @@ pub async fn update_repository<P: EmbeddingProvider>(
             .get_index_meta("embedding_dim")
             .unwrap_or(None),
     ) {
-        if !crate::config::model_names_match(&s_model, model_name) {
+        if !crate::config::model_names_match_with_aliases(
+            &s_model,
+            model_name,
+            &config.embedding.model_aliases,
+        ) {
             bail!(
                 "Index was created with model '{}' ({} dimensions), but you are using model '{}'. Please re-index with matching provider.",
                 s_model,
