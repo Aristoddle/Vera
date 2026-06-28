@@ -1,0 +1,4 @@
+# macOS: inherit MACOSX_DEPLOYMENT_TARGET from environment; don't hardcode 11.0.
+# Use scripts/install-vera-fork.sh which auto-detects running macOS version.
+[target.aarch64-apple-darwin]
+# No rustflags override — let env MACOSX_DEPLOYMENT_TARGET control the target.
