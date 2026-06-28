@@ -148,7 +148,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                     },
                     "path": {
                         "type": "string",
-                        "description": "Filter by file path glob (e.g., src/**/*.rs)"
+                        "description": "Filter by file path glob (e.g., src/**/*.rs). Bare directory paths are treated as recursive prefixes (e.g., backend/src matches backend/src/**)."
                     },
                     "symbol_type": {
                         "type": "string",
@@ -308,6 +308,18 @@ fn regex_search_filters(
     }
 }
 
+fn apply_intent_to_query(query: &str, intent: Option<&str>) -> String {
+    let intent = intent
+        .map(|value| value.split_whitespace().collect::<Vec<_>>().join(" "))
+        .filter(|value| !value.is_empty());
+    match intent {
+        // Keep the intent as plain query text. Tantivy treats `intent:` as a
+        // field query and Vera's BM25 schema has no `intent` field.
+        Some(intent) => format!("{query} {intent}"),
+        None => query.to_string(),
+    }
+}
+
 /// Handle the `search_code` tool.
 fn handle_search_code(args: &Value) -> ToolCallResult {
     // Collect queries: support both single `query` and multi `queries`.
@@ -397,11 +409,7 @@ fn handle_search_code(args: &Value) -> ToolCallResult {
     };
 
     for query in &queries {
-        // If intent is provided, prepend it to the query for better reranking.
-        let effective_query = match intent {
-            Some(i) => format!("intent: {i} | {query}"),
-            None => query.clone(),
-        };
+        let effective_query = apply_intent_to_query(query, intent);
         match vera_core::retrieval::search_service::execute_search(
             &index_dir,
             &effective_query,
@@ -641,6 +649,33 @@ mod tests {
         assert_eq!(filters.symbol_type.as_deref(), Some("function"));
         assert_eq!(filters.scope, Some(vera_core::types::SearchScope::Source));
         assert_eq!(filters.include_generated, Some(true));
+    }
+
+    #[test]
+    fn search_code_intent_appends_plain_text_without_tantivy_field_syntax() {
+        let query = apply_intent_to_query(
+            "config loading",
+            Some("find env based database connection setup"),
+        );
+
+        assert_eq!(
+            query,
+            "config loading find env based database connection setup"
+        );
+        assert!(!query.contains("intent:"));
+        assert!(!query.contains('|'));
+    }
+
+    #[test]
+    fn search_code_intent_ignores_empty_intent() {
+        assert_eq!(
+            apply_intent_to_query("config loading", Some(" \n\t ")),
+            "config loading"
+        );
+        assert_eq!(
+            apply_intent_to_query("config loading", None),
+            "config loading"
+        );
     }
 
     #[test]
