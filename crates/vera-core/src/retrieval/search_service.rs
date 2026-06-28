@@ -123,7 +123,8 @@ pub fn execute_search(
         }
     }
 
-    let provider = crate::embedding::CachedEmbeddingProvider::new(provider, 512);
+    let provider =
+        crate::embedding::CachedEmbeddingProvider::with_namespace(provider, 512, &model_name);
 
     // Create optional reranker.
     let reranker = rt

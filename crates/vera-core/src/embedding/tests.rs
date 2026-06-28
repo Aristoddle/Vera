@@ -764,3 +764,49 @@ async fn cached_provider_expected_dim_delegates() {
     let cached = CachedEmbeddingProvider::new(inner, 128);
     assert_eq!(cached.expected_dim(), Some(64));
 }
+
+#[tokio::test]
+async fn cached_provider_namespace_isolates_models() {
+    use crate::embedding::CachedEmbeddingProvider;
+
+    // Two providers with different namespaces (simulating different models).
+    let inner_a = MockProvider::new(3);
+    let cached_a = CachedEmbeddingProvider::with_namespace(inner_a, 128, "model-a");
+
+    let inner_b = MockProvider::new(3);
+    let cached_b = CachedEmbeddingProvider::with_namespace(inner_b, 128, "model-b");
+
+    // Same query text, different namespaces — must NOT share cache entries.
+    let query = vec!["hello".to_string()];
+    let vec_a = cached_a.embed_batch(&query).await.unwrap();
+    assert_eq!(cached_a.cache_size(), 1);
+
+    // Model B should get its own embedding, not model A's cached result.
+    let vec_b = cached_b.embed_batch(&query).await.unwrap();
+    assert_eq!(cached_b.cache_size(), 1);
+
+    // Both should have results (mock returns deterministic vectors based on dim).
+    assert_eq!(vec_a[0].len(), 3);
+    assert_eq!(vec_b[0].len(), 3);
+}
+
+#[tokio::test]
+async fn cached_provider_empty_namespace_backwards_compat() {
+    use crate::embedding::CachedEmbeddingProvider;
+
+    // Default constructor (no namespace) should still work — backwards compat.
+    let inner = MockProvider::new(4);
+    let cached = CachedEmbeddingProvider::new(inner, 128);
+
+    let query = vec!["test".to_string()];
+    let _ = cached.embed_batch(&query).await.unwrap();
+    assert_eq!(cached.cache_size(), 1, "empty namespace should still cache");
+
+    // Second call should hit cache.
+    let _ = cached.embed_batch(&query).await.unwrap();
+    assert_eq!(
+        cached.cache_size(),
+        1,
+        "repeat query should hit cache, not grow"
+    );
+}
