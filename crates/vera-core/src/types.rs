@@ -145,7 +145,25 @@ fn glob_matches(pattern: &str, path: &str) -> bool {
     let pattern = pattern.replace('\\', "/");
     let path = path.replace('\\', "/");
 
-    glob_match_recursive(&pattern, &path)
+    if glob_match_recursive(&pattern, &path) {
+        return true;
+    }
+
+    // Directory-prefix fallback: a bare path pattern with no wildcard
+    // characters (for example, `app/src`) should match any file beneath that
+    // directory (`app/src/foo.rs`). Keep this out of the recursive matcher so
+    // wildcard handlers like `*` retain strict single-segment semantics.
+    if pattern.chars().any(|ch| matches!(ch, '*' | '?' | '[')) {
+        return false;
+    }
+
+    let pattern = pattern.trim_end_matches('/');
+    if pattern.is_empty() {
+        return path.trim_matches('/').is_empty();
+    }
+
+    path.strip_prefix(pattern)
+        .is_some_and(|rest| rest.starts_with('/'))
 }
 
 /// Recursive glob matching helper.
@@ -1247,6 +1265,40 @@ mod tests {
     }
 
     #[test]
+    fn filter_by_path_literal_directory_prefix() {
+        let filters = SearchFilters {
+            path_glob: Some("src/features/orders".to_string()),
+            ..Default::default()
+        };
+        let nested = make_test_result(
+            "src/features/orders/orders.usecase.ts",
+            Language::TypeScript,
+            None,
+            None,
+        );
+        let sibling = make_test_result(
+            "src/features/orders-v2/usecase.ts",
+            Language::TypeScript,
+            None,
+            None,
+        );
+        assert!(filters.matches(&nested));
+        assert!(!filters.matches(&sibling));
+    }
+
+    #[test]
+    fn filter_by_path_single_star_does_not_cross_directory_boundary() {
+        let filters = SearchFilters {
+            path_glob: Some("src/*".to_string()),
+            ..Default::default()
+        };
+        let shallow = make_test_result("src/foo.rs", Language::Rust, None, None);
+        let deep = make_test_result("src/bar/baz.rs", Language::Rust, None, None);
+        assert!(filters.matches(&shallow));
+        assert!(!filters.matches(&deep));
+    }
+
+    #[test]
     fn filter_combined_lang_and_type() {
         let filters = SearchFilters {
             language: Some("rust".to_string()),
@@ -1352,6 +1404,26 @@ mod tests {
     fn glob_exact_match() {
         assert!(glob_matches("src/main.rs", "src/main.rs"));
         assert!(!glob_matches("src/main.rs", "src/lib.rs"));
+    }
+
+    #[test]
+    fn glob_literal_directory_matches_descendants() {
+        assert!(glob_matches("src", "src/index.ts"));
+        assert!(glob_matches(
+            "src/features/orders",
+            "src/features/orders/orders.usecase.ts"
+        ));
+    }
+
+    #[test]
+    fn glob_literal_directory_matches_self_and_trailing_slash() {
+        assert!(glob_matches("src/", "src/index.ts"));
+        assert!(glob_matches("src/features/orders", "src/features/orders"));
+    }
+
+    #[test]
+    fn glob_literal_directory_respects_segment_boundaries() {
+        assert!(!glob_matches("src", "src-other/index.ts"));
     }
 
     #[test]
