@@ -358,9 +358,16 @@ pub fn suggested_update_command(install_method: Option<&str>) -> String {
 }
 
 /// Compare two semver-ish strings. Returns true if `latest` > `current`.
+///
+/// Pre-release suffixes (e.g., `-aristoddle.1`, `-rc.1`) are stripped from the
+/// current version before comparison so that fork builds like `0.12.14-aristoddle.1`
+/// correctly compare as `>= 0.12.13` and do not trigger a false-positive update hint.
 fn is_newer(latest: &str, current: &str) -> bool {
     let parse = |s: &str| -> (u32, u32, u32) {
         let s = s.strip_prefix('v').unwrap_or(s);
+        // Strip pre-release suffix (everything from the first '-') so that
+        // fork builds like "0.12.14-aristoddle.1" compare as "0.12.14".
+        let s = s.split('-').next().unwrap_or(s);
         let mut parts = s.split('.').map(|p| p.parse::<u32>().unwrap_or(0));
         (
             parts.next().unwrap_or(0),
@@ -567,6 +574,20 @@ mod tests {
         assert!(!is_newer("0.3.1", "0.3.1"));
         assert!(!is_newer("0.3.0", "0.3.1"));
         assert!(is_newer("v0.4.0", "0.3.1"));
+    }
+
+    #[test]
+    fn is_newer_fork_suffix_no_false_positive() {
+        // Fork build "0.12.14-aristoddle.1" must NOT trigger an update hint
+        // when upstream is "0.12.13". Pre-release suffix is stripped so the
+        // base version (0.12.14) is compared correctly.
+        assert!(!is_newer("0.12.13", "0.12.14-aristoddle.1"));
+        // Fork build ahead of upstream — no warn.
+        assert!(!is_newer("0.12.14", "0.12.14-rc.1"));
+        // Upstream is genuinely newer — should still warn.
+        assert!(is_newer("0.12.15", "0.12.14-aristoddle.1"));
+        // v-prefix on latest works with fork current.
+        assert!(!is_newer("v0.12.13", "0.12.14-aristoddle.1"));
     }
 
     #[test]
