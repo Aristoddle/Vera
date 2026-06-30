@@ -36,6 +36,11 @@ struct TokensInParensProvider {
     max_chars: usize,
 }
 
+struct OpenAiInputLengthProvider {
+    dim: usize,
+    max_chars: usize,
+}
+
 struct BatchLimitedProvider {
     dim: usize,
     max_batch_size: usize,
@@ -105,6 +110,30 @@ impl EmbeddingProvider for TokensInParensProvider {
             return Err(EmbeddingError::ApiError {
                 status: 400,
                 message: "input (9448 tokens) is larger than the max context size (8192 tokens). skipping".to_string(),
+            });
+        }
+
+        Ok(texts
+            .iter()
+            .map(|text| vec![text.len() as f32, 1.0, 2.0, 3.0][..self.dim].to_vec())
+            .collect())
+    }
+
+    fn expected_dim(&self) -> Option<usize> {
+        Some(self.dim)
+    }
+}
+
+impl EmbeddingProvider for OpenAiInputLengthProvider {
+    async fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+        if texts
+            .iter()
+            .any(|text| text.chars().count() > self.max_chars)
+        {
+            // OpenAI's format carries the limit but no input token count.
+            return Err(EmbeddingError::ApiError {
+                status: 400,
+                message: r#"{"error":{"message":"Invalid 'input[3]': maximum input length is 8192 tokens.","type":"invalid_request_error","param":null,"code":null}}"#.to_string(),
             });
         }
 
@@ -550,6 +579,28 @@ async fn concurrent_embed_recovers_from_token_limit_batch_errors() {
 #[tokio::test]
 async fn concurrent_embed_recovers_from_tokens_in_parens_error() {
     let provider = TokensInParensProvider {
+        dim: 4,
+        max_chars: 80,
+    };
+    let mut chunks = sample_chunks(3);
+    chunks[1].content = format!("fn huge() {{\n    {}\n}}", "x".repeat(600));
+
+    let result = embed_chunks_concurrent(&provider, &chunks, 2, 2, 0)
+        .await
+        .unwrap();
+
+    assert_eq!(result.len(), 3);
+    assert_eq!(result[0].0, "chunk-0");
+    assert_eq!(result[1].0, "chunk-1");
+    assert_eq!(result[2].0, "chunk-2");
+}
+
+#[tokio::test]
+async fn concurrent_embed_recovers_from_openai_max_input_length_error() {
+    // Regression for issue #21: OpenAI's "maximum input length is N tokens"
+    // error must trigger truncation-retry instead of being fatal, even though
+    // it carries no input-token count.
+    let provider = OpenAiInputLengthProvider {
         dim: 4,
         max_chars: 80,
     };
