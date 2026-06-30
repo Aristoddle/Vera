@@ -54,6 +54,8 @@ pub fn execute_search(
     // (embedding + reranker); sending it to BM25 makes Tantivy parse
     // `intent:` as a non-existent field and fail. See issue #20.
     let vector_query = build_query_with_intent(query, intent);
+    // True when an intent prefix was actually applied (non-empty intent).
+    let has_intent = matches!(vector_query, std::borrow::Cow::Owned(_));
     let fetch_limit = compute_fetch_limit(query, filters, result_limit);
     let rt = tokio::runtime::Runtime::new()?;
 
@@ -134,7 +136,7 @@ pub fn execute_search(
             warn!("Failed to create reranker ({})", e);
             None
         });
-    let reranker_enabled = reranker.is_some() && !should_skip_reranking(query, filters);
+    let reranker_enabled = reranking_enabled(reranker.is_some(), has_intent, query, filters);
 
     // Classify query to adapt fusion parameters.
     let query_type = classify_query(query);
@@ -163,7 +165,7 @@ pub fn execute_search(
             &provider,
             reranker,
             query,
-            &vector_query,
+            vector_query.as_ref(),
             fetch_limit,
             rrf_k,
             stored_dim,
@@ -175,7 +177,7 @@ pub fn execute_search(
             index_dir,
             &provider,
             query,
-            &vector_query,
+            vector_query.as_ref(),
             fetch_limit,
             rrf_k,
             stored_dim,
@@ -208,13 +210,18 @@ pub fn execute_search(
 /// is returned unchanged when no usable intent is present. This prefixed form
 /// must never reach BM25: Tantivy's `QueryParser` treats `intent:` as a field
 /// query and there is no such field. See issue #20.
-pub(crate) fn build_query_with_intent(query: &str, intent: Option<&str>) -> String {
+pub(crate) fn build_query_with_intent<'a>(
+    query: &'a str,
+    intent: Option<&str>,
+) -> std::borrow::Cow<'a, str> {
     let intent = intent
         .map(|value| value.split_whitespace().collect::<Vec<_>>().join(" "))
         .filter(|value| !value.is_empty());
     match intent {
-        Some(intent) => format!("intent: {intent} | {query}"),
-        None => query.to_string(),
+        // Only allocate when an intent prefix is actually applied; otherwise
+        // borrow the raw query.
+        Some(intent) => std::borrow::Cow::Owned(format!("intent: {intent} | {query}")),
+        None => std::borrow::Cow::Borrowed(query),
     }
 }
 
@@ -265,6 +272,22 @@ fn effective_rerank_candidates(
     }
 
     base.max(fetch_limit)
+}
+
+/// Decide whether the cross-encoder reranker should run.
+///
+/// Skip heuristics (short identifier / path-weighted / filtered lookups) are
+/// based on the raw query. But when the user supplies an `--intent`, they are
+/// asking for semantic ranking, so the reranker must run even for short raw
+/// queries — otherwise the intent-enriched query would never reach the
+/// cross-encoder. See issue #20.
+fn reranking_enabled(
+    reranker_present: bool,
+    has_intent: bool,
+    query: &str,
+    filters: &SearchFilters,
+) -> bool {
+    reranker_present && (has_intent || !should_skip_reranking(query, filters))
 }
 
 fn should_skip_reranking(query: &str, filters: &SearchFilters) -> bool {
@@ -575,15 +598,34 @@ mod tests {
 
     #[test]
     fn build_query_with_intent_formats_and_normalizes() {
-        // No intent: raw query unchanged (this is what BM25 receives).
-        assert_eq!(build_query_with_intent("test query", None), "test query");
-        // Empty / whitespace-only intent collapses to no prefix.
-        assert_eq!(build_query_with_intent("test query", Some("   ")), "test query");
-        // Intent present: prefixed form with whitespace collapsed.
-        assert_eq!(
-            build_query_with_intent("test query", Some("find  auth\n handlers")),
-            "intent: find auth handlers | test query"
-        );
+        // No intent: raw query borrowed unchanged (this is what BM25 receives).
+        let none = build_query_with_intent("test query", None);
+        assert_eq!(none.as_ref(), "test query");
+        assert!(matches!(none, std::borrow::Cow::Borrowed(_)));
+        // Empty / whitespace-only intent collapses to no prefix (still borrowed).
+        let empty = build_query_with_intent("test query", Some("   "));
+        assert_eq!(empty.as_ref(), "test query");
+        assert!(matches!(empty, std::borrow::Cow::Borrowed(_)));
+        // Intent present: owned prefixed form with whitespace collapsed.
+        let some = build_query_with_intent("test query", Some("find  auth\n handlers"));
+        assert_eq!(some.as_ref(), "intent: find auth handlers | test query");
+        assert!(matches!(some, std::borrow::Cow::Owned(_)));
+    }
+
+    #[test]
+    fn reranking_runs_for_intent_searches_with_short_queries() {
+        let filters = SearchFilters::default();
+        // A short identifier query alone is skipped by the rerank heuristic.
+        assert!(should_skip_reranking("authenticate", &filters));
+        // Without intent that means reranking is off...
+        assert!(!reranking_enabled(true, false, "authenticate", &filters));
+        // ...but an intent forces the cross-encoder to run so it sees the
+        // intent-enriched query (issue #20 regression guard).
+        assert!(reranking_enabled(true, true, "authenticate", &filters));
+        // No reranker present: always off regardless of intent.
+        assert!(!reranking_enabled(false, true, "authenticate", &filters));
+        // Natural-language query without intent still reranks normally.
+        assert!(reranking_enabled(true, false, "how does auth work", &filters));
     }
 
     #[test]
