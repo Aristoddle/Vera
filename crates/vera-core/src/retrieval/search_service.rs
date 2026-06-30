@@ -42,12 +42,18 @@ pub struct SearchTimings {
 pub fn execute_search(
     index_dir: &Path,
     query: &str,
+    intent: Option<&str>,
     config: &VeraConfig,
     filters: &SearchFilters,
     result_limit: usize,
     backend: InferenceBackend,
 ) -> Result<(Vec<SearchResult>, SearchTimings)> {
     let total_start = Instant::now();
+    // `query` (raw) drives BM25, classification, expansion and exact-match
+    // augmentation. The intent prefix only enriches the semantic side
+    // (embedding + reranker); sending it to BM25 makes Tantivy parse
+    // `intent:` as a non-existent field and fail. See issue #20.
+    let vector_query = build_query_with_intent(query, intent);
     let fetch_limit = compute_fetch_limit(query, filters, result_limit);
     let rt = tokio::runtime::Runtime::new()?;
 
@@ -157,6 +163,7 @@ pub fn execute_search(
             &provider,
             reranker,
             query,
+            &vector_query,
             fetch_limit,
             rrf_k,
             stored_dim,
@@ -168,6 +175,7 @@ pub fn execute_search(
             index_dir,
             &provider,
             query,
+            &vector_query,
             fetch_limit,
             rrf_k,
             stored_dim,
@@ -191,6 +199,23 @@ pub fn execute_search(
 
     timings.total = Some(total_start.elapsed());
     Ok((apply_filters(results, filters, result_limit), timings))
+}
+
+/// Build the semantic query text used for embedding and reranking.
+///
+/// When an `--intent` is supplied it is prefixed as `intent: <intent> | <query>`
+/// (intent whitespace collapsed) to steer the embedding model. The raw `query`
+/// is returned unchanged when no usable intent is present. This prefixed form
+/// must never reach BM25: Tantivy's `QueryParser` treats `intent:` as a field
+/// query and there is no such field. See issue #20.
+pub(crate) fn build_query_with_intent(query: &str, intent: Option<&str>) -> String {
+    let intent = intent
+        .map(|value| value.split_whitespace().collect::<Vec<_>>().join(" "))
+        .filter(|value| !value.is_empty());
+    match intent {
+        Some(intent) => format!("intent: {intent} | {query}"),
+        None => query.to_string(),
+    }
 }
 
 /// Compute how many candidates to keep through fusion before final truncation.
@@ -498,6 +523,7 @@ mod tests {
             let res = execute_search(
                 index_dir,
                 "test",
+                None,
                 &config,
                 &filters,
                 10,
@@ -538,12 +564,26 @@ mod tests {
         let res = execute_search(
             index_dir,
             "test",
+            None,
             &config,
             &filters,
             10,
             crate::config::InferenceBackend::Api,
         );
         assert!(res.is_ok(), "Expected Ok but got {:?}", res);
+    }
+
+    #[test]
+    fn build_query_with_intent_formats_and_normalizes() {
+        // No intent: raw query unchanged (this is what BM25 receives).
+        assert_eq!(build_query_with_intent("test query", None), "test query");
+        // Empty / whitespace-only intent collapses to no prefix.
+        assert_eq!(build_query_with_intent("test query", Some("   ")), "test query");
+        // Intent present: prefixed form with whitespace collapsed.
+        assert_eq!(
+            build_query_with_intent("test query", Some("find  auth\n handlers")),
+            "intent: find auth handlers | test query"
+        );
     }
 
     #[test]

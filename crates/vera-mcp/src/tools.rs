@@ -397,14 +397,13 @@ fn handle_search_code(args: &Value) -> ToolCallResult {
     };
 
     for query in &queries {
-        // If intent is provided, prepend it to the query for better reranking.
-        let effective_query = match intent {
-            Some(i) => format!("intent: {i} | {query}"),
-            None => query.clone(),
-        };
+        // Pass the raw query plus the optional intent. Core applies the intent
+        // only to the semantic (embedding/rerank) side; BM25 gets the raw query
+        // so Tantivy does not parse `intent:` as a field. See issue #20.
         match vera_core::retrieval::search_service::execute_search(
             &index_dir,
-            &effective_query,
+            query,
+            intent,
             &config,
             &filters,
             per_query_limit,

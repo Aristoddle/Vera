@@ -28,6 +28,7 @@ use super::search_service::{SearchTimings, execute_search};
 pub fn execute_deep_search(
     index_dir: &Path,
     query: &str,
+    intent: Option<&str>,
     config: &VeraConfig,
     filters: &SearchFilters,
     result_limit: usize,
@@ -39,6 +40,7 @@ pub fn execute_deep_search(
             return super::iterative_search::execute_iterative_search(
                 index_dir,
                 query,
+                intent,
                 config,
                 filters,
                 result_limit,
@@ -51,6 +53,7 @@ pub fn execute_deep_search(
             return super::iterative_search::execute_iterative_search(
                 index_dir,
                 query,
+                intent,
                 config,
                 filters,
                 result_limit,
@@ -63,6 +66,7 @@ pub fn execute_deep_search(
     execute_rag_fusion(
         index_dir,
         query,
+        intent,
         config,
         filters,
         result_limit,
@@ -74,6 +78,7 @@ pub fn execute_deep_search(
 fn execute_rag_fusion(
     index_dir: &Path,
     query: &str,
+    intent: Option<&str>,
     config: &VeraConfig,
     filters: &SearchFilters,
     result_limit: usize,
@@ -124,6 +129,7 @@ fn execute_rag_fusion(
                             execute_search(
                                 &index_dir,
                                 &q,
+                                intent,
                                 &config,
                                 &filters,
                                 per_query_limit,

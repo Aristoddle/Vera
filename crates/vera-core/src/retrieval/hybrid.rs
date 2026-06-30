@@ -79,22 +79,23 @@ pub struct HybridTimings {
 pub async fn search_hybrid(
     index_dir: &Path,
     provider: &impl EmbeddingProvider,
-    query: &str,
+    bm25_query: &str,
+    vector_query: &str,
     limit: usize,
     rrf_k: f64,
     stored_dim: usize,
     vector_candidates: usize,
 ) -> Result<(Vec<SearchResult>, HybridTimings), HybridSearchError> {
-    let bm25_candidates = compute_bm25_candidates(query, limit);
+    let bm25_candidates = compute_bm25_candidates(bm25_query, limit);
     let mut timings = HybridTimings::default();
 
     let bm25_start = Instant::now();
-    let bm25_results = search_bm25(index_dir, query, bm25_candidates);
+    let bm25_results = search_bm25(index_dir, bm25_query, bm25_candidates);
     timings.bm25 = Some(bm25_start.elapsed());
 
     let embed_start = Instant::now();
     let vector_results =
-        search_vector(index_dir, provider, query, vector_candidates, stored_dim).await;
+        search_vector(index_dir, provider, vector_query, vector_candidates, stored_dim).await;
     let vector_elapsed = embed_start.elapsed();
     timings.embedding = Some(vector_elapsed);
     timings.vector = Some(vector_elapsed);
@@ -163,7 +164,8 @@ pub async fn search_hybrid_reranked(
     index_dir: &Path,
     provider: &impl EmbeddingProvider,
     reranker: &impl Reranker,
-    query: &str,
+    bm25_query: &str,
+    vector_query: &str,
     limit: usize,
     rrf_k: f64,
     stored_dim: usize,
@@ -175,7 +177,8 @@ pub async fn search_hybrid_reranked(
     let (hybrid_results, mut timings) = search_hybrid(
         index_dir,
         provider,
-        query,
+        bm25_query,
+        vector_query,
         fetch_limit,
         rrf_k,
         stored_dim,
@@ -188,11 +191,11 @@ pub async fn search_hybrid_reranked(
     }
 
     let rerank_start = Instant::now();
-    match rerank_results(reranker, query, &hybrid_results, rerank_candidates).await {
+    match rerank_results(reranker, vector_query, &hybrid_results, rerank_candidates).await {
         Ok(mut reranked) => {
             timings.reranking = Some(rerank_start.elapsed());
             info!(
-                query = query,
+                query = vector_query,
                 candidates = hybrid_results.len(),
                 reranked = reranked.len(),
                 "reranking complete"
@@ -706,6 +709,37 @@ mod tests {
         (index_dir, dim)
     }
 
+    // Regression for issue #20: the intent-prefixed query must only reach the
+    // vector side. BM25 receives the raw query, so an `intent: ... |` prefix in
+    // `vector_query` never makes Tantivy parse `intent:` as a missing field.
+    #[tokio::test]
+    async fn search_hybrid_keeps_intent_out_of_bm25() {
+        use crate::embedding::test_helpers::MockProvider;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let (index_dir, dim) = setup_test_index(tmp.path()).await;
+        let provider = MockProvider::new(dim);
+
+        // bm25_query is the raw user query; vector_query carries the intent prefix.
+        let (results, _timings) = search_hybrid(
+            &index_dir,
+            &provider,
+            "authenticate",
+            "intent: find auth handlers | authenticate",
+            5,
+            60.0,
+            dim,
+            50,
+        )
+        .await
+        .expect("hybrid search must not error when intent prefix is present");
+
+        assert!(
+            !results.is_empty(),
+            "BM25 should contribute results for the raw query 'authenticate'"
+        );
+    }
+
     #[tokio::test]
     async fn search_hybrid_reranked_returns_reranked_results() {
         use crate::embedding::test_helpers::MockProvider;
@@ -721,6 +755,7 @@ mod tests {
             &index_dir,
             &provider,
             &reranker,
+            "authenticate",
             "authenticate",
             5,
             60.0,
@@ -767,6 +802,7 @@ mod tests {
             &provider,
             &reranker,
             "authenticate",
+            "authenticate",
             5,
             60.0,
             dim,
@@ -803,6 +839,7 @@ mod tests {
             &provider,
             &reranker,
             "authenticate",
+            "authenticate",
             5,
             60.0,
             dim,
@@ -831,7 +868,7 @@ mod tests {
         let reranker = MockReranker::new();
 
         let (results, _timings) = search_hybrid_reranked(
-            &index_dir, &provider, &reranker, "function", 2, 60.0, dim, 10, 50,
+            &index_dir, &provider, &reranker, "function", "function", 2, 60.0, dim, 10, 50,
         )
         .await
         .unwrap();
@@ -912,6 +949,7 @@ mod tests {
             &provider,
             &reranker,
             id_query,
+            id_query,
             5,
             id_params.rrf_k,
             dim,
@@ -931,6 +969,7 @@ mod tests {
             &index_dir,
             &provider,
             &reranker,
+            nl_query,
             nl_query,
             5,
             nl_params.rrf_k,

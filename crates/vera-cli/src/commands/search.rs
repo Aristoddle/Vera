@@ -48,10 +48,10 @@ pub fn run(
     }
 
     let (results, timings) = if queries.len() == 1 {
-        let effective_query = apply_intent(&queries[0], intent);
         execute_query(
             &index_dir,
-            &effective_query,
+            &queries[0],
+            intent,
             &config,
             filters,
             result_limit,
@@ -86,9 +86,11 @@ pub fn run(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn execute_query(
     index_dir: &Path,
     query: &str,
+    intent: Option<&str>,
     config: &vera_core::config::VeraConfig,
     filters: &vera_core::types::SearchFilters,
     result_limit: usize,
@@ -99,6 +101,7 @@ fn execute_query(
         vera_core::retrieval::rag_fusion::execute_deep_search(
             index_dir,
             query,
+            intent,
             config,
             filters,
             result_limit,
@@ -108,6 +111,7 @@ fn execute_query(
         vera_core::retrieval::search_service::execute_search(
             index_dir,
             query,
+            intent,
             config,
             filters,
             result_limit,
@@ -134,10 +138,10 @@ fn execute_multi_query_search(
     let mut result_sets = Vec::with_capacity(queries.len());
 
     for query in queries {
-        let effective_query = apply_intent(query, intent);
         let (results, query_timings) = execute_query(
             index_dir,
-            &effective_query,
+            query,
+            intent,
             config,
             filters,
             per_query_limit,
@@ -175,16 +179,6 @@ fn normalize_queries(queries: &[String]) -> Vec<String> {
     }
 
     normalized
-}
-
-fn apply_intent(query: &str, intent: Option<&str>) -> String {
-    let intent = intent
-        .map(|value| value.split_whitespace().collect::<Vec<_>>().join(" "))
-        .filter(|value| !value.is_empty());
-    match intent {
-        Some(intent) => format!("intent: {intent} | {query}"),
-        None => query.to_string(),
-    }
 }
 
 fn compute_per_query_limit(result_limit: usize) -> usize {

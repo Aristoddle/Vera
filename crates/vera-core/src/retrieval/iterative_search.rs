@@ -21,6 +21,7 @@ use super::search_service::{SearchTimings, execute_search};
 pub fn execute_iterative_search(
     index_dir: &Path,
     query: &str,
+    intent: Option<&str>,
     config: &VeraConfig,
     filters: &SearchFilters,
     result_limit: usize,
@@ -30,7 +31,7 @@ pub fn execute_iterative_search(
     let fetch_per_hop = result_limit;
 
     let (initial_results, timings) =
-        execute_search(index_dir, query, config, filters, fetch_per_hop, backend)?;
+        execute_search(index_dir, query, intent, config, filters, fetch_per_hop, backend)?;
 
     if hops == 0 || initial_results.is_empty() {
         return Ok((initial_results, timings));
@@ -67,6 +68,7 @@ pub fn execute_iterative_search(
         let (hop_results, _) = execute_search(
             index_dir,
             symbol,
+            intent,
             config,
             filters,
             fetch_per_hop / 2,
