@@ -166,7 +166,8 @@ fn glob_matches(pattern: &str, path: &str) -> bool {
     // characters (e.g. Next.js dynamic-route dirs like `app/[slug]`), so they
     // must stay eligible for the fallback.
     if !pattern.is_empty() && !pattern.contains('*') {
-        return path.starts_with(&format!("{pattern}/"));
+        return path.starts_with(pattern)
+            && path.as_bytes().get(pattern.len()) == Some(&b'/');
     }
 
     false
