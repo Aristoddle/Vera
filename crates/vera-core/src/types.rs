@@ -180,8 +180,9 @@ fn glob_match_recursive(pattern: &str, text: &str) -> bool {
             return true;
         }
         // Try skipping path segments.
-        for (i, _) in text.char_indices() {
-            if text.as_bytes().get(i) == Some(&b'/') && glob_match_recursive(rest, &text[i + 1..]) {
+        for (i, ch) in text.char_indices() {
+            let next = i + ch.len_utf8();
+            if ch == '/' && glob_match_recursive(rest, &text[next..]) {
                 return true;
             }
         }
@@ -205,7 +206,8 @@ fn glob_match_recursive(pattern: &str, text: &str) -> bool {
             if ch == '/' {
                 break;
             }
-            if glob_match_recursive(rest, &text[i + 1..]) {
+            let next = i + ch.len_utf8();
+            if glob_match_recursive(rest, &text[next..]) {
                 return true;
             }
         }
@@ -1446,5 +1448,14 @@ mod tests {
         assert!(glob_matches("src/**", "src/main.rs"));
         assert!(glob_matches("src/**", "src/a/b/c.rs"));
         assert!(!glob_matches("src/**", "tests/main.rs"));
+    }
+
+    #[test]
+    fn glob_star_handles_unicode_filename_without_panicking() {
+        assert!(!glob_matches(
+            "**/*kvm*",
+            "docs/Daily Briefing — 2026-06-16.md"
+        ));
+        assert!(glob_matches("**/*kvm*", "docs/Daily Briefing — kvm.md"));
     }
 }
