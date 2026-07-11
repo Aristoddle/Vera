@@ -198,8 +198,9 @@ fn glob_match_recursive(pattern: &str, text: &str) -> bool {
             return true;
         }
         // Try skipping path segments.
-        for (i, _) in text.char_indices() {
-            if text.as_bytes().get(i) == Some(&b'/') && glob_match_recursive(rest, &text[i + 1..]) {
+        for (i, ch) in text.char_indices() {
+            let next = i + ch.len_utf8();
+            if ch == '/' && glob_match_recursive(rest, &text[next..]) {
                 return true;
             }
         }
@@ -223,7 +224,8 @@ fn glob_match_recursive(pattern: &str, text: &str) -> bool {
             if ch == '/' {
                 break;
             }
-            if glob_match_recursive(rest, &text[i + 1..]) {
+            let next = i + ch.len_utf8();
+            if glob_match_recursive(rest, &text[next..]) {
                 return true;
             }
         }
@@ -1497,5 +1499,14 @@ mod tests {
         let deep = make_test_result("src/bar/baz.rs", Language::Rust, None, None);
         assert!(filters.matches(&shallow));
         assert!(!filters.matches(&deep));
+    }
+
+    #[test]
+    fn glob_star_handles_unicode_filename_without_panicking() {
+        assert!(!glob_matches(
+            "**/*kvm*",
+            "docs/Daily Briefing — 2026-06-16.md"
+        ));
+        assert!(glob_matches("**/*kvm*", "docs/Daily Briefing — kvm.md"));
     }
 }
