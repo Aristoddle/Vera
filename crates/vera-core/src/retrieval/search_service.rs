@@ -140,14 +140,13 @@ pub fn execute_search(
     let query_params = params_for_query_type(query_type);
     let rrf_k = query_params.rrf_k;
     let vector_candidates = effective_vector_candidates(fetch_limit, query_params);
-    let rerank_candidates = effective_rerank_candidates(
+    let reranked_limits = reranked_search_limits(
         config.retrieval.rerank_candidates,
+        result_limit,
         fetch_limit,
         query,
         filters,
     );
-    let hybrid_result_limit =
-        effective_hybrid_result_limit(reranker_enabled, result_limit, fetch_limit);
 
     let ranking_stage = if reranker_enabled {
         RankingStage::PostRerank
@@ -164,10 +163,10 @@ pub fn execute_search(
             &provider,
             reranker,
             query,
-            hybrid_result_limit,
+            reranked_limits.result_limit,
             rrf_k,
             stored_dim,
-            rerank_candidates.max(fetch_limit),
+            reranked_limits.candidate_limit,
             vector_candidates,
         ))?
     } else {
@@ -249,15 +248,26 @@ fn effective_rerank_candidates(
     base.max(fetch_limit)
 }
 
-fn effective_hybrid_result_limit(
-    reranker_enabled: bool,
+struct RerankedSearchLimits {
+    result_limit: usize,
+    candidate_limit: usize,
+}
+
+fn reranked_search_limits(
+    configured_candidates: usize,
     result_limit: usize,
     fetch_limit: usize,
-) -> usize {
-    if reranker_enabled {
-        result_limit
-    } else {
-        fetch_limit
+    query: &str,
+    filters: &SearchFilters,
+) -> RerankedSearchLimits {
+    RerankedSearchLimits {
+        result_limit,
+        candidate_limit: effective_rerank_candidates(
+            configured_candidates,
+            fetch_limit,
+            query,
+            filters,
+        ),
     }
 }
 
@@ -587,9 +597,12 @@ mod tests {
     }
 
     #[test]
-    fn reranked_search_keeps_the_operator_limit_below_the_candidate_pool() {
-        assert_eq!(effective_hybrid_result_limit(true, 10, 80), 10);
-        assert_eq!(effective_hybrid_result_limit(false, 10, 80), 80);
+    fn structural_reranking_respects_the_configured_candidate_cap() {
+        let filters = SearchFilters::default();
+        let limits =
+            reranked_search_limits(50, 10, 160, "file type detection and filtering", &filters);
+        assert_eq!(limits.result_limit, 10);
+        assert_eq!(limits.candidate_limit, 50);
     }
 
     #[test]
