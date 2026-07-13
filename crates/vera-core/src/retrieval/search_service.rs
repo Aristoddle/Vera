@@ -146,6 +146,8 @@ pub fn execute_search(
         query,
         filters,
     );
+    let hybrid_result_limit =
+        effective_hybrid_result_limit(reranker_enabled, result_limit, fetch_limit);
 
     let ranking_stage = if reranker_enabled {
         RankingStage::PostRerank
@@ -162,7 +164,7 @@ pub fn execute_search(
             &provider,
             reranker,
             query,
-            fetch_limit,
+            hybrid_result_limit,
             rrf_k,
             stored_dim,
             rerank_candidates.max(fetch_limit),
@@ -245,6 +247,18 @@ fn effective_rerank_candidates(
     }
 
     base.max(fetch_limit)
+}
+
+fn effective_hybrid_result_limit(
+    reranker_enabled: bool,
+    result_limit: usize,
+    fetch_limit: usize,
+) -> usize {
+    if reranker_enabled {
+        result_limit
+    } else {
+        fetch_limit
+    }
 }
 
 fn should_skip_reranking(query: &str, filters: &SearchFilters) -> bool {
@@ -570,6 +584,12 @@ mod tests {
             params_for_query_type(crate::retrieval::query_classifier::QueryType::NaturalLanguage);
         let vc = effective_vector_candidates(10, nl_params);
         assert!(vc >= 50); // at least the minimum from compute_vector_candidates
+    }
+
+    #[test]
+    fn reranked_search_keeps_the_operator_limit_below_the_candidate_pool() {
+        assert_eq!(effective_hybrid_result_limit(true, 10, 80), 10);
+        assert_eq!(effective_hybrid_result_limit(false, 10, 80), 80);
     }
 
     #[test]
