@@ -135,12 +135,8 @@ pub fn execute_search(
     let query_params = params_for_query_type(query_type);
     let rrf_k = query_params.rrf_k;
     let vector_candidates = effective_vector_candidates(fetch_limit, query_params);
-    let rerank_candidates = effective_rerank_candidates(
-        config.retrieval.rerank_candidates,
-        fetch_limit,
-        query,
-        filters,
-    );
+    let rerank_candidates =
+        effective_rerank_candidates(config.retrieval.rerank_candidates, result_limit);
 
     let ranking_stage = if reranker_enabled {
         RankingStage::PostRerank
@@ -160,7 +156,7 @@ pub fn execute_search(
             fetch_limit,
             rrf_k,
             stored_dim,
-            rerank_candidates.max(fetch_limit),
+            rerank_candidates,
             vector_candidates,
         ))?
     } else {
@@ -229,17 +225,8 @@ fn effective_vector_candidates(
     compute_vector_candidates(fetch_limit, query_params.vector_candidate_multiplier)
 }
 
-fn effective_rerank_candidates(
-    base: usize,
-    fetch_limit: usize,
-    query: &str,
-    filters: &SearchFilters,
-) -> usize {
-    if needs_structural_overfetch(query, filters) {
-        return base;
-    }
-
-    base.max(fetch_limit)
+fn effective_rerank_candidates(configured: usize, result_limit: usize) -> usize {
+    configured.max(result_limit)
 }
 
 fn should_skip_reranking(query: &str, filters: &SearchFilters) -> bool {
@@ -547,17 +534,12 @@ mod tests {
     }
 
     #[test]
-    fn effective_candidates_use_base_multipliers() {
-        // Rerank candidates just return base.max(fetch_limit)
-        let filters = SearchFilters::default();
+    fn rerank_candidate_depth_is_independent_of_fetch_depth() {
+        assert_eq!(effective_rerank_candidates(20, 5), 20);
         assert_eq!(
-            effective_rerank_candidates(50, 10, "anything", &filters),
-            50
-        );
-        assert_eq!(effective_rerank_candidates(5, 10, "anything", &filters), 10);
-        assert_eq!(
-            effective_rerank_candidates(50, 160, "file type detection and filtering", &filters),
-            50
+            effective_rerank_candidates(4, 5),
+            5,
+            "reranking must cover enough candidates to return the requested result count"
         );
 
         // Vector candidates use query_params multiplier without inflation

@@ -9,6 +9,24 @@ use vera_core::indexing::IndexProgress;
 
 use crate::helpers::{load_runtime_config, print_human_summary};
 
+async fn wait_for_interrupt() {
+    let _ = tokio::signal::ctrl_c().await;
+}
+
+async fn cancel_on_signal<T, Operation, Signal>(
+    operation: Operation,
+    signal: Signal,
+) -> anyhow::Result<T>
+where
+    Operation: std::future::Future<Output = anyhow::Result<T>>,
+    Signal: std::future::Future<Output = ()>,
+{
+    tokio::select! {
+        result = operation => result,
+        _ = signal => bail!("indexing cancelled"),
+    }
+}
+
 /// Run the `vera index <path>` command.
 #[allow(clippy::too_many_arguments)]
 pub fn run(
@@ -86,11 +104,9 @@ pub fn execute(
     // Use progress bar for interactive (non-JSON) output.
     if json_output {
         let summary = rt
-            .block_on(vera_core::indexing::index_repository(
-                repo_path,
-                &provider,
-                &config,
-                &model_name,
+            .block_on(cancel_on_signal(
+                vera_core::indexing::index_repository(repo_path, &provider, &config, &model_name),
+                wait_for_interrupt(),
             ))
             .context("indexing failed")?;
         return Ok(summary);
@@ -129,17 +145,62 @@ pub fn execute(
         IndexProgress::StorageDone => {}
     };
 
-    let summary = rt
-        .block_on(vera_core::indexing::index_repository_with_progress(
+    let result = rt.block_on(cancel_on_signal(
+        vera_core::indexing::index_repository_with_progress(
             repo_path,
             &provider,
             &config,
             &model_name,
             on_progress,
-        ))
-        .context("indexing failed")?;
-
+        ),
+        wait_for_interrupt(),
+    ));
     multi.stop();
 
-    Ok(summary)
+    result.context("indexing failed")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct DropMarker(Arc<AtomicBool>);
+
+    impl Drop for DropMarker {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn operation_result_wins_before_cancellation() {
+        let result = cancel_on_signal(async { Ok::<_, anyhow::Error>(42) }, std::future::pending())
+            .await
+            .unwrap();
+
+        assert_eq!(result, 42);
+    }
+
+    #[tokio::test]
+    async fn cancellation_drops_in_flight_operation() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let dropped_for_operation = dropped.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+
+        let operation = async move {
+            let _marker = DropMarker(dropped_for_operation);
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+            Ok::<_, anyhow::Error>(())
+        };
+        let signal = async move {
+            let _ = started_rx.await;
+        };
+
+        let error = cancel_on_signal(operation, signal).await.unwrap_err();
+
+        assert!(error.to_string().contains("cancelled"));
+        assert!(dropped.load(Ordering::SeqCst));
+    }
 }

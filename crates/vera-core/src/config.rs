@@ -123,6 +123,11 @@ pub struct EmbeddingConfig {
     pub batch_size: usize,
     /// Maximum number of concurrent embedding API requests.
     pub max_concurrent_requests: usize,
+    /// Hard limit on the total number of embedding inputs that may be active
+    /// across concurrent API requests. This bounds abandoned backend work when
+    /// an indexing client disconnects.
+    #[serde(default = "default_max_in_flight_inputs")]
+    pub max_in_flight_inputs: usize,
     /// Request timeout in seconds.
     pub timeout_secs: u64,
     /// Maximum retries on transient errors.
@@ -150,12 +155,34 @@ impl Default for EmbeddingConfig {
         Self {
             batch_size: if is_local { 4 } else { 128 },
             max_concurrent_requests: if is_local { 1 } else { 8 },
+            max_in_flight_inputs: default_max_in_flight_inputs(),
             timeout_secs: 60,
             max_retries: 3,
             max_stored_dim: 1024,
             gpu_mem_limit_mb: 0,
             low_vram: false,
         }
+    }
+}
+
+fn default_max_in_flight_inputs() -> usize {
+    std::env::var("VERA_MAX_IN_FLIGHT_INPUTS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(16)
+}
+
+impl EmbeddingConfig {
+    /// Clamp configured batching so the product of batch size and concurrency
+    /// never exceeds `max_in_flight_inputs`.
+    pub fn bounded_parallelism(&self) -> (usize, usize) {
+        let max_in_flight = self.max_in_flight_inputs.max(1);
+        let batch_size = self.batch_size.max(1).min(max_in_flight);
+        let max_concurrent_requests = self
+            .max_concurrent_requests
+            .max(1)
+            .min((max_in_flight / batch_size).max(1));
+        (batch_size, max_concurrent_requests)
     }
 }
 
@@ -505,6 +532,36 @@ mod tests {
         assert!(config.retrieval.default_limit > 0);
         assert!(config.retrieval.rrf_k > 0.0);
         assert!(config.embedding.batch_size > 0);
+        assert!(config.embedding.max_in_flight_inputs > 0);
+        let (batch_size, concurrency) = config.embedding.bounded_parallelism();
+        assert!(
+            batch_size * concurrency <= config.embedding.max_in_flight_inputs,
+            "default embedding parallelism must respect its in-flight bound"
+        );
+    }
+
+    #[test]
+    fn embedding_parallelism_clamps_batch_and_concurrency() {
+        let config = EmbeddingConfig {
+            batch_size: 128,
+            max_concurrent_requests: 8,
+            max_in_flight_inputs: 16,
+            ..EmbeddingConfig::default()
+        };
+
+        assert_eq!(config.bounded_parallelism(), (16, 1));
+    }
+
+    #[test]
+    fn embedding_parallelism_normalizes_zero_values_to_one() {
+        let config = EmbeddingConfig {
+            batch_size: 0,
+            max_concurrent_requests: 0,
+            max_in_flight_inputs: 0,
+            ..EmbeddingConfig::default()
+        };
+
+        assert_eq!(config.bounded_parallelism(), (1, 1));
     }
 
     #[test]

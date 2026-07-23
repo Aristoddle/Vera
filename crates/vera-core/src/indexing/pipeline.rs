@@ -204,8 +204,19 @@ where
     }
 
     // ── 4. Generate embeddings (concurrent batches) ──────────────
-    let batch_size = config.embedding.batch_size;
-    let max_concurrent_requests = config.embedding.max_concurrent_requests;
+    let (batch_size, max_concurrent_requests) = config.embedding.bounded_parallelism();
+    if batch_size != config.embedding.batch_size
+        || max_concurrent_requests != config.embedding.max_concurrent_requests
+    {
+        info!(
+            configured_batch_size = config.embedding.batch_size,
+            configured_concurrency = config.embedding.max_concurrent_requests,
+            max_in_flight_inputs = config.embedding.max_in_flight_inputs,
+            batch_size,
+            max_concurrent_requests,
+            "clamped embedding parallelism to the in-flight input bound"
+        );
+    }
 
     let progress_cb = |done: usize, total: usize| {
         on_progress(IndexProgress::EmbeddingProgress { done, total });
