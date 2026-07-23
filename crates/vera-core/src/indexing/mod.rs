@@ -13,7 +13,9 @@ pub use pipeline::{
     FileError, IndexProgress, IndexSummary, index_dir, index_repository,
     index_repository_with_progress,
 };
-pub use update::{UpdateSummary, content_hash, update_repository};
+pub use update::{
+    UpdateProgress, UpdateSummary, content_hash, update_repository, update_repository_with_progress,
+};
 
 /// Truncate embedding vectors to at most `max_dim` dimensions.
 ///

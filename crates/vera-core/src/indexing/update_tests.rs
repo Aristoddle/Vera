@@ -8,7 +8,9 @@ use tempfile::TempDir;
 use crate::config::VeraConfig;
 use crate::embedding::test_helpers::MockProvider;
 use crate::embedding::{EmbeddingError, EmbeddingProvider};
-use crate::indexing::{index_dir, index_repository, update_repository};
+use crate::indexing::{
+    UpdateProgress, index_dir, index_repository, update_repository, update_repository_with_progress,
+};
 use crate::storage::bm25::Bm25Index;
 use crate::storage::metadata::MetadataStore;
 use crate::storage::vector::VectorStore;
@@ -115,7 +117,7 @@ async fn update_no_changes() {
 }
 
 #[tokio::test]
-async fn update_respects_max_in_flight_input_bound() {
+async fn update_reports_progress_and_respects_max_in_flight_input_bound() {
     let dir = TempDir::new().unwrap();
     fs::write(dir.path().join("main.rs"), "fn main() {}\n").unwrap();
 
@@ -135,12 +137,39 @@ async fn update_respects_max_in_flight_input_bound() {
     config.embedding.max_concurrent_requests = 8;
     config.embedding.max_in_flight_inputs = 2;
 
-    let summary = update_repository(dir.path(), &provider, &config, "mock-model")
+    let events = std::sync::Mutex::new(Vec::new());
+    let summary =
+        update_repository_with_progress(dir.path(), &provider, &config, "mock-model", |event| {
+            events.lock().unwrap().push(event)
+        })
         .await
         .unwrap();
 
     assert_eq!(summary.files_added, 3);
     assert_eq!(provider.largest_batch.load(Ordering::SeqCst), 2);
+
+    let events = events.into_inner().unwrap();
+    assert!(matches!(
+        events.first(),
+        Some(UpdateProgress::DiscoveryDone { .. })
+    ));
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, UpdateProgress::ClassificationDone { added: 3, .. }))
+    );
+    assert!(events.iter().any(|event| matches!(
+        event,
+        UpdateProgress::ParsingDone {
+            file_count: 3,
+            chunk_count
+        } if *chunk_count >= 3
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        UpdateProgress::EmbeddingProgress { done, total } if done == total && *total >= 3
+    )));
+    assert!(matches!(events.last(), Some(UpdateProgress::StorageDone)));
 }
 
 // ── Update: file modified ───────────────────────────────────────────

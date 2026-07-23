@@ -1,9 +1,12 @@
 //! `vera update <path>` — Incrementally update the index.
 
+use std::io::IsTerminal;
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::{Context, bail};
 use vera_core::config::InferenceBackend;
+use vera_core::indexing::UpdateProgress;
 
 use crate::helpers::{cancel_on_signal, load_runtime_config, wait_for_interrupt};
 
@@ -15,6 +18,7 @@ pub fn run(
     exclude: Vec<String>,
     no_ignore: bool,
     no_default_excludes: bool,
+    no_progress: bool,
 ) -> anyhow::Result<()> {
     let repo_path = Path::new(path);
 
@@ -76,14 +80,84 @@ pub fn run(
         }
     }
 
-    // Run the incremental update pipeline.
-    let summary = rt
-        .block_on(cancel_on_signal(
+    let show_progress = !json_output && !no_progress && std::io::stderr().is_terminal();
+    let summary = if show_progress {
+        let multi = cliclack::multi_progress("Updating...");
+        let spinner = multi.add(cliclack::spinner());
+        spinner.start("Discovering files...");
+        let embed_bar: Arc<cliclack::ProgressBar> = Arc::new(multi.add(cliclack::progress_bar(0)));
+        let embed_started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let spinner_ref = &spinner;
+        let embed_bar_ref = embed_bar.clone();
+        let embed_started_ref = embed_started.clone();
+
+        let on_progress = move |event: UpdateProgress| match event {
+            UpdateProgress::DiscoveryDone { file_count } => {
+                spinner_ref.stop(format!("Discovered {file_count} files"));
+                spinner_ref.start("Classifying changes...");
+            }
+            UpdateProgress::ClassificationDone {
+                modified,
+                added,
+                deleted,
+                unchanged,
+            } => {
+                spinner_ref.stop(format!(
+                    "Changes: {added} added, {modified} modified, {deleted} deleted; \
+                     {unchanged} unchanged"
+                ));
+                spinner_ref.start("Parsing changed files...");
+            }
+            UpdateProgress::ParsingDone {
+                file_count,
+                chunk_count,
+            } => {
+                spinner_ref.stop(format!(
+                    "Parsed {file_count} changed files into {chunk_count} chunks"
+                ));
+            }
+            UpdateProgress::EmbeddingProgress { done, total } => {
+                if !embed_started_ref.load(std::sync::atomic::Ordering::Relaxed) {
+                    embed_started_ref.store(true, std::sync::atomic::Ordering::Relaxed);
+                    embed_bar_ref.set_length(total as u64);
+                    embed_bar_ref.start("Generating embeddings...");
+                }
+                embed_bar_ref.set_position(done as u64);
+                embed_bar_ref.set_message(format!("Generating embeddings ({done}/{total})"));
+            }
+            UpdateProgress::EmbeddingDone { count } => {
+                if embed_started_ref.load(std::sync::atomic::Ordering::Relaxed) {
+                    embed_bar_ref.stop(format!("Generated {count} embeddings"));
+                }
+                spinner_ref.start("Writing index updates...");
+            }
+            UpdateProgress::StorageDone => {
+                spinner_ref.stop("Wrote index updates");
+            }
+        };
+
+        let result = rt.block_on(cancel_on_signal(
+            vera_core::indexing::update_repository_with_progress(
+                repo_path,
+                &provider,
+                &config,
+                &model_name,
+                on_progress,
+            ),
+            wait_for_interrupt(),
+            "update",
+        ));
+        multi.stop();
+        result.context("update failed")?
+    } else {
+        rt.block_on(cancel_on_signal(
             vera_core::indexing::update_repository(repo_path, &provider, &config, &model_name),
             wait_for_interrupt(),
             "update",
         ))
-        .context("update failed")?;
+        .context("update failed")?
+    };
 
     // Output results.
     if json_output {

@@ -21,7 +21,7 @@ use tracing::{debug, info, warn};
 
 use crate::config::VeraConfig;
 use crate::discovery;
-use crate::embedding::{EmbeddingProvider, embed_chunks_concurrent};
+use crate::embedding::{EmbeddingProvider, embed_chunks_concurrent_with_progress};
 use crate::parsing;
 use crate::storage::bm25::{Bm25Document, Bm25Index};
 use crate::storage::metadata::MetadataStore;
@@ -45,6 +45,31 @@ pub struct UpdateSummary {
     pub total_chunks: u64,
     /// Wall-clock elapsed time in seconds.
     pub elapsed_secs: f64,
+}
+
+/// Progress events emitted during an incremental update.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UpdateProgress {
+    /// File discovery complete.
+    DiscoveryDone { file_count: usize },
+    /// Existing and discovered files have been classified.
+    ClassificationDone {
+        modified: usize,
+        added: usize,
+        deleted: usize,
+        unchanged: usize,
+    },
+    /// Changed files have been parsed into chunks.
+    ParsingDone {
+        file_count: usize,
+        chunk_count: usize,
+    },
+    /// An embedding batch finished.
+    EmbeddingProgress { done: usize, total: usize },
+    /// All update embeddings have been generated.
+    EmbeddingDone { count: usize },
+    /// Updated index artifacts have been written to disk.
+    StorageDone,
 }
 
 /// Compute a SHA-256 content hash for a file's contents.
@@ -111,6 +136,21 @@ pub async fn update_repository<P: EmbeddingProvider>(
     config: &VeraConfig,
     model_name: &str,
 ) -> Result<UpdateSummary> {
+    update_repository_with_progress(repo_path, provider, config, model_name, |_| {}).await
+}
+
+/// Incrementally update an index with progress reporting via a callback.
+pub async fn update_repository_with_progress<P, F>(
+    repo_path: &Path,
+    provider: &P,
+    config: &VeraConfig,
+    model_name: &str,
+    on_progress: F,
+) -> Result<UpdateSummary>
+where
+    P: EmbeddingProvider,
+    F: Fn(UpdateProgress) + Send + Sync,
+{
     let start = Instant::now();
 
     // ── 1. Validate path ─────────────────────────────────────────
@@ -138,6 +178,9 @@ pub async fn update_repository<P: EmbeddingProvider>(
     // ── 2. Discover current files on disk ────────────────────────
     let disc =
         discovery::discover_files(&repo_root, &config.indexing).context("file discovery failed")?;
+    on_progress(UpdateProgress::DiscoveryDone {
+        file_count: disc.files.len(),
+    });
 
     // ── 3. Load stored hashes and classify files ─────────────────
     let metadata_path = idx_dir.join("metadata.db");
@@ -245,6 +288,12 @@ pub async fn update_repository<P: EmbeddingProvider>(
         unchanged,
         "file classification complete"
     );
+    on_progress(UpdateProgress::ClassificationDone {
+        modified: modified.len(),
+        added: added.len(),
+        deleted: deleted.len(),
+        unchanged,
+    });
 
     // ── 4. Process deletions ─────────────────────────────────────
     if !deleted.is_empty() {
@@ -333,6 +382,10 @@ pub async fn update_repository<P: EmbeddingProvider>(
             debug!(file = %rel_path, chunks = chunks.len(), refs = refs.len(), "parsed file");
             all_chunks.extend(chunks);
         }
+        on_progress(UpdateProgress::ParsingDone {
+            file_count: files_to_index.len(),
+            chunk_count: all_chunks.len(),
+        });
 
         if !all_chunks.is_empty() {
             // Generate embeddings.
@@ -349,15 +402,22 @@ pub async fn update_repository<P: EmbeddingProvider>(
                     "clamped update embedding parallelism to the in-flight input bound"
                 );
             }
-            let mut embeddings = embed_chunks_concurrent(
+            let progress_cb = |done: usize, total: usize| {
+                on_progress(UpdateProgress::EmbeddingProgress { done, total });
+            };
+            let mut embeddings = embed_chunks_concurrent_with_progress(
                 provider,
                 &all_chunks,
                 batch_size,
                 max_concurrent_requests,
                 config.indexing.max_chunk_bytes,
+                progress_cb,
             )
             .await
             .context("embedding generation failed")?;
+            on_progress(UpdateProgress::EmbeddingDone {
+                count: embeddings.len(),
+            });
 
             // Truncate if needed.
             let final_stored_dim = super::truncate_embeddings(&mut embeddings, stored_dim);
@@ -401,6 +461,8 @@ pub async fn update_repository<P: EmbeddingProvider>(
             bm25_index
                 .insert_batch(&bm25_docs)
                 .context("failed to insert updated BM25 documents")?;
+        } else {
+            on_progress(UpdateProgress::EmbeddingDone { count: 0 });
         }
 
         // Update file hashes for all indexed files.
@@ -409,12 +471,19 @@ pub async fn update_repository<P: EmbeddingProvider>(
                 .set_file_hash(rel_path, hash)
                 .context("failed to update file hash")?;
         }
+    } else {
+        on_progress(UpdateProgress::ParsingDone {
+            file_count: 0,
+            chunk_count: 0,
+        });
+        on_progress(UpdateProgress::EmbeddingDone { count: 0 });
     }
 
     // ── 6. Get final counts ──────────────────────────────────────
     let total_chunks = metadata_store
         .chunk_count()
         .context("failed to count chunks")?;
+    on_progress(UpdateProgress::StorageDone);
 
     let summary = UpdateSummary {
         files_modified: modified.len(),
