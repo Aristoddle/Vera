@@ -425,6 +425,7 @@ enum Commands {
                       Examples:\n  \
                       vera update .                  # Update current directory\n  \
                       vera update /path/to/repo      # Update a specific repo\n  \
+                      vera update . --max-files 250  # Bound work for this run\n  \
                       vera update . --json           # Output summary as JSON")]
     Update {
         /// Path to the directory to update.
@@ -443,6 +444,9 @@ enum Commands {
         /// Disable the interactive update progress display.
         #[arg(long)]
         no_progress: bool,
+        /// Maximum added or modified files to process in this run.
+        #[arg(long, value_name = "N")]
+        max_files: Option<std::num::NonZeroUsize>,
     },
 
     /// Show architecture overview of the indexed project.
@@ -790,16 +794,20 @@ fn main() {
             no_ignore,
             no_default_excludes,
             no_progress,
+            max_files,
         } => {
             tracing::info!(path = %path, "updating");
             commands::update::run(
                 &path,
                 cli.json,
-                backend.resolve(),
-                exclude,
-                no_ignore,
-                no_default_excludes,
-                no_progress,
+                commands::update::CommandOptions {
+                    backend: backend.resolve(),
+                    exclude,
+                    no_ignore,
+                    no_default_excludes,
+                    no_progress,
+                    max_files: max_files.map(std::num::NonZeroUsize::get),
+                },
             )
         }
         Commands::Overview => {
@@ -1190,6 +1198,23 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn cli_parses_update_max_files_flag() {
+        let cli = Cli::parse_from(["vera", "update", "/tmp/repo", "--max-files", "250"]);
+        assert!(matches!(
+            cli.command,
+            Commands::Update {
+                max_files: Some(max_files),
+                ..
+            } if max_files.get() == 250
+        ));
+    }
+
+    #[test]
+    fn cli_rejects_zero_update_max_files() {
+        assert!(Cli::try_parse_from(["vera", "update", "/tmp/repo", "--max-files", "0"]).is_err());
     }
 
     #[test]

@@ -9,7 +9,8 @@ use crate::config::VeraConfig;
 use crate::embedding::test_helpers::MockProvider;
 use crate::embedding::{EmbeddingError, EmbeddingProvider};
 use crate::indexing::{
-    UpdateProgress, index_dir, index_repository, update_repository, update_repository_with_progress,
+    UpdateOptions, UpdateProgress, index_dir, index_repository, update_repository,
+    update_repository_with_options_and_progress, update_repository_with_progress,
 };
 use crate::storage::bm25::Bm25Index;
 use crate::storage::metadata::MetadataStore;
@@ -109,6 +110,7 @@ async fn update_no_changes() {
     assert_eq!(update_summary.files_modified, 0);
     assert_eq!(update_summary.files_added, 0);
     assert_eq!(update_summary.files_deleted, 0);
+    assert_eq!(update_summary.files_deferred, 0);
     assert!(update_summary.files_unchanged > 0);
     assert_eq!(
         update_summary.total_chunks,
@@ -146,6 +148,7 @@ async fn update_reports_progress_and_respects_max_in_flight_input_bound() {
         .unwrap();
 
     assert_eq!(summary.files_added, 3);
+    assert_eq!(summary.files_deferred, 0);
     assert_eq!(provider.largest_batch.load(Ordering::SeqCst), 2);
 
     let events = events.into_inner().unwrap();
@@ -170,6 +173,101 @@ async fn update_reports_progress_and_respects_max_in_flight_input_bound() {
         UpdateProgress::EmbeddingProgress { done, total } if done == total && *total >= 3
     )));
     assert!(matches!(events.last(), Some(UpdateProgress::StorageDone)));
+}
+
+#[tokio::test]
+async fn update_max_files_defers_and_resumes_in_path_order() {
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("main.rs"), "fn main() {}\n").unwrap();
+
+    let provider = MockProvider::new(8);
+    let config = default_config();
+    index_repository(dir.path(), &provider, &config, "mock-model")
+        .await
+        .unwrap();
+
+    for name in ["gamma.rs", "alpha.rs", "beta.rs"] {
+        fs::write(dir.path().join(name), format!("fn {}() {{}}\n", &name[..4])).unwrap();
+    }
+
+    let options = UpdateOptions { max_files: Some(2) };
+    let first = update_repository_with_options_and_progress(
+        dir.path(),
+        &provider,
+        &config,
+        "mock-model",
+        &options,
+        |_| {},
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(first.files_added, 2);
+    assert_eq!(first.files_deferred, 1);
+    let idx = index_dir(&dir.path().canonicalize().unwrap());
+    let metadata = MetadataStore::open(&idx.join("metadata.db")).unwrap();
+    assert!(metadata.get_file_hash("alpha.rs").unwrap().is_some());
+    assert!(metadata.get_file_hash("beta.rs").unwrap().is_some());
+    assert!(metadata.get_file_hash("gamma.rs").unwrap().is_none());
+
+    let second = update_repository_with_options_and_progress(
+        dir.path(),
+        &provider,
+        &config,
+        "mock-model",
+        &options,
+        |_| {},
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(second.files_added, 1);
+    assert_eq!(second.files_deferred, 0);
+    assert!(metadata.get_file_hash("gamma.rs").unwrap().is_some());
+}
+
+#[tokio::test]
+async fn update_max_files_prioritizes_modifications_and_always_deletes() {
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("modified.rs"), "fn value() -> u8 { 1 }\n").unwrap();
+    fs::write(dir.path().join("deleted.rs"), "fn obsolete() {}\n").unwrap();
+
+    let provider = MockProvider::new(8);
+    let config = default_config();
+    index_repository(dir.path(), &provider, &config, "mock-model")
+        .await
+        .unwrap();
+
+    let modified_content = "fn value() -> u8 { 2 }\n";
+    fs::write(dir.path().join("modified.rs"), modified_content).unwrap();
+    fs::remove_file(dir.path().join("deleted.rs")).unwrap();
+    fs::write(dir.path().join("added.rs"), "fn added() {}\n").unwrap();
+
+    let options = UpdateOptions { max_files: Some(1) };
+    let summary = update_repository_with_options_and_progress(
+        dir.path(),
+        &provider,
+        &config,
+        "mock-model",
+        &options,
+        |_| {},
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(summary.files_modified, 1);
+    assert_eq!(summary.files_added, 0);
+    assert_eq!(summary.files_deleted, 1);
+    assert_eq!(summary.files_deferred, 1);
+
+    let idx = index_dir(&dir.path().canonicalize().unwrap());
+    let metadata = MetadataStore::open(&idx.join("metadata.db")).unwrap();
+    assert_eq!(
+        metadata.get_file_hash("modified.rs").unwrap().as_deref(),
+        Some(content_hash(modified_content).as_str())
+    );
+    assert!(metadata.get_file_hash("deleted.rs").unwrap().is_none());
+    assert!(metadata.get_file_hash("added.rs").unwrap().is_none());
 }
 
 // ── Update: file modified ───────────────────────────────────────────

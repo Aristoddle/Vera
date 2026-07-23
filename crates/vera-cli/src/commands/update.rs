@@ -6,20 +6,29 @@ use std::sync::Arc;
 
 use anyhow::{Context, bail};
 use vera_core::config::InferenceBackend;
-use vera_core::indexing::UpdateProgress;
+use vera_core::indexing::{UpdateOptions, UpdateProgress};
 
 use crate::helpers::{cancel_on_signal, load_runtime_config, wait_for_interrupt};
 
+pub struct CommandOptions {
+    pub backend: InferenceBackend,
+    pub exclude: Vec<String>,
+    pub no_ignore: bool,
+    pub no_default_excludes: bool,
+    pub no_progress: bool,
+    pub max_files: Option<usize>,
+}
+
 /// Run the `vera update <path>` command.
-pub fn run(
-    path: &str,
-    json_output: bool,
-    backend: InferenceBackend,
-    exclude: Vec<String>,
-    no_ignore: bool,
-    no_default_excludes: bool,
-    no_progress: bool,
-) -> anyhow::Result<()> {
+pub fn run(path: &str, json_output: bool, options: CommandOptions) -> anyhow::Result<()> {
+    let CommandOptions {
+        backend,
+        exclude,
+        no_ignore,
+        no_default_excludes,
+        no_progress,
+        max_files,
+    } = options;
     let repo_path = Path::new(path);
 
     if !repo_path.exists() {
@@ -81,6 +90,7 @@ pub fn run(
     }
 
     let show_progress = !json_output && !no_progress && std::io::stderr().is_terminal();
+    let options = UpdateOptions { max_files };
     let summary = if show_progress {
         let multi = cliclack::multi_progress("Updating...");
         let spinner = multi.add(cliclack::spinner());
@@ -102,10 +112,11 @@ pub fn run(
                 added,
                 deleted,
                 unchanged,
+                deferred,
             } => {
                 spinner_ref.stop(format!(
                     "Changes: {added} added, {modified} modified, {deleted} deleted; \
-                     {unchanged} unchanged"
+                     {unchanged} unchanged, {deferred} deferred"
                 ));
                 spinner_ref.start("Parsing changed files...");
             }
@@ -138,11 +149,12 @@ pub fn run(
         };
 
         let result = rt.block_on(cancel_on_signal(
-            vera_core::indexing::update_repository_with_progress(
+            vera_core::indexing::update_repository_with_options_and_progress(
                 repo_path,
                 &provider,
                 &config,
                 &model_name,
+                &options,
                 on_progress,
             ),
             wait_for_interrupt(),
@@ -152,7 +164,14 @@ pub fn run(
         result.context("update failed")?
     } else {
         rt.block_on(cancel_on_signal(
-            vera_core::indexing::update_repository(repo_path, &provider, &config, &model_name),
+            vera_core::indexing::update_repository_with_options_and_progress(
+                repo_path,
+                &provider,
+                &config,
+                &model_name,
+                &options,
+                |_| {},
+            ),
             wait_for_interrupt(),
             "update",
         ))
@@ -179,11 +198,15 @@ fn print_update_summary(summary: &vera_core::indexing::UpdateSummary) {
     println!("  Files added:     {}", summary.files_added);
     println!("  Files deleted:   {}", summary.files_deleted);
     println!("  Files unchanged: {}", summary.files_unchanged);
+    println!("  Files deferred:  {}", summary.files_deferred);
     println!("  Total chunks:    {}", summary.total_chunks);
     println!("  Elapsed time:    {:.2}s", summary.elapsed_secs);
 
-    let total_changed = summary.files_modified + summary.files_added + summary.files_deleted;
-    if total_changed == 0 {
+    let total_pending = summary.files_modified
+        + summary.files_added
+        + summary.files_deleted
+        + summary.files_deferred;
+    if total_pending == 0 {
         println!();
         println!("  Index is up to date — no changes detected.");
     }
