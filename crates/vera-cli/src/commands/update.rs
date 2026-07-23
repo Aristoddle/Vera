@@ -5,7 +5,7 @@ use std::path::Path;
 use anyhow::{Context, bail};
 use vera_core::config::InferenceBackend;
 
-use crate::helpers::load_runtime_config;
+use crate::helpers::{cancel_on_signal, load_runtime_config, wait_for_interrupt};
 
 /// Run the `vera update <path>` command.
 pub fn run(
@@ -78,11 +78,10 @@ pub fn run(
 
     // Run the incremental update pipeline.
     let summary = rt
-        .block_on(vera_core::indexing::update_repository(
-            repo_path,
-            &provider,
-            &config,
-            &model_name,
+        .block_on(cancel_on_signal(
+            vera_core::indexing::update_repository(repo_path, &provider, &config, &model_name),
+            wait_for_interrupt(),
+            "update",
         ))
         .context("update failed")?;
 

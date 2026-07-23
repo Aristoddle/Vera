@@ -336,11 +336,24 @@ pub async fn update_repository<P: EmbeddingProvider>(
 
         if !all_chunks.is_empty() {
             // Generate embeddings.
+            let (batch_size, max_concurrent_requests) = config.embedding.bounded_parallelism();
+            if batch_size != config.embedding.batch_size
+                || max_concurrent_requests != config.embedding.max_concurrent_requests
+            {
+                info!(
+                    configured_batch_size = config.embedding.batch_size,
+                    configured_concurrency = config.embedding.max_concurrent_requests,
+                    max_in_flight_inputs = config.embedding.max_in_flight_inputs,
+                    batch_size,
+                    max_concurrent_requests,
+                    "clamped update embedding parallelism to the in-flight input bound"
+                );
+            }
             let mut embeddings = embed_chunks_concurrent(
                 provider,
                 &all_chunks,
-                config.embedding.batch_size,
-                config.embedding.max_concurrent_requests,
+                batch_size,
+                max_concurrent_requests,
                 config.indexing.max_chunk_bytes,
             )
             .await

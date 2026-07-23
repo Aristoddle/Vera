@@ -1,11 +1,13 @@
 //! Tests for incremental update logic.
 
 use std::fs;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use tempfile::TempDir;
 
 use crate::config::VeraConfig;
 use crate::embedding::test_helpers::MockProvider;
+use crate::embedding::{EmbeddingError, EmbeddingProvider};
 use crate::indexing::{index_dir, index_repository, update_repository};
 use crate::storage::bm25::Bm25Index;
 use crate::storage::metadata::MetadataStore;
@@ -15,6 +17,42 @@ use super::content_hash;
 
 fn default_config() -> VeraConfig {
     VeraConfig::default()
+}
+
+struct BatchBoundProvider {
+    max_batch_size: usize,
+    largest_batch: AtomicUsize,
+}
+
+impl BatchBoundProvider {
+    fn new(max_batch_size: usize) -> Self {
+        Self {
+            max_batch_size,
+            largest_batch: AtomicUsize::new(0),
+        }
+    }
+}
+
+impl EmbeddingProvider for BatchBoundProvider {
+    async fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+        self.largest_batch.fetch_max(texts.len(), Ordering::SeqCst);
+        if texts.len() > self.max_batch_size {
+            return Err(EmbeddingError::ApiError {
+                status: 400,
+                message: format!(
+                    "batch contained {} inputs, limit is {}",
+                    texts.len(),
+                    self.max_batch_size
+                ),
+            });
+        }
+
+        Ok(vec![vec![0.0; 8]; texts.len()])
+    }
+
+    fn expected_dim(&self) -> Option<usize> {
+        Some(8)
+    }
 }
 
 // ── Content hash tests ──────────────────────────────────────────────
@@ -74,6 +112,35 @@ async fn update_no_changes() {
         update_summary.total_chunks,
         idx_summary.chunks_created as u64
     );
+}
+
+#[tokio::test]
+async fn update_respects_max_in_flight_input_bound() {
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("main.rs"), "fn main() {}\n").unwrap();
+
+    let initial_provider = MockProvider::new(8);
+    let initial_config = default_config();
+    index_repository(dir.path(), &initial_provider, &initial_config, "mock-model")
+        .await
+        .unwrap();
+
+    for name in ["one.rs", "two.rs", "three.rs"] {
+        fs::write(dir.path().join(name), format!("fn {}() {{}}\n", &name[..3])).unwrap();
+    }
+
+    let provider = BatchBoundProvider::new(2);
+    let mut config = default_config();
+    config.embedding.batch_size = 128;
+    config.embedding.max_concurrent_requests = 8;
+    config.embedding.max_in_flight_inputs = 2;
+
+    let summary = update_repository(dir.path(), &provider, &config, "mock-model")
+        .await
+        .unwrap();
+
+    assert_eq!(summary.files_added, 3);
+    assert_eq!(provider.largest_batch.load(Ordering::SeqCst), 2);
 }
 
 // ── Update: file modified ───────────────────────────────────────────

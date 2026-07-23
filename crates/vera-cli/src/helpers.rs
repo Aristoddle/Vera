@@ -3,6 +3,30 @@
 use clap::Args;
 use serde::Serialize;
 
+/// Wait for the process interrupt used to cancel long-running CLI operations.
+pub async fn wait_for_interrupt() {
+    let _ = tokio::signal::ctrl_c().await;
+}
+
+/// Run an operation until it completes or an interrupt signal wins.
+///
+/// Dropping the operation future propagates cancellation through in-flight
+/// client requests instead of leaving the CLI runtime alive until they finish.
+pub async fn cancel_on_signal<T, Operation, Signal>(
+    operation: Operation,
+    signal: Signal,
+    operation_name: &str,
+) -> anyhow::Result<T>
+where
+    Operation: std::future::Future<Output = anyhow::Result<T>>,
+    Signal: std::future::Future<Output = ()>,
+{
+    tokio::select! {
+        result = operation => result,
+        _ = signal => anyhow::bail!("{operation_name} cancelled"),
+    }
+}
+
 /// Load the effective runtime configuration.
 pub fn load_runtime_config() -> anyhow::Result<vera_core::config::VeraConfig> {
     crate::state::load_runtime_config()
@@ -366,5 +390,57 @@ pub fn print_human_summary(summary: &vera_core::indexing::IndexSummary, verbose:
     if summary.files_parsed == 0 && summary.chunks_created == 0 {
         println!();
         println!("  No source files found to index.");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct DropMarker(Arc<AtomicBool>);
+
+    impl Drop for DropMarker {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn operation_result_wins_before_cancellation() {
+        let result = cancel_on_signal(
+            async { Ok::<_, anyhow::Error>(42) },
+            std::future::pending(),
+            "test operation",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result, 42);
+    }
+
+    #[tokio::test]
+    async fn cancellation_drops_in_flight_operation() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let dropped_for_operation = dropped.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+
+        let operation = async move {
+            let _marker = DropMarker(dropped_for_operation);
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+            Ok::<_, anyhow::Error>(())
+        };
+        let signal = async move {
+            let _ = started_rx.await;
+        };
+
+        let error = cancel_on_signal(operation, signal, "test operation")
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("test operation cancelled"));
+        assert!(dropped.load(Ordering::SeqCst));
     }
 }
