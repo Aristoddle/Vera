@@ -168,7 +168,8 @@ impl Default for EmbeddingConfig {
 fn default_max_in_flight_inputs() -> usize {
     std::env::var("VERA_MAX_IN_FLIGHT_INPUTS")
         .ok()
-        .and_then(|value| value.parse().ok())
+        .and_then(|value| value.parse::<usize>().ok())
+        .map(|value| value.max(1))
         .unwrap_or(16)
 }
 
@@ -562,6 +563,25 @@ mod tests {
         };
 
         assert_eq!(config.bounded_parallelism(), (1, 1));
+    }
+
+    #[test]
+    fn max_in_flight_environment_value_normalizes_zero_to_one() {
+        let _guard = env_lock().lock().unwrap();
+        let previous = std::env::var_os("VERA_MAX_IN_FLIGHT_INPUTS");
+        set_env("VERA_MAX_IN_FLIGHT_INPUTS", "0");
+
+        let max_in_flight_inputs = default_max_in_flight_inputs();
+
+        if let Some(value) = previous {
+            unsafe {
+                std::env::set_var("VERA_MAX_IN_FLIGHT_INPUTS", value);
+            }
+        } else {
+            remove_env("VERA_MAX_IN_FLIGHT_INPUTS");
+        }
+
+        assert_eq!(max_in_flight_inputs, 1);
     }
 
     #[test]

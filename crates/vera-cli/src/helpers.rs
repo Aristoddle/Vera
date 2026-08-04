@@ -1,11 +1,12 @@
 //! Shared helper functions for CLI command implementations.
 
+use anyhow::Context;
 use clap::Args;
 use serde::Serialize;
 
 /// Wait for the process interrupt used to cancel long-running CLI operations.
-pub async fn wait_for_interrupt() {
-    let _ = tokio::signal::ctrl_c().await;
+pub async fn wait_for_interrupt() -> std::io::Result<()> {
+    tokio::signal::ctrl_c().await
 }
 
 /// Run an operation until it completes or an interrupt signal wins.
@@ -19,11 +20,14 @@ pub async fn cancel_on_signal<T, Operation, Signal>(
 ) -> anyhow::Result<T>
 where
     Operation: std::future::Future<Output = anyhow::Result<T>>,
-    Signal: std::future::Future<Output = ()>,
+    Signal: std::future::Future<Output = std::io::Result<()>>,
 {
     tokio::select! {
         result = operation => result,
-        _ = signal => anyhow::bail!("{operation_name} cancelled"),
+        signal_result = signal => {
+            signal_result.context("failed to listen for interrupt")?;
+            anyhow::bail!("{operation_name} cancelled")
+        },
     }
 }
 
@@ -411,7 +415,7 @@ mod tests {
     async fn operation_result_wins_before_cancellation() {
         let result = cancel_on_signal(
             async { Ok::<_, anyhow::Error>(42) },
-            std::future::pending(),
+            std::future::pending::<std::io::Result<()>>(),
             "test operation",
         )
         .await
@@ -434,6 +438,7 @@ mod tests {
         };
         let signal = async move {
             let _ = started_rx.await;
+            Ok(())
         };
 
         let error = cancel_on_signal(operation, signal, "test operation")
@@ -442,5 +447,24 @@ mod tests {
 
         assert!(error.to_string().contains("test operation cancelled"));
         assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn signal_listener_errors_are_propagated() {
+        let error = cancel_on_signal(
+            std::future::pending::<anyhow::Result<()>>(),
+            async { Err(std::io::Error::other("listener setup failed")) },
+            "test operation",
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("failed to listen for interrupt"));
+        assert!(
+            error
+                .source()
+                .is_some_and(|source| source.to_string().contains("listener setup failed"))
+        );
+        assert!(!error.to_string().contains("cancelled"));
     }
 }
