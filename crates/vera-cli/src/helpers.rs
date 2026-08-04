@@ -16,16 +16,42 @@ pub async fn wait_for_interrupt() -> std::io::Result<()> {
 pub async fn cancel_on_signal<T, Operation, Signal>(
     operation: Operation,
     signal: Signal,
+    cancellation: vera_core::CancellationToken,
     operation_name: &str,
 ) -> anyhow::Result<T>
 where
     Operation: std::future::Future<Output = anyhow::Result<T>>,
-    Signal: std::future::Future<Output = std::io::Result<()>>,
+    Signal: std::future::Future<Output = std::io::Result<()>> + Send + 'static,
 {
+    let signal_cancellation = cancellation.clone();
+    let mut signal_task = tokio::spawn(async move {
+        let result = signal.await;
+        signal_cancellation.cancel();
+        result
+    });
+    tokio::pin!(operation);
+
     tokio::select! {
-        result = operation => result,
-        signal_result = signal => {
-            signal_result.context("failed to listen for interrupt")?;
+        result = &mut operation => {
+            if cancellation.is_cancelled() {
+                signal_task
+                    .await
+                    .context("interrupt listener task failed")?
+                    .context("failed to listen for interrupt")?;
+
+                return match result {
+                    Ok(value) => Ok(value),
+                    Err(_) => anyhow::bail!("{operation_name} cancelled"),
+                };
+            }
+
+            signal_task.abort();
+            result
+        },
+        signal_result = &mut signal_task => {
+            signal_result
+                .context("interrupt listener task failed")?
+                .context("failed to listen for interrupt")?;
             anyhow::bail!("{operation_name} cancelled")
         },
     }
@@ -416,6 +442,7 @@ mod tests {
         let result = cancel_on_signal(
             async { Ok::<_, anyhow::Error>(42) },
             std::future::pending::<std::io::Result<()>>(),
+            vera_core::CancellationToken::new(),
             "test operation",
         )
         .await
@@ -440,8 +467,9 @@ mod tests {
             let _ = started_rx.await;
             Ok(())
         };
+        let cancellation = vera_core::CancellationToken::new();
 
-        let error = cancel_on_signal(operation, signal, "test operation")
+        let error = cancel_on_signal(operation, signal, cancellation, "test operation")
             .await
             .unwrap_err();
 
@@ -454,6 +482,7 @@ mod tests {
         let error = cancel_on_signal(
             std::future::pending::<anyhow::Result<()>>(),
             async { Err(std::io::Error::other("listener setup failed")) },
+            vera_core::CancellationToken::new(),
             "test operation",
         )
         .await
@@ -466,5 +495,34 @@ mod tests {
                 .is_some_and(|source| source.to_string().contains("listener setup failed"))
         );
         assert!(!error.to_string().contains("cancelled"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancellation_reaches_synchronous_operation_work() {
+        let cancellation = vera_core::CancellationToken::new();
+        let operation_cancellation = cancellation.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+
+        let operation = async move {
+            let _ = started_tx.send(());
+            while !operation_cancellation.is_cancelled() {
+                std::hint::spin_loop();
+            }
+            Err::<(), anyhow::Error>(anyhow::anyhow!("operation cancelled"))
+        };
+        let signal = async move {
+            let _ = started_rx.await;
+            Ok(())
+        };
+
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            cancel_on_signal(operation, signal, cancellation, "test operation"),
+        )
+        .await
+        .expect("synchronous operation should observe cancellation")
+        .unwrap_err();
+
+        assert!(error.to_string().contains("test operation cancelled"));
     }
 }

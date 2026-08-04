@@ -19,6 +19,7 @@ use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
 use tracing::{debug, info, warn};
 
+use crate::CancellationToken;
 use crate::config::VeraConfig;
 use crate::discovery;
 use crate::embedding::{EmbeddingProvider, embed_chunks_concurrent};
@@ -110,8 +111,10 @@ pub async fn update_repository<P: EmbeddingProvider>(
     provider: &P,
     config: &VeraConfig,
     model_name: &str,
+    cancellation: &CancellationToken,
 ) -> Result<UpdateSummary> {
     let start = Instant::now();
+    cancellation.check()?;
 
     // ── 1. Validate path ─────────────────────────────────────────
     if !repo_path.exists() {
@@ -136,8 +139,8 @@ pub async fn update_repository<P: EmbeddingProvider>(
     info!(path = %repo_root.display(), "starting incremental update");
 
     // ── 2. Discover current files on disk ────────────────────────
-    let disc =
-        discovery::discover_files(&repo_root, &config.indexing).context("file discovery failed")?;
+    let disc = discovery::discover_files(&repo_root, &config.indexing, cancellation)
+        .context("file discovery failed")?;
 
     // ── 3. Load stored hashes and classify files ─────────────────
     let metadata_path = idx_dir.join("metadata.db");
@@ -191,6 +194,7 @@ pub async fn update_repository<P: EmbeddingProvider>(
     // Read file contents and compute hashes for current files.
     let mut current_files: HashMap<String, String> = HashMap::new(); // rel_path → content
     for file in &disc.files {
+        cancellation.check()?;
         match std::fs::read_to_string(&file.absolute_path) {
             Ok(content) => {
                 current_files.insert(file.relative_path.clone(), content);
@@ -210,6 +214,7 @@ pub async fn update_repository<P: EmbeddingProvider>(
     let mut unchanged = 0usize;
 
     for (rel_path, content) in &current_files {
+        cancellation.check()?;
         let language = detect_language_for_path(rel_path);
         let hash = hash_for_indexing_source(content, rel_path, language, &repo_root);
         let stored_hash = metadata_store
@@ -233,6 +238,7 @@ pub async fn update_repository<P: EmbeddingProvider>(
     }
 
     for stored_path in &stored_files {
+        cancellation.check()?;
         if !current_paths.contains(stored_path.as_str()) {
             deleted.push(stored_path.clone());
         }
@@ -246,42 +252,16 @@ pub async fn update_repository<P: EmbeddingProvider>(
         "file classification complete"
     );
 
-    // ── 4. Process deletions ─────────────────────────────────────
-    if !deleted.is_empty() {
-        let vector_path = idx_dir.join("vectors.db");
-        let vector_store = VectorStore::open(&vector_path, stored_dim)
-            .context("failed to open vector store for deletion")?;
-        let bm25_dir = idx_dir.join("bm25");
-        let bm25_index =
-            Bm25Index::open(&bm25_dir).context("failed to open BM25 index for deletion")?;
-
-        for file_path in &deleted {
-            remove_file_from_index(&metadata_store, &vector_store, &bm25_index, file_path)?;
-        }
-    }
-
-    // ── 5. Process modifications and additions ───────────────────
+    // ── 4. Prepare modifications and additions ───────────────────
     let files_to_index: Vec<(String, String, String)> =
         modified.iter().chain(added.iter()).cloned().collect();
+    let mut all_chunks = Vec::new();
+    let mut references_by_file = Vec::new();
 
     if !files_to_index.is_empty() {
-        // For modified files, first remove old data.
-        if !modified.is_empty() {
-            let vector_path = idx_dir.join("vectors.db");
-            let vector_store = VectorStore::open(&vector_path, stored_dim)
-                .context("failed to open vector store for modification")?;
-            let bm25_dir = idx_dir.join("bm25");
-            let bm25_index =
-                Bm25Index::open(&bm25_dir).context("failed to open BM25 index for modification")?;
-
-            for (file_path, _, _) in &modified {
-                remove_file_from_index(&metadata_store, &vector_store, &bm25_index, file_path)?;
-            }
-        }
-
         // Parse and chunk new/modified files.
-        let mut all_chunks = Vec::new();
         for (rel_path, content, _hash) in &files_to_index {
+            cancellation.check()?;
             let language = detect_language_for_path(rel_path);
 
             // For RST, refs come from raw source; chunks from preprocessed.
@@ -323,86 +303,118 @@ pub async fn update_repository<P: EmbeddingProvider>(
                     }
                 }
             };
+            cancellation.check()?;
 
             if !refs.is_empty() {
-                metadata_store
-                    .insert_references(rel_path, &refs)
-                    .context("failed to store references")?;
+                references_by_file.push((rel_path.clone(), refs.clone()));
             }
 
             debug!(file = %rel_path, chunks = chunks.len(), refs = refs.len(), "parsed file");
             all_chunks.extend(chunks);
         }
+    }
 
-        if !all_chunks.is_empty() {
-            // Generate embeddings.
-            let (batch_size, max_concurrent_requests) = config.embedding.bounded_parallelism();
-            if batch_size != config.embedding.batch_size
-                || max_concurrent_requests != config.embedding.max_concurrent_requests
-            {
-                info!(
-                    configured_batch_size = config.embedding.batch_size,
-                    configured_concurrency = config.embedding.max_concurrent_requests,
-                    max_in_flight_inputs = config.embedding.max_in_flight_inputs,
-                    batch_size,
-                    max_concurrent_requests,
-                    "clamped update embedding parallelism to the in-flight input bound"
-                );
-            }
-            let mut embeddings = embed_chunks_concurrent(
-                provider,
-                &all_chunks,
+    let mut embeddings = Vec::new();
+    let mut final_stored_dim = stored_dim;
+    if !all_chunks.is_empty() {
+        // Generate embeddings.
+        cancellation.check()?;
+        let (batch_size, max_concurrent_requests) = config.embedding.bounded_parallelism();
+        if batch_size != config.embedding.batch_size
+            || max_concurrent_requests != config.embedding.max_concurrent_requests
+        {
+            info!(
+                configured_batch_size = config.embedding.batch_size,
+                configured_concurrency = config.embedding.max_concurrent_requests,
+                max_in_flight_inputs = config.embedding.max_in_flight_inputs,
                 batch_size,
                 max_concurrent_requests,
-                config.indexing.max_chunk_bytes,
-            )
-            .await
-            .context("embedding generation failed")?;
-
-            // Truncate if needed.
-            let final_stored_dim = super::truncate_embeddings(&mut embeddings, stored_dim);
-
-            // Store metadata.
-            metadata_store
-                .insert_chunks(&all_chunks)
-                .context("failed to insert updated chunk metadata")?;
-
-            // Store vectors.
-            let vector_path = idx_dir.join("vectors.db");
-            let vector_store = VectorStore::open(&vector_path, final_stored_dim)
-                .context("failed to open vector store for insertion")?;
-
-            let batch: Vec<(&str, &[f32])> = embeddings
-                .iter()
-                .map(|(id, vec)| (id.as_str(), vec.as_slice()))
-                .collect();
-            vector_store
-                .insert_batch(&batch)
-                .context("failed to insert updated vectors")?;
-
-            // Store BM25 documents.
-            let bm25_dir = idx_dir.join("bm25");
-            let bm25_index =
-                Bm25Index::open(&bm25_dir).context("failed to open BM25 index for insertion")?;
-
-            let lang_strings: Vec<String> =
-                all_chunks.iter().map(|c| c.language.to_string()).collect();
-            let bm25_docs: Vec<Bm25Document<'_>> = all_chunks
-                .iter()
-                .zip(lang_strings.iter())
-                .map(|(c, lang)| Bm25Document {
-                    chunk_id: &c.id,
-                    file_path: &c.file_path,
-                    content: &c.content,
-                    symbol_name: c.symbol_name.as_deref(),
-                    language: lang,
-                })
-                .collect();
-            bm25_index
-                .insert_batch(&bm25_docs)
-                .context("failed to insert updated BM25 documents")?;
+                "clamped update embedding parallelism to the in-flight input bound"
+            );
         }
+        embeddings = embed_chunks_concurrent(
+            provider,
+            &all_chunks,
+            batch_size,
+            max_concurrent_requests,
+            config.indexing.max_chunk_bytes,
+        )
+        .await
+        .context("embedding generation failed")?;
+        cancellation.check()?;
 
+        // Truncate if needed.
+        final_stored_dim = super::truncate_embeddings(&mut embeddings, stored_dim);
+    }
+
+    // ── 5. Publish the prepared update without interruption ──────
+    cancellation.check()?;
+
+    // Remove deleted files and stale data for modified files.
+    if !deleted.is_empty() || !modified.is_empty() {
+        let vector_path = idx_dir.join("vectors.db");
+        let vector_store = VectorStore::open(&vector_path, stored_dim)
+            .context("failed to open vector store for removal")?;
+        let bm25_dir = idx_dir.join("bm25");
+        let bm25_index =
+            Bm25Index::open(&bm25_dir).context("failed to open BM25 index for removal")?;
+
+        for file_path in deleted
+            .iter()
+            .chain(modified.iter().map(|(file_path, _, _)| file_path))
+        {
+            remove_file_from_index(&metadata_store, &vector_store, &bm25_index, file_path)?;
+        }
+    }
+
+    for (rel_path, refs) in &references_by_file {
+        metadata_store
+            .insert_references(rel_path, refs)
+            .context("failed to store references")?;
+    }
+
+    if !all_chunks.is_empty() {
+        // Store metadata.
+        metadata_store
+            .insert_chunks(&all_chunks)
+            .context("failed to insert updated chunk metadata")?;
+
+        // Store vectors.
+        let vector_path = idx_dir.join("vectors.db");
+        let vector_store = VectorStore::open(&vector_path, final_stored_dim)
+            .context("failed to open vector store for insertion")?;
+
+        let batch: Vec<(&str, &[f32])> = embeddings
+            .iter()
+            .map(|(id, vec)| (id.as_str(), vec.as_slice()))
+            .collect();
+        vector_store
+            .insert_batch(&batch)
+            .context("failed to insert updated vectors")?;
+
+        // Store BM25 documents.
+        let bm25_dir = idx_dir.join("bm25");
+        let bm25_index =
+            Bm25Index::open(&bm25_dir).context("failed to open BM25 index for insertion")?;
+
+        let lang_strings: Vec<String> = all_chunks.iter().map(|c| c.language.to_string()).collect();
+        let bm25_docs: Vec<Bm25Document<'_>> = all_chunks
+            .iter()
+            .zip(lang_strings.iter())
+            .map(|(c, lang)| Bm25Document {
+                chunk_id: &c.id,
+                file_path: &c.file_path,
+                content: &c.content,
+                symbol_name: c.symbol_name.as_deref(),
+                language: lang,
+            })
+            .collect();
+        bm25_index
+            .insert_batch(&bm25_docs)
+            .context("failed to insert updated BM25 documents")?;
+    }
+
+    if !files_to_index.is_empty() {
         // Update file hashes for all indexed files.
         for (rel_path, _content, hash) in &files_to_index {
             metadata_store

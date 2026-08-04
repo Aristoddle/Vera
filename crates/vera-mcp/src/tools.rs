@@ -364,11 +364,14 @@ fn handle_search_code(args: &Value) -> ToolCallResult {
             Ok(t) => t,
             Err(e) => return e,
         };
+        let cancellation = vera_core::CancellationToken::new();
         match rt.block_on(vera_core::indexing::index_repository(
             &cwd,
             &provider,
             &idx_config,
             &model_name,
+            |_| {},
+            &cancellation,
         )) {
             Ok(_) => {}
             Err(e) => return ToolCallResult::error(format!("Auto-indexing failed: {e}")),

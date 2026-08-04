@@ -77,10 +77,18 @@ pub fn run(
     }
 
     // Run the incremental update pipeline.
+    let cancellation = vera_core::CancellationToken::new();
     let summary = rt
         .block_on(cancel_on_signal(
-            vera_core::indexing::update_repository(repo_path, &provider, &config, &model_name),
+            vera_core::indexing::update_repository(
+                repo_path,
+                &provider,
+                &config,
+                &model_name,
+                &cancellation,
+            ),
             wait_for_interrupt(),
+            cancellation.clone(),
             "update",
         ))
         .context("update failed")?;

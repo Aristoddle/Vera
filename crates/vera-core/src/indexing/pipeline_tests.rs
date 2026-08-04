@@ -6,6 +6,7 @@ use std::path::Path;
 use tempfile::TempDir;
 
 use super::*;
+use crate::CancellationToken;
 use crate::config::VeraConfig;
 use crate::embedding::test_helpers::MockProvider;
 use crate::storage::bm25::Bm25Index;
@@ -28,9 +29,16 @@ async fn index_simple_repo() {
 
     let provider = MockProvider::new(8);
     let config = default_config();
-    let summary = index_repository(dir.path(), &provider, &config, "mock-model")
-        .await
-        .unwrap();
+    let summary = index_repository(
+        dir.path(),
+        &provider,
+        &config,
+        "mock-model",
+        |_| {},
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap();
 
     assert_eq!(summary.files_parsed, 2);
     assert!(summary.chunks_created > 0);
@@ -47,6 +55,31 @@ async fn index_simple_repo() {
 }
 
 #[tokio::test]
+async fn pre_cancelled_index_stops_before_creating_artifacts() {
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("main.rs"), "fn main() {}\n").unwrap();
+
+    let provider = MockProvider::new(8);
+    let config = default_config();
+    let cancellation = CancellationToken::new();
+    cancellation.cancel();
+
+    let error = super::index_repository(
+        dir.path(),
+        &provider,
+        &config,
+        "mock-model",
+        |_| {},
+        &cancellation,
+    )
+    .await
+    .unwrap_err();
+
+    assert!(error.to_string().contains("operation cancelled"));
+    assert!(!index_dir(dir.path()).exists());
+}
+
+#[tokio::test]
 async fn index_invalid_path() {
     let provider = MockProvider::new(8);
     let config = default_config();
@@ -55,6 +88,8 @@ async fn index_invalid_path() {
         &provider,
         &config,
         "mock-model",
+        |_| {},
+        &CancellationToken::new(),
     )
     .await;
 
@@ -74,7 +109,15 @@ async fn index_file_not_directory() {
 
     let provider = MockProvider::new(8);
     let config = default_config();
-    let result = index_repository(&file, &provider, &config, "mock-model").await;
+    let result = index_repository(
+        &file,
+        &provider,
+        &config,
+        "mock-model",
+        |_| {},
+        &CancellationToken::new(),
+    )
+    .await;
 
     assert!(result.is_err());
     let err = result.unwrap_err().to_string();
@@ -90,9 +133,16 @@ async fn index_empty_repo() {
 
     let provider = MockProvider::new(8);
     let config = default_config();
-    let summary = index_repository(dir.path(), &provider, &config, "mock-model")
-        .await
-        .unwrap();
+    let summary = index_repository(
+        dir.path(),
+        &provider,
+        &config,
+        "mock-model",
+        |_| {},
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap();
 
     assert_eq!(summary.files_parsed, 0);
     assert_eq!(summary.chunks_created, 0);
@@ -109,9 +159,16 @@ async fn index_skips_binary_files() {
 
     let provider = MockProvider::new(8);
     let config = default_config();
-    let summary = index_repository(dir.path(), &provider, &config, "mock-model")
-        .await
-        .unwrap();
+    let summary = index_repository(
+        dir.path(),
+        &provider,
+        &config,
+        "mock-model",
+        |_| {},
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap();
 
     assert_eq!(summary.files_parsed, 1);
     assert!(summary.binary_skipped >= 1);
@@ -128,9 +185,16 @@ async fn index_stores_correct_metadata() {
 
     let provider = MockProvider::new(8);
     let config = default_config();
-    let summary = index_repository(dir.path(), &provider, &config, "mock-model")
-        .await
-        .unwrap();
+    let summary = index_repository(
+        dir.path(),
+        &provider,
+        &config,
+        "mock-model",
+        |_| {},
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap();
 
     assert!(summary.chunks_created > 0);
 
@@ -155,9 +219,16 @@ async fn index_stores_bm25_index() {
 
     let provider = MockProvider::new(8);
     let config = default_config();
-    let _summary = index_repository(dir.path(), &provider, &config, "mock-model")
-        .await
-        .unwrap();
+    let _summary = index_repository(
+        dir.path(),
+        &provider,
+        &config,
+        "mock-model",
+        |_| {},
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap();
 
     // Verify BM25 index can be searched.
     let idx = index_dir(&dir.path().canonicalize().unwrap());
@@ -176,9 +247,16 @@ async fn index_summary_reports_parse_errors() {
 
     let provider = MockProvider::new(8);
     let config = default_config();
-    let summary = index_repository(dir.path(), &provider, &config, "mock-model")
-        .await
-        .unwrap();
+    let summary = index_repository(
+        dir.path(),
+        &provider,
+        &config,
+        "mock-model",
+        |_| {},
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap();
 
     // No errors expected for a simple valid file.
     assert!(summary.parse_errors.is_empty());
@@ -199,9 +277,16 @@ async fn index_handles_mixed_languages() {
 
     let provider = MockProvider::new(8);
     let config = default_config();
-    let summary = index_repository(dir.path(), &provider, &config, "mock-model")
-        .await
-        .unwrap();
+    let summary = index_repository(
+        dir.path(),
+        &provider,
+        &config,
+        "mock-model",
+        |_| {},
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap();
 
     assert_eq!(summary.files_parsed, 4);
     assert!(summary.chunks_created >= 4);
@@ -224,9 +309,16 @@ async fn index_permission_error_continues() {
 
     let provider = MockProvider::new(8);
     let config = default_config();
-    let summary = index_repository(dir.path(), &provider, &config, "mock-model")
-        .await
-        .unwrap();
+    let summary = index_repository(
+        dir.path(),
+        &provider,
+        &config,
+        "mock-model",
+        |_| {},
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap();
 
     // Should still complete successfully (exit 0).
     assert!(summary.files_parsed >= 1);

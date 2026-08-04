@@ -87,10 +87,19 @@ pub fn execute(
 
     // Use progress bar for interactive (non-JSON) output.
     if json_output {
+        let cancellation = vera_core::CancellationToken::new();
         let summary = rt
             .block_on(cancel_on_signal(
-                vera_core::indexing::index_repository(repo_path, &provider, &config, &model_name),
+                vera_core::indexing::index_repository(
+                    repo_path,
+                    &provider,
+                    &config,
+                    &model_name,
+                    |_| {},
+                    &cancellation,
+                ),
                 wait_for_interrupt(),
+                cancellation.clone(),
                 "indexing",
             ))
             .context("indexing failed")?;
@@ -130,15 +139,18 @@ pub fn execute(
         IndexProgress::StorageDone => {}
     };
 
+    let cancellation = vera_core::CancellationToken::new();
     let result = rt.block_on(cancel_on_signal(
-        vera_core::indexing::index_repository_with_progress(
+        vera_core::indexing::index_repository(
             repo_path,
             &provider,
             &config,
             &model_name,
             on_progress,
+            &cancellation,
         ),
         wait_for_interrupt(),
+        cancellation.clone(),
         "indexing",
     ));
     multi.stop();

@@ -12,6 +12,7 @@ use anyhow::{Context, Result, bail};
 use rayon::prelude::*;
 use tracing::{debug, info, warn};
 
+use crate::CancellationToken;
 use crate::config::VeraConfig;
 use crate::discovery::{self, DiscoveryResult};
 use crate::embedding::{EmbeddingProvider, embed_chunks_concurrent_with_progress};
@@ -72,9 +73,6 @@ pub enum IndexProgress {
     StorageDone,
 }
 
-/// No-op progress callback (used when caller doesn't need progress).
-pub(crate) fn no_progress(_: IndexProgress) {}
-
 // ── Index directory layout ───────────────────────────────────────────
 
 /// Default index directory name (placed inside the indexed repo).
@@ -110,28 +108,20 @@ pub fn index_dir(repo_root: &Path) -> std::path::PathBuf {
 ///
 /// # Errors
 /// Returns an error if the path is invalid, not a directory, or storage fails.
-pub async fn index_repository<P: EmbeddingProvider>(
-    repo_path: &Path,
-    provider: &P,
-    config: &VeraConfig,
-    model_name: &str,
-) -> Result<IndexSummary> {
-    index_repository_with_progress(repo_path, provider, config, model_name, no_progress).await
-}
-
-/// Index a repository with progress reporting via a callback.
-pub async fn index_repository_with_progress<P, F>(
+pub async fn index_repository<P, F>(
     repo_path: &Path,
     provider: &P,
     config: &VeraConfig,
     model_name: &str,
     on_progress: F,
+    cancellation: &CancellationToken,
 ) -> Result<IndexSummary>
 where
     P: EmbeddingProvider,
     F: Fn(IndexProgress) + Send + Sync,
 {
     let start = Instant::now();
+    cancellation.check()?;
 
     // ── 1. Validate path ─────────────────────────────────────────
     if !repo_path.exists() {
@@ -148,8 +138,8 @@ where
     info!(path = %repo_root.display(), "starting indexing");
 
     // ── 2. Discover files ────────────────────────────────────────
-    let discovery =
-        discovery::discover_files(&repo_root, &config.indexing).context("file discovery failed")?;
+    let discovery = discovery::discover_files(&repo_root, &config.indexing, cancellation)
+        .context("file discovery failed")?;
 
     if discovery.files.is_empty() {
         return Ok(IndexSummary {
@@ -178,7 +168,7 @@ where
 
     // ── 3. Parse and chunk each file (parallelized with rayon) ──
     let (all_chunks, parse_errors, file_hashes, all_refs) =
-        parse_discovered_files_parallel(&discovery, &repo_root, config);
+        parse_discovered_files_parallel(&discovery, &repo_root, config, cancellation)?;
 
     info!(
         chunks = all_chunks.len(),
@@ -204,6 +194,7 @@ where
     }
 
     // ── 4. Generate embeddings (concurrent batches) ──────────────
+    cancellation.check()?;
     let (batch_size, max_concurrent_requests) = config.embedding.bounded_parallelism();
     if batch_size != config.embedding.batch_size
         || max_concurrent_requests != config.embedding.max_concurrent_requests
@@ -231,6 +222,7 @@ where
     )
     .await
     .context("embedding generation failed")?;
+    cancellation.check()?;
 
     // Truncate vectors if max_stored_dim is configured.
     let stored_dim = super::truncate_embeddings(&mut embeddings, config.embedding.max_stored_dim);
@@ -286,12 +278,13 @@ fn parse_discovered_files_parallel(
     discovery: &DiscoveryResult,
     repo_root: &Path,
     config: &VeraConfig,
-) -> (
+    cancellation: &CancellationToken,
+) -> Result<(
     Vec<Chunk>,
     Vec<FileError>,
     Vec<(String, String)>,
     Vec<(String, Vec<RawReference>)>,
-) {
+)> {
     let config = Arc::new(config.clone());
     let repo_root = Arc::new(repo_root.to_path_buf());
 
@@ -301,18 +294,25 @@ fn parse_discovered_files_parallel(
         discovery
             .files
             .par_iter()
-            .map(|file| {
-                let source = std::fs::read_to_string(&file.absolute_path).map_err(|err| {
-                    warn!(
-                        file = %file.relative_path,
-                        error = %err,
-                        "failed to read file for parsing"
-                    );
-                    FileError {
-                        file_path: file.relative_path.clone(),
-                        error: err.to_string(),
+            .filter_map(|file| {
+                if cancellation.is_cancelled() {
+                    return None;
+                }
+
+                let source = match std::fs::read_to_string(&file.absolute_path) {
+                    Ok(source) => source,
+                    Err(err) => {
+                        warn!(
+                            file = %file.relative_path,
+                            error = %err,
+                            "failed to read file for parsing"
+                        );
+                        return Some(Err(FileError {
+                            file_path: file.relative_path.clone(),
+                            error: err.to_string(),
+                        }));
                     }
-                })?;
+                };
 
                 let language = file
                     .absolute_path
@@ -357,29 +357,35 @@ fn parse_discovered_files_parallel(
                         .map(|(chunks, refs)| (chunks, refs, hash))
                 };
 
-                parse_result
-                    .inspect(|(chunks, refs, _)| {
-                        debug!(
-                            file = %file.relative_path,
-                            chunks = chunks.len(),
-                            refs = refs.len(),
-                            "parsed file"
-                        );
-                    })
-                    .map(|(chunks, refs, hash)| (chunks, file.relative_path.clone(), hash, refs))
-                    .map_err(|err| {
-                        warn!(
-                            file = %file.relative_path,
-                            error = %err,
-                            "parse error"
-                        );
-                        FileError {
-                            file_path: file.relative_path.clone(),
-                            error: err.to_string(),
-                        }
-                    })
+                Some(
+                    parse_result
+                        .inspect(|(chunks, refs, _)| {
+                            debug!(
+                                file = %file.relative_path,
+                                chunks = chunks.len(),
+                                refs = refs.len(),
+                                "parsed file"
+                            );
+                        })
+                        .map(|(chunks, refs, hash)| {
+                            (chunks, file.relative_path.clone(), hash, refs)
+                        })
+                        .map_err(|err| {
+                            warn!(
+                                file = %file.relative_path,
+                                error = %err,
+                                "parse error"
+                            );
+                            FileError {
+                                file_path: file.relative_path.clone(),
+                                error: err.to_string(),
+                            }
+                        }),
+                )
             })
             .collect();
+
+    cancellation.check()?;
 
     // Flatten results into chunks, errors, file hashes, and references.
     let mut all_chunks = Vec::new();
@@ -399,7 +405,7 @@ fn parse_discovered_files_parallel(
         }
     }
 
-    (all_chunks, parse_errors, file_hashes, all_refs)
+    Ok((all_chunks, parse_errors, file_hashes, all_refs))
 }
 
 /// Write chunks, embeddings, BM25 index, file hashes, and references to disk.
