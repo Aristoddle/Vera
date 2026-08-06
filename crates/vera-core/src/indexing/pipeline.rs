@@ -108,7 +108,66 @@ pub fn index_dir(repo_root: &Path) -> std::path::PathBuf {
 ///
 /// # Errors
 /// Returns an error if the path is invalid, not a directory, or storage fails.
-pub async fn index_repository<P, F>(
+pub async fn index_repository<P: EmbeddingProvider>(
+    repo_path: &Path,
+    provider: &P,
+    config: &VeraConfig,
+    model_name: &str,
+) -> Result<IndexSummary> {
+    index_repository_with_cancellation(
+        repo_path,
+        provider,
+        config,
+        model_name,
+        &CancellationToken::new(),
+    )
+    .await
+}
+
+/// Index a repository while cooperatively observing cancellation.
+pub async fn index_repository_with_cancellation<P: EmbeddingProvider>(
+    repo_path: &Path,
+    provider: &P,
+    config: &VeraConfig,
+    model_name: &str,
+    cancellation: &CancellationToken,
+) -> Result<IndexSummary> {
+    index_repository_with_progress_and_cancellation(
+        repo_path,
+        provider,
+        config,
+        model_name,
+        |_| {},
+        cancellation,
+    )
+    .await
+}
+
+/// Index a repository and report progress to the supplied callback.
+pub async fn index_repository_with_progress<P, F>(
+    repo_path: &Path,
+    provider: &P,
+    config: &VeraConfig,
+    model_name: &str,
+    on_progress: F,
+) -> Result<IndexSummary>
+where
+    P: EmbeddingProvider,
+    F: Fn(IndexProgress) + Send + Sync,
+{
+    index_repository_with_progress_and_cancellation(
+        repo_path,
+        provider,
+        config,
+        model_name,
+        on_progress,
+        &CancellationToken::new(),
+    )
+    .await
+}
+
+/// Index a repository with progress reporting and cooperative cancellation.
+pub async fn index_repository_with_progress_and_cancellation<P, F>(
     repo_path: &Path,
     provider: &P,
     config: &VeraConfig,
@@ -138,8 +197,9 @@ where
     info!(path = %repo_root.display(), "starting indexing");
 
     // ── 2. Discover files ────────────────────────────────────────
-    let discovery = discovery::discover_files(&repo_root, &config.indexing, cancellation)
-        .context("file discovery failed")?;
+    let discovery =
+        discovery::discover_files_with_cancellation(&repo_root, &config.indexing, cancellation)
+            .context("file discovery failed")?;
 
     if discovery.files.is_empty() {
         return Ok(IndexSummary {

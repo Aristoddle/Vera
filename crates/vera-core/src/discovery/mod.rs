@@ -74,7 +74,12 @@ const BINARY_EXTENSIONS: &[&str] = &[
 ///
 /// Walks the directory respecting .gitignore patterns and default exclusions.
 /// Skips binary files and files exceeding the size threshold.
-pub fn discover_files(
+pub fn discover_files(root: &Path, config: &IndexingConfig) -> Result<DiscoveryResult> {
+    discover_files_with_cancellation(root, config, &CancellationToken::new())
+}
+
+/// Discover source files while cooperatively observing cancellation.
+pub fn discover_files_with_cancellation(
     root: &Path,
     config: &IndexingConfig,
     cancellation: &CancellationToken,
@@ -295,8 +300,7 @@ mod tests {
         fs::write(dir.path().join("main.rs"), "fn main() {}").unwrap();
         fs::write(dir.path().join("lib.py"), "def hello(): pass").unwrap();
 
-        let result =
-            discover_files(dir.path(), &default_config(), &CancellationToken::new()).unwrap();
+        let result = discover_files(dir.path(), &default_config()).unwrap();
         assert_eq!(result.files.len(), 2);
 
         let names: Vec<&str> = result
@@ -315,8 +319,7 @@ mod tests {
         fs::write(dir.path().join("secret.txt"), "sensitive data").unwrap();
         fs::write(dir.path().join(".gitignore"), "secret.txt\n").unwrap();
 
-        let result =
-            discover_files(dir.path(), &default_config(), &CancellationToken::new()).unwrap();
+        let result = discover_files(dir.path(), &default_config()).unwrap();
         let names: Vec<&str> = result
             .files
             .iter()
@@ -351,8 +354,7 @@ mod tests {
         fs::create_dir_all(&pycache).unwrap();
         fs::write(pycache.join("mod.pyc"), "bytecode").unwrap();
 
-        let result =
-            discover_files(dir.path(), &default_config(), &CancellationToken::new()).unwrap();
+        let result = discover_files(dir.path(), &default_config()).unwrap();
         let names: Vec<&str> = result
             .files
             .iter()
@@ -386,8 +388,7 @@ mod tests {
         fs::write(dir.path().join("program.exe"), "not really exe").unwrap();
         fs::write(dir.path().join("archive.zip"), "not really zip").unwrap();
 
-        let result =
-            discover_files(dir.path(), &default_config(), &CancellationToken::new()).unwrap();
+        let result = discover_files(dir.path(), &default_config()).unwrap();
         assert_eq!(result.files.len(), 1);
         assert_eq!(result.files[0].relative_path, "main.rs");
         assert_eq!(result.binary_skipped, 3);
@@ -401,8 +402,7 @@ mod tests {
         let binary_content = b"some text\x00more text";
         fs::write(dir.path().join("data.txt"), binary_content).unwrap();
 
-        let result =
-            discover_files(dir.path(), &default_config(), &CancellationToken::new()).unwrap();
+        let result = discover_files(dir.path(), &default_config()).unwrap();
         assert_eq!(result.files.len(), 1);
         assert_eq!(result.files[0].relative_path, "main.rs");
         assert_eq!(result.binary_skipped, 1);
@@ -417,8 +417,7 @@ mod tests {
         let large_content = "x".repeat(1_100_000);
         fs::write(dir.path().join("huge.rs"), large_content).unwrap();
 
-        let result =
-            discover_files(dir.path(), &default_config(), &CancellationToken::new()).unwrap();
+        let result = discover_files(dir.path(), &default_config()).unwrap();
         assert_eq!(result.files.len(), 1);
         assert_eq!(result.files[0].relative_path, "small.rs");
         assert_eq!(result.large_skipped, 1);
@@ -435,7 +434,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result = discover_files(dir.path(), &config, &CancellationToken::new()).unwrap();
+        let result = discover_files(dir.path(), &config).unwrap();
         assert_eq!(result.files.len(), 1);
         assert_eq!(result.files[0].relative_path, "small.rs");
         assert_eq!(result.large_skipped, 1);
@@ -447,8 +446,7 @@ mod tests {
         fs::write(dir.path().join("main.rs"), "fn main() {}").unwrap();
         fs::write(dir.path().join("empty.rs"), "").unwrap();
 
-        let result =
-            discover_files(dir.path(), &default_config(), &CancellationToken::new()).unwrap();
+        let result = discover_files(dir.path(), &default_config()).unwrap();
         assert_eq!(result.files.len(), 1);
         assert_eq!(result.files[0].relative_path, "main.rs");
     }
@@ -461,8 +459,7 @@ mod tests {
         fs::write(sub.join("helper.rs"), "fn help() {}").unwrap();
         fs::write(dir.path().join("main.rs"), "fn main() {}").unwrap();
 
-        let result =
-            discover_files(dir.path(), &default_config(), &CancellationToken::new()).unwrap();
+        let result = discover_files(dir.path(), &default_config()).unwrap();
         assert_eq!(result.files.len(), 2);
 
         let paths: Vec<&str> = result
@@ -494,8 +491,7 @@ mod tests {
         fs::write(dir.path().join("a.rs"), "fn a() {}").unwrap();
         fs::write(dir.path().join("m.rs"), "fn m() {}").unwrap();
 
-        let result =
-            discover_files(dir.path(), &default_config(), &CancellationToken::new()).unwrap();
+        let result = discover_files(dir.path(), &default_config()).unwrap();
         let paths: Vec<&str> = result
             .files
             .iter()
@@ -521,8 +517,7 @@ mod tests {
         fs::create_dir_all(&build).unwrap();
         fs::write(build.join("output.js"), "compiled").unwrap();
 
-        let result =
-            discover_files(dir.path(), &default_config(), &CancellationToken::new()).unwrap();
+        let result = discover_files(dir.path(), &default_config()).unwrap();
         let paths: Vec<&str> = result
             .files
             .iter()
@@ -558,8 +553,7 @@ mod tests {
         .unwrap();
         fs::write(includes.join("common.rst.inc"), "Shared include fragment\n").unwrap();
 
-        let result =
-            discover_files(dir.path(), &default_config(), &CancellationToken::new()).unwrap();
+        let result = discover_files(dir.path(), &default_config()).unwrap();
         let names: Vec<&str> = result
             .files
             .iter()
@@ -590,7 +584,7 @@ mod tests {
         let mut config = default_config();
         config.no_default_excludes = true;
 
-        let result = discover_files(dir.path(), &config, &CancellationToken::new()).unwrap();
+        let result = discover_files(dir.path(), &config).unwrap();
         let names: Vec<&str> = result
             .files
             .iter()
@@ -612,8 +606,7 @@ mod tests {
         fs::write(dir.path().join("app.log"), "more logs").unwrap();
         fs::write(dir.path().join(".gitignore"), "*.log\n").unwrap();
 
-        let result =
-            discover_files(dir.path(), &default_config(), &CancellationToken::new()).unwrap();
+        let result = discover_files(dir.path(), &default_config()).unwrap();
         let names: Vec<&str> = result
             .files
             .iter()
@@ -626,11 +619,7 @@ mod tests {
 
     #[test]
     fn handles_invalid_path() {
-        let result = discover_files(
-            Path::new("/nonexistent/path"),
-            &default_config(),
-            &CancellationToken::new(),
-        );
+        let result = discover_files(Path::new("/nonexistent/path"), &default_config());
         assert!(result.is_err());
     }
 
@@ -645,8 +634,7 @@ mod tests {
         // .veraignore only excludes secret.txt (notes.md should now be indexed)
         fs::write(dir.path().join(".veraignore"), "secret.txt\n").unwrap();
 
-        let result =
-            discover_files(dir.path(), &default_config(), &CancellationToken::new()).unwrap();
+        let result = discover_files(dir.path(), &default_config()).unwrap();
         let names: Vec<&str> = result
             .files
             .iter()
@@ -677,8 +665,7 @@ mod tests {
         )
         .unwrap();
 
-        let result =
-            discover_files(dir.path(), &default_config(), &CancellationToken::new()).unwrap();
+        let result = discover_files(dir.path(), &default_config()).unwrap();
         let names: Vec<&str> = result
             .files
             .iter()
@@ -702,8 +689,7 @@ mod tests {
         fs::write(dir.path().join("secret.txt"), "sensitive").unwrap();
         fs::write(dir.path().join(".gitignore"), "secret.txt\n").unwrap();
 
-        let result =
-            discover_files(dir.path(), &default_config(), &CancellationToken::new()).unwrap();
+        let result = discover_files(dir.path(), &default_config()).unwrap();
         let names: Vec<&str> = result
             .files
             .iter()
@@ -727,7 +713,7 @@ mod tests {
         let mut config = default_config();
         config.extra_excludes = vec!["vendor/**".to_string()];
 
-        let result = discover_files(dir.path(), &config, &CancellationToken::new()).unwrap();
+        let result = discover_files(dir.path(), &config).unwrap();
         let names: Vec<&str> = result
             .files
             .iter()
@@ -750,7 +736,7 @@ mod tests {
         let mut config = default_config();
         config.no_ignore = true;
 
-        let result = discover_files(dir.path(), &config, &CancellationToken::new()).unwrap();
+        let result = discover_files(dir.path(), &config).unwrap();
         let names: Vec<&str> = result
             .files
             .iter()
@@ -774,7 +760,7 @@ mod tests {
         let mut config = default_config();
         config.no_default_excludes = true;
 
-        let result = discover_files(dir.path(), &config, &CancellationToken::new()).unwrap();
+        let result = discover_files(dir.path(), &config).unwrap();
         let names: Vec<&str> = result
             .files
             .iter()
@@ -793,8 +779,7 @@ mod tests {
         fs::write(dir.path().join("main.rs"), "fn main() {}").unwrap();
         fs::write(dir.path().join(".veraignore"), "*.log\n").unwrap();
 
-        let result =
-            discover_files(dir.path(), &default_config(), &CancellationToken::new()).unwrap();
+        let result = discover_files(dir.path(), &default_config()).unwrap();
         let names: Vec<&str> = result
             .files
             .iter()

@@ -80,7 +80,7 @@ pub fn run(
     let cancellation = vera_core::CancellationToken::new();
     let summary = rt
         .block_on(cancel_on_signal(
-            vera_core::indexing::update_repository(
+            vera_core::indexing::update_repository_with_cancellation(
                 repo_path,
                 &provider,
                 &config,

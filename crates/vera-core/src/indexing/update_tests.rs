@@ -4,6 +4,7 @@ use std::fs;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use tempfile::TempDir;
+use tokio::sync::{Notify, watch};
 
 use crate::CancellationToken;
 use crate::config::VeraConfig;
@@ -23,14 +24,50 @@ fn default_config() -> VeraConfig {
 struct BatchBoundProvider {
     max_batch_size: usize,
     largest_batch: AtomicUsize,
+    active_inputs: AtomicUsize,
+    peak_active_inputs: AtomicUsize,
+    started_requests: AtomicUsize,
+    request_started: Notify,
+    release_requests: watch::Sender<bool>,
 }
 
 impl BatchBoundProvider {
     fn new(max_batch_size: usize) -> Self {
+        let (release_requests, _) = watch::channel(false);
         Self {
             max_batch_size,
             largest_batch: AtomicUsize::new(0),
+            active_inputs: AtomicUsize::new(0),
+            peak_active_inputs: AtomicUsize::new(0),
+            started_requests: AtomicUsize::new(0),
+            request_started: Notify::new(),
+            release_requests,
         }
+    }
+
+    async fn wait_for_started_requests(&self, minimum: usize) {
+        loop {
+            let request_started = self.request_started.notified();
+            if self.started_requests.load(Ordering::SeqCst) >= minimum {
+                return;
+            }
+            request_started.await;
+        }
+    }
+
+    fn release_requests(&self) {
+        self.release_requests.send_replace(true);
+    }
+}
+
+struct ActiveInputs<'a> {
+    count: &'a AtomicUsize,
+    inputs: usize,
+}
+
+impl Drop for ActiveInputs<'_> {
+    fn drop(&mut self) {
+        self.count.fetch_sub(self.inputs, Ordering::SeqCst);
     }
 }
 
@@ -46,6 +83,27 @@ impl EmbeddingProvider for BatchBoundProvider {
                     self.max_batch_size
                 ),
             });
+        }
+
+        let active_inputs =
+            self.active_inputs.fetch_add(texts.len(), Ordering::SeqCst) + texts.len();
+        let _active_inputs = ActiveInputs {
+            count: &self.active_inputs,
+            inputs: texts.len(),
+        };
+        self.peak_active_inputs
+            .fetch_max(active_inputs, Ordering::SeqCst);
+        self.started_requests.fetch_add(1, Ordering::SeqCst);
+        self.request_started.notify_one();
+
+        let mut release_requests = self.release_requests.subscribe();
+        if !*release_requests.borrow() {
+            release_requests
+                .changed()
+                .await
+                .map_err(|error| EmbeddingError::ResponseError {
+                    message: format!("test request release channel closed: {error}"),
+                })?;
         }
 
         Ok(vec![vec![0.0; 8]; texts.len()])
@@ -95,28 +153,15 @@ async fn update_no_changes() {
     let config = default_config();
 
     // Initial index.
-    let idx_summary = index_repository(
-        dir.path(),
-        &provider,
-        &config,
-        "mock-model",
-        |_| {},
-        &CancellationToken::new(),
-    )
-    .await
-    .unwrap();
+    let idx_summary = index_repository(dir.path(), &provider, &config, "mock-model")
+        .await
+        .unwrap();
     assert!(idx_summary.chunks_created > 0);
 
     // Update with no changes.
-    let update_summary = update_repository(
-        dir.path(),
-        &provider,
-        &config,
-        "mock-model",
-        &CancellationToken::new(),
-    )
-    .await
-    .unwrap();
+    let update_summary = update_repository(dir.path(), &provider, &config, "mock-model")
+        .await
+        .unwrap();
 
     assert_eq!(update_summary.files_modified, 0);
     assert_eq!(update_summary.files_added, 0);
@@ -135,39 +180,47 @@ async fn update_respects_max_in_flight_input_bound() {
 
     let initial_provider = MockProvider::new(8);
     let initial_config = default_config();
-    index_repository(
-        dir.path(),
-        &initial_provider,
-        &initial_config,
-        "mock-model",
-        |_| {},
-        &CancellationToken::new(),
-    )
-    .await
-    .unwrap();
+    index_repository(dir.path(), &initial_provider, &initial_config, "mock-model")
+        .await
+        .unwrap();
 
-    for name in ["one.rs", "two.rs", "three.rs"] {
+    for name in ["one.rs", "two.rs", "three.rs", "four.rs"] {
         fs::write(dir.path().join(name), format!("fn {}() {{}}\n", &name[..3])).unwrap();
     }
 
     let provider = BatchBoundProvider::new(2);
     let mut config = default_config();
-    config.embedding.batch_size = 128;
+    config.embedding.batch_size = 2;
     config.embedding.max_concurrent_requests = 8;
-    config.embedding.max_in_flight_inputs = 2;
+    config.embedding.max_in_flight_inputs = 4;
 
-    let summary = update_repository(
+    let cancellation = CancellationToken::new();
+    let update = crate::indexing::update_repository_with_cancellation(
         dir.path(),
         &provider,
         &config,
         "mock-model",
-        &CancellationToken::new(),
-    )
-    .await
-    .unwrap();
+        &cancellation,
+    );
+    let observe_concurrency = async {
+        provider.wait_for_started_requests(2).await;
+        tokio::task::yield_now().await;
+        let peak_active_inputs = provider.peak_active_inputs.load(Ordering::SeqCst);
+        provider.release_requests();
+        peak_active_inputs
+    };
+    let (summary, peak_active_inputs) =
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            tokio::join!(update, observe_concurrency)
+        })
+        .await
+        .expect("embedding requests should overlap without exceeding the input bound");
+    let summary = summary.unwrap();
 
-    assert_eq!(summary.files_added, 3);
+    assert_eq!(summary.files_added, 4);
     assert_eq!(provider.largest_batch.load(Ordering::SeqCst), 2);
+    assert_eq!(peak_active_inputs, 4);
+    assert!(peak_active_inputs <= config.embedding.max_in_flight_inputs);
 }
 
 // ── Update: file modified ───────────────────────────────────────────
@@ -186,16 +239,9 @@ async fn update_modified_file() {
     let config = default_config();
 
     // Initial index.
-    let idx_summary = index_repository(
-        dir.path(),
-        &provider,
-        &config,
-        "mock-model",
-        |_| {},
-        &CancellationToken::new(),
-    )
-    .await
-    .unwrap();
+    let idx_summary = index_repository(dir.path(), &provider, &config, "mock-model")
+        .await
+        .unwrap();
     let _initial_chunks = idx_summary.chunks_created as u64;
 
     // Modify one file.
@@ -206,15 +252,9 @@ async fn update_modified_file() {
     .unwrap();
 
     // Update.
-    let update_summary = update_repository(
-        dir.path(),
-        &provider,
-        &config,
-        "mock-model",
-        &CancellationToken::new(),
-    )
-    .await
-    .unwrap();
+    let update_summary = update_repository(dir.path(), &provider, &config, "mock-model")
+        .await
+        .unwrap();
 
     assert_eq!(update_summary.files_modified, 1);
     assert_eq!(update_summary.files_added, 0);
@@ -253,16 +293,9 @@ async fn update_detects_rst_include_dependency_changes() {
     let provider = MockProvider::new(8);
     let config = default_config();
 
-    index_repository(
-        dir.path(),
-        &provider,
-        &config,
-        "mock-model",
-        |_| {},
-        &CancellationToken::new(),
-    )
-    .await
-    .unwrap();
+    index_repository(dir.path(), &provider, &config, "mock-model")
+        .await
+        .unwrap();
 
     let idx = index_dir(&dir.path().canonicalize().unwrap());
     let metadata = MetadataStore::open(&idx.join("metadata.db")).unwrap();
@@ -279,15 +312,9 @@ async fn update_detects_rst_include_dependency_changes() {
     )
     .unwrap();
 
-    let update_summary = update_repository(
-        dir.path(),
-        &provider,
-        &config,
-        "mock-model",
-        &CancellationToken::new(),
-    )
-    .await
-    .unwrap();
+    let update_summary = update_repository(dir.path(), &provider, &config, "mock-model")
+        .await
+        .unwrap();
 
     assert_eq!(update_summary.files_modified, 1);
     assert_eq!(update_summary.files_added, 0);
@@ -318,16 +345,9 @@ async fn update_added_file() {
     let config = default_config();
 
     // Initial index.
-    let idx_summary = index_repository(
-        dir.path(),
-        &provider,
-        &config,
-        "mock-model",
-        |_| {},
-        &CancellationToken::new(),
-    )
-    .await
-    .unwrap();
+    let idx_summary = index_repository(dir.path(), &provider, &config, "mock-model")
+        .await
+        .unwrap();
     let initial_chunks = idx_summary.chunks_created as u64;
 
     // Add a new file.
@@ -338,15 +358,9 @@ async fn update_added_file() {
     .unwrap();
 
     // Update.
-    let update_summary = update_repository(
-        dir.path(),
-        &provider,
-        &config,
-        "mock-model",
-        &CancellationToken::new(),
-    )
-    .await
-    .unwrap();
+    let update_summary = update_repository(dir.path(), &provider, &config, "mock-model")
+        .await
+        .unwrap();
 
     assert_eq!(update_summary.files_modified, 0);
     assert_eq!(update_summary.files_added, 1);
@@ -387,31 +401,18 @@ async fn update_deleted_file() {
     let config = default_config();
 
     // Initial index.
-    let idx_summary = index_repository(
-        dir.path(),
-        &provider,
-        &config,
-        "mock-model",
-        |_| {},
-        &CancellationToken::new(),
-    )
-    .await
-    .unwrap();
+    let idx_summary = index_repository(dir.path(), &provider, &config, "mock-model")
+        .await
+        .unwrap();
     let initial_chunks = idx_summary.chunks_created as u64;
 
     // Delete a file.
     fs::remove_file(dir.path().join("lib.py")).unwrap();
 
     // Update.
-    let update_summary = update_repository(
-        dir.path(),
-        &provider,
-        &config,
-        "mock-model",
-        &CancellationToken::new(),
-    )
-    .await
-    .unwrap();
+    let update_summary = update_repository(dir.path(), &provider, &config, "mock-model")
+        .await
+        .unwrap();
 
     assert_eq!(update_summary.files_modified, 0);
     assert_eq!(update_summary.files_added, 0);
@@ -446,14 +447,7 @@ async fn update_without_index_fails() {
     let provider = MockProvider::new(8);
     let config = default_config();
 
-    let result = update_repository(
-        dir.path(),
-        &provider,
-        &config,
-        "mock-model",
-        &CancellationToken::new(),
-    )
-    .await;
+    let result = update_repository(dir.path(), &provider, &config, "mock-model").await;
     assert!(result.is_err());
     let err = result.unwrap_err().to_string();
     assert!(
@@ -470,16 +464,9 @@ async fn pre_cancelled_update_preserves_existing_index() {
 
     let provider = MockProvider::new(8);
     let config = default_config();
-    index_repository(
-        dir.path(),
-        &provider,
-        &config,
-        "mock-model",
-        |_| {},
-        &CancellationToken::new(),
-    )
-    .await
-    .unwrap();
+    index_repository(dir.path(), &provider, &config, "mock-model")
+        .await
+        .unwrap();
 
     let idx = index_dir(&dir.path().canonicalize().unwrap());
     let metadata = MetadataStore::open(&idx.join("metadata.db")).unwrap();
@@ -489,9 +476,15 @@ async fn pre_cancelled_update_preserves_existing_index() {
 
     let cancellation = CancellationToken::new();
     cancellation.cancel();
-    let error = update_repository(dir.path(), &provider, &config, "mock-model", &cancellation)
-        .await
-        .unwrap_err();
+    let error = crate::indexing::update_repository_with_cancellation(
+        dir.path(),
+        &provider,
+        &config,
+        "mock-model",
+        &cancellation,
+    )
+    .await
+    .unwrap_err();
 
     assert!(error.to_string().contains("operation cancelled"));
     let metadata = MetadataStore::open(&idx.join("metadata.db")).unwrap();
@@ -519,16 +512,9 @@ async fn update_matches_fresh_index() {
     let config = default_config();
 
     // Initial index.
-    index_repository(
-        dir.path(),
-        &provider,
-        &config,
-        "mock-model",
-        |_| {},
-        &CancellationToken::new(),
-    )
-    .await
-    .unwrap();
+    index_repository(dir.path(), &provider, &config, "mock-model")
+        .await
+        .unwrap();
 
     // Apply a sequence of changes.
     // 1. Modify main.rs
@@ -547,15 +533,9 @@ async fn update_matches_fresh_index() {
     .unwrap();
 
     // Run update.
-    let update_summary = update_repository(
-        dir.path(),
-        &provider,
-        &config,
-        "mock-model",
-        &CancellationToken::new(),
-    )
-    .await
-    .unwrap();
+    let update_summary = update_repository(dir.path(), &provider, &config, "mock-model")
+        .await
+        .unwrap();
     assert_eq!(update_summary.files_modified, 1);
     assert_eq!(update_summary.files_added, 1);
     assert_eq!(update_summary.files_deleted, 1);
@@ -568,16 +548,9 @@ async fn update_matches_fresh_index() {
     let updated_languages = updated_metadata.language_stats().unwrap();
 
     // Now do a fresh index of the same directory.
-    let _fresh_summary = index_repository(
-        dir.path(),
-        &provider,
-        &config,
-        "mock-model",
-        |_| {},
-        &CancellationToken::new(),
-    )
-    .await
-    .unwrap();
+    let _fresh_summary = index_repository(dir.path(), &provider, &config, "mock-model")
+        .await
+        .unwrap();
 
     let fresh_metadata = MetadataStore::open(&idx.join("metadata.db")).unwrap();
     let fresh_chunk_count = fresh_metadata.chunk_count().unwrap();
@@ -612,31 +585,18 @@ async fn update_mixed_add_modify_delete() {
     let config = default_config();
 
     // Initial index.
-    index_repository(
-        dir.path(),
-        &provider,
-        &config,
-        "mock-model",
-        |_| {},
-        &CancellationToken::new(),
-    )
-    .await
-    .unwrap();
+    index_repository(dir.path(), &provider, &config, "mock-model")
+        .await
+        .unwrap();
 
     // Modify a.rs, delete b.py, add d.ts.
     fs::write(dir.path().join("a.rs"), "fn a_updated() { 42 }").unwrap();
     fs::remove_file(dir.path().join("b.py")).unwrap();
     fs::write(dir.path().join("d.ts"), "function d(): void {}").unwrap();
 
-    let update_summary = update_repository(
-        dir.path(),
-        &provider,
-        &config,
-        "mock-model",
-        &CancellationToken::new(),
-    )
-    .await
-    .unwrap();
+    let update_summary = update_repository(dir.path(), &provider, &config, "mock-model")
+        .await
+        .unwrap();
 
     assert_eq!(update_summary.files_modified, 1);
     assert_eq!(update_summary.files_added, 1);
@@ -671,16 +631,9 @@ async fn update_vector_store_consistent() {
     let config = default_config();
 
     // Initial index.
-    index_repository(
-        dir.path(),
-        &provider,
-        &config,
-        "mock-model",
-        |_| {},
-        &CancellationToken::new(),
-    )
-    .await
-    .unwrap();
+    index_repository(dir.path(), &provider, &config, "mock-model")
+        .await
+        .unwrap();
 
     let idx = index_dir(&dir.path().canonicalize().unwrap());
     let initial_vec_count = VectorStore::open(&idx.join("vectors.db"), 8)
@@ -690,15 +643,9 @@ async fn update_vector_store_consistent() {
 
     // Add a file.
     fs::write(dir.path().join("lib.py"), "def lib(): return 1").unwrap();
-    update_repository(
-        dir.path(),
-        &provider,
-        &config,
-        "mock-model",
-        &CancellationToken::new(),
-    )
-    .await
-    .unwrap();
+    update_repository(dir.path(), &provider, &config, "mock-model")
+        .await
+        .unwrap();
 
     let after_add_vec_count = VectorStore::open(&idx.join("vectors.db"), 8)
         .unwrap()
@@ -711,15 +658,9 @@ async fn update_vector_store_consistent() {
 
     // Delete the added file.
     fs::remove_file(dir.path().join("lib.py")).unwrap();
-    update_repository(
-        dir.path(),
-        &provider,
-        &config,
-        "mock-model",
-        &CancellationToken::new(),
-    )
-    .await
-    .unwrap();
+    update_repository(dir.path(), &provider, &config, "mock-model")
+        .await
+        .unwrap();
 
     let after_del_vec_count = VectorStore::open(&idx.join("vectors.db"), 8)
         .unwrap()

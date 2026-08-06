@@ -200,7 +200,7 @@ fn run_update_blocking(
     ))?;
     let cancellation = vera_core::CancellationToken::new();
 
-    rt.block_on(vera_core::indexing::update_repository(
+    rt.block_on(vera_core::indexing::update_repository_with_cancellation(
         repo_path,
         &provider,
         &config,

@@ -336,21 +336,23 @@ impl OpenAiProvider {
         let status = response.status().as_u16();
 
         if status == 401 || status == 403 {
-            let text = response.text().await.unwrap_or_default();
+            let text = read_response_text(response, "failed to read authentication error response")
+                .await?;
             return Err(EmbeddingError::AuthError {
                 message: sanitize_error_message(&text),
             });
         }
 
         if status == 429 {
-            let text = response.text().await.unwrap_or_default();
+            let text = read_response_text(response, "failed to read rate limit response").await?;
             return Err(EmbeddingError::RateLimitError {
                 message: sanitize_error_message(&text),
             });
         }
 
         if !response.status().is_success() {
-            let text = response.text().await.unwrap_or_default();
+            let text =
+                read_response_text(response, "failed to read embedding error response").await?;
             // Some providers return 400 with "Unable to process" for transient
             // overload conditions. Treat these as rate limits so they get retried.
             if status == 400 && text.contains("Unable to process") {
@@ -364,17 +366,10 @@ impl OpenAiProvider {
             });
         }
 
-        let resp: EmbeddingResponse = response.json().await.map_err(|e| {
-            if e.is_timeout() {
-                EmbeddingError::TimeoutError {
-                    message: format!("timed out reading embedding response: {e}"),
-                }
-            } else {
-                EmbeddingError::ResponseError {
-                    message: format!("failed to parse embedding response: {e}"),
-                }
-            }
-        })?;
+        let resp: EmbeddingResponse = response
+            .json()
+            .await
+            .map_err(|error| response_read_error(error, "failed to parse embedding response"))?;
 
         // Sort by index to ensure correct ordering.
         let mut data = resp.data;
@@ -394,6 +389,28 @@ impl OpenAiProvider {
 
         Ok(vectors)
     }
+}
+
+fn response_read_error(error: reqwest::Error, context: &str) -> EmbeddingError {
+    if error.is_timeout() {
+        EmbeddingError::TimeoutError {
+            message: format!("{context}: {error}"),
+        }
+    } else {
+        EmbeddingError::ResponseError {
+            message: format!("{context}: {error}"),
+        }
+    }
+}
+
+async fn read_response_text(
+    response: reqwest::Response,
+    context: &str,
+) -> Result<String, EmbeddingError> {
+    response
+        .text()
+        .await
+        .map_err(|error| response_read_error(error, context))
 }
 
 impl EmbeddingProvider for OpenAiProvider {
@@ -1176,6 +1193,9 @@ pub(crate) mod test_helpers {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[test]
     fn prepare_query_text_with_prefix() {
@@ -1324,5 +1344,53 @@ mod tests {
 
         assert!(!is_retryable_error(&timeout));
         assert!(is_retryable_error(&connection));
+    }
+
+    #[tokio::test]
+    async fn delayed_rate_limit_body_is_a_non_retryable_timeout() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let server_request_count = request_count.clone();
+
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                server_request_count.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let mut request = [0_u8; 2048];
+                    let _ = stream.read(&mut request).await;
+                    stream
+                        .write_all(
+                            b"HTTP/1.1 429 Too Many Requests\r\nContent-Length: 4\r\nConnection: close\r\n\r\n",
+                        )
+                        .await
+                        .unwrap();
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    let _ = stream.write_all(b"slow").await;
+                });
+            }
+        });
+
+        let config = EmbeddingProviderConfig::new(
+            format!("http://{address}"),
+            "test-model".into(),
+            "test-key".into(),
+        )
+        .with_timeout(Duration::from_millis(50))
+        .with_max_retries(3);
+        let provider = OpenAiProvider::new(config).unwrap();
+
+        let error = tokio::time::timeout(
+            Duration::from_secs(1),
+            provider.embed_batch(&["input".to_string()]),
+        )
+        .await
+        .expect("a body timeout must not enter rate-limit backoff")
+        .unwrap_err();
+
+        assert!(matches!(error, EmbeddingError::TimeoutError { .. }));
+        assert_eq!(request_count.load(Ordering::SeqCst), 1);
+        server.abort();
     }
 }

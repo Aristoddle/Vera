@@ -90,12 +90,11 @@ pub fn execute(
         let cancellation = vera_core::CancellationToken::new();
         let summary = rt
             .block_on(cancel_on_signal(
-                vera_core::indexing::index_repository(
+                vera_core::indexing::index_repository_with_cancellation(
                     repo_path,
                     &provider,
                     &config,
                     &model_name,
-                    |_| {},
                     &cancellation,
                 ),
                 wait_for_interrupt(),
@@ -141,7 +140,7 @@ pub fn execute(
 
     let cancellation = vera_core::CancellationToken::new();
     let result = rt.block_on(cancel_on_signal(
-        vera_core::indexing::index_repository(
+        vera_core::indexing::index_repository_with_progress_and_cancellation(
             repo_path,
             &provider,
             &config,

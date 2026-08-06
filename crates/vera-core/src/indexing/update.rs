@@ -111,6 +111,23 @@ pub async fn update_repository<P: EmbeddingProvider>(
     provider: &P,
     config: &VeraConfig,
     model_name: &str,
+) -> Result<UpdateSummary> {
+    update_repository_with_cancellation(
+        repo_path,
+        provider,
+        config,
+        model_name,
+        &CancellationToken::new(),
+    )
+    .await
+}
+
+/// Update an existing repository index while cooperatively observing cancellation.
+pub async fn update_repository_with_cancellation<P: EmbeddingProvider>(
+    repo_path: &Path,
+    provider: &P,
+    config: &VeraConfig,
+    model_name: &str,
     cancellation: &CancellationToken,
 ) -> Result<UpdateSummary> {
     let start = Instant::now();
@@ -139,8 +156,9 @@ pub async fn update_repository<P: EmbeddingProvider>(
     info!(path = %repo_root.display(), "starting incremental update");
 
     // ── 2. Discover current files on disk ────────────────────────
-    let disc = discovery::discover_files(&repo_root, &config.indexing, cancellation)
-        .context("file discovery failed")?;
+    let disc =
+        discovery::discover_files_with_cancellation(&repo_root, &config.indexing, cancellation)
+            .context("file discovery failed")?;
 
     // ── 3. Load stored hashes and classify files ─────────────────
     let metadata_path = idx_dir.join("metadata.db");

@@ -197,6 +197,7 @@ pub async fn search_hybrid_reranked(
                 reranked = reranked.len(),
                 "reranking complete"
             );
+            reranked.extend(hybrid_results.into_iter().skip(rerank_candidates));
             reranked.truncate(limit);
             Ok((reranked, timings))
         }
@@ -837,6 +838,53 @@ mod tests {
         .unwrap();
 
         assert!(results.len() <= 2, "should respect the limit of 2");
+    }
+
+    #[tokio::test]
+    async fn reranking_preserves_unreranked_tail_for_later_filtering() {
+        use crate::embedding::test_helpers::MockProvider;
+        use crate::retrieval::apply_filters;
+        use crate::retrieval::reranker::test_helpers::MockReranker;
+        use crate::types::SearchFilters;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let (index_dir, dim) = setup_test_index(tmp.path()).await;
+        let provider = MockProvider::new(dim);
+        let reranker = MockReranker::new();
+
+        let (hybrid_results, _) =
+            search_hybrid(&index_dir, &provider, "function", 10, 60.0, dim, 50)
+                .await
+                .unwrap();
+        let first = hybrid_results
+            .first()
+            .expect("test index should have results");
+        let tail_candidate = hybrid_results
+            .iter()
+            .skip(1)
+            .find(|candidate| candidate.file_path != first.file_path)
+            .expect("test index should have a tail candidate from another file")
+            .clone();
+
+        let (reranked_results, _) = search_hybrid_reranked(
+            &index_dir, &provider, &reranker, "function", 10, 60.0, dim, 1, 50,
+        )
+        .await
+        .unwrap();
+        let filtered = apply_filters(
+            reranked_results,
+            &SearchFilters {
+                path_glob: Some(tail_candidate.file_path.clone()),
+                ..Default::default()
+            },
+            10,
+        );
+
+        assert!(filtered.iter().any(|result| {
+            result.file_path == tail_candidate.file_path
+                && result.line_start == tail_candidate.line_start
+                && result.line_end == tail_candidate.line_end
+        }));
     }
 
     // ── compute_vector_candidates tests ─────────────────────────────

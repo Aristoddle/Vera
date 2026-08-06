@@ -365,12 +365,11 @@ fn handle_search_code(args: &Value) -> ToolCallResult {
             Err(e) => return e,
         };
         let cancellation = vera_core::CancellationToken::new();
-        match rt.block_on(vera_core::indexing::index_repository(
+        match rt.block_on(vera_core::indexing::index_repository_with_cancellation(
             &cwd,
             &provider,
             &idx_config,
             &model_name,
-            |_| {},
             &cancellation,
         )) {
             Ok(_) => {}
