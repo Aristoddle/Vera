@@ -334,7 +334,13 @@ impl VeraConfig {
                     } else {
                         128
                     };
-                    self.embedding.batch_size = auto_batch;
+                    // Unified memory is shared with macOS and apps; cap the
+                    // CoreML batch so large-RAM Macs don't starve the system.
+                    if ep == OnnxExecutionProvider::CoreMl {
+                        self.embedding.batch_size = auto_batch.min(64);
+                    } else {
+                        self.embedding.batch_size = auto_batch;
+                    }
 
                     // Set a conservative memory limit only for low-VRAM GPUs
                     // to prevent ORT from grabbing all VRAM. For >=8GB, no limit.
@@ -374,10 +380,48 @@ pub fn detect_gpu_info(ep: OnnxExecutionProvider) -> GpuInfo {
     match ep {
         OnnxExecutionProvider::Cuda => detect_nvidia_gpu_info(),
         OnnxExecutionProvider::Rocm => detect_rocm_gpu_info(),
+        OnnxExecutionProvider::CoreMl => detect_apple_silicon_mem_info(),
         _ => GpuInfo {
             vram_free_mb: None,
             fingerprint: host_fingerprint(ep),
         },
+    }
+}
+
+/// Apple Silicon uses unified memory: the GPU shares system RAM. Report half
+/// of total RAM (via `sysctl hw.memsize`) as the available pool so batch
+/// auto-scaling works; returns None for VRAM off-macOS or on parse failure.
+fn detect_apple_silicon_mem_info() -> GpuInfo {
+    let output = std::process::Command::new("sysctl")
+        .args(["-n", "hw.memsize"])
+        .output()
+        .ok();
+    let total_mb = output
+        .filter(|o| o.status.success())
+        .and_then(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .trim()
+                .parse::<u64>()
+                .ok()
+        })
+        .map(|bytes| bytes / (1024 * 1024));
+    // Half of system RAM is a conservative proxy for what the GPU can use
+    // while macOS and other apps stay responsive.
+    let vram_free_mb = total_mb.map(|mb| mb / 2);
+    let brand = std::process::Command::new("sysctl")
+        .args(["-n", "machdep.cpu.brand_string"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|s| !s.is_empty());
+    let fingerprint = match (brand, total_mb) {
+        (Some(brand), Some(mb)) => format!("{brand}|{mb}MB-unified"),
+        _ => host_fingerprint(OnnxExecutionProvider::CoreMl),
+    };
+    GpuInfo {
+        vram_free_mb,
+        fingerprint,
     }
 }
 
