@@ -460,6 +460,9 @@ enum Commands {
         /// Disable smart default exclusions.
         #[arg(long)]
         no_default_excludes: bool,
+        /// Disable the interactive update progress display.
+        #[arg(long)]
+        no_progress: bool,
     },
 
     /// Show architecture overview of the indexed project.
@@ -840,6 +843,7 @@ fn main() {
             exclude,
             no_ignore,
             no_default_excludes,
+            no_progress,
         } => {
             tracing::info!(path = %path, "updating");
             commands::update::run(
@@ -849,6 +853,7 @@ fn main() {
                 exclude,
                 no_ignore,
                 no_default_excludes,
+                no_progress,
             )
         }
         Commands::Overview { git_scope } => {
@@ -1261,6 +1266,18 @@ mod tests {
     fn cli_parses_update_command() {
         let cli = Cli::parse_from(["vera", "update", "/tmp/repo"]);
         assert!(matches!(cli.command, Commands::Update { path, .. } if path == "/tmp/repo"));
+    }
+
+    #[test]
+    fn cli_parses_update_no_progress_flag() {
+        let cli = Cli::parse_from(["vera", "update", "/tmp/repo", "--no-progress"]);
+        assert!(matches!(
+            cli.command,
+            Commands::Update {
+                no_progress: true,
+                ..
+            }
+        ));
     }
 
     #[test]

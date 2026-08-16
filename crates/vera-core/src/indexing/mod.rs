@@ -13,11 +13,10 @@ pub mod update;
 pub use freshness::{IndexFreshness, detect_staleness};
 pub use pipeline::{
     FileError, IndexProgress, IndexSummary, index_dir, index_repository,
-    index_repository_with_cancellation, index_repository_with_progress,
-    index_repository_with_progress_and_cancellation,
+    index_repository_with_progress,
 };
 pub use update::{
-    UpdateSummary, content_hash, update_repository, update_repository_with_cancellation,
+    UpdateProgress, UpdateSummary, content_hash, update_repository, update_repository_with_progress,
 };
 
 /// Truncate embedding vectors to at most `max_dim` dimensions.
