@@ -64,3 +64,7 @@ cargo run --release --bin vera-eval -- run --json-only  # JSON output only
 ```
 
 Benchmark details: [docs/benchmarks.md](docs/benchmarks.md).
+
+## Branch Policy
+
+Until v1.0.0 ships, feature work targets the `feat/v1-prep` integration branch; `master` takes hotfixes only. After the v1.0.0 release, PRs target `master` directly.

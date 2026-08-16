@@ -23,6 +23,7 @@ Download from [GitHub Releases](https://github.com/lemon07r/Vera/releases) for L
 **Build from source** (Rust 1.85+):
 ```bash
 git clone https://github.com/lemon07r/Vera.git && cd Vera
+bash scripts/bootstrap-vendored-grammars.sh   # downloads the four grammars that are not tracked in git
 cargo build --release
 cp target/release/vera ~/.local/bin/
 vera setup

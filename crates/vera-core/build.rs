@@ -27,91 +27,28 @@ fn main() {
             .compile("tree-sitter-proto");
     }
 
-    let dockerfile_dir = std::path::Path::new("../tree-sitter-dockerfile/src");
-    if !dockerfile_dir.join("parser.c").exists() {
-        println!(
-            "cargo:warning=tree-sitter-dockerfile grammar not found. Run .factory/init.sh to download."
+    // These grammars are not tracked in git; scripts/bootstrap-vendored-grammars.sh
+    // downloads them. Fail at build-script time instead of at link time.
+    for name in ["dockerfile", "astro", "scss", "vue"] {
+        let dir = std::path::PathBuf::from(format!("../tree-sitter-{name}/src"));
+        let parser = dir.join("parser.c");
+        assert!(
+            parser.exists(),
+            "tree-sitter-{name} grammar not found. Run scripts/bootstrap-vendored-grammars.sh to download it."
         );
-    }
-    if dockerfile_dir.exists() {
-        println!("cargo:rerun-if-changed=../tree-sitter-dockerfile/src/parser.c");
-        println!("cargo:rerun-if-changed=../tree-sitter-dockerfile/src/scanner.c");
+        println!("cargo:rerun-if-changed={}", parser.display());
         cc::Build::new()
-            .include(dockerfile_dir)
-            .file(dockerfile_dir.join("parser.c"))
+            .include(&dir)
+            .file(&parser)
             .warnings(false)
-            .compile("tree-sitter-dockerfile-parser");
+            .compile(&format!("tree-sitter-{name}-parser"));
 
+        let scanner = dir.join("scanner.c");
+        println!("cargo:rerun-if-changed={}", scanner.display());
         cc::Build::new()
-            .include(dockerfile_dir)
-            .file(dockerfile_dir.join("scanner.c"))
+            .include(&dir)
+            .file(&scanner)
             .warnings(false)
-            .compile("tree-sitter-dockerfile-scanner");
-    }
-
-    let astro_dir = std::path::Path::new("../tree-sitter-astro/src");
-    if !astro_dir.join("parser.c").exists() {
-        println!(
-            "cargo:warning=tree-sitter-astro grammar not found. Run .factory/init.sh to download."
-        );
-    }
-    if astro_dir.exists() {
-        println!("cargo:rerun-if-changed=../tree-sitter-astro/src/parser.c");
-        println!("cargo:rerun-if-changed=../tree-sitter-astro/src/scanner.c");
-        cc::Build::new()
-            .include(astro_dir)
-            .file(astro_dir.join("parser.c"))
-            .warnings(false)
-            .compile("tree-sitter-astro-parser");
-
-        cc::Build::new()
-            .include(astro_dir)
-            .file(astro_dir.join("scanner.c"))
-            .warnings(false)
-            .compile("tree-sitter-astro-scanner");
-    }
-
-    let scss_dir = std::path::Path::new("../tree-sitter-scss/src");
-    if !scss_dir.join("parser.c").exists() {
-        println!(
-            "cargo:warning=tree-sitter-scss grammar not found. Run scripts/bootstrap-vendored-grammars.sh to download."
-        );
-    }
-    if scss_dir.exists() {
-        println!("cargo:rerun-if-changed=../tree-sitter-scss/src/parser.c");
-        println!("cargo:rerun-if-changed=../tree-sitter-scss/src/scanner.c");
-        cc::Build::new()
-            .include(scss_dir)
-            .file(scss_dir.join("parser.c"))
-            .warnings(false)
-            .compile("tree-sitter-scss-parser");
-
-        cc::Build::new()
-            .include(scss_dir)
-            .file(scss_dir.join("scanner.c"))
-            .warnings(false)
-            .compile("tree-sitter-scss-scanner");
-    }
-
-    let vue_dir = std::path::Path::new("../tree-sitter-vue/src");
-    if !vue_dir.join("parser.c").exists() {
-        println!(
-            "cargo:warning=tree-sitter-vue grammar not found. Run .factory/init.sh to download."
-        );
-    }
-    if vue_dir.exists() {
-        println!("cargo:rerun-if-changed=../tree-sitter-vue/src/parser.c");
-        println!("cargo:rerun-if-changed=../tree-sitter-vue/src/scanner.c");
-        cc::Build::new()
-            .include(vue_dir)
-            .file(vue_dir.join("parser.c"))
-            .warnings(false)
-            .compile("tree-sitter-vue-parser");
-
-        cc::Build::new()
-            .include(vue_dir)
-            .file(vue_dir.join("scanner.c"))
-            .warnings(false)
-            .compile("tree-sitter-vue-scanner");
+            .compile(&format!("tree-sitter-{name}-scanner"));
     }
 }
