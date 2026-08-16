@@ -1,12 +1,12 @@
 # Agent-Level Vera Benchmark
 
-This benchmark measures whether a coding agent answers cross-file questions about Flask with less tool use and lower latency when Vera is available. It records answer text, tool-call counts, token usage reported by the agent stream, and wall-clock time. It does not score answer quality automatically.
+This benchmark measures whether a coding agent answers cross-file questions about Flask with less tool use and lower latency when Vera is available. It records answer text, tool-call counts, token usage reported by the agent stream, and wall-clock time. Answer quality is graded separately by `judge.py`, which scores each answer blind (no arm label) against `flask/answer-key.md` with a 0-10 rubric.
 
 The `with-vera` arm is a fresh copy of Flask with a local Vera index and the project-scoped Droid skill installed. Its `PATH` resolves the release Vera binary first. The `control` arm is an otherwise identical copy with Vera artifacts removed and a `vera` shim that exits 127 with `vera: not available in this environment`. Questions run sequentially, alternating which arm goes first.
 
 ## Questions
 
-Put exactly 10 top-level numbered questions in `flask/questions.md`, numbered `1.` through `10.`. The harness reads this file before setup or analysis and fails clearly if it is missing or malformed. Keep any private grading material outside both sandbox copies; the harness does not copy it into an arm and does not include it in prompts.
+Put exactly 10 questions in `flask/questions.md` under `## Question 1` through `## Question 10` headings. The harness reads this file before setup or analysis and fails clearly if it is missing or malformed. Keep any private grading material outside both sandbox copies; the harness does not copy it into an arm and does not include it in prompts.
 
 ## Reproduce
 
@@ -36,7 +36,13 @@ To parse or re-parse existing JSONL outputs without invoking an agent:
 python3 benchmarks/agent-bench/run.py --analyze /tmp/agent-bench/<timestamp>
 ```
 
-Running the script with no mode performs setup, the full sweep, and analysis sequentially. Each question writes `with-vera/qNN.jsonl` and `control/qNN.jsonl`; `results.json` contains per-question records and aggregate totals.
+Pick the tested model and reasoning effort with `--model` and `--effort` (defaults: `claude-opus-5`, `medium`). Each model+effort pair writes its own transcripts (`qNN.<model>-<effort>.jsonl`) and `results.<model>-<effort>.json`, so several lanes can share one run directory. Grade a lane's answers with:
+
+```bash
+python3 benchmarks/agent-bench/judge.py /tmp/agent-bench/<timestamp> <model>-<effort>
+```
+
+Running the script with no mode performs setup, the full sweep, and analysis sequentially.
 
 ## Limitations
 

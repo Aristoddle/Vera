@@ -39,10 +39,10 @@ This benchmark used 10 cross-file tracing questions about the Flask codebase. Th
 |--------------|-----|------------|------------|--------------|-----------|
 | claude-opus-5 (medium effort) | with-vera | 10.0/10 | 186 | 298 | 1367 s |
 | claude-opus-5 (medium effort) | control | 10.0/10 | 173 | 212 | 1252 s |
-| kimi-k3 (medium effort) | with-vera | 10.0/10 (9 answered; 1 run hit a quota abort) | 205 | 198,847 | 1307 s |
-| kimi-k3 (medium effort) | control | 9.9/10 | 181 | 303,608 | 1242 s |
+| kimi-k3 (medium effort) | with-vera | 10.0/10 | 219 | 230,567 | 1312 s |
+| kimi-k3 (medium effort) | control | 9.9/10 | 190 | 278,041 | 1198 s |
 
-The opus table's input-token counts include only non-cached tokens because nearly everything there was cache reads. The kimi lane is the honest context-size comparison: with Vera, the agent pulled 35% fewer input tokens (198.8k vs 303.6k) to reach the same answer quality.
+The opus table's input-token counts include only non-cached tokens because nearly everything there was cache reads. The kimi lane is the honest context-size comparison: with Vera, the agent pulled 17% fewer input tokens (230.6k vs 278.0k) to reach the same answer quality.
 
 On a small, well-organized repo, a frontier model answers these questions perfectly with plain grep+read, so quality parity is expected. Vera's measurable effect at this scale is reduced context consumption for the mid-tier model, at roughly equal wall time with slightly more tool calls. Larger and less familiar codebases are where the retrieval advantage should grow. Treat this as a floor, not a ceiling.
 
