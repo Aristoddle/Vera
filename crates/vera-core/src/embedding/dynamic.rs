@@ -55,6 +55,7 @@ impl EmbeddingProvider for DynamicProvider {
         match self {
             Self::Api(p) => p.embed_batch_cancellable(texts, cancel).await,
             Self::Local(p) => p.embed_batch_cancellable(texts, cancel).await,
+            Self::Model2Vec(p) => p.embed_batch_cancellable(texts, cancel).await,
         }
     }
 }

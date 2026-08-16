@@ -160,6 +160,7 @@ fn backend_label(backend: InferenceBackend) -> &'static str {
     use vera_core::config::OnnxExecutionProvider;
     match backend {
         InferenceBackend::Api => "api",
+        InferenceBackend::PotionCode => "potion-code (CPU)",
         InferenceBackend::OnnxJina(OnnxExecutionProvider::Cpu) => "cpu",
         InferenceBackend::OnnxJina(OnnxExecutionProvider::Cuda) => "cuda (GPU)",
         InferenceBackend::OnnxJina(OnnxExecutionProvider::Rocm) => "rocm (AMD GPU)",
