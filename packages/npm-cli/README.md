@@ -38,6 +38,7 @@ vera search "authentication logic"
 | Inspect index health | `vera stats --json` |
 | Keep the index up to date | `vera update .` |
 | Watch for file changes | `vera watch .` |
+| Run local HTTP inference server | `vera serve` |
 | Diagnose setup issues | `vera doctor` |
 | Run the deeper local probe | `vera doctor --probe` |
 | Repair missing local assets | `vera repair` |

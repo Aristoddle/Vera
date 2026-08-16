@@ -41,7 +41,7 @@ Expected filenames for the curated presets:
 | Potion Code | `tokenizer.json`, `model.safetensors`, `config.json` |
 | Jina embeddings | `onnx/model_quantized.onnx`, `onnx/model_quantized.onnx_data`, `tokenizer.json` (`vera setup --onnx-jina-coreml` and `vera repair --onnx-jina-coreml` use `onnx/model_fp16.onnx` and `onnx/model_fp16.onnx_data` instead) |
 | CodeRankEmbed | `onnx/model_quantized.onnx`, `tokenizer.json` |
-| Jina reranker | `onnx/model_quantized.onnx`, `tokenizer.json` (`vera setup --onnx-jina-coreml` and `vera repair --onnx-jina-coreml` use `onnx/model_fp16.onnx` instead) |
+| Jina reranker | `onnx/model_quantized.onnx`, `tokenizer.json` |
 
 If you want to keep a custom embedding model somewhere else, skip copying it into the models directory and point Vera at it directly with `vera setup --embedding-dir /path/to/model-dir`.
 

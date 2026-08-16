@@ -7,6 +7,7 @@
 | `vera-core` | Parsing, indexing, storage, embedding, retrieval | `lib.rs` |
 | `vera-cli` | CLI (clap derive macros) | `main.rs` |
 | `vera-mcp` | MCP server (JSON-RPC over stdio) | `server.rs` |
+| `vera-serve` | HTTP inference server (OpenAI/Cohere-compatible) | `lib.rs` |
 | `eval` | Benchmark harness and metrics | `src/main.rs` |
 | `tree-sitter-{sql,proto,vue,dockerfile,astro}` | Vendored C grammars (built via `cc`) | `build.rs` |
 
@@ -66,7 +67,7 @@ All stored in `.vera/` at the project root.
 
 ## vera-cli
 
-`main.rs` parses args via clap. `commands/` contains the CLI subcommand implementations and helpers: `agent`, `config`, `doctor`, `explain_path`, `grep`, `index`, `mcp`, `overview`, `references` (also used by `dead-code`), `repair`, `search`, `setup`, `stats`, `structural`, `uninstall`, `update`, `upgrade`, and `watch`.
+`main.rs` parses args via clap. `commands/` contains the CLI subcommand implementations and helpers: `agent`, `config`, `doctor`, `explain_path`, `grep`, `index`, `mcp`, `overview`, `references` (also used by `dead-code`), `repair`, `search`, `serve`, `setup`, `stats`, `structural`, `uninstall`, `update`, `upgrade`, and `watch`.
 
 ## vera-mcp
 

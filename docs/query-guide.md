@@ -31,7 +31,7 @@ If your first search returns too much, add filters one at a time:
 
 - `--lang rust`: restrict to a specific language
 - `--path "src/**/*.ts"`: restrict to a file path pattern; repeat it to OR several patterns
-- `--type function`: restrict to functions, classes, methods, or structs
+- `--type function`: restrict to functions and methods (function and method are aliases in both directions)
 - `--scope docs`: restrict to docs and markdown
 - `--scope runtime`: restrict to extracted runtime trees and bundled app code
 - `--include-generated`: include dist/minified/generated artifacts

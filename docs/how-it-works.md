@@ -10,7 +10,7 @@ For config and document-like files, Vera uses whole-file chunks instead. Module-
 
 Each chunk carries metadata: file path, line range, language, symbol name, and symbol type. This means search results map to actual code boundaries, not random slices.
 
-Large symbols (>150 lines) are split at logical boundaries. Languages without a tree-sitter grammar fall back to sliding-window chunking. See [features.md](features.md#tree-sitter-structural-parsing) for chunking benchmarks.
+Large symbols (>200 lines) are split at logical boundaries. Languages without a tree-sitter grammar fall back to sliding-window chunking. See [features.md](features.md#tree-sitter-structural-parsing) for chunking benchmarks.
 
 During parsing, Vera also records file-level diagnostics such as tree-sitter error nodes, Tier 0 fallback, and outright parse failures. `vera stats` surfaces these later as index-health signals instead of silently dropping them on the floor.
 

@@ -17,6 +17,8 @@ Results from both paths merge through Reciprocal Rank Fusion (RRF), so a result 
 
 After fusion, the top candidates go through a cross-encoder that reads query and candidate together as a single pair. This is the most impactful stage: it lifts MRR@10 from 0.39 to 0.60 (54% improvement). Most code search tools skip this step entirely.
 
+Vera supports local cross-encoders (Jina) and remote reranking endpoints (Jina, Cohere, or Voyage AI `rerank-2` with `RERANKER_MODEL_BASE_URL=https://api.voyageai.com/v1`, with wire format handled automatically).
+
 Large candidate sets are automatically batched (default 20 per request, configurable via `VERA_MAX_RERANK_BATCH`). Individual documents exceeding the reranker's context window are truncated at the last newline boundary before the character limit (default 4800, configurable via `VERA_MAX_RERANK_DOC_CHARS`). Both settings work automatically with no required configuration.
 
 ### Multi-Query Search
@@ -78,13 +80,15 @@ Symbol-aware chunking scores 2.3x higher MRR on symbol lookup than sliding-windo
 
 ### Adaptive Chunking
 
-Large symbols (>150 lines) are split at logical boundaries: closing braces, semicolons, blank lines. This preserves readability instead of cutting at arbitrary line counts. Languages without a tree-sitter grammar fall back to sliding-window chunking. Module-level gaps between symbols are kept as chunks when they carry useful retrieval context.
+Large symbols (>200 lines) are split at logical boundaries: closing braces, semicolons, blank lines. This preserves readability instead of cutting at arbitrary line counts. Languages without a tree-sitter grammar fall back to sliding-window chunking. Module-level gaps between symbols are kept as chunks when they carry useful retrieval context.
 
 Chunks that exceed the embedding model's input limit are automatically split in a post-processing pass. API mode uses a 24KB byte budget (roughly 6K-7K tokens, safe for any modern embedding model). Local mode uses the model's own tokenizer and max_length. Override with `VERA_MAX_CHUNK_BYTES` if needed.
 
 ### Incremental Updates
 
 `vera update .` compares content hashes against the stored index and only re-parses, re-chunks, and re-embeds changed files. For small changes this takes seconds, not minutes.
+
+Pass `--max-files <N>` to bound the number of added or modified files processed in a single run. Any remaining files are reported as deferred in the update summary so you can process them in subsequent runs.
 
 ### File Watching
 
@@ -100,7 +104,7 @@ Vera respects `.gitignore` by default. For more control, `.veraignore` (gitignor
 
 ### Progress Reporting
 
-Indexing shows a live progress bar with file discovery, parsing, and embedding generation phases. JSON output mode (`--json`) skips the progress UI for machine consumption.
+Indexing and updating show an interactive progress display with file discovery, classification, parsing, and embedding generation phases. Pass `--no-progress` to disable interactive progress bars, or use `--json` for machine consumption.
 
 ### Verbose Indexing
 
@@ -259,9 +263,24 @@ During setup, Vera offers to add a usage snippet to your project's agent config 
 
 `vera backend` manages the model backend separately from the full setup wizard. Switch GPU backends, pick Potion Code CPU, swap ONNX embedding models, or reconfigure API endpoints without re-running setup.
 
+### HTTP Inference Server
+
+`vera serve` starts a local HTTP daemon exposing OpenAI-compatible and Cohere-compatible inference endpoints for standard Vera clients and external tools:
+
+- `POST /v1/embeddings`: OpenAI-compatible embedding format
+- `POST /v1/rerank`: Cohere/Jina-compatible reranker format
+- `GET /v1/health`: liveness probe and active model metadata
+
+Key flags:
+- `--port <PORT>`: TCP port to listen on (default: 3000)
+- `--host <HOST>`: bind address (default: 127.0.0.1)
+- `--api-key <KEY>`: require Bearer token authentication (or set `VERA_SERVE_KEY`)
+- `--idle-timeout <SECS>`: seconds of inactivity before unloading models from memory (0 = reload per request, -1 = keep loaded indefinitely, default: 0)
+- Backend flags: `--potion-code`, `--onnx-jina-cuda`, `--onnx-jina-rocm`, `--onnx-jina-coreml`, `--onnx-jina-openvino`, `--onnx-jina-directml`, or `--api`
+
 ### Diagnostics
 
-`vera doctor` reports the saved and active backend, installed version, and checks GitHub for newer releases. `--probe` adds a deeper read-only local backend check. `--json` outputs machine-readable diagnostics. `vera repair` re-fetches missing local assets.
+`vera doctor` reports the saved and active backend, installed version, checks GitHub for newer releases, and detects missing, corrupt, or truncated ONNX model caches. If model assets are damaged, it suggests running `vera repair --<backend>`; runtime embedding load errors provide the same repair hint. `--probe` adds a deeper read-only local backend check. `--json` outputs machine-readable diagnostics. `vera repair` re-fetches missing or corrupt local assets.
 
 ### Self-Updating
 
@@ -270,6 +289,8 @@ During setup, Vera offers to add a usage snippet to your project's agent config 
 ### Configuration and Stats
 
 `vera config` shows the current configuration. `vera stats` shows index statistics plus persisted health signals such as tree-sitter errors, Tier 0 fallback, and parse failures.
+
+To allow switching between equivalent embedding model names without triggering a re-index, configure `embedding.model_aliases` in config or export `VERA_EMBEDDING_MODEL_ALIASES` (semicolon-separated groups of comma-separated aliases, such as `canonical,alias;other,other-alias`).
 
 ### Uninstalling
 

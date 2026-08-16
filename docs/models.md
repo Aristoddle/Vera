@@ -133,9 +133,25 @@ vera setup --api --yes
 
 Only model calls leave your machine. Indexing, storage, and search remain local.
 
+## Model Aliases
+
+When switching between endpoints or local model names that provide identical embeddings, configure aliases so Vera does not require a full re-index.
+
+Set `embedding.model_aliases` in config or export `VERA_EMBEDDING_MODEL_ALIASES`:
+
+```bash
+export VERA_EMBEDDING_MODEL_ALIASES="jina-embeddings-v3,jina-v3;text-embedding-3-small,openai-small"
+```
+
+The syntax uses semicolon-separated groups of comma-separated equivalent model names. Each group must contain at least two names.
+
+## Apple Silicon Memory and Batching
+
+On macOS Apple Silicon, CoreML auto-detects unified memory by reading `sysctl hw.memsize`. Vera treats half of system RAM as the available GPU pool for auto-scaling and caps the CoreML auto batch size at 64 to keep macOS and other applications responsive.
+
 ## Notes
 
 - Custom ONNX options only affect Jina ONNX local embeddings. API mode and Potion Code are unchanged.
 - Query prefixes only apply to ONNX local embedding queries, not API embeddings.
-- If you switch local embedding models, re-index the repo so the stored vectors match the active model.
+- If you switch local embedding models without configured aliases, re-index the repo so the stored vectors match the active model.
 - If your network blocks CLI downloads, use [manual-install.md](manual-install.md).

@@ -38,6 +38,7 @@ vera-ai search "authentication logic"
 | Inspect index health | `vera-ai stats --json` |
 | Keep the index up to date | `vera-ai update .` |
 | Watch for file changes | `vera-ai watch .` |
+| Run local HTTP inference server | `vera-ai serve` |
 | Diagnose setup issues | `vera-ai doctor` |
 | Run the deeper local probe | `vera-ai doctor --probe` |
 | Repair missing local assets | `vera-ai repair` |

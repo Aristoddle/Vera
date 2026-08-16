@@ -58,7 +58,7 @@ Many providers offer free tiers or generous trial credits. Any OpenAI-compatible
 |----------|-----------|-------|
 | [Jina AI](https://jina.ai/) | Yes (1M tokens free) | Vera's default local models are Jina, so the API versions work well too |
 | [OpenAI](https://platform.openai.com/) | Trial credits | `text-embedding-3-small` or `text-embedding-3-large` |
-| [Voyage AI](https://www.voyageai.com/) | Free tier available | Code-optimized models |
+| [Voyage AI](https://www.voyageai.com/) | Free tier available | Code-optimized models (`voyage-code-3`, `rerank-2`) |
 | [Cohere](https://cohere.com/) | Trial key | `embed-english-v3.0` |
 
 For non-interactive setup, set the environment variables directly and add `--yes`:
@@ -68,13 +68,20 @@ export EMBEDDING_MODEL_BASE_URL=https://api.jina.ai/v1
 export EMBEDDING_MODEL_ID=jina-embeddings-v3
 export EMBEDDING_MODEL_API_KEY=your-key
 
-# Optional: reranker for better precision
+# Optional: reranker for better precision (Jina or Voyage AI)
 export RERANKER_MODEL_BASE_URL=https://api.jina.ai/v1
 export RERANKER_MODEL_ID=jina-reranker-v2-base-multilingual
 export RERANKER_MODEL_API_KEY=your-key
 
+# Or for Voyage AI:
+# export RERANKER_MODEL_BASE_URL=https://api.voyageai.com/v1
+# export RERANKER_MODEL_ID=rerank-2
+# export RERANKER_MODEL_API_KEY=your-key
+
 vera setup --api --yes
 ```
+
+Vera automatically handles Voyage AI's rerank wire format when `RERANKER_MODEL_BASE_URL` points to `https://api.voyageai.com/v1`.
 
 Only model calls leave your machine. Indexing, storage, and search remain local.
 

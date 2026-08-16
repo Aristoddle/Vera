@@ -148,6 +148,7 @@ Repeat `--path` to match any of several file path patterns. Path patterns use OR
 | Get a project overview | `vera overview` |
 | Scope a search to changed files | `vera search "query" --changed` |
 | Keep the index fresh | `vera watch .` |
+| Run local HTTP inference server | `vera serve` |
 | Check your setup | `vera doctor` |
 | Repair missing local assets | `vera repair` |
 | Install agent skills | `vera agent install` |

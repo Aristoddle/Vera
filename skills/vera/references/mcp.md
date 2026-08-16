@@ -30,7 +30,7 @@ vera mcp
 
 The server exposes:
 
-- `search_code` (supports `queries` array for multi-query search, `intent` for reranking, and `changed` / `since` / `base` git scopes; auto-indexes and starts watcher on first use)
+- `search_code` (supports `queries` array for multi-query search, `intent` for reranking, `path` argument as a string or an array of strings with OR semantics, and `changed` / `since` / `base` git scopes; auto-indexes and starts watcher on first use)
 - `get_stats`
 - `get_overview` (includes detected project conventions and supports git-scoped summaries)
 - `regex_search` (regex, context, scope, generated-file toggle, compact output, and git-scoped file selection)
