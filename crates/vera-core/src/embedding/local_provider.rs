@@ -337,16 +337,19 @@ impl LocalEmbeddingProvider {
                     .map_err(|fallback_error| EmbeddingError::ApiError {
                         status: 500,
                         message: format!(
-                            "{}\nCPU fallback also failed: {}",
+                            "{}\nHint: run `vera repair --onnx-jina-{ep}`.\nCPU fallback also failed: {}\nHint: run `vera repair --onnx-jina-cpu`.",
                             crate::local_models::wrap_ort_error(error),
-                            crate::local_models::wrap_ort_error(fallback_error)
+                            crate::local_models::wrap_ort_error(fallback_error),
                         ),
                     })?
             }
             Err(error) => {
                 return Err(EmbeddingError::ApiError {
                     status: 500,
-                    message: crate::local_models::wrap_ort_error(error),
+                    message: format!(
+                        "{}\nHint: run `vera repair --onnx-jina-{ep}`.",
+                        crate::local_models::wrap_ort_error(error)
+                    ),
                 });
             }
         };

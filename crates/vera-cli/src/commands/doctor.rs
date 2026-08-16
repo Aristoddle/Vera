@@ -92,7 +92,8 @@ pub fn run(json_output: bool, probe: bool) -> anyhow::Result<()> {
 
             let model_assets =
                 vera_core::local_models::inspect_local_model_files_for_ep(ep, &embedding_model)?;
-            checks.push(local_model_assets_check(&model_assets));
+            let repair_hint = format!("run `vera repair --onnx-jina-{ep}`");
+            checks.push(local_model_assets_check(&model_assets, &repair_hint));
             if probe {
                 checks.extend(probe_local_backend(ep, &runtime_path, &model_assets)?);
             }
@@ -104,7 +105,10 @@ pub fn run(json_output: bool, probe: bool) -> anyhow::Result<()> {
                 detail: vera_core::local_models::potion_code_model_name().to_string(),
             });
             let model_assets = vera_core::local_models::inspect_potion_code_model_files()?;
-            checks.push(local_model_assets_check(&model_assets));
+            checks.push(local_model_assets_check(
+                &model_assets,
+                "run `vera repair --potion-code`",
+            ));
             if probe {
                 checks.extend(probe_potion_backend(&model_assets));
             }
@@ -223,16 +227,50 @@ fn saved_backend_check(config: &state::StoredConfig) -> DoctorCheck {
 
 fn local_model_assets_check(
     model_assets: &[vera_core::local_models::LocalModelAssetStatus],
+    repair_hint: &str,
 ) -> DoctorCheck {
-    let present = model_assets.iter().filter(|asset| asset.exists).count();
+    let valid = model_assets.iter().filter(|asset| asset.is_valid()).count();
+    let missing = model_assets
+        .iter()
+        .filter(|asset| asset.is_missing())
+        .map(|asset| asset.name)
+        .collect::<Vec<_>>();
+    let invalid = model_assets
+        .iter()
+        .filter(|asset| asset.is_invalid())
+        .map(|asset| {
+            asset.detail.as_deref().map_or_else(
+                || asset.name.to_string(),
+                |detail| format!("{} ({detail})", asset.name),
+            )
+        })
+        .collect::<Vec<_>>();
+    let status = if invalid.is_empty() && missing.is_empty() {
+        CheckStatus::Ok
+    } else if invalid.is_empty() {
+        CheckStatus::Warn
+    } else {
+        CheckStatus::Fail
+    };
+    let detail = if !invalid.is_empty() {
+        format!(
+            "{valid}/{} local assets valid; invalid: {}; {repair_hint}",
+            model_assets.len(),
+            invalid.join(", ")
+        )
+    } else if !missing.is_empty() {
+        format!(
+            "{valid}/{} local assets valid; missing: {}; {repair_hint}",
+            model_assets.len(),
+            missing.join(", ")
+        )
+    } else {
+        format!("{valid}/{} local assets valid", model_assets.len())
+    };
     DoctorCheck {
         name: "local-models",
-        status: if present == model_assets.len() {
-            CheckStatus::Ok
-        } else {
-            CheckStatus::Warn
-        },
-        detail: format!("{present}/{} local assets present", model_assets.len()),
+        status,
+        detail,
     }
 }
 
@@ -433,7 +471,7 @@ fn missing_assets(
             model_assets
                 .iter()
                 .find(|asset| asset.name == *required_name)
-                .filter(|asset| !asset.exists)
+                .filter(|asset| !asset.is_valid())
                 .map(|asset| asset.name)
         })
         .collect()

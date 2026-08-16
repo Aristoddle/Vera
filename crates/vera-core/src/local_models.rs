@@ -3,9 +3,11 @@ use futures::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
-use tokio::fs::{self, File};
+use std::sync::atomic::{AtomicU64, Ordering};
+use tokio::fs;
 use tokio::io::AsyncWriteExt;
 
 const HUB_URL: &str = "https://huggingface.co";
@@ -19,6 +21,8 @@ const EMBEDDING_ONNX_GPU_DATA_FILE: &str = "onnx/model_fp16.onnx_data";
 const EMBEDDING_TOKENIZER_FILE: &str = "tokenizer.json";
 const EMBEDDING_DIM: usize = 768;
 const EMBEDDING_MAX_LENGTH: usize = 512;
+const ONNX_HEADER_MAX_BYTES: usize = 4 * 1024;
+const ONNX_HEADER_MAX_FIELDS: usize = 256;
 
 const CODERANK_EMBEDDING_REPO: &str = "Zenabius/CodeRankEmbed-onnx";
 const CODERANK_QUERY_PREFIX: &str = "Represent this query for searching relevant code:";
@@ -70,6 +74,7 @@ const CUDA_RUNTIME_LIBRARY_PREFIXES: [&str; 3] =
 const ORT_VERSION_MACOS_X86: &str = "1.23.2";
 
 static ORT_INIT_RESULT: OnceLock<std::result::Result<(), String>> = OnceLock::new();
+static MODEL_DOWNLOAD_ATTEMPT: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -323,11 +328,42 @@ impl LocalEmbeddingModelConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum LocalModelAssetState {
+    Missing,
+    Valid,
+    Invalid,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct LocalModelAssetStatus {
     pub name: &'static str,
     pub path: PathBuf,
     pub exists: bool,
+    pub state: LocalModelAssetState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalModelAssetKind {
+    Other,
+    Onnx,
+}
+
+impl LocalModelAssetStatus {
+    pub fn is_valid(&self) -> bool {
+        self.state == LocalModelAssetState::Valid
+    }
+
+    pub fn is_missing(&self) -> bool {
+        self.state == LocalModelAssetState::Missing
+    }
+
+    pub fn is_invalid(&self) -> bool {
+        self.state == LocalModelAssetState::Invalid
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2327,7 +2363,15 @@ pub fn wrap_ort_error(e: impl std::fmt::Display) -> String {
 
 /// Download a file from HuggingFace Hub using atomic writes.
 pub async fn ensure_model_file(repo_id: &str, file_path: &str) -> Result<PathBuf> {
-    ensure_model_file_impl(repo_id, file_path, HUB_URL, None).await
+    ensure_model_file_with_kind(repo_id, file_path, asset_kind_for_file(file_path)).await
+}
+
+async fn ensure_model_file_with_kind(
+    repo_id: &str,
+    file_path: &str,
+    asset_kind: LocalModelAssetKind,
+) -> Result<PathBuf> {
+    ensure_model_file_impl(repo_id, file_path, asset_kind, HUB_URL, None).await
 }
 
 pub fn configured_local_model_name() -> String {
@@ -2345,9 +2389,24 @@ pub fn potion_code_model_name() -> &'static str {
 }
 
 pub async fn ensure_potion_code_assets() -> Result<PathBuf> {
-    ensure_model_file(POTION_CODE_REPO, POTION_CODE_TOKENIZER_FILE).await?;
-    ensure_model_file(POTION_CODE_REPO, POTION_CODE_MODEL_FILE).await?;
-    ensure_model_file(POTION_CODE_REPO, POTION_CODE_CONFIG_FILE).await?;
+    ensure_model_file_with_kind(
+        POTION_CODE_REPO,
+        POTION_CODE_TOKENIZER_FILE,
+        LocalModelAssetKind::Other,
+    )
+    .await?;
+    ensure_model_file_with_kind(
+        POTION_CODE_REPO,
+        POTION_CODE_MODEL_FILE,
+        LocalModelAssetKind::Other,
+    )
+    .await?;
+    ensure_model_file_with_kind(
+        POTION_CODE_REPO,
+        POTION_CODE_CONFIG_FILE,
+        LocalModelAssetKind::Other,
+    )
+    .await?;
     potion_code_model_dir()
 }
 
@@ -2361,14 +2420,7 @@ pub fn inspect_potion_code_model_files() -> Result<Vec<LocalModelAssetStatus>> {
 
     Ok(files
         .into_iter()
-        .map(|(name, file)| {
-            let path = model_dir.join(file);
-            LocalModelAssetStatus {
-                name,
-                exists: path.exists(),
-                path,
-            }
-        })
+        .map(|(name, file)| inspect_asset(name, model_dir.join(file), LocalModelAssetKind::Other))
         .collect())
 }
 
@@ -2377,12 +2429,24 @@ pub async fn ensure_local_embedding_assets(
 ) -> Result<LocalEmbeddingAssetPaths> {
     match &config.source {
         LocalEmbeddingSource::HuggingFace { repo } => Ok(LocalEmbeddingAssetPaths {
-            onnx_path: ensure_model_file(repo, &config.onnx_file).await?,
+            onnx_path: ensure_model_file_with_kind(
+                repo,
+                &config.onnx_file,
+                LocalModelAssetKind::Onnx,
+            )
+            .await?,
             onnx_data_path: match config.onnx_data_file.as_deref() {
-                Some(path) => Some(ensure_model_file(repo, path).await?),
+                Some(path) => {
+                    Some(ensure_model_file_with_kind(repo, path, LocalModelAssetKind::Other).await?)
+                }
                 None => None,
             },
-            tokenizer_path: ensure_model_file(repo, &config.tokenizer_file).await?,
+            tokenizer_path: ensure_model_file_with_kind(
+                repo,
+                &config.tokenizer_file,
+                LocalModelAssetKind::Other,
+            )
+            .await?,
         }),
         LocalEmbeddingSource::Directory { .. } => verify_local_embedding_assets(config),
     }
@@ -2392,22 +2456,35 @@ fn verify_local_embedding_assets(
     config: &LocalEmbeddingModelConfig,
 ) -> Result<LocalEmbeddingAssetPaths> {
     let paths = config.cached_asset_paths()?;
-    require_existing_file(&paths.onnx_path, "embedding ONNX model")?;
+    require_valid_file(
+        &paths.onnx_path,
+        "embedding ONNX model",
+        LocalModelAssetKind::Onnx,
+    )?;
     if let Some(path) = paths.onnx_data_path.as_ref() {
-        require_existing_file(path, "embedding ONNX external data")?;
+        require_valid_file(
+            path,
+            "embedding ONNX external data",
+            LocalModelAssetKind::Other,
+        )?;
     }
-    require_existing_file(&paths.tokenizer_path, "embedding tokenizer")?;
+    require_valid_file(
+        &paths.tokenizer_path,
+        "embedding tokenizer",
+        LocalModelAssetKind::Other,
+    )?;
     Ok(paths)
 }
 
-fn require_existing_file(path: &Path, label: &str) -> Result<()> {
-    if path.exists() {
-        return Ok(());
+fn require_valid_file(path: &Path, label: &str, asset_kind: LocalModelAssetKind) -> Result<()> {
+    if !path.exists() {
+        anyhow::bail!(
+            "{label} not found at {}.\nHint: place the file there, or point `vera setup` at a Hugging Face repo instead.",
+            path.display()
+        );
     }
-    anyhow::bail!(
-        "{label} not found at {}.\nHint: place the file there, or point `vera setup` at a Hugging Face repo instead.",
-        path.display()
-    );
+    validate_file(path, asset_kind)
+        .with_context(|| format!("{label} integrity check failed at {}", path.display()))
 }
 
 /// Download or validate the local embedding model, the curated local reranker, and the ORT library.
@@ -2430,8 +2507,22 @@ pub async fn prepare_local_models_for_ep(
         paths.push(path);
     }
     paths.push(embedding_paths.tokenizer_path);
-    paths.push(ensure_model_file(RERANKER_REPO, reranker_onnx_file_for_ep(ep)).await?);
-    paths.push(ensure_model_file(RERANKER_REPO, RERANKER_TOKENIZER_FILE).await?);
+    paths.push(
+        ensure_model_file_with_kind(
+            RERANKER_REPO,
+            reranker_onnx_file_for_ep(ep),
+            LocalModelAssetKind::Onnx,
+        )
+        .await?,
+    );
+    paths.push(
+        ensure_model_file_with_kind(
+            RERANKER_REPO,
+            RERANKER_TOKENIZER_FILE,
+            LocalModelAssetKind::Other,
+        )
+        .await?,
+    );
     Ok(paths)
 }
 
@@ -2453,50 +2544,170 @@ pub fn inspect_local_model_files_for_ep(
         .join(RERANKER_REPO)
         .join(RERANKER_TOKENIZER_FILE);
     let mut assets = vec![
-        LocalModelAssetStatus {
-            name: "onnx-runtime",
-            exists: ort_path.exists(),
-            path: ort_path,
-        },
-        LocalModelAssetStatus {
-            name: "embedding-onnx",
-            exists: embedding_paths.onnx_path.exists(),
-            path: embedding_paths.onnx_path,
-        },
-        LocalModelAssetStatus {
-            name: "embedding-tokenizer",
-            exists: embedding_paths.tokenizer_path.exists(),
-            path: embedding_paths.tokenizer_path,
-        },
-        LocalModelAssetStatus {
-            name: "reranker-onnx",
-            exists: reranker_onnx.exists(),
-            path: reranker_onnx,
-        },
-        LocalModelAssetStatus {
-            name: "reranker-tokenizer",
-            exists: reranker_tokenizer.exists(),
-            path: reranker_tokenizer,
-        },
+        inspect_asset("onnx-runtime", ort_path, LocalModelAssetKind::Other),
+        inspect_asset(
+            "embedding-onnx",
+            embedding_paths.onnx_path,
+            LocalModelAssetKind::Onnx,
+        ),
+        inspect_asset(
+            "embedding-tokenizer",
+            embedding_paths.tokenizer_path,
+            LocalModelAssetKind::Other,
+        ),
+        inspect_asset("reranker-onnx", reranker_onnx, LocalModelAssetKind::Onnx),
+        inspect_asset(
+            "reranker-tokenizer",
+            reranker_tokenizer,
+            LocalModelAssetKind::Other,
+        ),
     ];
 
     if let Some(path) = embedding_paths.onnx_data_path {
         assets.insert(
             2,
-            LocalModelAssetStatus {
-                name: "embedding-onnx-data",
-                exists: path.exists(),
-                path,
-            },
+            inspect_asset("embedding-onnx-data", path, LocalModelAssetKind::Other),
         );
     }
 
     Ok(assets)
 }
 
+fn inspect_asset(
+    name: &'static str,
+    path: PathBuf,
+    asset_kind: LocalModelAssetKind,
+) -> LocalModelAssetStatus {
+    let exists = path.exists();
+    let (state, detail) = if !exists {
+        (
+            LocalModelAssetState::Missing,
+            Some("file not found".to_string()),
+        )
+    } else {
+        match validate_file(&path, asset_kind) {
+            Ok(()) => (LocalModelAssetState::Valid, None),
+            Err(error) => (LocalModelAssetState::Invalid, Some(error.to_string())),
+        }
+    };
+    LocalModelAssetStatus {
+        name,
+        path,
+        exists,
+        state,
+        detail,
+    }
+}
+
+fn validate_file(path: &Path, asset_kind: LocalModelAssetKind) -> Result<()> {
+    let metadata = std::fs::metadata(path)
+        .with_context(|| format!("failed to inspect file {}", path.display()))?;
+    if !metadata.is_file() {
+        anyhow::bail!("path is not a regular file");
+    }
+    if metadata.len() == 0 {
+        anyhow::bail!("file is empty");
+    }
+    if asset_kind == LocalModelAssetKind::Onnx {
+        validate_onnx_header(path)?;
+    }
+    Ok(())
+}
+
+fn validate_onnx_header(path: &Path) -> Result<()> {
+    let file = std::fs::File::open(path)
+        .with_context(|| format!("failed to open ONNX file {}", path.display()))?;
+    let mut header = Vec::with_capacity(ONNX_HEADER_MAX_BYTES);
+    file.take(ONNX_HEADER_MAX_BYTES as u64)
+        .read_to_end(&mut header)?;
+
+    let mut offset = 0;
+    for _ in 0..ONNX_HEADER_MAX_FIELDS {
+        if offset == header.len() {
+            break;
+        }
+        let (key, next_offset) = read_protobuf_varint(&header, offset)
+            .context("file does not contain a complete protobuf field header")?;
+        offset = next_offset;
+        let field_number = key >> 3;
+        let wire_type = key & 0x07;
+        if field_number == 0 {
+            anyhow::bail!("ONNX ModelProto contains an invalid field number");
+        }
+
+        match wire_type {
+            0 => {
+                let (value, next_offset) = read_protobuf_varint(&header, offset)
+                    .context("ONNX ModelProto field is truncated")?;
+                offset = next_offset;
+                if field_number == 1 {
+                    if value == 0 {
+                        anyhow::bail!("ONNX ModelProto ir_version is zero");
+                    }
+                    return Ok(());
+                }
+            }
+            1 => offset = skip_protobuf_bytes(&header, offset, 8)?,
+            2 => {
+                let (length, next_offset) = read_protobuf_varint(&header, offset)
+                    .context("ONNX ModelProto length-delimited field is truncated")?;
+                let length =
+                    usize::try_from(length).context("ONNX ModelProto field length is too large")?;
+                offset = skip_protobuf_bytes(&header, next_offset, length)?;
+            }
+            5 => offset = skip_protobuf_bytes(&header, offset, 4)?,
+            3 | 4 => anyhow::bail!("ONNX ModelProto uses unsupported protobuf groups"),
+            _ => anyhow::bail!("ONNX ModelProto contains an unknown protobuf wire type"),
+        }
+    }
+
+    anyhow::bail!(
+        "ONNX ModelProto ir_version field was not found in the first {} bytes",
+        ONNX_HEADER_MAX_BYTES
+    )
+}
+
+fn skip_protobuf_bytes(bytes: &[u8], offset: usize, length: usize) -> Result<usize> {
+    let end = offset
+        .checked_add(length)
+        .context("ONNX ModelProto field length overflows")?;
+    if end > bytes.len() {
+        anyhow::bail!("ONNX ModelProto field is truncated");
+    }
+    Ok(end)
+}
+
+fn read_protobuf_varint(bytes: &[u8], offset: usize) -> Option<(u64, usize)> {
+    let mut value = 0u64;
+    for (index, byte) in bytes.iter().copied().enumerate().skip(offset) {
+        let shift = (index - offset) * 7;
+        if shift >= 64 {
+            return None;
+        }
+        value |= u64::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            return Some((value, index + 1));
+        }
+    }
+    None
+}
+
+fn asset_kind_for_file(file_path: &str) -> LocalModelAssetKind {
+    if Path::new(file_path)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("onnx"))
+    {
+        LocalModelAssetKind::Onnx
+    } else {
+        LocalModelAssetKind::Other
+    }
+}
+
 async fn ensure_model_file_impl(
     repo_id: &str,
     file_path: &str,
+    asset_kind: LocalModelAssetKind,
     base_url: &str,
     home_override: Option<&std::path::Path>,
 ) -> Result<PathBuf> {
@@ -2508,7 +2719,16 @@ async fn ensure_model_file_impl(
     let target_path = models_dir.join(file_path);
 
     if target_path.exists() {
-        return Ok(target_path);
+        match validate_file(&target_path, asset_kind) {
+            Ok(()) => return Ok(target_path),
+            Err(error) => {
+                tracing::warn!(
+                    path = %target_path.display(),
+                    error = %error,
+                    "cached model file failed integrity check; re-downloading"
+                );
+            }
+        }
     }
 
     if let Some(parent) = target_path.parent() {
@@ -2523,12 +2743,19 @@ async fn ensure_model_file_impl(
     let res = client.get(&url).send().await?.error_for_status()?;
     let total_size = res.content_length();
 
-    let temp_path = target_path.with_extension(format!("part.{}", std::process::id()));
-    let mut file = File::create(&temp_path).await?;
-    let mut stream = res.bytes_stream();
+    let attempt = MODEL_DOWNLOAD_ATTEMPT.fetch_add(1, Ordering::Relaxed);
+    let temp_path = target_path.with_extension(format!("part.{}.{}", std::process::id(), attempt));
     let mut downloaded = 0;
+    let mut temp_created = false;
 
     let download_result: Result<()> = async {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+            .await?;
+        temp_created = true;
+        let mut stream = res.bytes_stream();
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|e| anyhow::anyhow!("Download error: {}", e))?;
             file.write_all(&chunk).await?;
@@ -2546,22 +2773,26 @@ async fn ensure_model_file_impl(
         }
         file.flush().await?;
         file.sync_all().await?;
+        drop(file);
+        validate_file(&temp_path, asset_kind)
+            .with_context(|| format!("downloaded model failed integrity check: {file_path}"))?;
         eprintln!("\nDownload complete: {}", file_path);
 
-        if let Err(e) = fs::rename(&temp_path, &target_path).await {
-            if target_path.exists() {
-                // Another process won the race
-                let _ = fs::remove_file(&temp_path).await;
-            } else {
-                return Err(e.into());
-            }
+        #[cfg(windows)]
+        if target_path.exists() {
+            fs::remove_file(&target_path).await.with_context(|| {
+                format!("failed to replace cached model {}", target_path.display())
+            })?;
         }
+        fs::rename(&temp_path, &target_path).await?;
         Ok(())
     }
     .await;
 
     if let Err(e) = download_result {
-        let _ = fs::remove_file(&temp_path).await;
+        if temp_created {
+            let _ = fs::remove_file(&temp_path).await;
+        }
         return Err(e).context(format!(
             "Expected path: {}. Hint: check network connection or manually place model at {}",
             target_path.display(),
@@ -2777,6 +3008,90 @@ mod tests {
     }
 
     #[test]
+    fn onnx_integrity_check_rejects_truncated_and_garbage_files() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let truncated = temp_dir.path().join("truncated.onnx");
+        let garbage = temp_dir.path().join("garbage.onnx");
+        std::fs::write(&truncated, [0x08]).unwrap();
+        std::fs::write(&garbage, b"not an onnx model").unwrap();
+
+        assert!(validate_file(&truncated, LocalModelAssetKind::Onnx).is_err());
+        assert!(validate_file(&garbage, LocalModelAssetKind::Onnx).is_err());
+    }
+
+    #[test]
+    fn onnx_integrity_check_scans_fields_before_ir_version() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("model.onnx");
+        // ModelProto.producer (field 2) may precede ir_version (field 1).
+        std::fs::write(
+            &path,
+            [
+                0x12, 0x08, b'p', b'r', b'o', b'd', b'u', b'c', b'e', b'r', 0x08, 0x01,
+            ],
+        )
+        .unwrap();
+
+        assert!(validate_file(&path, LocalModelAssetKind::Onnx).is_ok());
+    }
+
+    #[test]
+    fn onnx_integrity_check_accepts_multibyte_ir_version() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("model.onnx");
+        std::fs::write(&path, [0x08, 0xac, 0x02]).unwrap();
+
+        assert!(validate_file(&path, LocalModelAssetKind::Onnx).is_ok());
+    }
+
+    #[test]
+    fn onnx_integrity_check_rejects_zero_and_truncated_fields() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let zero = temp_dir.path().join("zero.onnx");
+        let truncated = temp_dir.path().join("truncated-field.onnx");
+        std::fs::write(&zero, [0x08, 0x00]).unwrap();
+        std::fs::write(&truncated, [0x12, 0x03, b'p']).unwrap();
+
+        assert!(validate_file(&zero, LocalModelAssetKind::Onnx).is_err());
+        assert!(validate_file(&truncated, LocalModelAssetKind::Onnx).is_err());
+    }
+
+    #[test]
+    fn explicit_onnx_asset_kind_validates_custom_filename() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("model.bin");
+        std::fs::write(&path, b"not an onnx model").unwrap();
+
+        assert!(validate_file(&path, LocalModelAssetKind::Onnx).is_err());
+    }
+
+    #[test]
+    fn onnx_integrity_check_accepts_a_valid_model_proto_header() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("model.onnx");
+        std::fs::write(&path, [0x08, 0x01]).unwrap();
+
+        let status = inspect_asset("embedding-onnx", path, LocalModelAssetKind::Onnx);
+        assert!(status.exists);
+        assert_eq!(status.state, LocalModelAssetState::Valid);
+        assert!(status.detail.is_none());
+    }
+
+    #[test]
+    fn inspect_asset_reports_missing_files_distinctly() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let status = inspect_asset(
+            "embedding-onnx",
+            temp_dir.path().join("missing.onnx"),
+            LocalModelAssetKind::Onnx,
+        );
+
+        assert!(!status.exists);
+        assert_eq!(status.state, LocalModelAssetState::Missing);
+        assert_eq!(status.detail.as_deref(), Some("file not found"));
+    }
+
+    #[test]
     fn reranker_onnx_file_selects_expected_model_per_backend() {
         // Every backend uses the quantized export: no prebuilt reranker ONNX
         // runs on the CoreML GPU, and quantized INT8 is the fastest CPU path.
@@ -2839,19 +3154,108 @@ mod tests {
 
         let base_url = format!("http://127.0.0.1:{}", port);
 
-        let res =
-            ensure_model_file_impl("test-repo", "test-file.bin", &base_url, Some(&home)).await;
+        let res = ensure_model_file_impl(
+            "test-repo",
+            "test-file.bin",
+            LocalModelAssetKind::Other,
+            &base_url,
+            Some(&home),
+        )
+        .await;
 
         assert!(res.is_err(), "Download should fail due to truncated stream");
 
         let target_dir = home.join("models").join("test-repo");
-        let part_file = target_dir
-            .join("test-file.bin")
-            .with_extension(format!("part.{}", std::process::id()));
+        let has_part_file = std::fs::read_dir(&target_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("test-file.part.")
+            });
         assert!(
-            !part_file.exists(),
+            !has_part_file,
             "Partial file should be cleaned up on failure"
         );
+    }
+
+    #[tokio::test]
+    async fn failed_onnx_download_preserves_invalid_cached_file() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let home = temp_dir.path().join(".vera");
+        let target = home.join("models").join("test-repo").join("model.onnx");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        let cached = b"cached-corrupt-model";
+        std::fs::write(&target, cached).unwrap();
+
+        let listener = match TcpListener::bind("127.0.0.1:0") {
+            Ok(listener) => listener,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(err) => panic!("failed to bind test listener: {err}"),
+        };
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let response = b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n";
+                let _ = stream.write_all(response);
+            }
+        });
+
+        let base_url = format!("http://127.0.0.1:{port}");
+        let result = ensure_model_file_impl(
+            "test-repo",
+            "model.onnx",
+            LocalModelAssetKind::Onnx,
+            &base_url,
+            Some(&home),
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), cached);
+    }
+
+    #[tokio::test]
+    async fn successful_onnx_download_replaces_invalid_cached_file() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let home = temp_dir.path().join(".vera");
+        let target = home.join("models").join("test-repo").join("model.bin");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(&target, b"cached-corrupt-model").unwrap();
+
+        let listener = match TcpListener::bind("127.0.0.1:0") {
+            Ok(listener) => listener,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(err) => panic!("failed to bind test listener: {err}"),
+        };
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut request = [0u8; 4096];
+                let _ = std::io::Read::read(&mut stream, &mut request);
+                let response =
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n\x08\x01";
+                let _ = stream.write_all(response);
+                let _ = stream.flush();
+                let _ = stream.shutdown(std::net::Shutdown::Write);
+            }
+        });
+
+        let base_url = format!("http://127.0.0.1:{port}");
+        let result = ensure_model_file_impl(
+            "test-repo",
+            "model.bin",
+            LocalModelAssetKind::Onnx,
+            &base_url,
+            Some(&home),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result, target);
+        assert_eq!(std::fs::read(&target).unwrap(), [0x08, 0x01]);
     }
 
     #[cfg(target_os = "macos")]
