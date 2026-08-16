@@ -117,7 +117,7 @@ vera update .
 
 ```bash
 vera search "error handling" --lang rust
-vera search "routes" --path "src/**/*.ts"
+vera search "routes" --path "src/**/*.ts" --path "tests/**/*.ts"
 vera search "handler" --type function --limit 5
 vera search "OAuth token refresh" "JWT expiry handling" "auth middleware"
 vera search "config" --intent "find where database connection strings are loaded"
@@ -131,6 +131,8 @@ vera structural routes --path "src/**/*.ts"
 vera structural impls Loader
 vera references parse_config --changed
 ```
+
+Repeat `--path` to match any of several file path patterns. Path patterns use OR semantics; other filters still combine with AND semantics.
 
 ### Common Tasks
 

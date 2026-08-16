@@ -19,7 +19,7 @@ Semantic code search CLI. Combines BM25 keyword matching with vector similarity 
    ```sh
      vera search "authentication middleware"
      vera search "parse_config" --type function --limit 5
-     vera search "database connection" --lang rust --path "src/**"
+     vera search "database connection" --lang rust --path "src/**" --path "tests/**"
      vera search "token validation" --changed          # only modified, staged, and untracked files
      vera search "config loading" --base origin/main   # only files changed since merge-base
      vera search "OAuth token refresh" "JWT expiry handling" "auth middleware"
@@ -104,7 +104,7 @@ Vera favors source files by default. Use `--scope docs` for prose and ADRs, `--s
 - Use 2-3 varied queries to capture different aspects (e.g., "OAuth token refresh", "JWT expiry handling", "auth middleware"). You can pass them in one call: `vera search "OAuth token refresh" "JWT expiry handling" "auth middleware"`.
 - Add `--intent` when the query is ambiguous but your higher-level goal is clear (e.g., `vera search "config" --intent "find where database connection strings are loaded from environment variables"`).
 - For known symbol names, search the exact name: `vera search "parse_config"`.
-- Start broad, then narrow with `--lang`, `--path`, `--type`, `--limit`.
+- Start broad, then narrow with `--lang`, `--path`, `--type`, `--limit`. Repeat `--path` to OR multiple path patterns.
 - When reviewing a PR or a narrow worktree change, add `--changed`, `--since <rev>`, or `--base <rev>` before broadening the query.
 - After code changes mid-session, run `vera update .` before searching again (or use `vera watch .` to auto-update).
 

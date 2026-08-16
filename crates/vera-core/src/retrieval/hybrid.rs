@@ -1048,7 +1048,7 @@ mod tests {
         let filtered = apply_filters(
             reranked_results,
             &SearchFilters {
-                path_glob: Some(tail_candidate.file_path.clone()),
+                path_glob: vec![tail_candidate.file_path.clone()],
                 ..Default::default()
             },
             10,

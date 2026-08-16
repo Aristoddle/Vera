@@ -970,7 +970,7 @@ async fn filter_by_path_glob() {
     let results = bm25_search(&bm25, &meta, "request", 20);
 
     let filters = SearchFilters {
-        path_glob: Some("**/*.rs".to_string()),
+        path_glob: vec!["**/*.rs".to_string()],
         ..Default::default()
     };
     let filtered = apply_filters(results, &filters, 20);
@@ -991,7 +991,7 @@ async fn filter_by_path_glob_specific_directory() {
     let results = bm25_search(&bm25, &meta, "function class struct", 30);
 
     let filters = SearchFilters {
-        path_glob: Some("src/auth*".to_string()),
+        path_glob: vec!["src/auth*".to_string()],
         ..Default::default()
     };
     let filtered = apply_filters(results, &filters, 30);
@@ -1017,10 +1017,12 @@ async fn filter_by_symbol_type_function() {
     let filtered = apply_filters(results, &filters, 20);
 
     for result in &filtered {
-        assert_eq!(
-            result.symbol_type,
-            Some(SymbolType::Function),
-            "all filtered results should be functions, got: {:?}",
+        assert!(
+            matches!(
+                result.symbol_type,
+                Some(SymbolType::Function) | Some(SymbolType::Method)
+            ),
+            "all filtered results should be functions or methods, got: {:?}",
             result.symbol_type
         );
     }
@@ -1088,7 +1090,7 @@ async fn filter_combined_path_and_lang() {
 
     let filters = SearchFilters {
         language: Some("python".to_string()),
-        path_glob: Some("**/*.py".to_string()),
+        path_glob: vec!["**/*.py".to_string()],
         ..Default::default()
     };
     let filtered = apply_filters(results, &filters, 20);

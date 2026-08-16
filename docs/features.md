@@ -66,7 +66,7 @@ Vera favors source files by default. Docs, runtime extracts, and generated/minif
 
 ### Search Filters
 
-Narrow results by language (`--lang rust`), file path glob (`--path "src/**/*.rs"`), symbol type (`--type function`), corpus scope (`--scope source`), and result count (`--limit 5`). Filters combine with AND semantics.
+Narrow results by language (`--lang rust`), file path glob (`--path "src/**/*.rs"`), symbol type (`--type function`), corpus scope (`--scope source`), and result count (`--limit 5`). Repeat `--path` for multiple patterns. Path patterns use OR semantics; other filters combine with AND semantics.
 
 ## Parsing and Indexing
 
@@ -146,7 +146,7 @@ Use this as the default structural workflow. Use `vera references` for exact cal
 
 ### Regex Search
 
-`vera grep "pattern"` runs regex search over indexed files with configurable context lines, case sensitivity, and the same corpus filters as `vera search` (`--lang`, `--path`, `--type`, `--scope`). It complements semantic search for exact string matching, import statements, TODOs, and known identifiers.
+`vera grep "pattern"` runs regex search over indexed files with configurable context lines, case sensitivity, and the same corpus filters as `vera search` (`--lang`, `--path`, `--type`, `--scope`). Repeat `--path` to match any of several patterns. It complements semantic search for exact string matching, import statements, TODOs, and known identifiers.
 
 ## Model Backend
 

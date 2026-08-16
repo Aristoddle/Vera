@@ -59,10 +59,12 @@ pub struct SearchFilterArgs {
     /// Filter by programming language (case-insensitive).
     #[arg(long)]
     pub lang: Option<String>,
-    /// Filter by file path glob pattern (e.g., "src/**/*.rs").
+    /// Filter by file path glob pattern (e.g., "src/**/*.rs"). Repeatable;
+    /// patterns are combined with OR semantics.
     #[arg(long)]
-    pub path: Option<String>,
+    pub path: Vec<String>,
     /// Filter by symbol type.
+    /// Note: function and method are treated as aliases.
     #[arg(long, rename_all = "snake_case")]
     pub r#type: Option<String>,
     /// Restrict results to a coarse corpus scope.

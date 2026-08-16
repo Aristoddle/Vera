@@ -466,6 +466,7 @@ enum Commands {
         /// Maximum number of results to return (default: 5).
         #[arg(long, short = 'n')]
         limit: Option<usize>,
+        /// Search symbol type. Note: function and method are treated as aliases.
         #[command(flatten)]
         filters: helpers::SearchFilterArgs,
 
@@ -1236,13 +1237,24 @@ mod tests {
 
     #[test]
     fn cli_parses_search_with_path_filter() {
-        let cli = Cli::parse_from(["vera", "search", "config", "--path", "src/**/*.rs"]);
+        let cli = Cli::parse_from([
+            "vera",
+            "search",
+            "config",
+            "--path",
+            "src/**/*.rs",
+            "--path",
+            "tests/**/*.rs",
+        ]);
         match cli.command {
             Commands::Search {
                 queries, filters, ..
             } => {
                 assert_eq!(queries, vec!["config".to_string()]);
-                assert_eq!(filters.path, Some("src/**/*.rs".to_string()));
+                assert_eq!(
+                    filters.path,
+                    vec!["src/**/*.rs".to_string(), "tests/**/*.rs".to_string()]
+                );
             }
             _ => panic!("expected Search command"),
         }
@@ -1272,7 +1284,7 @@ mod tests {
             } => {
                 assert_eq!(queries, vec!["handle request".to_string()]);
                 assert_eq!(filters.lang, Some("typescript".to_string()));
-                assert_eq!(filters.path, Some("src/**/*.ts".to_string()));
+                assert_eq!(filters.path, vec!["src/**/*.ts".to_string()]);
                 assert_eq!(filters.r#type, Some("function".to_string()));
                 assert_eq!(limit, Some(3));
             }
@@ -1427,7 +1439,7 @@ mod tests {
                 pattern, filters, ..
             } => {
                 assert_eq!(pattern, "queryClient|invalidateQueries");
-                assert_eq!(filters.path, Some("frontend/src/**".to_string()));
+                assert_eq!(filters.path, vec!["frontend/src/**".to_string()]);
             }
             _ => panic!("expected Grep command"),
         }
@@ -1454,7 +1466,7 @@ mod tests {
             } => {
                 assert_eq!(pattern, "Authorization");
                 assert_eq!(filters.lang, Some("rust".to_string()));
-                assert_eq!(filters.path, Some("src/**/*.rs".to_string()));
+                assert_eq!(filters.path, vec!["src/**/*.rs".to_string()]);
                 assert_eq!(filters.r#type, Some("function".to_string()));
                 assert_eq!(filters.scope, Some("source".to_string()));
             }
@@ -1536,7 +1548,7 @@ mod tests {
                 ));
                 assert_eq!(query.as_deref(), Some("DATABASE_URL"));
                 assert_eq!(filters.lang, Some("rust".to_string()));
-                assert_eq!(filters.path, Some("src/**/*.rs".to_string()));
+                assert_eq!(filters.path, vec!["src/**/*.rs".to_string()]);
                 assert_eq!(filters.r#type, Some("function".to_string()));
                 assert!(git_scope.changed);
                 assert!(compact);

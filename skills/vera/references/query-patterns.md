@@ -7,7 +7,7 @@ vera search "authentication middleware"
 vera search "JWT token validation"
 vera search "parse_config"
 vera search "request rate limiting" --lang rust
-vera search "routes" --path "src/**/*.ts"
+vera search "routes" --path "src/**/*.ts" --path "tests/**/*.ts"
 vera search "handler" --type function --limit 5
 vera search "token validation" --changed
 vera search "config loading" --base origin/main
@@ -61,7 +61,7 @@ vera grep "parse" --compact                  # signatures only
 Add one filter at a time:
 
 1. `--lang rust`: restrict to a language
-2. `--path "src/auth/**"`: restrict to a path glob
+2. `--path "src/auth/**"`: restrict to a path glob; repeat it to OR multiple patterns
 3. `--type function`: restrict to symbol type
 4. `--limit 3`: fewer, higher-confidence results
 5. `--scope source`: restrict to a corpus scope (see SKILL.md for scope table)

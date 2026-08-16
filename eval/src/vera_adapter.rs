@@ -64,7 +64,7 @@ impl ToolAdapter for VeraBm25Adapter {
 
         let mut filters = SearchFilters::default();
         if let Some(scope) = path_scope {
-            filters.path_glob = Some(format!("{scope}/**"));
+            filters.path_glob = vec![format!("{scope}/**")];
         }
 
         match self.runtime.block_on(self.search_context.search(
@@ -224,7 +224,7 @@ impl ToolAdapter for VeraFullAdapter {
 
         let mut filters = SearchFilters::default();
         if let Some(scope) = path_scope {
-            filters.path_glob = Some(format!("{scope}/**"));
+            filters.path_glob = vec![format!("{scope}/**")];
         }
 
         match self.runtime.block_on(self.search_context.search(

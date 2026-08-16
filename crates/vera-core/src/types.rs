@@ -44,13 +44,15 @@ impl std::str::FromStr for SearchScope {
 /// Filters that can be applied to search results.
 ///
 /// All filters are optional. When set, they restrict results to only those
-/// matching all specified criteria (AND semantics).
+/// matching all specified criteria (AND semantics). Multiple path patterns
+/// use OR semantics within the path filter.
 #[derive(Debug, Clone, Default)]
 pub struct SearchFilters {
     /// Filter by programming language (case-insensitive match).
     pub language: Option<String>,
-    /// Filter by file path glob pattern (e.g., `src/**/*.rs`).
-    pub path_glob: Option<String>,
+    /// Filter by file path glob patterns (e.g., `src/**/*.rs`). Patterns use
+    /// OR semantics.
+    pub path_glob: Vec<String>,
     /// Restrict results to an exact set of repository-relative file paths.
     pub exact_paths: Option<Arc<HashSet<String>>>,
     /// Filter by symbol type (case-insensitive match).
@@ -69,7 +71,7 @@ impl SearchFilters {
     /// Returns true if no filters are set.
     pub fn is_empty(&self) -> bool {
         self.language.is_none()
-            && self.path_glob.is_none()
+            && self.path_glob.is_empty()
             && self.exact_paths.is_none()
             && self.symbol_type.is_none()
             && self.scope.is_none()
@@ -84,10 +86,13 @@ impl SearchFilters {
             }
         }
 
-        if let Some(ref pattern) = self.path_glob {
-            if !glob_matches(pattern, file_path) {
-                return false;
-            }
+        if !self.path_glob.is_empty()
+            && !self
+                .path_glob
+                .iter()
+                .any(|pattern| glob_matches(pattern, file_path))
+        {
+            return false;
         }
 
         if let Some(ref exact_paths) = self.exact_paths {
@@ -103,7 +108,19 @@ impl SearchFilters {
     pub fn matches_symbol_type(&self, symbol_type: Option<SymbolType>) -> bool {
         if let Some(ref requested) = self.symbol_type {
             match symbol_type {
-                Some(symbol_type) => symbol_type.to_string().eq_ignore_ascii_case(requested),
+                Some(symbol_type) => {
+                    if symbol_type.to_string().eq_ignore_ascii_case(requested) {
+                        return true;
+                    }
+                    // Treat function/method as equivalent for user-facing filtering.
+                    if requested.eq_ignore_ascii_case("function") {
+                        return symbol_type == SymbolType::Method;
+                    }
+                    if requested.eq_ignore_ascii_case("method") {
+                        return symbol_type == SymbolType::Function;
+                    }
+                    false
+                }
                 None => false,
             }
         } else {
@@ -1223,10 +1240,46 @@ mod tests {
             Some("Bar"),
             Some(SymbolType::Class),
         );
+        let method = make_test_result(
+            "a.ts",
+            Language::TypeScript,
+            Some("baz"),
+            Some(SymbolType::Method),
+        );
         let none_sym = make_test_result("a.rs", Language::Rust, None, None);
         assert!(filters.matches(&func));
+        assert!(filters.matches(&method));
         assert!(!filters.matches(&cls));
         assert!(!filters.matches(&none_sym));
+    }
+
+    #[test]
+    fn filter_by_symbol_type_method_matches_function() {
+        let filters = SearchFilters {
+            symbol_type: Some("method".to_string()),
+            ..Default::default()
+        };
+        let method = make_test_result(
+            "a.ts",
+            Language::TypeScript,
+            Some("baz"),
+            Some(SymbolType::Method),
+        );
+        let function = make_test_result(
+            "a.rs",
+            Language::Rust,
+            Some("foo"),
+            Some(SymbolType::Function),
+        );
+        let class = make_test_result(
+            "a.py",
+            Language::Python,
+            Some("Bar"),
+            Some(SymbolType::Class),
+        );
+        assert!(filters.matches(&method));
+        assert!(filters.matches(&function));
+        assert!(!filters.matches(&class));
     }
 
     #[test]
@@ -1247,7 +1300,7 @@ mod tests {
     #[test]
     fn filter_by_path_glob_extension() {
         let filters = SearchFilters {
-            path_glob: Some("*.rs".to_string()),
+            path_glob: vec!["*.rs".to_string()],
             ..Default::default()
         };
         let rs = make_test_result("main.rs", Language::Rust, None, None);
@@ -1259,7 +1312,7 @@ mod tests {
     #[test]
     fn filter_by_path_glob_directory() {
         let filters = SearchFilters {
-            path_glob: Some("src/**/*.rs".to_string()),
+            path_glob: vec!["src/**/*.rs".to_string()],
             ..Default::default()
         };
         let in_src = make_test_result("src/lib.rs", Language::Rust, None, None);
@@ -1273,7 +1326,7 @@ mod tests {
     #[test]
     fn filter_by_path_glob_doublestar_prefix() {
         let filters = SearchFilters {
-            path_glob: Some("**/test_*.py".to_string()),
+            path_glob: vec!["**/test_*.py".to_string()],
             ..Default::default()
         };
         let deep = make_test_result("tests/unit/test_auth.py", Language::Python, None, None);
@@ -1282,6 +1335,20 @@ mod tests {
         assert!(filters.matches(&deep));
         assert!(filters.matches(&top));
         assert!(!filters.matches(&no_match));
+    }
+
+    #[test]
+    fn filter_by_path_glob_matches_any_pattern() {
+        let filters = SearchFilters {
+            path_glob: vec!["src/**/*.rs".to_string(), "tests/**/*.py".to_string()],
+            ..Default::default()
+        };
+        let rust = make_test_result("src/lib.rs", Language::Rust, None, None);
+        let python = make_test_result("tests/unit/test_auth.py", Language::Python, None, None);
+        let other = make_test_result("docs/guide.md", Language::Markdown, None, None);
+        assert!(filters.matches(&rust));
+        assert!(filters.matches(&python));
+        assert!(!filters.matches(&other));
     }
 
     #[test]
@@ -1467,7 +1534,7 @@ mod tests {
     #[test]
     fn filter_by_path_plain_directory_prefix() {
         let filters = SearchFilters {
-            path_glob: Some("app/src".to_string()),
+            path_glob: vec!["app/src".to_string()],
             ..Default::default()
         };
         let inside = make_test_result("app/src/foo.ts", Language::TypeScript, None, None);
@@ -1482,7 +1549,7 @@ mod tests {
         // A wildcard pattern must NOT get directory-prefix treatment: `app/*`
         // stays single-segment and does not match nested files.
         let wildcard = SearchFilters {
-            path_glob: Some("app/*".to_string()),
+            path_glob: vec!["app/*".to_string()],
             ..Default::default()
         };
         assert!(!wildcard.matches(&deep));
@@ -1492,7 +1559,7 @@ mod tests {
     fn single_star_does_not_cross_directory_boundary() {
         // `src/*` must not match `src/bar/baz` — `*` is single-segment only.
         let filters = SearchFilters {
-            path_glob: Some("src/*".to_string()),
+            path_glob: vec!["src/*".to_string()],
             ..Default::default()
         };
         let shallow = make_test_result("src/foo.rs", Language::Rust, None, None);

@@ -71,6 +71,8 @@ For non-interactive setup, check that all three environment variables are set be
 - `EMBEDDING_MODEL_ID`
 - `EMBEDDING_MODEL_API_KEY`
 
+If the active embedding model name differs from the one stored in the index, re-index the repo. For verified equivalent model names, configure `embedding.model_aliases` with `vera config set`, or set `VERA_EMBEDDING_MODEL_ALIASES` as semicolon-separated groups of comma-separated aliases, such as `canonical,alias`.
+
 If you're using a reranker in non-interactive setup, its three variables (`RERANKER_MODEL_BASE_URL`, `RERANKER_MODEL_ID`, `RERANKER_MODEL_API_KEY`) must either all be set or all be absent. Partial configuration will fail.
 
 If the provider returns a batch-size error such as `at most 100 requests can be in one batch`, lower the embedding batch size:
@@ -102,7 +104,7 @@ If you still see repeated retries or very slow indexing, lower `embedding.batch_
 Try narrowing your search:
 
 - `--lang rust`: filter by language
-- `--path "src/**/*.ts"`: filter by file path
+- `--path "src/**/*.ts"`: filter by file path; repeat it to match any of several patterns
 - `--type function`: filter by symbol type
 - `--limit 5`: return fewer results
 - Rewrite the query to be more specific about the behavior you're looking for

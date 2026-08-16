@@ -413,7 +413,7 @@ mod tests {
             0,
             &SearchFilters {
                 language: Some("python".to_string()),
-                path_glob: Some("tests/**".to_string()),
+                path_glob: vec!["tests/**".to_string()],
                 ..Default::default()
             },
         )

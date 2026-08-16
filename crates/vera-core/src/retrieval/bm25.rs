@@ -572,7 +572,7 @@ mod tests {
         bm25_index.insert_batch(&docs).unwrap();
 
         let filters = SearchFilters {
-            path_glob: Some("fastapi/**".to_string()),
+            path_glob: vec!["fastapi/**".to_string()],
             ..Default::default()
         };
         let query = "how does dependency injection work";

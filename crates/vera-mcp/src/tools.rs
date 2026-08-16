@@ -158,7 +158,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                     },
                     "path": {
                         "type": "string",
-                        "description": "Filter by file path glob (e.g., src/**/*.rs)"
+                        "description": "Filter by file path glob, as a string or an array of strings. Repeated patterns use OR semantics (e.g., src/**/*.rs)"
                     },
                     "symbol_type": {
                         "type": "string",
@@ -327,7 +327,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                     },
                     "path": {
                         "type": "string",
-                        "description": "Filter by file path glob (e.g., src/**/*.rs)"
+                        "description": "Filter by file path glob, as a string or an array of strings. Repeated patterns use OR semantics (e.g., src/**/*.rs)"
                     },
                     "symbol_type": {
                         "type": "string",
@@ -538,9 +538,27 @@ fn search_code_filters(
     args: &Value,
     scope: Option<vera_core::types::SearchScope>,
 ) -> vera_core::types::SearchFilters {
+    let path_glob = match args.get("path") {
+        Some(value) if value.is_string() => value
+            .as_str()
+            .map(|path| vec![path.to_string()])
+            .unwrap_or_default(),
+        Some(value) => value
+            .as_array()
+            .map(|paths| {
+                paths
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(String::from)
+                    .collect()
+            })
+            .unwrap_or_default(),
+        None => Vec::new(),
+    };
+
     vera_core::types::SearchFilters {
         language: args.get("lang").and_then(|v| v.as_str()).map(String::from),
-        path_glob: args.get("path").and_then(|v| v.as_str()).map(String::from),
+        path_glob,
         exact_paths: None,
         symbol_type: args
             .get("symbol_type")
@@ -1146,10 +1164,25 @@ mod tests {
         );
 
         assert_eq!(filters.language.as_deref(), Some("rust"));
-        assert_eq!(filters.path_glob.as_deref(), Some("src/**/*.rs"));
+        assert_eq!(filters.path_glob, vec!["src/**/*.rs"]);
         assert_eq!(filters.symbol_type.as_deref(), Some("function"));
         assert_eq!(filters.scope, Some(vera_core::types::SearchScope::Source));
         assert_eq!(filters.include_generated, Some(true));
+    }
+
+    #[test]
+    fn search_code_filters_accept_path_array() {
+        let filters = search_code_filters(
+            &serde_json::json!({
+                "path": ["src/**/*.rs", "tests/**/*.py"],
+            }),
+            None,
+        );
+
+        assert_eq!(
+            filters.path_glob,
+            vec!["src/**/*.rs".to_string(), "tests/**/*.py".to_string()]
+        );
     }
 
     #[test]

@@ -11,7 +11,7 @@ vera search "authentication middleware"
 vera search "JWT token validation"
 vera search "request rate limiting" --lang rust
 vera search "database connection pooling"
-vera search "routes" --path "src/**/*.ts"
+vera search "routes" --path "src/**/*.ts" --path "tests/**/*.ts"
 vera search "handler" --type function --limit 5
 ```
 
@@ -30,7 +30,7 @@ Single generic words return too many results. Be specific about the behavior or 
 If your first search returns too much, add filters one at a time:
 
 - `--lang rust`: restrict to a specific language
-- `--path "src/**/*.ts"`: restrict to a file path pattern
+- `--path "src/**/*.ts"`: restrict to a file path pattern; repeat it to OR several patterns
 - `--type function`: restrict to functions, classes, methods, or structs
 - `--scope docs`: restrict to docs and markdown
 - `--scope runtime`: restrict to extracted runtime trees and bundled app code

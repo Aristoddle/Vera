@@ -159,7 +159,11 @@ impl SearchContext {
                     .unwrap_or(None),
             ) {
                 if let Some(model_name) = self.model_name.as_deref() {
-                    if !crate::config::model_names_match(&s_model, model_name) {
+                    if !crate::config::model_names_match_with_aliases(
+                        &s_model,
+                        model_name,
+                        &config.embedding.model_aliases,
+                    ) {
                         warn!(
                             "Index model '{}' does not match active model '{}'; using BM25-only search",
                             s_model, model_name
@@ -322,7 +326,7 @@ fn compute_fetch_limit(query: &str, filters: &SearchFilters, result_limit: usize
 
     // Path globs are applied post-retrieval, so we need a much larger pool
     // to ensure enough matching files survive filtering.
-    if filters.path_glob.is_some() {
+    if !filters.path_glob.is_empty() {
         fetch_limit = fetch_limit.max(result_limit.saturating_mul(10).max(result_limit + 100));
     }
 
@@ -342,7 +346,7 @@ fn compute_fetch_limit(query: &str, filters: &SearchFilters, result_limit: usize
 fn needs_structural_overfetch(query: &str, filters: &SearchFilters) -> bool {
     matches!(classify_query(query), QueryType::NaturalLanguage)
         && query.split_whitespace().count() >= 4
-        && filters.path_glob.is_none()
+        && filters.path_glob.is_empty()
         && filters.exact_paths.is_none()
         && filters.symbol_type.is_none()
         && !is_path_weighted_query(query)
@@ -377,7 +381,7 @@ fn reranking_enabled(
 
 fn should_skip_reranking(query: &str, filters: &SearchFilters) -> bool {
     let word_count = query.split_whitespace().count();
-    filters.path_glob.is_some()
+    !filters.path_glob.is_empty()
         || filters.exact_paths.is_some()
         || filters.symbol_type.is_some()
         || is_path_weighted_query(query)
@@ -1146,7 +1150,7 @@ mod tests {
         bm25.insert_batch(&docs).unwrap();
 
         let filters = SearchFilters {
-            path_glob: Some("fastapi/**".to_string()),
+            path_glob: vec!["fastapi/**".to_string()],
             ..Default::default()
         };
         let rt = tokio::runtime::Runtime::new().unwrap();
