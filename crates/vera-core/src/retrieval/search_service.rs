@@ -232,6 +232,7 @@ impl SearchContext {
                 vector_query.as_ref(),
                 filters,
                 fetch_limit,
+                result_limit,
                 rrf_k,
                 stored_dim,
                 rerank_candidates,
