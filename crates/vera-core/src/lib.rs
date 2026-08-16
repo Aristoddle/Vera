@@ -12,11 +12,14 @@
 //! - [`storage`] — Persistent storage backends (SQLite + sqlite-vec, Tantivy).
 //! - [`embedding`] — Embedding generation via external API providers.
 
+mod cancellation;
 pub mod chunk_text;
 pub mod corpus;
 pub mod discovery;
 pub mod embedding;
 pub mod git_scope;
+
+pub use cancellation::CancellationToken;
 
 /// Install the rustls crypto provider (ring). Safe to call multiple times.
 pub fn init_tls() {

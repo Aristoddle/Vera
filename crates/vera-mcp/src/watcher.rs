@@ -173,11 +173,13 @@ fn run_update_blocking(
     let (provider, model_name) = rt.block_on(vera_core::embedding::create_dynamic_provider(
         &config, backend,
     ))?;
+    let cancellation = vera_core::CancellationToken::new();
 
-    rt.block_on(vera_core::indexing::update_repository(
+    rt.block_on(vera_core::indexing::update_repository_with_cancellation(
         repo_path,
         &provider,
         &config,
         &model_name,
+        &cancellation,
     ))
 }

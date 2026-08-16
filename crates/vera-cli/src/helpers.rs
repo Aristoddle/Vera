@@ -4,8 +4,57 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use anyhow::Context;
 use clap::Args;
 use serde::Serialize;
+
+/// Wait for the process interrupt used to cancel long-running CLI operations.
+pub async fn wait_for_interrupt() -> std::io::Result<()> {
+    tokio::signal::ctrl_c().await
+}
+
+/// Run an operation until it completes or an interrupt signal wins.
+///
+/// Dropping the operation future propagates cancellation through in-flight
+/// client requests instead of leaving the CLI runtime alive until they finish.
+pub async fn cancel_on_signal<T, Operation, Signal>(
+    operation: Operation,
+    signal: Signal,
+    cancellation: vera_core::CancellationToken,
+    operation_name: &str,
+) -> anyhow::Result<T>
+where
+    Operation: std::future::Future<Output = anyhow::Result<T>>,
+    Signal: std::future::Future<Output = std::io::Result<()>> + Send + 'static,
+{
+    let signal_cancellation = cancellation.clone();
+    let (signal_task_started_tx, signal_task_started_rx) = tokio::sync::oneshot::channel();
+    let mut signal_task = tokio::spawn(async move {
+        let _ = signal_task_started_tx.send(());
+        let result = signal.await;
+        signal_cancellation.cancel();
+        result
+    });
+    signal_task_started_rx
+        .await
+        .context("interrupt listener task failed to start")?;
+    tokio::pin!(operation);
+
+    tokio::select! {
+        biased;
+
+        signal_result = &mut signal_task => {
+            signal_result
+                .context("interrupt listener task failed")?
+                .context("failed to listen for interrupt")?;
+            anyhow::bail!("{operation_name} cancelled")
+        },
+        result = &mut operation => {
+            signal_task.abort();
+            result
+        },
+    }
+}
 
 /// Load the effective runtime configuration.
 pub fn load_runtime_config() -> anyhow::Result<vera_core::config::VeraConfig> {
@@ -513,6 +562,10 @@ pub fn print_human_summary(summary: &vera_core::indexing::IndexSummary, verbose:
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
     #[test]
     fn index_freshness_summary_formats_nonzero_counts() {
         let freshness = vera_core::indexing::IndexFreshness {
@@ -521,5 +574,139 @@ mod tests {
             files_deleted: 3,
         };
         assert_eq!(freshness.summary(), "2 added, 1 modified, 3 deleted");
+    }
+
+    struct DropMarker(Arc<AtomicBool>);
+
+    impl Drop for DropMarker {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn operation_result_wins_before_cancellation() {
+        let result = cancel_on_signal(
+            async { Ok::<_, anyhow::Error>(42) },
+            std::future::pending::<std::io::Result<()>>(),
+            vera_core::CancellationToken::new(),
+            "test operation",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result, 42);
+    }
+
+    #[tokio::test]
+    async fn interrupt_wins_when_operation_and_signal_are_ready() {
+        let cancellation = vera_core::CancellationToken::new();
+        let error = cancel_on_signal(
+            async { Ok::<_, anyhow::Error>(42) },
+            async { Ok(()) },
+            cancellation.clone(),
+            "test operation",
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("test operation cancelled"));
+        assert!(cancellation.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn external_cancellation_does_not_wait_for_pending_signal() {
+        let cancellation = vera_core::CancellationToken::new();
+        cancellation.cancel();
+
+        let error = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            cancel_on_signal(
+                async { Err::<(), _>(anyhow::anyhow!("operation failed")) },
+                std::future::pending::<std::io::Result<()>>(),
+                cancellation,
+                "test operation",
+            ),
+        )
+        .await
+        .expect("operation result should not wait for the signal listener")
+        .unwrap_err();
+
+        assert!(error.to_string().contains("operation failed"));
+    }
+
+    #[tokio::test]
+    async fn cancellation_drops_in_flight_operation() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let dropped_for_operation = dropped.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+
+        let operation = async move {
+            let _marker = DropMarker(dropped_for_operation);
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+            Ok::<_, anyhow::Error>(())
+        };
+        let signal = async move {
+            let _ = started_rx.await;
+            Ok(())
+        };
+        let cancellation = vera_core::CancellationToken::new();
+
+        let error = cancel_on_signal(operation, signal, cancellation, "test operation")
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("test operation cancelled"));
+        assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn signal_listener_errors_are_propagated() {
+        let error = cancel_on_signal(
+            std::future::pending::<anyhow::Result<()>>(),
+            async { Err(std::io::Error::other("listener setup failed")) },
+            vera_core::CancellationToken::new(),
+            "test operation",
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("failed to listen for interrupt"));
+        assert!(
+            error
+                .source()
+                .is_some_and(|source| source.to_string().contains("listener setup failed"))
+        );
+        assert!(!error.to_string().contains("cancelled"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancellation_reaches_synchronous_operation_work() {
+        let cancellation = vera_core::CancellationToken::new();
+        let operation_cancellation = cancellation.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+
+        let operation = async move {
+            let _ = started_tx.send(());
+            while !operation_cancellation.is_cancelled() {
+                std::hint::spin_loop();
+            }
+            Err::<(), anyhow::Error>(anyhow::anyhow!("operation cancelled"))
+        };
+        let signal = async move {
+            let _ = started_rx.await;
+            Ok(())
+        };
+
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            cancel_on_signal(operation, signal, cancellation, "test operation"),
+        )
+        .await
+        .expect("synchronous operation should observe cancellation")
+        .unwrap_err();
+
+        assert!(error.to_string().contains("operation cancelled"));
     }
 }

@@ -12,6 +12,7 @@ use anyhow::{Context, Result, bail};
 use rayon::prelude::*;
 use tracing::{debug, info, warn};
 
+use crate::CancellationToken;
 use crate::config::VeraConfig;
 use crate::discovery::{self, DiscoveryResult};
 use crate::embedding::{EmbeddingProvider, embed_chunks_concurrent_with_progress};
@@ -77,9 +78,6 @@ pub enum IndexProgress {
     StorageDone,
 }
 
-/// No-op progress callback (used when caller doesn't need progress).
-pub(crate) fn no_progress(_: IndexProgress) {}
-
 // ── Index directory layout ───────────────────────────────────────────
 
 /// Default index directory name (placed inside the indexed repo).
@@ -121,10 +119,36 @@ pub async fn index_repository<P: EmbeddingProvider>(
     config: &VeraConfig,
     model_name: &str,
 ) -> Result<IndexSummary> {
-    index_repository_with_progress(repo_path, provider, config, model_name, no_progress).await
+    index_repository_with_cancellation(
+        repo_path,
+        provider,
+        config,
+        model_name,
+        &CancellationToken::new(),
+    )
+    .await
 }
 
-/// Index a repository with progress reporting via a callback.
+/// Index a repository while cooperatively observing cancellation.
+pub async fn index_repository_with_cancellation<P: EmbeddingProvider>(
+    repo_path: &Path,
+    provider: &P,
+    config: &VeraConfig,
+    model_name: &str,
+    cancellation: &CancellationToken,
+) -> Result<IndexSummary> {
+    index_repository_with_progress_and_cancellation(
+        repo_path,
+        provider,
+        config,
+        model_name,
+        |_| {},
+        cancellation,
+    )
+    .await
+}
+
+/// Index a repository and report progress to the supplied callback.
 pub async fn index_repository_with_progress<P, F>(
     repo_path: &Path,
     provider: &P,
@@ -136,7 +160,32 @@ where
     P: EmbeddingProvider,
     F: Fn(IndexProgress) + Send + Sync,
 {
+    index_repository_with_progress_and_cancellation(
+        repo_path,
+        provider,
+        config,
+        model_name,
+        on_progress,
+        &CancellationToken::new(),
+    )
+    .await
+}
+
+/// Index a repository with progress reporting and cooperative cancellation.
+pub async fn index_repository_with_progress_and_cancellation<P, F>(
+    repo_path: &Path,
+    provider: &P,
+    config: &VeraConfig,
+    model_name: &str,
+    on_progress: F,
+    cancellation: &CancellationToken,
+) -> Result<IndexSummary>
+where
+    P: EmbeddingProvider,
+    F: Fn(IndexProgress) + Send + Sync,
+{
     let start = Instant::now();
+    cancellation.check()?;
 
     // ── 1. Validate path ─────────────────────────────────────────
     if !repo_path.exists() {
@@ -154,7 +203,8 @@ where
 
     // ── 2. Discover files ────────────────────────────────────────
     let discovery =
-        discovery::discover_files(&repo_root, &config.indexing).context("file discovery failed")?;
+        discovery::discover_files_with_cancellation(&repo_root, &config.indexing, cancellation)
+            .context("file discovery failed")?;
 
     if discovery.files.is_empty() {
         return Ok(IndexSummary {
@@ -185,7 +235,7 @@ where
 
     // ── 3. Parse and chunk each file (parallelized with rayon) ──
     let (all_chunks, parse_errors, file_hashes, all_refs, all_type_relations, file_states) =
-        parse_discovered_files_parallel(&discovery, &repo_root, config);
+        parse_discovered_files_parallel(&discovery, &repo_root, config, cancellation)?;
 
     info!(
         chunks = all_chunks.len(),
@@ -213,8 +263,20 @@ where
     }
 
     // ── 4. Generate embeddings (concurrent batches) ──────────────
-    let batch_size = config.embedding.batch_size;
-    let max_concurrent_requests = config.embedding.max_concurrent_requests;
+    cancellation.check()?;
+    let (batch_size, max_concurrent_requests) = config.embedding.bounded_parallelism();
+    if batch_size != config.embedding.batch_size
+        || max_concurrent_requests != config.embedding.max_concurrent_requests
+    {
+        info!(
+            configured_batch_size = config.embedding.batch_size,
+            configured_concurrency = config.embedding.max_concurrent_requests,
+            max_in_flight_inputs = config.embedding.max_in_flight_inputs,
+            batch_size,
+            max_concurrent_requests,
+            "clamped embedding parallelism to the in-flight input bound"
+        );
+    }
 
     let progress_cb = |done: usize, total: usize| {
         on_progress(IndexProgress::EmbeddingProgress { done, total });
@@ -229,6 +291,7 @@ where
     )
     .await
     .context("embedding generation failed")?;
+    cancellation.check()?;
 
     // Truncate vectors if max_stored_dim is configured.
     let stored_dim = super::truncate_embeddings(&mut embeddings, config.embedding.max_stored_dim);
@@ -291,14 +354,15 @@ fn parse_discovered_files_parallel(
     discovery: &DiscoveryResult,
     repo_root: &Path,
     config: &VeraConfig,
-) -> (
+    cancellation: &CancellationToken,
+) -> Result<(
     Vec<Chunk>,
     Vec<FileError>,
     Vec<(String, String)>,
     Vec<(String, Vec<RawReference>)>,
     Vec<(String, Vec<RawTypeRelation>)>,
     Vec<FileIndexState>,
-) {
+)> {
     let config = Arc::new(config.clone());
     let repo_root = Arc::new(repo_root.to_path_buf());
 
@@ -315,6 +379,17 @@ fn parse_discovered_files_parallel(
         .files
         .par_iter()
         .map(|file| {
+            if cancellation.is_cancelled() {
+                return ParsedFileResult {
+                    chunks: Vec::new(),
+                    parse_error: None,
+                    file_hash: None,
+                    refs: None,
+                    type_relations: None,
+                    file_state: None,
+                };
+            }
+
             let source = match std::fs::read_to_string(&file.absolute_path) {
                 Ok(source) => source,
                 Err(err) => {
@@ -447,6 +522,8 @@ fn parse_discovered_files_parallel(
         })
         .collect();
 
+    cancellation.check()?;
+
     // Flatten results into chunks, errors, file hashes, and references.
     let mut all_chunks = Vec::new();
     let mut parse_errors = Vec::new();
@@ -473,14 +550,14 @@ fn parse_discovered_files_parallel(
         }
     }
 
-    (
+    Ok((
         all_chunks,
         parse_errors,
         file_hashes,
         all_refs,
         all_type_relations,
         file_states,
-    )
+    ))
 }
 
 /// Write chunks, embeddings, BM25 index, file hashes, and references to disk.

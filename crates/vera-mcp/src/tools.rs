@@ -679,11 +679,13 @@ fn ensure_index_and_watcher(cwd: &std::path::Path) -> Result<std::path::PathBuf,
 
     if !index_dir.exists() {
         let (rt, provider, idx_config, model_name) = create_runtime_and_provider()?;
-        rt.block_on(vera_core::indexing::index_repository(
+        let cancellation = vera_core::CancellationToken::new();
+        rt.block_on(vera_core::indexing::index_repository_with_cancellation(
             cwd,
             &provider,
             &idx_config,
             &model_name,
+            &cancellation,
         ))
         .map_err(|e| ToolCallResult::error(format!("Auto-indexing failed: {e}")))?;
     }

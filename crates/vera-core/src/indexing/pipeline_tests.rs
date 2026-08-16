@@ -6,6 +6,7 @@ use std::path::Path;
 use tempfile::TempDir;
 
 use super::*;
+use crate::CancellationToken;
 use crate::config::VeraConfig;
 use crate::embedding::test_helpers::MockProvider;
 use crate::storage::bm25::Bm25Index;
@@ -28,9 +29,10 @@ async fn index_simple_repo() {
 
     let provider = MockProvider::new(8);
     let config = default_config();
-    let summary = index_repository(dir.path(), &provider, &config, "mock-model")
-        .await
-        .unwrap();
+    let summary =
+        index_repository_with_progress(dir.path(), &provider, &config, "mock-model", |_| {})
+            .await
+            .unwrap();
 
     assert_eq!(summary.files_parsed, 2);
     assert!(summary.chunks_created > 0);
@@ -44,6 +46,31 @@ async fn index_simple_repo() {
     assert!(idx.join("metadata.db").exists());
     assert!(idx.join("vectors.db").exists());
     assert!(idx.join("bm25").exists());
+}
+
+#[tokio::test]
+async fn pre_cancelled_index_stops_before_creating_artifacts() {
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("main.rs"), "fn main() {}\n").unwrap();
+
+    let provider = MockProvider::new(8);
+    let config = default_config();
+    let cancellation = CancellationToken::new();
+    cancellation.cancel();
+
+    let error = super::index_repository_with_progress_and_cancellation(
+        dir.path(),
+        &provider,
+        &config,
+        "mock-model",
+        |_| {},
+        &cancellation,
+    )
+    .await
+    .unwrap_err();
+
+    assert!(error.to_string().contains("operation cancelled"));
+    assert!(!index_dir(dir.path()).exists());
 }
 
 #[tokio::test]

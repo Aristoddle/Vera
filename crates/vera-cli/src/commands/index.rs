@@ -7,7 +7,9 @@ use anyhow::{Context, bail};
 use vera_core::config::InferenceBackend;
 use vera_core::indexing::IndexProgress;
 
-use crate::helpers::{load_runtime_config, print_human_summary};
+use crate::helpers::{
+    cancel_on_signal, load_runtime_config, print_human_summary, wait_for_interrupt,
+};
 
 /// Run the `vera index <path>` command.
 #[allow(clippy::too_many_arguments)]
@@ -85,12 +87,19 @@ pub fn execute(
 
     // Use progress bar for interactive (non-JSON) output.
     if json_output {
+        let cancellation = vera_core::CancellationToken::new();
         let summary = rt
-            .block_on(vera_core::indexing::index_repository(
-                repo_path,
-                &provider,
-                &config,
-                &model_name,
+            .block_on(cancel_on_signal(
+                vera_core::indexing::index_repository_with_cancellation(
+                    repo_path,
+                    &provider,
+                    &config,
+                    &model_name,
+                    &cancellation,
+                ),
+                wait_for_interrupt(),
+                cancellation.clone(),
+                "indexing",
             ))
             .context("indexing failed")?;
         return Ok(summary);
@@ -129,17 +138,21 @@ pub fn execute(
         IndexProgress::StorageDone => {}
     };
 
-    let summary = rt
-        .block_on(vera_core::indexing::index_repository_with_progress(
+    let cancellation = vera_core::CancellationToken::new();
+    let result = rt.block_on(cancel_on_signal(
+        vera_core::indexing::index_repository_with_progress_and_cancellation(
             repo_path,
             &provider,
             &config,
             &model_name,
             on_progress,
-        ))
-        .context("indexing failed")?;
-
+            &cancellation,
+        ),
+        wait_for_interrupt(),
+        cancellation.clone(),
+        "indexing",
+    ));
     multi.stop();
 
-    Ok(summary)
+    result.context("indexing failed")
 }

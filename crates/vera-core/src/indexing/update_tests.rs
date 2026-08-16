@@ -1,11 +1,15 @@
 //! Tests for incremental update logic.
 
 use std::fs;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use tempfile::TempDir;
+use tokio::sync::{Notify, watch};
 
+use crate::CancellationToken;
 use crate::config::VeraConfig;
 use crate::embedding::test_helpers::MockProvider;
+use crate::embedding::{EmbeddingError, EmbeddingProvider};
 use crate::indexing::{index_dir, index_repository, update_repository};
 use crate::storage::bm25::Bm25Index;
 use crate::storage::metadata::MetadataStore;
@@ -15,6 +19,99 @@ use super::content_hash;
 
 fn default_config() -> VeraConfig {
     VeraConfig::default()
+}
+
+struct BatchBoundProvider {
+    max_batch_size: usize,
+    largest_batch: AtomicUsize,
+    active_inputs: AtomicUsize,
+    peak_active_inputs: AtomicUsize,
+    started_requests: AtomicUsize,
+    request_started: Notify,
+    release_requests: watch::Sender<bool>,
+}
+
+impl BatchBoundProvider {
+    fn new(max_batch_size: usize) -> Self {
+        let (release_requests, _) = watch::channel(false);
+        Self {
+            max_batch_size,
+            largest_batch: AtomicUsize::new(0),
+            active_inputs: AtomicUsize::new(0),
+            peak_active_inputs: AtomicUsize::new(0),
+            started_requests: AtomicUsize::new(0),
+            request_started: Notify::new(),
+            release_requests,
+        }
+    }
+
+    async fn wait_for_started_requests(&self, minimum: usize) {
+        loop {
+            let request_started = self.request_started.notified();
+            if self.started_requests.load(Ordering::SeqCst) >= minimum {
+                return;
+            }
+            request_started.await;
+        }
+    }
+
+    fn release_requests(&self) {
+        self.release_requests.send_replace(true);
+    }
+}
+
+struct ActiveInputs<'a> {
+    count: &'a AtomicUsize,
+    inputs: usize,
+}
+
+impl Drop for ActiveInputs<'_> {
+    fn drop(&mut self) {
+        self.count.fetch_sub(self.inputs, Ordering::SeqCst);
+    }
+}
+
+impl EmbeddingProvider for BatchBoundProvider {
+    async fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+        self.largest_batch.fetch_max(texts.len(), Ordering::SeqCst);
+        if texts.len() > self.max_batch_size {
+            return Err(EmbeddingError::ApiError {
+                status: 400,
+                message: format!(
+                    "batch contained {} inputs, limit is {}",
+                    texts.len(),
+                    self.max_batch_size
+                ),
+            });
+        }
+
+        let active_inputs =
+            self.active_inputs.fetch_add(texts.len(), Ordering::SeqCst) + texts.len();
+        let _active_inputs = ActiveInputs {
+            count: &self.active_inputs,
+            inputs: texts.len(),
+        };
+        self.peak_active_inputs
+            .fetch_max(active_inputs, Ordering::SeqCst);
+        self.started_requests.fetch_add(1, Ordering::SeqCst);
+        self.request_started.notify_one();
+
+        let mut release_requests = self.release_requests.subscribe();
+        if !*release_requests.borrow() {
+            release_requests
+                .changed()
+                .await
+                .map_err(|error| EmbeddingError::ResponseError {
+                    message: format!("test request release channel closed: {error}"),
+                })?;
+        }
+
+        Ok(vec![vec![0.0; 8]; texts.len()])
+    }
+
+    fn expected_dim(&self) -> Option<usize> {
+        Some(8)
+    }
 }
 
 // ── Content hash tests ──────────────────────────────────────────────
@@ -74,6 +171,56 @@ async fn update_no_changes() {
         update_summary.total_chunks,
         idx_summary.chunks_created as u64
     );
+}
+
+#[tokio::test]
+async fn update_respects_max_in_flight_input_bound() {
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("main.rs"), "fn main() {}\n").unwrap();
+
+    let initial_provider = MockProvider::new(8);
+    let initial_config = default_config();
+    index_repository(dir.path(), &initial_provider, &initial_config, "mock-model")
+        .await
+        .unwrap();
+
+    for name in ["one.rs", "two.rs", "three.rs", "four.rs"] {
+        fs::write(dir.path().join(name), format!("fn {}() {{}}\n", &name[..3])).unwrap();
+    }
+
+    let provider = BatchBoundProvider::new(2);
+    let mut config = default_config();
+    config.embedding.batch_size = 2;
+    config.embedding.max_concurrent_requests = 8;
+    config.embedding.max_in_flight_inputs = 4;
+
+    let cancellation = CancellationToken::new();
+    let update = crate::indexing::update_repository_with_cancellation(
+        dir.path(),
+        &provider,
+        &config,
+        "mock-model",
+        &cancellation,
+    );
+    let observe_concurrency = async {
+        provider.wait_for_started_requests(2).await;
+        tokio::task::yield_now().await;
+        let peak_active_inputs = provider.peak_active_inputs.load(Ordering::SeqCst);
+        provider.release_requests();
+        peak_active_inputs
+    };
+    let (summary, peak_active_inputs) =
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            tokio::join!(update, observe_concurrency)
+        })
+        .await
+        .expect("embedding requests should overlap without exceeding the input bound");
+    let summary = summary.unwrap();
+
+    assert_eq!(summary.files_added, 4);
+    assert_eq!(provider.largest_batch.load(Ordering::SeqCst), 2);
+    assert_eq!(peak_active_inputs, 4);
+    assert!(peak_active_inputs <= config.embedding.max_in_flight_inputs);
 }
 
 // ── Update: file modified ───────────────────────────────────────────
@@ -341,6 +488,41 @@ async fn update_without_index_fails() {
         err.contains("no index found"),
         "should report no index: {err}"
     );
+}
+
+#[tokio::test]
+async fn pre_cancelled_update_preserves_existing_index() {
+    let dir = TempDir::new().unwrap();
+    let source_path = dir.path().join("main.rs");
+    fs::write(&source_path, "fn original() {}\n").unwrap();
+
+    let provider = MockProvider::new(8);
+    let config = default_config();
+    index_repository(dir.path(), &provider, &config, "mock-model")
+        .await
+        .unwrap();
+
+    let idx = index_dir(&dir.path().canonicalize().unwrap());
+    let metadata = MetadataStore::open(&idx.join("metadata.db")).unwrap();
+    let original_hash = metadata.get_file_hash("main.rs").unwrap();
+    drop(metadata);
+    fs::write(&source_path, "fn changed() {}\n").unwrap();
+
+    let cancellation = CancellationToken::new();
+    cancellation.cancel();
+    let error = crate::indexing::update_repository_with_cancellation(
+        dir.path(),
+        &provider,
+        &config,
+        "mock-model",
+        &cancellation,
+    )
+    .await
+    .unwrap_err();
+
+    assert!(error.to_string().contains("operation cancelled"));
+    let metadata = MetadataStore::open(&idx.join("metadata.db")).unwrap();
+    assert_eq!(metadata.get_file_hash("main.rs").unwrap(), original_hash);
 }
 
 // ── Update: consistency with fresh index ────────────────────────────

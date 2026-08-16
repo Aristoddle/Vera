@@ -24,6 +24,7 @@ use ignore::gitignore::{Gitignore, GitignoreBuilder, Glob as GitignoreGlob};
 use ignore::overrides::{Override, OverrideBuilder};
 use tracing::{debug, warn};
 
+use crate::CancellationToken;
 use crate::config::IndexingConfig;
 
 /// A discovered source file ready for indexing.
@@ -183,6 +184,16 @@ const BINARY_EXTENSIONS: &[&str] = &[
 /// Walks the directory respecting .gitignore patterns and default exclusions.
 /// Skips binary files and files exceeding the size threshold.
 pub fn discover_files(root: &Path, config: &IndexingConfig) -> Result<DiscoveryResult> {
+    discover_files_with_cancellation(root, config, &CancellationToken::new())
+}
+
+/// Discover source files while cooperatively observing cancellation.
+pub fn discover_files_with_cancellation(
+    root: &Path,
+    config: &IndexingConfig,
+    cancellation: &CancellationToken,
+) -> Result<DiscoveryResult> {
+    cancellation.check()?;
     let root = root
         .canonicalize()
         .with_context(|| format!("failed to resolve path: {}", root.display()))?;
@@ -213,6 +224,7 @@ pub fn discover_files(root: &Path, config: &IndexingConfig) -> Result<DiscoveryR
     let mut error_skipped = 0usize;
 
     for entry in walker.build() {
+        cancellation.check()?;
         let entry = match entry {
             Ok(e) => e,
             Err(err) => {
