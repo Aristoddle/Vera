@@ -4,6 +4,7 @@ secrets.env
 !.env.example
 /AGENTS.md
 /HANDOFF.md
+/V1-STATUS.md
 response.md
 .junie/
 .bench/

@@ -16,7 +16,7 @@ use anyhow::{Context, Result};
 use tracing::{debug, info, warn};
 
 use crate::embedding::EmbeddingProvider;
-use crate::retrieval::bm25::search_bm25_with_stores;
+use crate::retrieval::bm25::search_bm25_with_stores_and_filters;
 use crate::retrieval::query_classifier::{QueryType, classify_query, params_for_query_type};
 use crate::retrieval::ranking::is_path_weighted_query;
 use crate::retrieval::reranker::{Reranker, rerank_results};
@@ -24,7 +24,7 @@ use crate::retrieval::vector::{VectorSearchError, search_vector_with_stores};
 use crate::storage::bm25::Bm25Index;
 use crate::storage::metadata::MetadataStore;
 use crate::storage::vector::VectorStore;
-use crate::types::SearchResult;
+use crate::types::{SearchFilters, SearchResult};
 
 /// Errors specific to hybrid search.
 #[derive(Debug, thiserror::Error)]
@@ -81,10 +81,12 @@ pub struct HybridTimings {
 /// database connections while vector search (embedding + nearest-neighbor)
 /// runs on the async runtime. If vector search fails (e.g., embedding API
 /// unavailable), falls back to BM25-only results with a warning.
+#[allow(clippy::too_many_arguments)]
 pub async fn search_hybrid(
     index_dir: &Path,
     provider: &impl EmbeddingProvider,
     query: &str,
+    filters: &SearchFilters,
     limit: usize,
     rrf_k: f64,
     stored_dim: usize,
@@ -100,6 +102,7 @@ pub async fn search_hybrid(
     let bm25_dir = index_dir.join("bm25");
     let metadata_path = index_dir.join("metadata.db");
     let bm25_query = query.to_string();
+    let bm25_filters = filters.clone();
     let bm25_handle = tokio::task::spawn_blocking(move || {
         let start = Instant::now();
         let result = Bm25Index::open(&bm25_dir)
@@ -107,7 +110,13 @@ pub async fn search_hybrid(
             .and_then(|index| {
                 let store = MetadataStore::open(&metadata_path)
                     .context("failed to open metadata store for BM25 search")?;
-                search_bm25_with_stores(&index, &store, &bm25_query, bm25_candidates)
+                search_bm25_with_stores_and_filters(
+                    &index,
+                    &store,
+                    &bm25_query,
+                    &bm25_filters,
+                    bm25_candidates,
+                )
             });
         (result, start.elapsed())
     });
@@ -121,7 +130,7 @@ pub async fn search_hybrid(
                 MetadataStore::open(&vector_metadata_path).context("failed to open metadata store");
             match vector_store_result {
                 Ok(vector_metadata) => {
-                    search_vector_with_stores(
+                    match search_vector_with_stores(
                         &vector_store,
                         &vector_metadata,
                         provider,
@@ -129,6 +138,13 @@ pub async fn search_hybrid(
                         vector_candidates,
                     )
                     .await
+                    {
+                        Ok(mut results) => {
+                            filter_results(&mut results, filters);
+                            Ok(results)
+                        }
+                        Err(err) => Err(err),
+                    }
                 }
                 Err(err) => Err(VectorSearchError::StorageError(err)),
             }
@@ -222,6 +238,7 @@ pub async fn search_hybrid_reranked(
     provider: &impl EmbeddingProvider,
     reranker: &impl Reranker,
     query: &str,
+    filters: &SearchFilters,
     limit: usize,
     rrf_k: f64,
     stored_dim: usize,
@@ -234,6 +251,7 @@ pub async fn search_hybrid_reranked(
         index_dir,
         provider,
         query,
+        filters,
         fetch_limit,
         rrf_k,
         stored_dim,
@@ -271,6 +289,12 @@ pub async fn search_hybrid_reranked(
             results.truncate(limit);
             Ok((results, timings))
         }
+    }
+}
+
+fn filter_results(results: &mut Vec<SearchResult>, filters: &SearchFilters) {
+    if !filters.is_empty() {
+        results.retain(|result| filters.matches(result));
     }
 }
 
@@ -800,6 +824,7 @@ mod tests {
             &provider,
             &reranker,
             "authenticate",
+            &SearchFilters::default(),
             5,
             60.0,
             dim,
@@ -845,6 +870,7 @@ mod tests {
             &provider,
             &reranker,
             "authenticate",
+            &SearchFilters::default(),
             5,
             60.0,
             dim,
@@ -881,6 +907,7 @@ mod tests {
             &provider,
             &reranker,
             "authenticate",
+            &SearchFilters::default(),
             5,
             60.0,
             dim,
@@ -909,7 +936,16 @@ mod tests {
         let reranker = MockReranker::new();
 
         let (results, _timings) = search_hybrid_reranked(
-            &index_dir, &provider, &reranker, "function", 2, 60.0, dim, 10, 50,
+            &index_dir,
+            &provider,
+            &reranker,
+            "function",
+            &SearchFilters::default(),
+            2,
+            60.0,
+            dim,
+            10,
+            50,
         )
         .await
         .unwrap();
@@ -990,6 +1026,7 @@ mod tests {
             &provider,
             &reranker,
             id_query,
+            &SearchFilters::default(),
             5,
             id_params.rrf_k,
             dim,
@@ -1010,6 +1047,7 @@ mod tests {
             &provider,
             &reranker,
             nl_query,
+            &SearchFilters::default(),
             5,
             nl_params.rrf_k,
             dim,

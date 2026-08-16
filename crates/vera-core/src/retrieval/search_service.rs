@@ -23,7 +23,7 @@ use crate::retrieval::ranking::{
     RankingStage, apply_query_ranking_with_filters, is_path_weighted_query,
 };
 use crate::retrieval::{
-    apply_filters, search_bm25_with_stores, search_hybrid, search_hybrid_reranked,
+    apply_filters, search_bm25_with_stores_and_filters, search_hybrid, search_hybrid_reranked,
 };
 use crate::storage::bm25::Bm25Index;
 use crate::storage::metadata::MetadataStore;
@@ -215,6 +215,7 @@ impl SearchContext {
                 provider,
                 reranker,
                 query,
+                filters,
                 fetch_limit,
                 rrf_k,
                 stored_dim,
@@ -227,6 +228,7 @@ impl SearchContext {
                 index_dir,
                 provider,
                 query,
+                filters,
                 fetch_limit,
                 rrf_k,
                 stored_dim,
@@ -353,7 +355,13 @@ fn run_bm25_only(
         Bm25Index::open(&index_dir.join("bm25")).context("failed to open BM25 index for search")?;
     let metadata_store = MetadataStore::open(&index_dir.join("metadata.db"))
         .context("failed to open metadata store for search")?;
-    let results = search_bm25_with_stores(&bm25_index, &metadata_store, query, fetch_limit)?;
+    let results = search_bm25_with_stores_and_filters(
+        &bm25_index,
+        &metadata_store,
+        query,
+        filters,
+        fetch_limit,
+    )?;
     let bm25_elapsed = bm25_start.elapsed();
     let aug_start = Instant::now();
     let results = augment_exact_match_candidates_with_store(
@@ -1042,6 +1050,77 @@ mod tests {
         assert!(timings.bm25.is_some());
         assert!(timings.vector.is_none());
         restore_test_env(saved_env);
+    }
+
+    #[test]
+    fn bm25_only_search_fills_path_scoped_results_from_deeper_pool() {
+        let dir = tempdir().unwrap();
+        let index_dir = dir.path();
+        let metadata_store = MetadataStore::open(&index_dir.join("metadata.db")).unwrap();
+        let bm25 = Bm25Index::open(&index_dir.join("bm25")).unwrap();
+
+        let mut chunks = Vec::new();
+        for i in 0..160 {
+            chunks.push(Chunk {
+                id: format!("noise:{i}"),
+                file_path: format!("other/dependency_injection_work_{i}.py"),
+                line_start: 1,
+                line_end: 4,
+                content:
+                    "def dependency_injection_work():\n    dependency injection work dependency injection work"
+                        .to_string(),
+                language: Language::Python,
+                symbol_type: Some(SymbolType::Function),
+                symbol_name: Some("dependency_injection_work".to_string()),
+            });
+        }
+        chunks.push(Chunk {
+            id: "fastapi:dependency".to_string(),
+            file_path: "fastapi/dependencies/utils.py".to_string(),
+            line_start: 42,
+            line_end: 55,
+            content: "def solve_dependencies():\n    \"\"\"Resolve dependency injection for request handlers.\"\"\"\n    return values"
+                .to_string(),
+            language: Language::Python,
+            symbol_type: Some(SymbolType::Function),
+            symbol_name: Some("solve_dependencies".to_string()),
+        });
+
+        metadata_store.insert_chunks(&chunks).unwrap();
+        let lang_strings: Vec<String> = chunks.iter().map(|c| c.language.to_string()).collect();
+        let docs: Vec<Bm25Document<'_>> = chunks
+            .iter()
+            .zip(lang_strings.iter())
+            .map(|(chunk, language)| Bm25Document {
+                chunk_id: &chunk.id,
+                file_path: &chunk.file_path,
+                content: &chunk.content,
+                symbol_name: chunk.symbol_name.as_deref(),
+                language,
+            })
+            .collect();
+        bm25.insert_batch(&docs).unwrap();
+
+        let filters = SearchFilters {
+            path_glob: Some("fastapi/**".to_string()),
+            ..Default::default()
+        };
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let context = SearchContext::bm25_only();
+
+        let (results, timings) = rt
+            .block_on(context.search(
+                index_dir,
+                "how does dependency injection work",
+                &VeraConfig::default(),
+                &filters,
+                5,
+            ))
+            .unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].file_path, "fastapi/dependencies/utils.py");
+        assert!(timings.bm25.is_some());
     }
 
     #[test]

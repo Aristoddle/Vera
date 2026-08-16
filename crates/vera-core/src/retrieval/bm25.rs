@@ -13,7 +13,11 @@ use tracing::debug;
 use crate::chunk_text::split_identifier;
 use crate::storage::bm25::Bm25Index;
 use crate::storage::metadata::MetadataStore;
-use crate::types::SearchResult;
+use crate::types::{SearchFilters, SearchResult};
+
+const FILTERED_RAW_MULTIPLIER: usize = 24;
+const FILTERED_RAW_MIN_EXTRA: usize = 1_000;
+const FILTERED_RAW_MAX: usize = 20_000;
 
 /// Perform a BM25 keyword search over the indexed chunks.
 ///
@@ -37,6 +41,28 @@ pub fn search_bm25(index_dir: &Path, query: &str, limit: usize) -> Result<Vec<Se
         MetadataStore::open(&metadata_path).context("failed to open metadata store for search")?;
 
     search_bm25_with_stores(&bm25_index, &metadata_store, query, limit)
+}
+
+/// Perform a filtered BM25 keyword search over the indexed chunks.
+///
+/// When filters are active, this scans a larger raw Tantivy pool before
+/// hydration so scoped searches are not starved by high-scoring off-scope
+/// chunks. Unfiltered calls keep the same candidate behavior as
+/// [`search_bm25`].
+pub fn search_bm25_with_filters(
+    index_dir: &Path,
+    query: &str,
+    filters: &SearchFilters,
+    limit: usize,
+) -> Result<Vec<SearchResult>> {
+    let bm25_dir = index_dir.join("bm25");
+    let metadata_path = index_dir.join("metadata.db");
+
+    let bm25_index = Bm25Index::open(&bm25_dir).context("failed to open BM25 index for search")?;
+    let metadata_store =
+        MetadataStore::open(&metadata_path).context("failed to open metadata store for search")?;
+
+    search_bm25_with_stores_and_filters(&bm25_index, &metadata_store, query, filters, limit)
 }
 
 /// Expand a query by appending sub-tokens from compound identifiers.
@@ -77,12 +103,56 @@ pub fn search_bm25_with_stores(
     query: &str,
     limit: usize,
 ) -> Result<Vec<SearchResult>> {
-    // Fetch more candidates than the limit to account for missing metadata.
-    let candidates = limit.saturating_mul(2).max(limit + 10);
+    search_bm25_with_stores_inner(
+        bm25_index,
+        metadata_store,
+        query,
+        limit,
+        unfiltered_raw_candidate_limit(limit),
+        None,
+    )
+}
+
+/// Perform BM25 search using pre-opened stores and active filters.
+///
+/// Filtered searches scan a larger raw Tantivy pool, hydrate each raw hit,
+/// and keep only matching chunks until `limit` filtered results are collected.
+pub fn search_bm25_with_stores_and_filters(
+    bm25_index: &Bm25Index,
+    metadata_store: &MetadataStore,
+    query: &str,
+    filters: &SearchFilters,
+    limit: usize,
+) -> Result<Vec<SearchResult>> {
+    if filters.is_empty() {
+        return search_bm25_with_stores(bm25_index, metadata_store, query, limit);
+    }
+
+    search_bm25_with_stores_inner(
+        bm25_index,
+        metadata_store,
+        query,
+        limit,
+        filtered_raw_candidate_limit(limit),
+        Some(filters),
+    )
+}
+
+fn search_bm25_with_stores_inner(
+    bm25_index: &Bm25Index,
+    metadata_store: &MetadataStore,
+    query: &str,
+    limit: usize,
+    raw_limit: usize,
+    filters: Option<&SearchFilters>,
+) -> Result<Vec<SearchResult>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
 
     let expanded = expand_query_identifiers(query);
     let bm25_results = bm25_index
-        .search(&expanded, candidates)
+        .search(&expanded, raw_limit)
         .with_context(|| format!("BM25 search failed for query: {query}"))?;
 
     debug!(
@@ -91,7 +161,7 @@ pub fn search_bm25_with_stores(
         "BM25 search returned candidates"
     );
 
-    let mut results = Vec::with_capacity(bm25_results.len());
+    let mut results = Vec::with_capacity(limit.min(bm25_results.len()));
 
     for bm25_result in &bm25_results {
         let chunk = metadata_store
@@ -111,7 +181,7 @@ pub fn search_bm25_with_stores(
             continue;
         };
 
-        results.push(SearchResult {
+        let result = SearchResult {
             file_path: chunk.file_path,
             line_start: chunk.line_start,
             line_end: chunk.line_end,
@@ -120,7 +190,13 @@ pub fn search_bm25_with_stores(
             score: f64::from(bm25_result.score),
             symbol_name: chunk.symbol_name,
             symbol_type: chunk.symbol_type,
-        });
+        };
+
+        if filters.is_some_and(|filters| !filters.matches(&result)) {
+            continue;
+        }
+
+        results.push(result);
 
         if results.len() >= limit {
             break;
@@ -134,6 +210,21 @@ pub fn search_bm25_with_stores(
     );
 
     Ok(results)
+}
+
+fn unfiltered_raw_candidate_limit(limit: usize) -> usize {
+    limit.saturating_mul(2).max(limit.saturating_add(10))
+}
+
+fn filtered_raw_candidate_limit(limit: usize) -> usize {
+    if limit == 0 {
+        0
+    } else {
+        limit
+            .saturating_mul(FILTERED_RAW_MULTIPLIER)
+            .max(limit.saturating_add(FILTERED_RAW_MIN_EXTRA))
+            .min(FILTERED_RAW_MAX)
+    }
 }
 
 #[cfg(test)]
@@ -424,5 +515,79 @@ mod tests {
             result.line_end >= result.line_start,
             "line_end >= line_start"
         );
+    }
+
+    #[test]
+    fn filtered_raw_candidate_limit_is_bounded() {
+        assert_eq!(filtered_raw_candidate_limit(0), 0);
+        assert_eq!(filtered_raw_candidate_limit(10), 1_010);
+        assert_eq!(filtered_raw_candidate_limit(1_000), 20_000);
+    }
+
+    #[test]
+    fn filtered_search_finds_scoped_result_buried_by_off_scope_hits() {
+        let metadata_store = MetadataStore::open_in_memory().unwrap();
+        let bm25_index = Bm25Index::open_in_memory().unwrap();
+
+        let mut chunks = Vec::new();
+        for i in 0..160 {
+            chunks.push(Chunk {
+                id: format!("noise:{i}"),
+                file_path: format!("other/dependency_injection_work_{i}.py"),
+                line_start: 1,
+                line_end: 4,
+                content:
+                    "def dependency_injection_work():\n    dependency injection work dependency injection work"
+                        .to_string(),
+                language: Language::Python,
+                symbol_type: Some(SymbolType::Function),
+                symbol_name: Some("dependency_injection_work".to_string()),
+            });
+        }
+        chunks.push(Chunk {
+            id: "fastapi:dependency".to_string(),
+            file_path: "fastapi/dependencies/utils.py".to_string(),
+            line_start: 42,
+            line_end: 55,
+            content: "def solve_dependencies():\n    \"\"\"Resolve dependency injection for request handlers.\"\"\"\n    return values"
+                .to_string(),
+            language: Language::Python,
+            symbol_type: Some(SymbolType::Function),
+            symbol_name: Some("solve_dependencies".to_string()),
+        });
+
+        metadata_store.insert_chunks(&chunks).unwrap();
+        let lang_strings: Vec<String> = chunks.iter().map(|c| c.language.to_string()).collect();
+        let docs: Vec<Bm25Document<'_>> = chunks
+            .iter()
+            .zip(lang_strings.iter())
+            .map(|(chunk, language)| Bm25Document {
+                chunk_id: &chunk.id,
+                file_path: &chunk.file_path,
+                content: &chunk.content,
+                symbol_name: chunk.symbol_name.as_deref(),
+                language,
+            })
+            .collect();
+        bm25_index.insert_batch(&docs).unwrap();
+
+        let filters = SearchFilters {
+            path_glob: Some("fastapi/**".to_string()),
+            ..Default::default()
+        };
+        let query = "how does dependency injection work";
+
+        let shallow = search_bm25_with_stores(&bm25_index, &metadata_store, query, 10).unwrap();
+        assert!(
+            shallow.iter().all(|result| !filters.matches(result)),
+            "unfiltered top results should be off-scope"
+        );
+
+        let filtered =
+            search_bm25_with_stores_and_filters(&bm25_index, &metadata_store, query, &filters, 10)
+                .unwrap();
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].file_path, "fastapi/dependencies/utils.py");
     }
 }

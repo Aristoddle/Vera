@@ -18,7 +18,10 @@ pub mod search_service;
 pub mod type_relations;
 pub mod vector;
 
-pub use bm25::{search_bm25, search_bm25_with_stores};
+pub use bm25::{
+    search_bm25, search_bm25_with_filters, search_bm25_with_stores,
+    search_bm25_with_stores_and_filters,
+};
 pub use hybrid::{
     HybridSearchError, HybridTimings, fuse_rrf, fuse_rrf_multi, fuse_rrf_multi_weighted,
     search_hybrid, search_hybrid_reranked,
