@@ -1,5 +1,16 @@
 # Troubleshooting
 
+## Building from source fails on macOS with "symbol(s) not found for architecture arm64"
+
+On macOS 14+, the Xcode SDK compiles C dependencies (tree-sitter grammars, ring) for the running OS version, but Cargo's default minimum for `aarch64-apple-darwin` is macOS 11.0. The 11.0 ABI lacks newer symbols, so linking fails.
+
+Set the deployment target to your running macOS version before building:
+
+```bash
+export MACOSX_DEPLOYMENT_TARGET="$(sw_vers -productVersion)"
+cargo build --release
+```
+
 ## "No index found in current directory"
 
 Either the repository hasn't been indexed yet, or you're running the command from the wrong directory.
