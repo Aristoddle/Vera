@@ -293,6 +293,21 @@ pub fn is_local_mode() -> bool {
         .unwrap_or(false)
 }
 
+/// Whether experimental structural graph augmentation is enabled.
+///
+/// This is intentionally an environment-only ablation switch rather than a
+/// persisted retrieval setting. Accepted truthy values are `1`, `true`, and
+/// `yes`, case-insensitively.
+pub fn graph_augmentation_enabled() -> bool {
+    std::env::var("VERA_GRAPH_AUGMENT")
+        .map(|value| {
+            value.eq_ignore_ascii_case("1")
+                || value.eq_ignore_ascii_case("true")
+                || value.eq_ignore_ascii_case("yes")
+        })
+        .unwrap_or(false)
+}
+
 fn backend_from_env() -> Option<InferenceBackend> {
     std::env::var("VERA_BACKEND")
         .ok()
@@ -662,6 +677,36 @@ mod tests {
             batch_size * concurrency <= config.embedding.max_in_flight_inputs,
             "default embedding parallelism must respect its in-flight bound"
         );
+    }
+
+    #[test]
+    fn graph_augmentation_env_accepts_only_truthy_values() {
+        let _guard = env_lock().lock().unwrap();
+        let previous = std::env::var_os("VERA_GRAPH_AUGMENT");
+
+        for value in ["1", "true", "TRUE", "yes", "YeS"] {
+            set_env("VERA_GRAPH_AUGMENT", value);
+            assert!(
+                graph_augmentation_enabled(),
+                "{value} should enable the flag"
+            );
+        }
+
+        for value in ["0", "false", "no", "", "on"] {
+            set_env("VERA_GRAPH_AUGMENT", value);
+            assert!(
+                !graph_augmentation_enabled(),
+                "{value} should disable the flag"
+            );
+        }
+
+        if let Some(value) = previous {
+            unsafe {
+                std::env::set_var("VERA_GRAPH_AUGMENT", value);
+            }
+        } else {
+            remove_env("VERA_GRAPH_AUGMENT");
+        }
     }
 
     #[test]

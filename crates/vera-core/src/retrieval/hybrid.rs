@@ -17,6 +17,7 @@ use tracing::{debug, info, warn};
 
 use crate::embedding::EmbeddingProvider;
 use crate::retrieval::bm25::search_bm25_with_stores_and_filters;
+use crate::retrieval::graph_augmentation::augment_pool;
 use crate::retrieval::query_classifier::{QueryType, classify_query, params_for_query_type};
 use crate::retrieval::ranking::is_path_weighted_query;
 use crate::retrieval::reranker::{Reranker, rerank_results};
@@ -251,9 +252,44 @@ pub async fn search_hybrid_reranked(
     rerank_candidates: usize,
     vector_candidates: usize,
 ) -> Result<(Vec<SearchResult>, HybridTimings), HybridSearchError> {
+    search_hybrid_reranked_with_augmentation(
+        index_dir,
+        provider,
+        reranker,
+        bm25_query,
+        vector_query,
+        filters,
+        fetch_limit,
+        result_limit,
+        rrf_k,
+        stored_dim,
+        rerank_candidates,
+        vector_candidates,
+        false,
+    )
+    .await
+}
+
+/// Perform hybrid search with optional experimental graph augmentation.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn search_hybrid_reranked_with_augmentation(
+    index_dir: &Path,
+    provider: &impl EmbeddingProvider,
+    reranker: &impl Reranker,
+    bm25_query: &str,
+    vector_query: &str,
+    filters: &SearchFilters,
+    fetch_limit: usize,
+    result_limit: usize,
+    rrf_k: f64,
+    stored_dim: usize,
+    rerank_candidates: usize,
+    vector_candidates: usize,
+    graph_augmentation_enabled: bool,
+) -> Result<(Vec<SearchResult>, HybridTimings), HybridSearchError> {
     let fusion_limit = rerank_candidates.max(fetch_limit);
 
-    let (hybrid_results, mut timings) = search_hybrid(
+    let (mut hybrid_results, mut timings) = search_hybrid(
         index_dir,
         provider,
         bm25_query,
@@ -266,16 +302,29 @@ pub async fn search_hybrid_reranked(
     )
     .await?;
 
+    let augmented_count = if graph_augmentation_enabled {
+        augment_pool(index_dir, &mut hybrid_results, filters)
+    } else {
+        0
+    };
+
     if hybrid_results.is_empty() {
         return Ok((hybrid_results, timings));
     }
 
-    if hybrid_results.len() <= result_limit {
+    if hybrid_results.len() <= result_limit && augmented_count == 0 {
         return Ok((hybrid_results, timings));
     }
 
     let rerank_start = Instant::now();
-    match rerank_results(reranker, vector_query, &hybrid_results, rerank_candidates).await {
+    // When graph candidates were appended, score the whole expanded pool so
+    // candidates beyond the normal rerank prefix still compete semantically.
+    let rerank_limit = if augmented_count > 0 {
+        hybrid_results.len()
+    } else {
+        rerank_candidates
+    };
+    match rerank_results(reranker, vector_query, &hybrid_results, rerank_limit).await {
         Ok(mut reranked) => {
             timings.reranking = Some(rerank_start.elapsed());
             info!(
@@ -284,7 +333,7 @@ pub async fn search_hybrid_reranked(
                 reranked = reranked.len(),
                 "reranking complete"
             );
-            reranked.extend(hybrid_results.into_iter().skip(rerank_candidates));
+            reranked.extend(hybrid_results.into_iter().skip(rerank_limit));
             reranked.truncate(fetch_limit);
             Ok((reranked, timings))
         }
