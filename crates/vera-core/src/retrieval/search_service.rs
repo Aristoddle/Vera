@@ -14,7 +14,9 @@ use crate::chunk_text::file_name;
 use crate::config::{InferenceBackend, VeraConfig};
 use crate::embedding::{CachedEmbeddingProvider, DynamicProvider, EmbeddingProvider};
 use crate::retrieval::dynamic_reranker::DynamicReranker;
-use crate::retrieval::hybrid::compute_vector_candidates;
+use crate::retrieval::hybrid::{
+    compute_vector_candidates, search_hybrid_reranked_with_augmentation,
+};
 use crate::retrieval::query_classifier::{QueryType, classify_query, params_for_query_type};
 use crate::retrieval::query_utils::{
     looks_like_compound_identifier, looks_like_filename, path_depth, trim_query_token,
@@ -22,9 +24,7 @@ use crate::retrieval::query_utils::{
 use crate::retrieval::ranking::{
     RankingStage, apply_query_ranking_with_filters, is_path_weighted_query,
 };
-use crate::retrieval::{
-    apply_filters, search_bm25_with_stores_and_filters, search_hybrid, search_hybrid_reranked,
-};
+use crate::retrieval::{apply_filters, search_bm25_with_stores_and_filters, search_hybrid};
 use crate::storage::bm25::Bm25Index;
 use crate::storage::metadata::MetadataStore;
 use crate::types::{Chunk, SearchFilters, SearchResult, SymbolType};
@@ -224,7 +224,7 @@ impl SearchContext {
                 .reranker
                 .as_ref()
                 .expect("reranker_enabled requires an initialized reranker");
-            search_hybrid_reranked(
+            search_hybrid_reranked_with_augmentation(
                 index_dir,
                 provider,
                 reranker,
@@ -237,6 +237,7 @@ impl SearchContext {
                 stored_dim,
                 rerank_candidates,
                 vector_candidates,
+                crate::config::graph_augmentation_enabled(),
             )
             .await?
         } else {
