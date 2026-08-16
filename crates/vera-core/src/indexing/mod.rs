@@ -16,7 +16,8 @@ pub use pipeline::{
     index_repository_with_progress,
 };
 pub use update::{
-    UpdateProgress, UpdateSummary, content_hash, update_repository, update_repository_with_progress,
+    UpdateOptions, UpdateProgress, UpdateSummary, content_hash, update_repository,
+    update_repository_with_options_and_progress, update_repository_with_progress,
 };
 
 /// Truncate embedding vectors to at most `max_dim` dimensions.

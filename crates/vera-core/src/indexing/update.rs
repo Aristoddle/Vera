@@ -48,10 +48,19 @@ pub struct UpdateSummary {
     pub files_using_tier0_fallback: usize,
     /// Files that failed to parse during the update.
     pub parse_errors: Vec<FileError>,
+    /// Added or modified files deferred by the per-run file limit.
+    pub files_deferred: usize,
     /// Total chunks after the update.
     pub total_chunks: u64,
     /// Wall-clock elapsed time in seconds.
     pub elapsed_secs: f64,
+}
+
+/// Optional controls for a single incremental update run.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct UpdateOptions {
+    /// Maximum added or modified files to process. Deletions are always applied.
+    pub max_files: Option<usize>,
 }
 
 /// Progress events emitted during an incremental update.
@@ -65,6 +74,7 @@ pub enum UpdateProgress {
         added: usize,
         deleted: usize,
         unchanged: usize,
+        deferred: usize,
     },
     /// Changed files have been parsed into chunks.
     ParsingDone {
@@ -143,7 +153,15 @@ pub async fn update_repository<P: EmbeddingProvider>(
     config: &VeraConfig,
     model_name: &str,
 ) -> Result<UpdateSummary> {
-    update_repository_with_progress(repo_path, provider, config, model_name, |_| {}).await
+    update_repository_with_options_and_progress(
+        repo_path,
+        provider,
+        config,
+        model_name,
+        &UpdateOptions::default(),
+        |_| {},
+    )
+    .await
 }
 
 /// Incrementally update an index with progress reporting via a callback.
@@ -152,6 +170,30 @@ pub async fn update_repository_with_progress<P, F>(
     provider: &P,
     config: &VeraConfig,
     model_name: &str,
+    on_progress: F,
+) -> Result<UpdateSummary>
+where
+    P: EmbeddingProvider,
+    F: Fn(UpdateProgress) + Send + Sync,
+{
+    update_repository_with_options_and_progress(
+        repo_path,
+        provider,
+        config,
+        model_name,
+        &UpdateOptions::default(),
+        on_progress,
+    )
+    .await
+}
+
+/// Incrementally update an index with per-run options and progress reporting.
+pub async fn update_repository_with_options_and_progress<P, F>(
+    repo_path: &Path,
+    provider: &P,
+    config: &VeraConfig,
+    model_name: &str,
+    options: &UpdateOptions,
     on_progress: F,
 ) -> Result<UpdateSummary>
 where
@@ -288,11 +330,30 @@ where
         }
     }
 
+    modified.sort_by(|left, right| left.0.cmp(&right.0));
+    added.sort_by(|left, right| left.0.cmp(&right.0));
+    deleted.sort();
+
+    let pending_files = modified.len() + added.len();
+    let files_to_process = options
+        .max_files
+        .unwrap_or(pending_files)
+        .min(pending_files);
+    let modified_to_process = modified.len().min(files_to_process);
+    let added_to_process = added
+        .len()
+        .min(files_to_process.saturating_sub(modified_to_process));
+    let files_deferred = pending_files - modified_to_process - added_to_process;
+    modified.truncate(modified_to_process);
+    added.truncate(added_to_process);
+
     info!(
         modified = modified.len(),
         added = added.len(),
         deleted = deleted.len(),
         unchanged,
+        deferred = files_deferred,
+        max_files = options.max_files,
         "file classification complete"
     );
     on_progress(UpdateProgress::ClassificationDone {
@@ -300,6 +361,7 @@ where
         added: added.len(),
         deleted: deleted.len(),
         unchanged,
+        deferred: files_deferred,
     });
 
     // ── 4. Process deletions ─────────────────────────────────────
@@ -599,6 +661,7 @@ where
             .filter(|state| state.status == FileIndexStatus::Indexed && state.tier0_fallback)
             .count(),
         parse_errors,
+        files_deferred,
         total_chunks,
         elapsed_secs: start.elapsed().as_secs_f64(),
     };
@@ -608,6 +671,7 @@ where
         added = summary.files_added,
         deleted = summary.files_deleted,
         unchanged = summary.files_unchanged,
+        deferred = summary.files_deferred,
         total_chunks = summary.total_chunks,
         elapsed = %format!("{:.2}s", summary.elapsed_secs),
         "incremental update complete"
