@@ -6,6 +6,7 @@ use crate::embedding::provider::{
 };
 use crate::local_models::configured_local_model_name;
 use std::time::Duration;
+use tokio_util::sync::CancellationToken;
 
 pub enum DynamicProvider {
     Api(OpenAiProvider),
@@ -43,6 +44,17 @@ impl EmbeddingProvider for DynamicProvider {
             Self::Api(p) => p.max_batch_size(),
             Self::Local(p) => p.max_batch_size(),
             Self::Model2Vec(p) => p.max_batch_size(),
+        }
+    }
+
+    async fn embed_batch_cancellable(
+        &self,
+        texts: &[String],
+        cancel: &CancellationToken,
+    ) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+        match self {
+            Self::Api(p) => p.embed_batch_cancellable(texts, cancel).await,
+            Self::Local(p) => p.embed_batch_cancellable(texts, cancel).await,
         }
     }
 }

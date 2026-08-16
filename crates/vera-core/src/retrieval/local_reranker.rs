@@ -6,6 +6,7 @@ use ort::session::{Session, builder::GraphOptimizationLevel};
 use std::sync::{Arc, Mutex};
 use tokenizers::Tokenizer;
 use tokio::task;
+use tokio_util::sync::CancellationToken;
 
 const RERANKER_REPO: &str = "jinaai/jina-reranker-v2-base-multilingual";
 const TOKENIZER_FILE: &str = "tokenizer.json";
@@ -181,16 +182,28 @@ impl LocalReranker {
         Ok(results)
     }
 
-    fn do_rerank(&self, query: &str, documents: &[String]) -> Result<Vec<RerankScore>> {
+    fn do_rerank_cancellable(
+        &self,
+        query: &str,
+        documents: &[String],
+        cancel: &CancellationToken,
+    ) -> Result<Vec<RerankScore>, RerankerError> {
         if documents.is_empty() {
             return Ok(Vec::new());
         }
 
         let mut combined = Vec::with_capacity(documents.len());
         for (batch_index, batch) in documents.chunks(MAX_RERANK_BATCH_SIZE).enumerate() {
-            let mut scores =
-                self.do_rerank_batch(query, batch, batch_index * MAX_RERANK_BATCH_SIZE)?;
-            combined.append(&mut scores);
+            if cancel.is_cancelled() {
+                return Err(RerankerError::Cancelled);
+            }
+            let scores = self
+                .do_rerank_batch(query, batch, batch_index * MAX_RERANK_BATCH_SIZE)
+                .map_err(|e| RerankerError::ApiError {
+                    status: 500,
+                    message: e.to_string(),
+                })?;
+            combined.extend(scores);
         }
 
         combined.sort_by(|a, b| {
@@ -310,18 +323,32 @@ impl Reranker for LocalReranker {
         let documents = documents.to_vec();
 
         task::spawn_blocking(move || {
-            provider
-                .do_rerank(&query, &documents)
-                .map_err(|e| RerankerError::ApiError {
-                    status: 500,
-                    message: e.to_string(),
-                })
+            provider.do_rerank_cancellable(&query, &documents, &CancellationToken::new())
         })
         .await
         .map_err(|e| RerankerError::ApiError {
             status: 500,
             message: e.to_string(),
         })?
+    }
+
+    async fn rerank_cancellable(
+        &self,
+        query: &str,
+        documents: &[String],
+        cancel: &CancellationToken,
+    ) -> Result<Vec<RerankScore>, RerankerError> {
+        let provider = self.clone();
+        let query = query.to_string();
+        let documents = documents.to_vec();
+        let cancel = cancel.clone();
+
+        task::spawn_blocking(move || provider.do_rerank_cancellable(&query, &documents, &cancel))
+            .await
+            .map_err(|e| RerankerError::ApiError {
+                status: 500,
+                message: e.to_string(),
+            })?
     }
 }
 

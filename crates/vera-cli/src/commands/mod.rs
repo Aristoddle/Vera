@@ -14,6 +14,7 @@ pub mod overview;
 pub mod references;
 pub mod repair;
 pub mod search;
+pub mod serve;
 pub mod setup;
 pub mod stats;
 pub mod structural;
