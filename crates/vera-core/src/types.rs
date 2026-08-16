@@ -157,7 +157,32 @@ fn glob_matches(pattern: &str, path: &str) -> bool {
     let pattern = pattern.replace('\\', "/");
     let path = path.replace('\\', "/");
 
-    glob_match_recursive(&pattern, &path)
+    // Normalize a leading `./` on both sides and a trailing `/` on the
+    // pattern, so `./app/src` and `app/src/` behave like `app/src`.
+    let pattern = pattern
+        .strip_prefix("./")
+        .unwrap_or(&pattern)
+        .trim_end_matches('/');
+    let path = path.strip_prefix("./").unwrap_or(&path);
+
+    if glob_match_recursive(pattern, path) {
+        return true;
+    }
+
+    // Directory-prefix fallback: a bare pattern with no wildcards (e.g.
+    // `app/src`) should match any file beneath that directory
+    // (`app/src/foo.ts`), i.e. behave like `app/src/**`. Kept out of the
+    // recursive matcher so wildcards like `*` retain single-segment semantics.
+    //
+    // Only `*`/`**` are wildcards in this matcher; `?` and `[` are literal
+    // characters (e.g. Next.js dynamic-route dirs like `app/[slug]`), so they
+    // must stay eligible for the fallback.
+    if !pattern.is_empty() && !pattern.contains('*') {
+        return path.starts_with(pattern)
+            && path.as_bytes().get(pattern.len()) == Some(&b'/');
+    }
+
+    false
 }
 
 /// Recursive glob matching helper.
@@ -1401,5 +1426,77 @@ mod tests {
         assert!(glob_matches("src/**", "src/main.rs"));
         assert!(glob_matches("src/**", "src/a/b/c.rs"));
         assert!(!glob_matches("src/**", "tests/main.rs"));
+    }
+
+    #[test]
+    fn glob_bare_directory_matches_files_beneath() {
+        // Bare directory pattern (no wildcards) behaves like `app/src/**`.
+        assert!(glob_matches("app/src", "app/src/foo.ts"));
+        assert!(glob_matches("app/src", "app/src/bar/baz.rs"));
+        // But not siblings or unrelated directories.
+        assert!(!glob_matches("app/src", "app/srcs/foo.ts"));
+        assert!(!glob_matches("app/src", "other/src/foo.ts"));
+        // Single-segment bare directory.
+        assert!(glob_matches("src", "src/foo.rs"));
+        assert!(!glob_matches("src", "srcs/foo.rs"));
+        // The directory path itself (exact, no trailing file) still matches.
+        assert!(glob_matches("app/src", "app/src"));
+        // `?` and `[` are literals in this matcher, not wildcards, so bare
+        // directories containing them (e.g. Next.js `app/[slug]`) still get
+        // the directory-prefix fallback.
+        assert!(glob_matches("app/[slug]", "app/[slug]/page.tsx"));
+        assert!(!glob_matches("app/[slug]", "app/other/page.tsx"));
+    }
+
+    #[test]
+    fn glob_trailing_slash_pattern_matches_directory() {
+        // A trailing slash on the pattern is normalized away.
+        assert!(glob_matches("app/src/", "app/src/foo.ts"));
+        assert!(!glob_matches("app/src/", "app/srcs/foo.ts"));
+    }
+
+    #[test]
+    fn glob_leading_dot_slash_is_normalized() {
+        // `./app/src` behaves like `app/src` against unprefixed paths.
+        assert!(glob_matches("./app/src", "app/src/foo.ts"));
+        // And a `./`-prefixed path is normalized too.
+        assert!(glob_matches("app/src", "./app/src/foo.ts"));
+    }
+
+    #[test]
+    fn filter_by_path_plain_directory_prefix() {
+        let filters = SearchFilters {
+            path_glob: Some("app/src".to_string()),
+            ..Default::default()
+        };
+        let inside = make_test_result("app/src/foo.ts", Language::TypeScript, None, None);
+        let deep = make_test_result("app/src/bar/baz.rs", Language::Rust, None, None);
+        let sibling = make_test_result("app/srcs/foo.ts", Language::TypeScript, None, None);
+        let other = make_test_result("other/src/foo.ts", Language::TypeScript, None, None);
+        assert!(filters.matches(&inside));
+        assert!(filters.matches(&deep));
+        assert!(!filters.matches(&sibling));
+        assert!(!filters.matches(&other));
+
+        // A wildcard pattern must NOT get directory-prefix treatment: `app/*`
+        // stays single-segment and does not match nested files.
+        let wildcard = SearchFilters {
+            path_glob: Some("app/*".to_string()),
+            ..Default::default()
+        };
+        assert!(!wildcard.matches(&deep));
+    }
+
+    #[test]
+    fn single_star_does_not_cross_directory_boundary() {
+        // `src/*` must not match `src/bar/baz` — `*` is single-segment only.
+        let filters = SearchFilters {
+            path_glob: Some("src/*".to_string()),
+            ..Default::default()
+        };
+        let shallow = make_test_result("src/foo.rs", Language::Rust, None, None);
+        let deep = make_test_result("src/bar/baz.rs", Language::Rust, None, None);
+        assert!(filters.matches(&shallow));
+        assert!(!filters.matches(&deep));
     }
 }
