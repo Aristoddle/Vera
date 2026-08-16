@@ -191,7 +191,10 @@ class Server {
 "#;
     let chunks =
         parse_and_chunk(source, "server.ts", Language::TypeScript, &default_config()).unwrap();
-    assert!(chunks.len() >= 3, "expected function + interface + class");
+    assert!(
+        chunks.len() >= 5,
+        "expected function + interface + class + methods"
+    );
 
     let func = chunks
         .iter()
@@ -210,6 +213,18 @@ class Server {
         .find(|c| c.symbol_name == Some("Server".to_string()));
     assert!(cls.is_some());
     assert_eq!(cls.unwrap().symbol_type, Some(SymbolType::Class));
+
+    let constructor = chunks
+        .iter()
+        .find(|c| c.symbol_name == Some("constructor".to_string()));
+    assert!(constructor.is_some());
+    assert_eq!(constructor.unwrap().symbol_type, Some(SymbolType::Method));
+
+    let method = chunks
+        .iter()
+        .find(|c| c.symbol_name == Some("start".to_string()));
+    assert!(method.is_some());
+    assert_eq!(method.unwrap().symbol_type, Some(SymbolType::Method));
 }
 
 #[test]

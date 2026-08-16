@@ -1132,11 +1132,18 @@ fn collect_symbols(
             return;
         }
 
-        // For C#, PHP, Dart classes, extract methods:
-        if (lang == Language::CSharp || lang == Language::Php || lang == Language::Dart)
+        // For class-like declarations in languages where methods live inside
+        // class/interface/enum bodies, extract nested methods as separate symbols.
+        if (lang == Language::CSharp
+            || lang == Language::Php
+            || lang == Language::Dart
+            || lang == Language::TypeScript
+            || lang == Language::JavaScript
+            || lang == Language::Java)
             && (kind == "class_declaration"
                 || kind == "class_definition"
-                || kind == "interface_declaration")
+                || kind == "interface_declaration"
+                || kind == "enum_declaration")
         {
             extract_general_class_methods(node, source, lang, symbols, sym_type);
             return;
@@ -1667,6 +1674,39 @@ fn extract_general_class_methods(
                             });
                         }
                     }
+                } else if lang == Language::Java && class_sym_type == SymbolType::Enum {
+                    // Java enum methods can be nested under enum_body_declarations
+                    // wrappers instead of appearing as direct enum_body children.
+                    let mut java_cursor = item.walk();
+                    for java_child in item.children(&mut java_cursor) {
+                        if let Some(sym_type) = classify_node(lang, java_child.kind()) {
+                            let name = extract_name(&java_child, source);
+                            symbols.push(RawSymbol {
+                                name,
+                                symbol_type: sym_type,
+                                start_byte: java_child.start_byte(),
+                                end_byte: java_child.end_byte(),
+                                start_row: java_child.start_position().row,
+                                end_row: java_child.end_position().row,
+                            });
+                            continue;
+                        }
+
+                        let mut java_inner_cursor = java_child.walk();
+                        for java_inner in java_child.children(&mut java_inner_cursor) {
+                            if let Some(sym_type) = classify_node(lang, java_inner.kind()) {
+                                let name = extract_name(&java_inner, source);
+                                symbols.push(RawSymbol {
+                                    name,
+                                    symbol_type: sym_type,
+                                    start_byte: java_inner.start_byte(),
+                                    end_byte: java_inner.end_byte(),
+                                    start_row: java_inner.start_position().row,
+                                    end_row: java_inner.end_position().row,
+                                });
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1858,8 +1898,8 @@ class UserService {
 "#;
         let symbols = parse_and_extract(source, Language::TypeScript);
         assert!(
-            symbols.len() >= 3,
-            "expected >= 3 symbols, got {}",
+            symbols.len() >= 4,
+            "expected >= 4 symbols, got {}",
             symbols.len()
         );
 
@@ -1876,6 +1916,12 @@ class UserService {
             .find(|s| s.name.as_deref() == Some("UserService"));
         assert!(class.is_some(), "should find class 'UserService'");
         assert_eq!(class.unwrap().symbol_type, SymbolType::Class);
+
+        let method = symbols
+            .iter()
+            .find(|s| s.name.as_deref() == Some("getUser"));
+        assert!(method.is_some(), "should find method 'getUser'");
+        assert_eq!(method.unwrap().symbol_type, SymbolType::Method);
     }
 
     #[test]
@@ -1933,8 +1979,8 @@ class Calculator {
 "#;
         let symbols = parse_and_extract(source, Language::Java);
         assert!(
-            symbols.len() >= 1,
-            "expected >= 1 symbol, got {}",
+            symbols.len() >= 3,
+            "expected >= 3 symbols, got {}",
             symbols.len()
         );
 
@@ -1943,6 +1989,46 @@ class Calculator {
             .find(|s| s.name.as_deref() == Some("Calculator"));
         assert!(class.is_some(), "should find class 'Calculator'");
         assert_eq!(class.unwrap().symbol_type, SymbolType::Class);
+
+        let add = symbols.iter().find(|s| s.name.as_deref() == Some("add"));
+        assert!(add.is_some(), "should find method 'add'");
+        assert_eq!(add.unwrap().symbol_type, SymbolType::Method);
+
+        let multiply = symbols
+            .iter()
+            .find(|s| s.name.as_deref() == Some("multiply"));
+        assert!(multiply.is_some(), "should find method 'multiply'");
+        assert_eq!(multiply.unwrap().symbol_type, SymbolType::Method);
+    }
+
+    #[test]
+    fn java_enum_extracts_methods() {
+        let source = r#"
+enum Direction {
+    UP,
+    DOWN;
+
+    int code() {
+        return ordinal();
+    }
+}
+"#;
+        let symbols = parse_and_extract(source, Language::Java);
+        assert!(
+            symbols.len() >= 2,
+            "expected >= 2 symbols, got {}",
+            symbols.len()
+        );
+
+        let enm = symbols
+            .iter()
+            .find(|s| s.name.as_deref() == Some("Direction"));
+        assert!(enm.is_some(), "should find enum 'Direction'");
+        assert_eq!(enm.unwrap().symbol_type, SymbolType::Enum);
+
+        let method = symbols.iter().find(|s| s.name.as_deref() == Some("code"));
+        assert!(method.is_some(), "should find enum method 'code'");
+        assert_eq!(method.unwrap().symbol_type, SymbolType::Method);
     }
 
     #[test]
