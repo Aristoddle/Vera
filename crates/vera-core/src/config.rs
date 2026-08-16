@@ -147,6 +147,20 @@ pub struct EmbeddingConfig {
     /// When true, forces conservative GPU settings (batch_size=1, low mem limit).
     #[serde(default)]
     pub low_vram: bool,
+    /// Equivalent embedding model names.
+    ///
+    /// OpenAI-compatible providers sometimes expose a deployment alias while the
+    /// embedding response, stored index metadata, or another compatible gateway
+    /// reports the canonical upstream model name. Each inner list is one
+    /// equivalence class. When two model names normalize into the same list, Vera
+    /// treats them as index-compatible after the existing dimension check passes.
+    /// Only alias models you have verified produce compatible embeddings.
+    ///
+    /// Can also be supplied with `VERA_EMBEDDING_MODEL_ALIASES`, using
+    /// semicolon-separated groups of comma-separated aliases:
+    /// `text-embedding-3-large,text-embedding-3-large-2;model-a,model-a-prod`
+    #[serde(default)]
+    pub model_aliases: Vec<Vec<String>>,
 }
 
 impl Default for EmbeddingConfig {
@@ -161,6 +175,7 @@ impl Default for EmbeddingConfig {
             max_stored_dim: 1024,
             gpu_mem_limit_mb: 0,
             low_vram: false,
+            model_aliases: Vec::new(),
         }
     }
 }
@@ -558,8 +573,58 @@ pub fn resolve_backend(backend: Option<InferenceBackend>) -> InferenceBackend {
 /// normalises both names by stripping everything up to and including
 /// the last `/` and then comparing case-insensitively.
 pub fn model_names_match(a: &str, b: &str) -> bool {
-    let norm = |s: &str| s.rsplit('/').next().unwrap_or(s).to_ascii_lowercase();
-    norm(a) == norm(b)
+    model_names_match_with_aliases(a, b, &[])
+}
+
+/// Check whether two model names match using configured alias groups plus
+/// aliases supplied by `VERA_EMBEDDING_MODEL_ALIASES`.
+pub fn model_names_match_with_aliases(a: &str, b: &str, aliases: &[Vec<String>]) -> bool {
+    let a = normalize_model_name(a);
+    let b = normalize_model_name(b);
+    a == b || aliases_match(&a, &b, aliases) || aliases_match_env(&a, &b)
+}
+
+fn normalize_model_name(s: &str) -> String {
+    s.rsplit('/')
+        .next()
+        .unwrap_or(s)
+        .trim()
+        .to_ascii_lowercase()
+}
+
+fn aliases_match(a: &str, b: &str, aliases: &[Vec<String>]) -> bool {
+    aliases.iter().any(|group| {
+        let mut has_a = false;
+        let mut has_b = false;
+        for alias in group {
+            let normalized = normalize_model_name(alias);
+            has_a |= normalized == a;
+            has_b |= normalized == b;
+        }
+        has_a && has_b
+    })
+}
+
+fn aliases_match_env(a: &str, b: &str) -> bool {
+    std::env::var("VERA_EMBEDDING_MODEL_ALIASES")
+        .ok()
+        .map(|value| aliases_match(a, b, &parse_model_alias_groups(&value)))
+        .unwrap_or(false)
+}
+
+fn parse_model_alias_groups(value: &str) -> Vec<Vec<String>> {
+    value
+        .split(';')
+        .filter_map(|group| {
+            let aliases = group
+                .split(',')
+                .map(str::trim)
+                .filter(|alias| !alias.is_empty())
+                .map(ToOwned::to_owned)
+                .collect::<Vec<_>>();
+            (aliases.len() >= 2).then_some(aliases)
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -746,5 +811,55 @@ mod tests {
     #[test]
     fn model_names_match_different_models() {
         assert!(!model_names_match("jina-embeddings-v5", "jina-reranker-v2"));
+    }
+
+    #[test]
+    fn model_names_match_configured_alias_group() {
+        let aliases = vec![vec![
+            "text-embedding-3-large".to_string(),
+            "text-embedding-3-large-2".to_string(),
+        ]];
+
+        assert!(model_names_match_with_aliases(
+            "text-embedding-3-large",
+            "text-embedding-3-large-2",
+            &aliases
+        ));
+        assert!(!model_names_match_with_aliases(
+            "text-embedding-3-large",
+            "text-embedding-3-small",
+            &aliases
+        ));
+    }
+
+    #[test]
+    fn model_names_match_env_alias_group() {
+        let _guard = env_lock().lock().unwrap();
+        set_env(
+            "VERA_EMBEDDING_MODEL_ALIASES",
+            "text-embedding-3-large,text-embedding-3-large-2;other,other-prod",
+        );
+
+        assert!(model_names_match(
+            "text-embedding-3-large",
+            "text-embedding-3-large-2"
+        ));
+        assert!(model_names_match("other", "other-prod"));
+        assert!(!model_names_match(
+            "text-embedding-3-large",
+            "text-embedding-3-small"
+        ));
+
+        remove_env("VERA_EMBEDDING_MODEL_ALIASES");
+    }
+
+    #[test]
+    fn model_alias_groups_ignore_single_entry_groups() {
+        assert!(parse_model_alias_groups("solo;").is_empty());
+        assert_eq!(
+            parse_model_alias_groups("a,b; c , d").len(),
+            2,
+            "whitespace-tolerant groups parse"
+        );
     }
 }
