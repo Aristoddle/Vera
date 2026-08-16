@@ -365,11 +365,11 @@ fn effective_rerank_candidates(configured: usize, result_limit: usize) -> usize 
 
 /// Decide whether the cross-encoder reranker should run.
 ///
-/// Skip heuristics (short identifier / path-weighted / filtered lookups) are
-/// based on the raw query. But when the user supplies an `--intent`, they are
-/// asking for semantic ranking, so the reranker must run even for short raw
-/// queries — otherwise the intent-enriched query would never reach the
-/// cross-encoder. See issue #20.
+/// Skip heuristics (short identifier / path-weighted / exact-path or
+/// symbol-type filtered lookups) are based on the raw query. But when the user
+/// supplies an `--intent`, they are asking for semantic ranking, so the
+/// reranker must run even for short raw queries — otherwise the intent-enriched
+/// query would never reach the cross-encoder. See issue #20.
 fn reranking_enabled(
     reranker_present: bool,
     has_intent: bool,
@@ -381,8 +381,7 @@ fn reranking_enabled(
 
 fn should_skip_reranking(query: &str, filters: &SearchFilters) -> bool {
     let word_count = query.split_whitespace().count();
-    !filters.path_glob.is_empty()
-        || filters.exact_paths.is_some()
+    filters.exact_paths.is_some()
         || filters.symbol_type.is_some()
         || is_path_weighted_query(query)
         || (matches!(classify_query(query), QueryType::Identifier) && word_count <= 2)
@@ -1205,6 +1204,19 @@ mod tests {
             true,
             false,
             "how does auth work",
+            &filters
+        ));
+    }
+
+    #[test]
+    fn path_glob_filters_do_not_skip_reranking() {
+        let filters = SearchFilters {
+            path_glob: vec!["crates/vera-core/**".to_string()],
+            ..Default::default()
+        };
+
+        assert!(!should_skip_reranking(
+            "how does dependency injection work",
             &filters
         ));
     }
