@@ -28,6 +28,7 @@ use super::search_service::{SearchContext, SearchTimings};
 pub fn execute_deep_search(
     index_dir: &Path,
     query: &str,
+    intent: Option<&str>,
     config: &VeraConfig,
     filters: &SearchFilters,
     result_limit: usize,
@@ -39,6 +40,7 @@ pub fn execute_deep_search(
         &context,
         index_dir,
         query,
+        intent,
         config,
         filters,
         result_limit,
@@ -49,6 +51,7 @@ pub async fn execute_deep_search_with_context(
     context: &SearchContext,
     index_dir: &Path,
     query: &str,
+    intent: Option<&str>,
     config: &VeraConfig,
     filters: &SearchFilters,
     result_limit: usize,
@@ -60,6 +63,7 @@ pub async fn execute_deep_search_with_context(
                 context,
                 index_dir,
                 query,
+                intent,
                 config,
                 filters,
                 result_limit,
@@ -73,6 +77,7 @@ pub async fn execute_deep_search_with_context(
                 context,
                 index_dir,
                 query,
+                intent,
                 config,
                 filters,
                 result_limit,
@@ -86,6 +91,7 @@ pub async fn execute_deep_search_with_context(
         context,
         index_dir,
         query,
+        intent,
         config,
         filters,
         result_limit,
@@ -94,10 +100,12 @@ pub async fn execute_deep_search_with_context(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn execute_rag_fusion_with_context(
     context: &SearchContext,
     index_dir: &Path,
     query: &str,
+    intent: Option<&str>,
     config: &VeraConfig,
     filters: &SearchFilters,
     result_limit: usize,
@@ -135,7 +143,7 @@ async fn execute_rag_fusion_with_context(
 
     for (idx, query) in queries.iter().enumerate() {
         let result = context
-            .search(index_dir, query, config, filters, per_query_limit)
+            .search(index_dir, query, intent, config, filters, per_query_limit)
             .await;
         match result {
             Ok((results, timings)) => {

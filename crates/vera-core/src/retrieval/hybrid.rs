@@ -85,23 +85,24 @@ pub struct HybridTimings {
 pub async fn search_hybrid(
     index_dir: &Path,
     provider: &impl EmbeddingProvider,
-    query: &str,
+    bm25_query: &str,
+    vector_query: &str,
     filters: &SearchFilters,
     limit: usize,
     rrf_k: f64,
     stored_dim: usize,
     vector_candidates: usize,
 ) -> Result<(Vec<SearchResult>, HybridTimings), HybridSearchError> {
-    let query_type = classify_query(query);
+    let query_type = classify_query(bm25_query);
     let query_params = params_for_query_type(query_type);
-    let bm25_candidates = compute_bm25_candidates(query, limit);
+    let bm25_candidates = compute_bm25_candidates(bm25_query, limit);
     let mut timings = HybridTimings::default();
 
     // Spawn BM25 search in a blocking task with its own database connections.
     // This runs concurrently with vector search (embedding + nearest-neighbor).
     let bm25_dir = index_dir.join("bm25");
     let metadata_path = index_dir.join("metadata.db");
-    let bm25_query = query.to_string();
+    let bm25_query = bm25_query.to_string();
     let bm25_filters = filters.clone();
     let bm25_handle = tokio::task::spawn_blocking(move || {
         let start = Instant::now();
@@ -134,7 +135,7 @@ pub async fn search_hybrid(
                         &vector_store,
                         &vector_metadata,
                         provider,
-                        query,
+                        vector_query,
                         vector_candidates,
                     )
                     .await
@@ -226,7 +227,9 @@ pub async fn search_hybrid(
 /// - `index_dir` — Path to the `.vera` index directory
 /// - `provider` — Embedding provider for vector search
 /// - `reranker` — Reranker for result refinement
-/// - `query` — The search query text
+/// - `bm25_query` — Raw query text for the BM25 side (never intent-prefixed)
+/// - `vector_query` — Query text for embedding and reranking (may carry intent)
+/// - `filters` — Post-retrieval filters applied before fusion and reranking
 /// - `limit` — Maximum number of results to return
 /// - `rrf_k` — RRF constant (typically 60.0)
 /// - `stored_dim` — Dimensionality of stored vectors
@@ -237,7 +240,8 @@ pub async fn search_hybrid_reranked(
     index_dir: &Path,
     provider: &impl EmbeddingProvider,
     reranker: &impl Reranker,
-    query: &str,
+    bm25_query: &str,
+    vector_query: &str,
     filters: &SearchFilters,
     limit: usize,
     rrf_k: f64,
@@ -250,7 +254,8 @@ pub async fn search_hybrid_reranked(
     let (hybrid_results, mut timings) = search_hybrid(
         index_dir,
         provider,
-        query,
+        bm25_query,
+        vector_query,
         filters,
         fetch_limit,
         rrf_k,
@@ -264,11 +269,11 @@ pub async fn search_hybrid_reranked(
     }
 
     let rerank_start = Instant::now();
-    match rerank_results(reranker, query, &hybrid_results, rerank_candidates).await {
+    match rerank_results(reranker, vector_query, &hybrid_results, rerank_candidates).await {
         Ok(mut reranked) => {
             timings.reranking = Some(rerank_start.elapsed());
             info!(
-                query = query,
+                query = vector_query,
                 candidates = hybrid_results.len(),
                 reranked = reranked.len(),
                 "reranking complete"
@@ -808,6 +813,38 @@ mod tests {
         (index_dir, dim)
     }
 
+    // Regression for issue #20: the intent-prefixed query must only reach the
+    // vector side. BM25 receives the raw query, so an `intent: ... |` prefix in
+    // `vector_query` never makes Tantivy parse `intent:` as a missing field.
+    #[tokio::test]
+    async fn search_hybrid_keeps_intent_out_of_bm25() {
+        use crate::embedding::test_helpers::MockProvider;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let (index_dir, dim) = setup_test_index(tmp.path()).await;
+        let provider = MockProvider::new(dim);
+
+        // bm25_query is the raw user query; vector_query carries the intent prefix.
+        let (results, _timings) = search_hybrid(
+            &index_dir,
+            &provider,
+            "authenticate",
+            "intent: find auth handlers | authenticate",
+            &SearchFilters::default(),
+            5,
+            60.0,
+            dim,
+            50,
+        )
+        .await
+        .expect("hybrid search must not error when intent prefix is present");
+
+        assert!(
+            !results.is_empty(),
+            "BM25 should contribute results for the raw query 'authenticate'"
+        );
+    }
+
     #[tokio::test]
     async fn search_hybrid_reranked_returns_reranked_results() {
         use crate::embedding::test_helpers::MockProvider;
@@ -823,6 +860,7 @@ mod tests {
             &index_dir,
             &provider,
             &reranker,
+            "authenticate",
             "authenticate",
             &SearchFilters::default(),
             5,
@@ -870,6 +908,7 @@ mod tests {
             &provider,
             &reranker,
             "authenticate",
+            "authenticate",
             &SearchFilters::default(),
             5,
             60.0,
@@ -907,6 +946,7 @@ mod tests {
             &provider,
             &reranker,
             "authenticate",
+            "authenticate",
             &SearchFilters::default(),
             5,
             60.0,
@@ -939,6 +979,7 @@ mod tests {
             &index_dir,
             &provider,
             &reranker,
+            "function",
             "function",
             &SearchFilters::default(),
             2,
@@ -1026,6 +1067,7 @@ mod tests {
             &provider,
             &reranker,
             id_query,
+            id_query,
             &SearchFilters::default(),
             5,
             id_params.rrf_k,
@@ -1046,6 +1088,7 @@ mod tests {
             &index_dir,
             &provider,
             &reranker,
+            nl_query,
             nl_query,
             &SearchFilters::default(),
             5,

@@ -18,9 +18,11 @@ use super::search_service::{SearchContext, SearchTimings};
 /// 2. Extract unique symbol names from the top results.
 /// 3. Run follow-up searches for each extracted symbol.
 /// 4. Merge and deduplicate, preserving the original result order first.
+#[allow(clippy::too_many_arguments)]
 pub fn execute_iterative_search(
     index_dir: &Path,
     query: &str,
+    intent: Option<&str>,
     config: &VeraConfig,
     filters: &SearchFilters,
     result_limit: usize,
@@ -33,6 +35,7 @@ pub fn execute_iterative_search(
         &context,
         index_dir,
         query,
+        intent,
         config,
         filters,
         result_limit,
@@ -40,10 +43,12 @@ pub fn execute_iterative_search(
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn execute_iterative_search_with_context(
     context: &SearchContext,
     index_dir: &Path,
     query: &str,
+    intent: Option<&str>,
     config: &VeraConfig,
     filters: &SearchFilters,
     result_limit: usize,
@@ -52,7 +57,7 @@ pub async fn execute_iterative_search_with_context(
     let fetch_per_hop = result_limit;
 
     let (initial_results, timings) = context
-        .search(index_dir, query, config, filters, fetch_per_hop)
+        .search(index_dir, query, intent, config, filters, fetch_per_hop)
         .await?;
 
     if hops == 0 || initial_results.is_empty() {
@@ -88,7 +93,14 @@ pub async fn execute_iterative_search_with_context(
 
     for symbol in &follow_up_symbols {
         let (hop_results, _) = context
-            .search(index_dir, symbol, config, filters, fetch_per_hop / 2)
+            .search(
+                index_dir,
+                symbol,
+                intent,
+                config,
+                filters,
+                fetch_per_hop / 2,
+            )
             .await?;
 
         for r in hop_results {

@@ -70,6 +70,7 @@ impl ToolAdapter for VeraBm25Adapter {
         match self.runtime.block_on(self.search_context.search(
             &index_dir(repo_path),
             query,
+            None,
             &self.config,
             &filters,
             RESULT_LIMIT,
@@ -229,6 +230,7 @@ impl ToolAdapter for VeraFullAdapter {
         match self.runtime.block_on(self.search_context.search(
             &index_dir(repo_path),
             query,
+            None,
             &self.config,
             &filters,
             RESULT_LIMIT,

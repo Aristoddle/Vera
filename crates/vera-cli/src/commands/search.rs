@@ -54,8 +54,7 @@ pub fn run(
     };
 
     let (results, timings) = if queries.len() == 1 {
-        let effective_query = apply_intent(&queries[0], intent);
-        runner.execute_query(&effective_query)?
+        runner.execute_query(&queries[0], intent)?
     } else {
         runner.execute_multi_query_search(&queries, intent)?
     };
@@ -86,13 +85,18 @@ struct SearchRunner<'a> {
 }
 
 impl SearchRunner<'_> {
-    fn execute_query(&self, query: &str) -> anyhow::Result<(Vec<SearchResult>, SearchTimings)> {
+    fn execute_query(
+        &self,
+        query: &str,
+        intent: Option<&str>,
+    ) -> anyhow::Result<(Vec<SearchResult>, SearchTimings)> {
         if self.deep {
             self.rt.block_on(
                 vera_core::retrieval::rag_fusion::execute_deep_search_with_context(
                     self.search_context,
                     self.index_dir,
                     query,
+                    intent,
                     self.config,
                     self.filters,
                     self.result_limit,
@@ -102,6 +106,7 @@ impl SearchRunner<'_> {
             self.rt.block_on(self.search_context.search(
                 self.index_dir,
                 query,
+                intent,
                 self.config,
                 self.filters,
                 self.result_limit,
@@ -121,12 +126,11 @@ impl SearchRunner<'_> {
         let mut result_sets = Vec::with_capacity(queries.len());
 
         for query in queries {
-            let effective_query = apply_intent(query, intent);
             let query_runner = SearchRunner {
                 result_limit: per_query_limit,
                 ..*self
             };
-            let (results, query_timings) = query_runner.execute_query(&effective_query)?;
+            let (results, query_timings) = query_runner.execute_query(query, intent)?;
             merge_timings(&mut timings, &query_timings);
             result_sets.push(results);
             weights.push(1.0);
@@ -166,16 +170,6 @@ fn normalize_queries(queries: &[String]) -> Vec<String> {
     }
 
     normalized
-}
-
-fn apply_intent(query: &str, intent: Option<&str>) -> String {
-    let intent = intent
-        .map(|value| value.split_whitespace().collect::<Vec<_>>().join(" "))
-        .filter(|value| !value.is_empty());
-    match intent {
-        Some(intent) => format!("intent: {intent} | {query}"),
-        None => query.to_string(),
-    }
 }
 
 fn compute_per_query_limit(result_limit: usize) -> usize {
