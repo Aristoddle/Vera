@@ -47,6 +47,17 @@ pub async fn create_dynamic_reranker(
 
     match backend {
         InferenceBackend::OnnxJina(ep) => {
+            // Prefer a configured API reranker over the local ONNX one: hosted
+            // rerankers are typically higher quality, and setting
+            // RERANKER_MODEL_* signals explicit intent to use one.
+            if let Ok(cfg) = RerankerConfig::from_env() {
+                let cfg = cfg
+                    .with_timeout(Duration::from_secs(30))
+                    .with_max_retries(2);
+                let p = ApiReranker::new(cfg)
+                    .map_err(|err| anyhow::anyhow!("failed to init reranker: {err}"))?;
+                return Ok(Some(DynamicReranker::Api(p)));
+            }
             let p = LocalReranker::new_with_ep(ep)
                 .await
                 .map_err(|e| anyhow::anyhow!("Failed to initialize local reranker: {e}\nHint: check network connection or manually place model at ~/.vera/models/"))?;
