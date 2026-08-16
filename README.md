@@ -179,6 +179,8 @@ vera explain-path path/to/file
 
 ## Benchmarks
 
+`v1.0.0-rc` full-pipeline benchmark: `nDCG@10` 0.7327 on the full 1,251-task Semble suite (63 repos). See [docs/benchmarks.md](docs/benchmarks.md) for ablation detail.
+
 21-task benchmark across `ripgrep`, `flask`, `fastify`, and `turborepo`:
 
 | Metric | ripgrep | cocoindex | ColGREP (149M) | Vera |

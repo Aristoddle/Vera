@@ -1,9 +1,52 @@
 # Vera Benchmarks
 
-This page tracks two benchmark snapshots:
+This page tracks the v1.0 full-pipeline results and ablations first, then older snapshots kept for historical comparison.
 
-- the current local release benchmark used to tune retrieval quality
-- the older public API benchmark kept for historical comparison
+## v1.0 Full-Pipeline Benchmark
+
+The v1.0.0-rc run used the full 1,251-task Semble suite across 63 repos on the `vera-cuda` lane: hybrid BM25+vector retrieval, RRF fusion, and a local ONNX cross-encoder reranker on CUDA, measured 2026-08-16 against the v1.0.0 release candidate. The older "BM25 scoped filters" full-suite row (`nDCG@10` 0.7267, measured in May 2026) was a BM25-only lane using an older harness. Cross-date comparisons are approximate.
+
+### Main Results
+
+| Variant | nDCG@10 | Recall@1 | Recall@5 | Mean search latency |
+|---------|---------|----------|----------|---------------------|
+| Baseline (pre-ablation HEAD) | 0.7209 | 0.5336 | 0.8088 | 310 ms |
+| v1.0.0-rc (C1+C2 merged) | 0.7327 | 0.5476 | 0.8144 | 2421 ms |
+
+### Ablations
+
+All ablations were measured on the full 1,251-task suite against the stated base.
+
+| Ablation | What it changes | nDCG delta | R@1 delta | Latency effect | Decision |
+|----------|-----------------|------------|-----------|----------------|----------|
+| C1: rerank no-surplus skip | Skip reranking when the fused pool has no surplus over the requested limit | -0.0002 | +0.0000 | -2.4 ms mean | Shipped |
+| C2: rerank path-glob searches | Always rerank path-scoped searches (removes the old skip heuristic) | +0.0113 | +0.0132 | scoped queries now pay rerank cost | Shipped |
+| GA: structural graph augmentation | Append bounded caller/implementation chunks into the rerank pool (`VERA_GRAPH_AUGMENT=1`) | +0.0047 | +0.0080 | +2018 ms mean (reranks the expanded pool) | Merged off by default: gain too small for the latency, R@5 did not move |
+
+Artifacts:
+
+- [2026-08-16-vera-cuda-baseline-full.json](../benchmarks/results/semble/2026-08-16-vera-cuda-baseline-full.json)
+- [2026-08-16-vera-cuda-c1-full.json](../benchmarks/results/semble/2026-08-16-vera-cuda-c1-full.json)
+- [2026-08-16-vera-cuda-c2-full.json](../benchmarks/results/semble/2026-08-16-vera-cuda-c2-full.json)
+- [2026-08-16-vera-cuda-v1-full.json](../benchmarks/results/semble/2026-08-16-vera-cuda-v1-full.json)
+- [2026-08-16-vera-cuda-ga-full.json](../benchmarks/results/semble/2026-08-16-vera-cuda-ga-full.json)
+
+### Agent-Level Benchmark
+
+This benchmark used 10 cross-file tracing questions about the Flask codebase. The question set and harness are documented in [benchmarks/agent-bench/README.md](../benchmarks/agent-bench/README.md). Each question was answered by a fresh `droid exec` agent in two arms: `with-vera`, with a Vera index and agent skill installed; and `control`, with the Vera CLI blocked and exiting 127. Answers were graded blind against a verified answer key by a judge model using a 0-10 rubric per question. Efficiency metrics came from the agent harness stream: tool calls, input tokens, and wall time.
+
+| Tested model | Arm | Mean score | Tool calls | Input tokens | Wall time |
+|--------------|-----|------------|------------|--------------|-----------|
+| claude-opus-5 (medium effort) | with-vera | 10.0/10 | 186 | 298 | 1367 s |
+| claude-opus-5 (medium effort) | control | 10.0/10 | 173 | 212 | 1252 s |
+| kimi-k3 (medium effort) | with-vera | 10.0/10 (9 answered; 1 run hit a quota abort) | 205 | 198,847 | 1307 s |
+| kimi-k3 (medium effort) | control | 9.9/10 | 181 | 303,608 | 1242 s |
+
+The opus table's input-token counts include only non-cached tokens because nearly everything there was cache reads. The kimi lane is the honest context-size comparison: with Vera, the agent pulled 35% fewer input tokens (198.8k vs 303.6k) to reach the same answer quality.
+
+On a small, well-organized repo, a frontier model answers these questions perfectly with plain grep+read, so quality parity is expected. Vera's measurable effect at this scale is reduced context consumption for the mid-tier model, at roughly equal wall time with slightly more tool calls. Larger and less familiar codebases are where the retrieval advantage should grow. Treat this as a floor, not a ceiling.
+
+Limitations: 10 questions, 1 repo, 1 run per cell, and no statistical power claims.
 
 ## Current Local Release Benchmark
 
