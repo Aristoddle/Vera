@@ -230,7 +230,8 @@ pub async fn search_hybrid(
 /// - `bm25_query` — Raw query text for the BM25 side (never intent-prefixed)
 /// - `vector_query` — Query text for embedding and reranking (may carry intent)
 /// - `filters` — Post-retrieval filters applied before fusion and reranking
-/// - `limit` — Maximum number of results to return
+/// - `fetch_limit` — Maximum number of candidates to retain through fusion
+/// - `result_limit` — Maximum number of results to return to the user
 /// - `rrf_k` — RRF constant (typically 60.0)
 /// - `stored_dim` — Dimensionality of stored vectors
 /// - `rerank_candidates` — Number of candidates to send to the reranker
@@ -243,13 +244,14 @@ pub async fn search_hybrid_reranked(
     bm25_query: &str,
     vector_query: &str,
     filters: &SearchFilters,
-    limit: usize,
+    fetch_limit: usize,
+    result_limit: usize,
     rrf_k: f64,
     stored_dim: usize,
     rerank_candidates: usize,
     vector_candidates: usize,
 ) -> Result<(Vec<SearchResult>, HybridTimings), HybridSearchError> {
-    let fetch_limit = rerank_candidates.max(limit);
+    let fusion_limit = rerank_candidates.max(fetch_limit);
 
     let (hybrid_results, mut timings) = search_hybrid(
         index_dir,
@@ -257,7 +259,7 @@ pub async fn search_hybrid_reranked(
         bm25_query,
         vector_query,
         filters,
-        fetch_limit,
+        fusion_limit,
         rrf_k,
         stored_dim,
         vector_candidates,
@@ -265,6 +267,10 @@ pub async fn search_hybrid_reranked(
     .await?;
 
     if hybrid_results.is_empty() {
+        return Ok((hybrid_results, timings));
+    }
+
+    if hybrid_results.len() <= result_limit {
         return Ok((hybrid_results, timings));
     }
 
@@ -279,7 +285,7 @@ pub async fn search_hybrid_reranked(
                 "reranking complete"
             );
             reranked.extend(hybrid_results.into_iter().skip(rerank_candidates));
-            reranked.truncate(limit);
+            reranked.truncate(fetch_limit);
             Ok((reranked, timings))
         }
         Err(rerank_err) => {
@@ -292,7 +298,7 @@ pub async fn search_hybrid_reranked(
                 "Warning: reranker unavailable ({rerank_err}), returning unreranked results."
             );
             let mut results = hybrid_results;
-            results.truncate(limit);
+            results.truncate(fetch_limit);
             Ok((results, timings))
         }
     }
@@ -865,6 +871,7 @@ mod tests {
             "authenticate",
             &SearchFilters::default(),
             5,
+            5,
             60.0,
             dim,
             10,
@@ -890,6 +897,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn search_hybrid_reranked_skips_without_surplus_and_runs_with_surplus() {
+        use crate::embedding::test_helpers::MockProvider;
+        use crate::retrieval::reranker::RerankerError;
+        use crate::retrieval::reranker::test_helpers::MockReranker;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let (index_dir, dim) = setup_test_index(tmp.path()).await;
+        let provider = MockProvider::new(dim);
+        let reranker = MockReranker::failing(RerankerError::ConnectionError {
+            message: "reranker should only be called for a surplus pool".to_string(),
+        });
+        let fetch_limit = 10;
+
+        let (fused_results, _) = search_hybrid(
+            &index_dir,
+            &provider,
+            "function",
+            "function",
+            &SearchFilters::default(),
+            fetch_limit,
+            60.0,
+            dim,
+            50,
+        )
+        .await
+        .unwrap();
+        assert!(!fused_results.is_empty());
+
+        let (_, timings) = search_hybrid_reranked(
+            &index_dir,
+            &provider,
+            &reranker,
+            "function",
+            "function",
+            &SearchFilters::default(),
+            fetch_limit,
+            fused_results.len(),
+            60.0,
+            dim,
+            10,
+            50,
+        )
+        .await
+        .unwrap();
+        assert!(
+            timings.reranking.is_none(),
+            "reranker should not be called when the fused pool fits the result limit"
+        );
+
+        let (_, timings) = search_hybrid_reranked(
+            &index_dir,
+            &provider,
+            &reranker,
+            "function",
+            "function",
+            &SearchFilters::default(),
+            fetch_limit,
+            fused_results.len() - 1,
+            60.0,
+            dim,
+            10,
+            50,
+        )
+        .await
+        .unwrap();
+        assert!(
+            timings.reranking.is_some(),
+            "reranker should be called when the fused pool exceeds the result limit"
+        );
+    }
+
+    #[tokio::test]
     async fn search_hybrid_reranked_degrades_on_reranker_failure() {
         use crate::embedding::test_helpers::MockProvider;
         use crate::retrieval::reranker::RerankerError;
@@ -911,6 +990,7 @@ mod tests {
             "authenticate",
             "authenticate",
             &SearchFilters::default(),
+            5,
             5,
             60.0,
             dim,
@@ -950,6 +1030,7 @@ mod tests {
             "authenticate",
             &SearchFilters::default(),
             5,
+            5,
             60.0,
             dim,
             10,
@@ -983,6 +1064,7 @@ mod tests {
             "function",
             "function",
             &SearchFilters::default(),
+            2,
             2,
             60.0,
             dim,
@@ -1037,6 +1119,7 @@ mod tests {
             "function",
             "function",
             &SearchFilters::default(),
+            10,
             10,
             60.0,
             dim,
@@ -1137,6 +1220,7 @@ mod tests {
             id_query,
             &SearchFilters::default(),
             5,
+            5,
             id_params.rrf_k,
             dim,
             10,
@@ -1158,6 +1242,7 @@ mod tests {
             nl_query,
             nl_query,
             &SearchFilters::default(),
+            5,
             5,
             nl_params.rrf_k,
             dim,
