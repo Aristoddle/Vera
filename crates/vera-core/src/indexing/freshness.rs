@@ -120,7 +120,7 @@ pub fn detect_staleness(
                 .is_none_or(|refresh_time| file_may_be_newer(absolute_path, refresh_time))
         })
     {
-        let content = match std::fs::read_to_string(absolute_path) {
+        let content = match crate::discovery::read_source_lossy(absolute_path) {
             Ok(content) => content,
             Err(err) => {
                 warn!(

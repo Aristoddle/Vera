@@ -286,7 +286,7 @@ where
         }
 
         let file_abs = repo_root.join(&file_rel);
-        let content = match std::fs::read_to_string(&file_abs) {
+        let content = match crate::discovery::read_source_lossy(&file_abs) {
             Ok(content) => content,
             Err(e) => {
                 tracing::debug!("skipping {}: {e}", file_rel);

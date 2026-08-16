@@ -85,7 +85,7 @@ pub fn search_regex(
         };
 
         let file_abs = project_root.join(file_rel);
-        let content = match std::fs::read_to_string(&file_abs) {
+        let content = match crate::discovery::read_source_lossy(&file_abs) {
             Ok(c) => c,
             Err(_) => continue,
         };

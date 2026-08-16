@@ -179,6 +179,20 @@ const BINARY_EXTENSIONS: &[&str] = &[
     "bin", "dat", "pak",
 ];
 
+/// Read a source file as UTF-8, replacing invalid sequences lossily.
+///
+/// Discovery already excludes binary files, so a file that reaches this
+/// helper is considered text; strict `read_to_string` would skip text files
+/// with stray invalid bytes (mixed encodings, latin-1 notes). Lossy decoding
+/// indexes them instead of silently dropping them from the index.
+pub fn read_source_lossy(path: &Path) -> std::io::Result<String> {
+    let bytes = std::fs::read(path)?;
+    match String::from_utf8(bytes) {
+        Ok(text) => Ok(text),
+        Err(err) => Ok(String::from_utf8_lossy(err.as_bytes()).into_owned()),
+    }
+}
+
 /// Discover source files in a directory tree.
 ///
 /// Walks the directory respecting .gitignore patterns and default exclusions.
@@ -883,6 +897,22 @@ mod tests {
 
     fn default_config() -> IndexingConfig {
         IndexingConfig::default()
+    }
+
+    #[test]
+    fn read_source_lossy_decodes_invalid_utf8() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("notes.txt");
+        // Latin-1 "café" with an invalid UTF-8 byte sequence.
+        fs::write(&path, b"caf\xe9\nplain text\n").unwrap();
+
+        let content = read_source_lossy(&path).unwrap();
+        assert!(content.contains("caf\u{FFFD}"));
+        assert!(content.contains("plain text"));
+
+        let good = dir.path().join("ok.rs");
+        fs::write(&good, "fn main() {}\n").unwrap();
+        assert_eq!(read_source_lossy(&good).unwrap(), "fn main() {}\n");
     }
 
     #[test]

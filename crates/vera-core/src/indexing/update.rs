@@ -283,7 +283,7 @@ where
     // Read file contents and compute hashes for current files.
     let mut current_files: HashMap<String, String> = HashMap::new(); // rel_path → content
     for file in &disc.files {
-        match std::fs::read_to_string(&file.absolute_path) {
+        match discovery::read_source_lossy(&file.absolute_path) {
             Ok(content) => {
                 current_files.insert(file.relative_path.clone(), content);
             }

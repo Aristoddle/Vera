@@ -43,7 +43,7 @@ pub fn search_callers(
         }
 
         let file_abs = repo_root.join(&caller.file_path);
-        let content = match std::fs::read_to_string(&file_abs) {
+        let content = match crate::discovery::read_source_lossy(&file_abs) {
             Ok(content) => content,
             Err(_) => continue,
         };

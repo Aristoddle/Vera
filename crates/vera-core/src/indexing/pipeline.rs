@@ -390,7 +390,7 @@ fn parse_discovered_files_parallel(
                 };
             }
 
-            let source = match std::fs::read_to_string(&file.absolute_path) {
+            let source = match crate::discovery::read_source_lossy(&file.absolute_path) {
                 Ok(source) => source,
                 Err(err) => {
                     warn!(
