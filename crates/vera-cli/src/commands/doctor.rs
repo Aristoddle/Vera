@@ -407,6 +407,19 @@ fn probe_local_backend(
         });
     }
 
+    // No prebuilt reranker ONNX export runs on the CoreML GPU (the quantized
+    // export has ops the CoreML EP cannot execute, the fp16 export has an
+    // unsupported input dtype), so ORT silently falls back to CPU for the
+    // reranker even though the embedding model is GPU-accelerated. The probes
+    // above cannot detect this, so surface it deterministically here.
+    if ep == vera_core::config::OnnxExecutionProvider::CoreMl {
+        checks.push(DoctorCheck {
+            name: "probe-reranker-coreml-cpu",
+            status: CheckStatus::Warn,
+            detail: "the reranker runs on CPU under CoreML (no CoreML-compatible reranker ONNX export exists); only the embedding model is GPU-accelerated. Reranking will be slower than embedding. If reranking latency is unacceptable, disable it with `vera config set retrieval.reranking_enabled false`".to_string(),
+        });
+    }
+
     Ok(checks)
 }
 

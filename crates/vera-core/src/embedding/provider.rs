@@ -630,8 +630,8 @@ fn context_size_info(error: &EmbeddingError) -> Option<ContextSizeInfo> {
     let batch_tokens_re =
         BATCH_TOKENS_RE.get_or_init(|| Regex::new(r"your batch has (\d+) tokens?").unwrap());
     // OpenAI: `Invalid 'input[3]': maximum input length is 8192 tokens.`
-    let max_input_length_re = MAX_INPUT_LENGTH_RE
-        .get_or_init(|| Regex::new(r"maximum input length is (\d+)").unwrap());
+    let max_input_length_re =
+        MAX_INPUT_LENGTH_RE.get_or_init(|| Regex::new(r"maximum input length is (\d+)").unwrap());
 
     let max_tokens = n_ctx_re
         .captures(&lower)

@@ -43,16 +43,17 @@ pub const LEGACY_EMBEDDING_QUERY_PREFIX_ENV: &str = "VERA_EMBEDDING_QUERY_PREFIX
 
 const RERANKER_REPO: &str = "jinaai/jina-reranker-v2-base-multilingual";
 const RERANKER_ONNX_FILE: &str = "onnx/model_quantized.onnx";
-/// CoreML cannot execute the quantized reranker export because it contains
-/// DynamicQuantizeLinear/MatMulInteger ops that the CoreML EP does not support.
-const RERANKER_ONNX_COREML_FILE: &str = "onnx/model_fp16.onnx";
 const RERANKER_TOKENIZER_FILE: &str = "tokenizer.json";
 
-pub fn reranker_onnx_file_for_ep(ep: OnnxExecutionProvider) -> &'static str {
-    match ep {
-        OnnxExecutionProvider::CoreMl => RERANKER_ONNX_COREML_FILE,
-        _ => RERANKER_ONNX_FILE,
-    }
+/// No prebuilt reranker ONNX export runs on the CoreML GPU: the quantized
+/// export contains DynamicQuantizeLinear/MatMulInteger ops the CoreML EP cannot
+/// execute, and the fp16 export stores every tensor as float16 which the CoreML
+/// EP rejects as an input dtype (ORT partitions 0 nodes and silently falls back
+/// to CPU). Since CoreML cannot accelerate the reranker either way, all backends
+/// use the quantized INT8 export — the fastest CPU path. `vera doctor` surfaces
+/// the CoreML CPU fallback so the all-green probe does not mislead users.
+pub fn reranker_onnx_file_for_ep(_ep: OnnxExecutionProvider) -> &'static str {
+    RERANKER_ONNX_FILE
 }
 
 /// ONNX Runtime version to auto-download. Using 1.24.4 for CUDA 13 support.
@@ -2777,10 +2778,12 @@ mod tests {
 
     #[test]
     fn reranker_onnx_file_selects_expected_model_per_backend() {
+        // Every backend uses the quantized export: no prebuilt reranker ONNX
+        // runs on the CoreML GPU, and quantized INT8 is the fastest CPU path.
         let cases = [
             (OnnxExecutionProvider::Cpu, RERANKER_ONNX_FILE),
             (OnnxExecutionProvider::Cuda, RERANKER_ONNX_FILE),
-            (OnnxExecutionProvider::CoreMl, RERANKER_ONNX_COREML_FILE),
+            (OnnxExecutionProvider::CoreMl, RERANKER_ONNX_FILE),
         ];
 
         for (ep, expected) in cases {
