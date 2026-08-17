@@ -27,7 +27,7 @@ use crate::{
 type ProviderPair = (Arc<DynamicProvider>, Option<Arc<DynamicReranker>>);
 type AcquireError = (StatusCode, Json<ApiError>);
 
-async fn load_fresh(state: &AppState) -> Result<ProviderPair, AcquireError> {
+async fn load_embedding(state: &AppState) -> Result<Arc<DynamicProvider>, AcquireError> {
     let (embedding, _) =
         vera_core::embedding::create_dynamic_provider(&state.config, state.backend)
             .await
@@ -35,30 +35,37 @@ async fn load_fresh(state: &AppState) -> Result<ProviderPair, AcquireError> {
                 error!(error = %e, "failed to load embedding model");
                 (
                     StatusCode::SERVICE_UNAVAILABLE,
-                    Json(ApiError {
-                        error: "embedding model unavailable".into(),
-                    }),
+                    Json(ApiError::new("embedding model unavailable", "server_error")),
                 )
             })?;
-    let reranker = if state.reranker_available {
+    Ok(Arc::new(embedding))
+}
+
+async fn load_reranker(state: &AppState) -> Result<Option<Arc<DynamicReranker>>, AcquireError> {
+    if !state.reranker_available {
+        return Ok(None);
+    }
+
+    Ok(
         vera_core::retrieval::create_dynamic_reranker(&state.config, state.backend)
             .await
             .unwrap_or_else(|e| {
                 error!(error = %e, "failed to load reranker");
                 None
             })
-            .map(Arc::new)
-    } else {
-        None
-    };
-    Ok((Arc::new(embedding), reranker))
+            .map(Arc::new),
+    )
 }
 
-/// Acquire providers: per-request (no cache) or from the idle cache.
-async fn acquire_providers(state: &AppState) -> Result<ProviderPair, AcquireError> {
+async fn load_fresh(state: &AppState) -> Result<ProviderPair, AcquireError> {
+    Ok((load_embedding(state).await?, load_reranker(state).await?))
+}
+
+/// Acquire the embedding provider: per-request when the cache is disabled, or
+/// from the shared pair cache when an idle timeout was configured.
+async fn acquire_embedding(state: &AppState) -> Result<Arc<DynamicProvider>, AcquireError> {
     if state.idle_timeout.is_none() {
-        // Cache disabled — load fresh, drop when handler returns.
-        return load_fresh(state).await;
+        return load_embedding(state).await;
     }
 
     let mut guard = state.provider_cache.lock().await;
@@ -70,12 +77,30 @@ async fn acquire_providers(state: &AppState) -> Result<ProviderPair, AcquireErro
             last_used: Instant::now(),
         });
     }
-    let cached = guard.as_mut().unwrap();
+    let cached = guard.as_mut().expect("provider cache initialized");
     cached.last_used = Instant::now();
-    Ok((
-        Arc::clone(&cached.embedding),
-        cached.reranker.as_ref().map(Arc::clone),
-    ))
+    Ok(Arc::clone(&cached.embedding))
+}
+
+/// Acquire the reranker: per-request when the cache is disabled, or from the
+/// shared pair cache when an idle timeout was configured.
+async fn acquire_reranker(state: &AppState) -> Result<Option<Arc<DynamicReranker>>, AcquireError> {
+    if state.idle_timeout.is_none() {
+        return load_reranker(state).await;
+    }
+
+    let mut guard = state.provider_cache.lock().await;
+    if guard.is_none() {
+        let (embedding, reranker) = load_fresh(state).await?;
+        *guard = Some(CachedProviders {
+            embedding,
+            reranker,
+            last_used: Instant::now(),
+        });
+    }
+    let cached = guard.as_mut().expect("provider cache initialized");
+    cached.last_used = Instant::now();
+    Ok(cached.reranker.as_ref().map(Arc::clone))
 }
 
 // ── Auth ──────────────────────────────────────────────────────────────────────
@@ -103,9 +128,10 @@ fn check_auth(state: &AppState, headers: &HeaderMap) -> Option<(StatusCode, Json
     if !constant_time_eq(provided, key) {
         Some((
             StatusCode::UNAUTHORIZED,
-            Json(ApiError {
-                error: "invalid or missing API key".into(),
-            }),
+            Json(ApiError::new(
+                "invalid or missing API key",
+                "authentication_error",
+            )),
         ))
     } else {
         None
@@ -125,16 +151,17 @@ pub async fn embeddings(
     if req.input.is_empty() {
         return (
             StatusCode::BAD_REQUEST,
-            Json(ApiError {
-                error: "input must not be empty".into(),
-            }),
+            Json(ApiError::new(
+                "input must not be empty",
+                "invalid_request_error",
+            )),
         )
             .into_response();
     }
 
     let total_chars: usize = req.input.iter().map(|s| s.len()).sum();
 
-    let (provider, _) = match acquire_providers(&state).await {
+    let provider = match acquire_embedding(&state).await {
         Ok(p) => p,
         Err((status, body)) => return (status, body).into_response(),
     };
@@ -166,18 +193,14 @@ pub async fn embeddings(
         }
         Err(EmbeddingError::Cancelled) => (
             StatusCode::from_u16(499).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
-            Json(ApiError {
-                error: "request cancelled".into(),
-            }),
+            Json(ApiError::new("request cancelled", "server_error")),
         )
             .into_response(),
         Err(e) => {
             error!(error = %e, "embedding inference failed");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiError {
-                    error: "internal server error".into(),
-                }),
+                Json(ApiError::new("internal server error", "server_error")),
             )
                 .into_response()
         }
@@ -197,23 +220,25 @@ pub async fn rerank(
     if !state.reranker_available {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(ApiError {
-                error: "reranker not available on this server".into(),
-            }),
+            Json(ApiError::new(
+                "reranker not available on this server",
+                "server_error",
+            )),
         )
             .into_response();
     }
 
-    let (_, reranker_opt) = match acquire_providers(&state).await {
+    let reranker_opt = match acquire_reranker(&state).await {
         Ok(p) => p,
         Err((status, body)) => return (status, body).into_response(),
     };
     let Some(reranker) = reranker_opt else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(ApiError {
-                error: "reranker not available on this server".into(),
-            }),
+            Json(ApiError::new(
+                "reranker not available on this server",
+                "server_error",
+            )),
         )
             .into_response();
     };
@@ -252,18 +277,14 @@ pub async fn rerank(
         }
         Err(RerankerError::Cancelled) => (
             StatusCode::from_u16(499).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
-            Json(ApiError {
-                error: "request cancelled".into(),
-            }),
+            Json(ApiError::new("request cancelled", "server_error")),
         )
             .into_response(),
         Err(e) => {
             error!(error = %e, "rerank inference failed");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiError {
-                    error: "internal server error".into(),
-                }),
+                Json(ApiError::new("internal server error", "server_error")),
             )
                 .into_response()
         }

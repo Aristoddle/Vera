@@ -99,5 +99,36 @@ pub struct HealthResponse {
 
 #[derive(Serialize)]
 pub struct ApiError {
-    pub error: String,
+    pub error: ApiErrorDetails,
+}
+
+#[derive(Serialize)]
+pub struct ApiErrorDetails {
+    pub message: String,
+    #[serde(rename = "type")]
+    pub error_type: String,
+}
+
+impl ApiError {
+    pub fn new(message: impl Into<String>, error_type: impl Into<String>) -> Self {
+        Self {
+            error: ApiErrorDetails {
+                message: message.into(),
+                error_type: error_type.into(),
+            },
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn api_error_has_structured_message_and_type() {
+        let error = ApiError::new("bad input", "invalid_request_error");
+
+        assert_eq!(error.error.message, "bad input");
+        assert_eq!(error.error.error_type, "invalid_request_error");
+    }
 }
