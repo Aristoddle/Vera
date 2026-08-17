@@ -7,7 +7,6 @@ Modes:
   - hybrid          : BM25 + vector via RRF fusion + reranking (default)
   - hybrid-norerank : BM25 + vector via RRF fusion, no reranking
   - bm25-only       : BM25 keyword search only (no embedding API)
-  - vector-only     : Vector similarity search only (embedding API)
 
 Usage:
     python3 benchmarks/scripts/run_vera_benchmarks.py [--mode MODE] [--runs N]
@@ -116,7 +115,6 @@ def run_search(
       - hybrid          : full pipeline (BM25 + vector + reranking)
       - hybrid-norerank : BM25 + vector, no reranking
       - bm25-only       : BM25 only (unset embedding env vars)
-      - vector-only     : handled by calling vector search directly
     """
     repo_path = CORPUS_DIR / repo_name
     full_env = {**os.environ, **env}
@@ -137,19 +135,6 @@ def run_search(
             "RERANKER_MODEL_API_KEY",
         ]:
             full_env.pop(key, None)
-    elif mode == "vector-only":
-        # We'll handle vector-only by searching with the hybrid pipeline
-        # but the BM25 results will naturally merge via RRF.
-        # A true vector-only mode would require passing a flag.
-        # For now, we run hybrid without reranking and note this in the report.
-        # Actually, let's use a different approach: we need to modify the pipeline.
-        # Since we can't easily do vector-only via CLI, we'll run hybrid-norerank
-        # and note this is a hybrid baseline. For a true vector-only comparison,
-        # we use the M1 vector-only baseline from the competitor baselines.
-        # UPDATE: Let's create a proper vector-only by disabling BM25 contribution.
-        # Since the CLI doesn't support a --mode flag, we'll note this limitation.
-        pass
-
     cmd = [
         str(VERA_BIN),
         "--json",
@@ -508,35 +493,26 @@ def verify_assertions(vera_results: dict[str, dict]) -> list[tuple[str, bool, st
         f"hybrid={h_mrr:.4f}, bm25-only={b_mrr:.4f}",
     ))
 
-    # 2. Hybrid MRR@10 > vector-only MRR@10
-    # Use M1 baseline vector-only if we don't have vera vector-only
-    if "vector-only" in vera_results:
-        v_mrr = vera_results["vector-only"]["aggregate"]["retrieval"].get("mrr", 0)
-        checks.append((
-            "Hybrid MRR@10 > vector-only MRR@10",
-            h_mrr > v_mrr,
-            f"hybrid={h_mrr:.4f}, vector-only={v_mrr:.4f}",
-        ))
-    else:
-        # Fall back to M1 baseline
-        baselines = load_baselines()
-        if baselines and "vector-only" in baselines:
-            v_mrr = baselines["vector-only"]["aggregate"]["retrieval"].get("mrr", 0)
-        elif baselines:
-            # Try other keys
-            for key, data in baselines.items():
-                if "vector" in key.lower():
-                    v_mrr = data["aggregate"]["retrieval"].get("mrr", 0)
-                    break
-            else:
-                v_mrr = 0.2814  # Hardcoded from baseline report
+    # 2. Hybrid MRR@10 > vector-only MRR@10 (M1 baseline; the CLI has no
+    # vector-only mode, so Vera-side vector-only numbers cannot be produced)
+    baselines = load_baselines()
+    if baselines and "vector-only" in baselines:
+        v_mrr = baselines["vector-only"]["aggregate"]["retrieval"].get("mrr", 0)
+    elif baselines:
+        # Try other keys
+        for key, data in baselines.items():
+            if "vector" in key.lower():
+                v_mrr = data["aggregate"]["retrieval"].get("mrr", 0)
+                break
         else:
-            v_mrr = 0.2814
-        checks.append((
-            "Hybrid MRR@10 > vector-only MRR@10 (M1 baseline)",
-            h_mrr > v_mrr,
-            f"hybrid={h_mrr:.4f}, vector-only-baseline={v_mrr:.4f}",
-        ))
+            v_mrr = 0.2814  # Hardcoded from baseline report
+    else:
+        v_mrr = 0.2814
+    checks.append((
+        "Hybrid MRR@10 > vector-only MRR@10 (M1 baseline)",
+        h_mrr > v_mrr,
+        f"hybrid={h_mrr:.4f}, vector-only-baseline={v_mrr:.4f}",
+    ))
 
     # 3. Reranked Precision@3 > unreranked Precision@3
     h_p3 = hybrid.get("precision_at_3", 0)
@@ -584,7 +560,7 @@ def main():
         "--modes",
         nargs="+",
         default=["hybrid", "hybrid-norerank", "bm25-only"],
-        choices=["hybrid", "hybrid-norerank", "bm25-only", "vector-only"],
+        choices=["hybrid", "hybrid-norerank", "bm25-only"],
         help="Retrieval modes to benchmark",
     )
     parser.add_argument(
