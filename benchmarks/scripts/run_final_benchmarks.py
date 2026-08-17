@@ -18,8 +18,23 @@ Requires:
     - No existing .vera indexes (script cleans them)
 """
 
+from bench_common import (
+    TASKS_DIR,
+    binary_version,
+    compute_task_metrics,
+    git_sha,
+    is_match,
+    load_secrets,
+    load_tasks,
+    matched_relevances,
+    mrr,
+    ndcg_at_k,
+    percentile,
+    precision_at_k,
+    recall_at_k,
+)
+
 import json
-import math
 import os
 import subprocess
 import sys
@@ -30,7 +45,6 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 VERA_BIN = REPO_ROOT / "target" / "release" / "vera"
 CORPUS_DIR = REPO_ROOT / ".bench" / "repos"
-TASKS_DIR = REPO_ROOT / "eval" / "tasks"
 RESULTS_DIR = REPO_ROOT / "benchmarks" / "results" / "final-suite"
 REPORTS_DIR = REPO_ROOT / "benchmarks" / "reports"
 BASELINES_FILE = (
@@ -42,47 +56,8 @@ REPO_ORDER = ["ripgrep", "flask", "fastify", "turborepo"]
 COOLDOWN_SECS = 15  # pause between repos for API rate limit recovery
 
 
-def load_secrets() -> dict[str, str]:
-    """Load API credentials from secrets.env."""
-    secrets_path = REPO_ROOT / "secrets.env"
-    env = {}
-    if secrets_path.exists():
-        with open(secrets_path) as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                if "=" in line:
-                    key, _, value = line.partition("=")
-                    value = value.strip().strip("'\"")
-                    env[key.strip()] = value
-    return env
 
 
-def load_tasks() -> list[dict]:
-    """Load all 21 benchmark tasks."""
-    tasks = []
-    for task_file in sorted(TASKS_DIR.glob("*.json")):
-        with open(task_file) as f:
-            file_tasks = json.load(f)
-            tasks.extend(file_tasks)
-    return tasks
-
-
-def get_vera_version() -> str:
-    result = subprocess.run(
-        [str(VERA_BIN), "--version"],
-        capture_output=True, text=True, timeout=10,
-    )
-    return result.stdout.strip()
-
-
-def get_git_sha() -> str:
-    result = subprocess.run(
-        ["git", "rev-parse", "HEAD"],
-        capture_output=True, text=True, cwd=REPO_ROOT, timeout=10,
-    )
-    return result.stdout.strip()
 
 
 # ── Indexing ──────────────────────────────────────────────────────────
@@ -235,99 +210,12 @@ def run_search(
     return (results, elapsed_ms)
 
 
-def is_match(result: dict, gt: dict) -> bool:
-    return (
-        result.get("file_path") == gt["file_path"]
-        and result.get("line_start", 0) <= gt["line_end"]
-        and result.get("line_end", 0) >= gt["line_start"]
-    )
 
 
-def recall_at_k(results: list[dict], ground_truth: list[dict], k: int) -> float:
-    if not ground_truth:
-        return 0.0
-    top_k = results[:k]
-    found = sum(1 for gt in ground_truth if any(is_match(r, gt) for r in top_k))
-    return found / len(ground_truth)
 
 
-def mrr_score(results: list[dict], ground_truth: list[dict]) -> float:
-    for i, result in enumerate(results):
-        if any(is_match(result, gt) for gt in ground_truth):
-            return 1.0 / (i + 1)
-    return 0.0
 
 
-def precision_at_k(results: list[dict], ground_truth: list[dict], k: int) -> float:
-    top_k = results[:k]
-    if not top_k:
-        return 0.0
-    relevant = sum(
-        1 for r in top_k if any(is_match(r, gt) for gt in ground_truth)
-    )
-    return relevant / len(top_k)
-
-
-def matched_relevances(results: list[dict], ground_truth: list[dict], k: int) -> list[int]:
-    top_k = results[:k]
-    used = [False] * len(ground_truth)
-    relevances = []
-
-    for result in top_k:
-        best_idx = None
-        best_rel = 0
-        for idx, gt in enumerate(ground_truth):
-            if used[idx] or not is_match(result, gt):
-                continue
-            rel = gt.get("relevance", 1)
-            if rel > best_rel:
-                best_idx = idx
-                best_rel = rel
-
-        if best_idx is not None:
-            used[best_idx] = True
-            relevances.append(best_rel)
-        else:
-            relevances.append(0)
-
-    return relevances
-
-
-def ndcg_at_k(results: list[dict], ground_truth: list[dict], k: int) -> float:
-    dcg = 0.0
-    for i, relevance in enumerate(matched_relevances(results, ground_truth, k)):
-        dcg += relevance / math.log2(i + 2.0)
-
-    ideal_rels = sorted(
-        [gt.get("relevance", 1) for gt in ground_truth], reverse=True
-    )[:k]
-    ideal_dcg = sum(rel / math.log2(i + 2.0) for i, rel in enumerate(ideal_rels))
-    return dcg / ideal_dcg if ideal_dcg > 0 else 0.0
-
-
-def compute_task_metrics(results: list[dict], ground_truth: list[dict]) -> dict:
-    return {
-        "recall_at_1": recall_at_k(results, ground_truth, 1),
-        "recall_at_5": recall_at_k(results, ground_truth, 5),
-        "recall_at_10": recall_at_k(results, ground_truth, 10),
-        "mrr": mrr_score(results, ground_truth),
-        "ndcg": ndcg_at_k(results, ground_truth, 10),
-        "precision_at_3": precision_at_k(results, ground_truth, 3),
-    }
-
-
-def percentile(values: list[float], p: float) -> float:
-    if not values:
-        return 0.0
-    sorted_vals = sorted(values)
-    n = len(sorted_vals)
-    if n == 1:
-        return sorted_vals[0]
-    rank = p / 100.0 * (n - 1)
-    lower = int(rank)
-    upper = min(lower + 1, n - 1)
-    frac = rank - lower
-    return sorted_vals[lower] * (1 - frac) + sorted_vals[upper] * frac
 
 
 # ── Benchmark Runner ─────────────────────────────────────────────────
@@ -552,8 +440,8 @@ def generate_report(
     add()
 
     add("### Vera Configuration")
-    add(f"- **Version:** {get_vera_version()}")
-    add(f"- **Git SHA:** `{get_git_sha()}`")
+    add(f"- **Version:** {binary_version(VERA_BIN)}")
+    add(f"- **Git SHA:** `{git_sha()}`")
     add("- **Build:** `cargo build --release` (optimized)")
     add("- **Embedding model:** Qwen3-Embedding-8B (4096→1024-dim Matryoshka truncation)")
     add("- **Reranker model:** Qwen3-Reranker (cross-encoder via API)")
@@ -1078,8 +966,8 @@ def main():
     baselines = load_baselines()
     timestamp = datetime.now(timezone.utc).isoformat()
 
-    print(f"Vera version: {get_vera_version()}")
-    print(f"Git SHA: {get_git_sha()}")
+    print(f"Vera version: {binary_version(VERA_BIN)}")
+    print(f"Git SHA: {git_sha()}")
     print(f"Tasks: {len(tasks)}")
     print(f"Repos: {', '.join(REPO_ORDER)}")
     print(f"Baselines loaded: {list(baselines.keys()) if baselines else 'None'}")
@@ -1120,8 +1008,8 @@ def main():
         print(f"Saved: {output_file}")
 
     combined = {
-        "vera_version": get_vera_version(),
-        "git_sha": get_git_sha(),
+        "vera_version": binary_version(VERA_BIN),
+        "git_sha": git_sha(),
         "timestamp": timestamp,
         "modes": vera_results,
         "index_stats": index_stats,

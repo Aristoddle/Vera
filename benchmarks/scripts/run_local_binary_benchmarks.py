@@ -21,10 +21,21 @@ from pathlib import Path
 from statistics import median
 from typing import Any
 
+from bench_common import (
+    TASKS_DIR,
+    binary_version,
+    git_sha,
+    is_match,
+    load_tasks,
+    matched_relevances,
+    mrr,
+    ndcg_at_k,
+    recall_at_k,
+)
+
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 CORPUS_DIR = REPO_ROOT / ".bench" / "repos"
-TASKS_DIR = REPO_ROOT / "eval" / "tasks"
 RESULTS_DIR = REPO_ROOT / "benchmarks" / "results" / "local-binaries"
 METRIC_KEYS = ["recall_at_1", "recall_at_5", "recall_at_10", "mrr", "ndcg"]
 
@@ -55,12 +66,6 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def load_tasks() -> list[dict[str, Any]]:
-    tasks: list[dict[str, Any]] = []
-    for task_file in sorted(TASKS_DIR.glob("*.json")):
-        tasks.extend(json.loads(task_file.read_text()))
-    return tasks
-
 
 def repo_order(tasks: list[dict[str, Any]]) -> list[str]:
     seen = set()
@@ -84,83 +89,11 @@ def run_json(cmd: list[str], cwd: Path) -> tuple[Any, float]:
     return (json.loads(stdout) if stdout else [], elapsed)
 
 
-def binary_version(binary: Path) -> str:
-    proc = subprocess.run(
-        [str(binary), "--version"],
-        text=True,
-        capture_output=True,
-        timeout=10,
-    )
-    return proc.stdout.strip() or proc.stderr.strip() or "unknown"
 
 
-def git_sha() -> str:
-    proc = subprocess.run(
-        ["git", "rev-parse", "HEAD"],
-        cwd=REPO_ROOT,
-        text=True,
-        capture_output=True,
-        timeout=10,
-    )
-    return proc.stdout.strip()
 
 
-def is_match(result: dict[str, Any], gt: dict[str, Any]) -> bool:
-    return (
-        result.get("file_path") == gt["file_path"]
-        and result.get("line_start", 0) <= gt["line_end"]
-        and result.get("line_end", 0) >= gt["line_start"]
-    )
 
-
-def recall_at_k(results: list[dict[str, Any]], ground_truth: list[dict[str, Any]], k: int) -> float:
-    if not ground_truth:
-        return 0.0
-    top_k = results[:k]
-    found = sum(1 for gt in ground_truth if any(is_match(result, gt) for result in top_k))
-    return found / len(ground_truth)
-
-
-def mrr(results: list[dict[str, Any]], ground_truth: list[dict[str, Any]]) -> float:
-    for idx, result in enumerate(results):
-        if any(is_match(result, gt) for gt in ground_truth):
-            return 1.0 / (idx + 1)
-    return 0.0
-
-
-def matched_relevances(
-    results: list[dict[str, Any]],
-    ground_truth: list[dict[str, Any]],
-    k: int,
-) -> list[int]:
-    used = [False] * len(ground_truth)
-    relevances = []
-    for result in results[:k]:
-        best_idx = None
-        best_rel = 0
-        for idx, gt in enumerate(ground_truth):
-            if used[idx] or not is_match(result, gt):
-                continue
-            rel = gt.get("relevance", 1)
-            if rel > best_rel:
-                best_idx = idx
-                best_rel = rel
-        if best_idx is None:
-            relevances.append(0)
-        else:
-            used[best_idx] = True
-            relevances.append(best_rel)
-    return relevances
-
-
-def ndcg(results: list[dict[str, Any]], ground_truth: list[dict[str, Any]], k: int = 10) -> float:
-    dcg = sum(
-        rel / math.log2(rank + 2.0)
-        for rank, rel in enumerate(matched_relevances(results, ground_truth, k))
-    )
-    ideal = sorted((gt.get("relevance", 1) for gt in ground_truth), reverse=True)[:k]
-    idcg = sum(rel / math.log2(rank + 2.0) for rank, rel in enumerate(ideal))
-    return dcg / idcg if idcg > 0 else 0.0
 
 
 def aggregate_metrics(rows: list[dict[str, Any]]) -> dict[str, float]:
@@ -229,7 +162,7 @@ def run_task(
         "recall_at_5": recall_at_k(results, task["ground_truth"], 5),
         "recall_at_10": recall_at_k(results, task["ground_truth"], 10),
         "mrr": mrr(results, task["ground_truth"]),
-        "ndcg": ndcg(results, task["ground_truth"], 10),
+        "ndcg": ndcg_at_k(results, task["ground_truth"], 10),
     }
     return {
         "task_id": task["id"],

@@ -14,19 +14,19 @@ Environment:
     (from secrets.env, needed for vector-only baseline)
 """
 
+from bench_common import TASKS_DIR, is_match, mrr, percentile, recall_at_k
+
 import json
 import math
 import os
 import re
 import subprocess
-import sys
 import time
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
-TASKS_DIR = REPO_ROOT / "eval" / "tasks"
 CORPUS_FILE = REPO_ROOT / "eval" / "corpus.toml"
 BENCH_REPOS = REPO_ROOT / ".bench" / "repos"
 RESULTS_DIR = REPO_ROOT / "benchmarks" / "results" / "competitor-baselines"
@@ -62,27 +62,7 @@ def load_corpus() -> dict:
 # Metrics computation (mirrors eval harness metrics)
 # ---------------------------------------------------------------------------
 
-def is_match(result: dict, gt: dict) -> bool:
-    """Check if result overlaps with ground truth entry."""
-    return (result["file_path"] == gt["file_path"]
-            and result["line_start"] <= gt["line_end"]
-            and result["line_end"] >= gt["line_start"])
 
-
-def recall_at_k(results: list[dict], ground_truth: list[dict], k: int) -> float:
-    if not ground_truth:
-        return 0.0
-    top_k = results[:k]
-    found = sum(1 for gt in ground_truth
-                if any(is_match(r, gt) for r in top_k))
-    return found / len(ground_truth)
-
-
-def mrr(results: list[dict], ground_truth: list[dict]) -> float:
-    for i, r in enumerate(results):
-        if any(is_match(r, gt) for gt in ground_truth):
-            return 1.0 / (i + 1)
-    return 0.0
 
 
 def ndcg(results: list[dict], ground_truth: list[dict], k: int = 10) -> float:
@@ -109,20 +89,6 @@ def compute_metrics(results: list[dict], ground_truth: list[dict]) -> dict:
         "ndcg": ndcg(results, ground_truth, 10),
     }
 
-
-def percentile(values: list[float], p: float) -> float:
-    if not values:
-        return 0.0
-    values = sorted(values)
-    if len(values) == 1:
-        return values[0]
-    rank = p / 100.0 * (len(values) - 1)
-    lower = int(math.floor(rank))
-    upper = int(math.ceil(rank))
-    frac = rank - lower
-    if lower == upper:
-        return values[lower]
-    return values[lower] * (1 - frac) + values[upper] * frac
 
 
 def estimate_tokens(text: str) -> int:
