@@ -86,9 +86,7 @@ pub(crate) fn file_role_label(file_path: &str, language: Language) -> &'static s
 
 pub(crate) fn is_path_weighted_query(query: &str) -> bool {
     let lower = query.trim().to_ascii_lowercase();
-    lower.contains('/')
-        || lower.contains('\\')
-        || lower.contains(".toml")
+    if lower.contains(".toml")
         || lower.contains(".json")
         || lower.contains(".yaml")
         || lower.contains(".yml")
@@ -97,4 +95,38 @@ pub(crate) fn is_path_weighted_query(query: &str) -> bool {
         || lower.contains("dockerfile")
         || lower.contains("makefile")
         || lower.contains("cmakelists.txt")
+    {
+        return true;
+    }
+
+    // A slash alone does not make a path query: prose like "read/write
+    // request handling" must stay semantic. Require a slash-bearing token
+    // that is the whole query or has path shape (prefix or file extension).
+    let tokens: Vec<&str> = lower
+        .split_whitespace()
+        .map(crate::retrieval::query_utils::trim_query_token)
+        .filter(|token| !token.is_empty())
+        .collect();
+    tokens
+        .iter()
+        .any(|token| is_path_shaped_token(token, tokens.len() == 1))
+}
+
+fn is_path_shaped_token(token: &str, single_token_query: bool) -> bool {
+    if !token.contains('/') && !token.contains('\\') {
+        return false;
+    }
+    if single_token_query
+        || token.starts_with("./")
+        || token.starts_with("../")
+        || token.starts_with('/')
+        || token.starts_with('~')
+        || token.as_bytes().get(1) == Some(&b':')
+    // Windows drive prefix
+    {
+        return true;
+    }
+    // src/main.rs: the last path segment carries a file extension.
+    let last_segment = token.rsplit(['/', '\\']).next().unwrap_or(token);
+    last_segment.contains('.')
 }

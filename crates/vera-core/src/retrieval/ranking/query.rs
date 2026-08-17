@@ -52,22 +52,25 @@ impl QueryFeatures {
             .cloned();
         let exact_filename = cleaned_tokens
             .iter()
-            .find(|token| looks_like_filename(token))
+            .find(|token| looks_like_filename(token) && !looks_like_qualified_identifier(token))
             .map(|token| file_name(token).to_string());
         let exact_identifier = raw_tokens
             .iter()
             .map(|token| trim_query_token(token))
             .find(|token| {
                 !token.is_empty()
-                    && !looks_like_filename(&token.to_ascii_lowercase())
-                    && looks_like_compound_identifier(token)
+                    && (looks_like_qualified_identifier(token)
+                        || (!looks_like_filename(&token.to_ascii_lowercase())
+                            && looks_like_compound_identifier(token)))
             })
             .map(|token| token.to_ascii_lowercase())
             .or_else(|| {
                 if query_type == QueryType::Identifier && cleaned_tokens.len() == 1 {
                     cleaned_tokens
                         .first()
-                        .filter(|token| !looks_like_filename(token))
+                        .filter(|token| {
+                            !looks_like_filename(token) || looks_like_qualified_identifier(token)
+                        })
                         .cloned()
                 } else {
                     None
@@ -79,14 +82,18 @@ impl QueryFeatures {
                 .map(|token| trim_query_token(token))
                 .find(|token| {
                     !token.is_empty()
-                        && !looks_like_filename(&token.to_ascii_lowercase())
-                        && looks_like_compound_identifier(token)
+                        && (looks_like_qualified_identifier(token)
+                            || (!looks_like_filename(&token.to_ascii_lowercase())
+                                && looks_like_compound_identifier(token)))
                 })
                 .map(ToString::to_string)
         });
         let keywords = cleaned_tokens
             .iter()
-            .filter(|token| !looks_like_filename(token) && !is_query_stopword(token))
+            .filter(|token| {
+                (!looks_like_filename(token) || looks_like_qualified_identifier(token))
+                    && !is_query_stopword(token)
+            })
             .map(|token| normalize_token(token))
             .filter(|token| !token.is_empty())
             .collect();
@@ -176,5 +183,49 @@ impl QueryFeatures {
             requested_symbol_types,
             query_type,
         }
+    }
+}
+
+/// Check whether a token is a scope-qualified identifier rather than a file
+/// name whose extension happens to contain a dot.
+pub(crate) fn looks_like_qualified_identifier(token: &str) -> bool {
+    let valid_segment = |segment: &str| {
+        !segment.is_empty()
+            && segment
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+    };
+
+    if token.contains("::") {
+        return token
+            .split("::")
+            .all(|scope| scope.split('.').all(&valid_segment));
+    }
+
+    let segments: Vec<_> = token.split('.').collect();
+    segments.len() >= 3 && segments.iter().all(|segment| valid_segment(segment))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn preserves_scope_qualified_identifiers_as_exact_symbols() {
+        let features = QueryFeatures::from_query("std::io::Error");
+
+        assert_eq!(features.exact_filename, None);
+        assert_eq!(features.exact_identifier.as_deref(), Some("std::io::error"));
+        assert_eq!(
+            features.exact_identifier_case.as_deref(),
+            Some("std::io::Error")
+        );
+    }
+
+    #[test]
+    fn rejects_dotted_file_names_as_qualified_identifiers() {
+        assert!(!looks_like_qualified_identifier("config.toml"));
+        assert!(looks_like_qualified_identifier("config.retrieval.rrf_k"));
+        assert!(looks_like_qualified_identifier("crate::retrieval::hybrid"));
     }
 }

@@ -569,3 +569,22 @@ fn definition_queries_boost_symbol_definitions() {
 
     assert_eq!(ranked[0].symbol_type, Some(SymbolType::Struct));
 }
+
+#[test]
+fn path_weighted_query_requires_path_shaped_token() {
+    // Slash prose stays semantic.
+    assert!(!is_path_weighted_query("read/write request handling"));
+    assert!(!is_path_weighted_query("client/server architecture"));
+    assert!(!is_path_weighted_query("and/or logic in the parser"));
+
+    // Real paths stay path-weighted.
+    assert!(is_path_weighted_query("src/main.rs"));
+    assert!(is_path_weighted_query("crates/vera-core/src"));
+    assert!(is_path_weighted_query("how does src/main.rs work"));
+    assert!(is_path_weighted_query("what lives in ./crates today"));
+    assert!(is_path_weighted_query(r"c:\src\main.rs details"));
+
+    // Config-filename mentions keep the existing substring behavior.
+    assert!(is_path_weighted_query("config.toml loading"));
+    assert!(is_path_weighted_query("dockerfile setup"));
+}

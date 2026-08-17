@@ -79,9 +79,26 @@ pub fn augment_multi_query_exact_matches(
         return Ok(apply_filters(results, filters, result_limit));
     };
 
-    let mut supplemental = Vec::new();
+    let mut per_query: Vec<std::vec::IntoIter<SearchResult>> = Vec::with_capacity(queries.len());
     for (query_index, query) in queries.iter().enumerate() {
-        supplemental.extend(collect_exact_match_candidates(&store, query, query_index)?);
+        per_query.push(collect_exact_match_candidates(&store, query, query_index)?.into_iter());
+    }
+
+    // Interleave candidates across queries (round-robin) so a high-cardinality
+    // first subquery cannot exhaust the result limit before later subqueries
+    // contribute. Per-query ordering is preserved.
+    let mut supplemental = Vec::new();
+    loop {
+        let mut progressed = false;
+        for candidates in &mut per_query {
+            if let Some(candidate) = candidates.next() {
+                supplemental.push(candidate);
+                progressed = true;
+            }
+        }
+        if !progressed {
+            break;
+        }
     }
 
     if supplemental.is_empty() {
@@ -117,7 +134,10 @@ pub(crate) fn collect_exact_match_candidates(
 ) -> Result<Vec<SearchResult>> {
     let mut candidates = Vec::new();
 
-    if let Some(filename) = extract_exact_filename(query).filter(|_| is_path_weighted_query(query))
+    // Bare filename queries ("handler.py") are unambiguous direct lookups, so
+    // they bypass the path-weighted gate that prose queries must pass.
+    if let Some(filename) = extract_exact_filename(query)
+        .filter(|_| is_path_weighted_query(query) || query.split_whitespace().count() == 1)
     {
         let mut matching_files: Vec<String> = store
             .indexed_files()?
@@ -402,11 +422,15 @@ pub(crate) fn extract_exact_filename(query: &str) -> Option<String> {
 }
 
 pub(crate) fn extract_exact_identifier_case(query: &str) -> Option<String> {
+    let single_token_query = query.split_whitespace().count() == 1;
     query
         .split_whitespace()
         .map(trim_query_token)
         .filter(|token| !token.is_empty())
-        .find(|token| !looks_like_filename(token) && looks_like_compound_identifier(token))
+        .find(|token| {
+            (!looks_like_filename(token) || token.contains("::"))
+                && (looks_like_compound_identifier(token) || single_token_query)
+        })
         .map(ToString::to_string)
 }
 
@@ -488,4 +512,26 @@ pub(crate) fn uppercase_identifier_query(identifier: &str) -> bool {
         .chars()
         .next()
         .is_some_and(|ch| ch.is_ascii_uppercase())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extracts_lowercase_single_word_symbols() {
+        assert_eq!(
+            extract_exact_identifier_case("authenticate"),
+            Some("authenticate".to_string())
+        );
+        assert_eq!(extract_exact_identifier_case("Cargo.toml"), None);
+    }
+
+    #[test]
+    fn extracts_scope_qualified_symbols_with_dots() {
+        assert_eq!(
+            extract_exact_identifier_case("std::io::Error"),
+            Some("std::io::Error".to_string())
+        );
+    }
 }

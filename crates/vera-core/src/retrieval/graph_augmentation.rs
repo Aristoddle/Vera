@@ -97,11 +97,21 @@ fn select_seed_symbols(pool: &[SearchResult]) -> Vec<String> {
                 return None;
             }
 
-            let symbol = result.symbol_name.as_deref()?;
+            let symbol = base_symbol_name(result.symbol_name.as_deref()?);
+            if symbol.is_empty() {
+                return None;
+            }
             seen.insert(symbol.to_string()).then(|| symbol.to_string())
         })
         .take(MAX_SEEDS)
         .collect()
+}
+
+fn base_symbol_name(symbol: &str) -> &str {
+    symbol
+        .split_once(" (part ")
+        .map(|(base, _)| base)
+        .unwrap_or(symbol)
 }
 
 fn is_seed_symbol_type(symbol_type: SymbolType) -> bool {
@@ -377,5 +387,27 @@ mod tests {
             );
         }
         assert!(!caller_lookup_is_skipped("authenticate_user"));
+    }
+
+    #[test]
+    fn normalizes_split_chunk_seed_names() {
+        let pool = vec![
+            result(
+                "large.rs",
+                1,
+                1.0,
+                Some("LargeFunction (part 1)"),
+                Some(SymbolType::Function),
+            ),
+            result(
+                "large.rs",
+                20,
+                0.9,
+                Some("LargeFunction (part 2)"),
+                Some(SymbolType::Function),
+            ),
+        ];
+
+        assert_eq!(select_seed_symbols(&pool), vec!["LargeFunction"]);
     }
 }

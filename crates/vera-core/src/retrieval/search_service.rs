@@ -952,4 +952,96 @@ mod tests {
             Some("persist_factory_auth_record")
         );
     }
+
+    #[test]
+    fn multi_query_exact_matches_interleave_across_queries() {
+        let dir = tempdir().unwrap();
+        let metadata_path = dir.path().join("metadata.db");
+        let store = MetadataStore::open(&metadata_path).unwrap();
+
+        let mut chunks: Vec<Chunk> = (0..5)
+            .map(|i| Chunk {
+                id: format!("common:{i}"),
+                file_path: format!("src/common_{i}.rs"),
+                line_start: 1,
+                line_end: 10,
+                content: "pub fn common_fn() {}".to_string(),
+                language: Language::Rust,
+                symbol_type: Some(SymbolType::Function),
+                symbol_name: Some("common_fn".to_string()),
+            })
+            .collect();
+        chunks.push(Chunk {
+            id: "rare:0".to_string(),
+            file_path: "src/rare.rs".to_string(),
+            line_start: 1,
+            line_end: 10,
+            content: "pub fn rare_fn() {}".to_string(),
+            language: Language::Rust,
+            symbol_type: Some(SymbolType::Function),
+            symbol_name: Some("rare_fn".to_string()),
+        });
+        store.insert_chunks(&chunks).unwrap();
+
+        let augmented = augment_multi_query_exact_matches(
+            dir.path(),
+            &["common_fn".to_string(), "rare_fn".to_string()],
+            Vec::new(),
+            &SearchFilters::default(),
+            3,
+        )
+        .unwrap();
+
+        // The first query keeps the top slot, but the second query must
+        // contribute instead of being crowded out by the first query's rows.
+        assert_eq!(augmented.len(), 3);
+        assert_eq!(augmented[0].symbol_name.as_deref(), Some("common_fn"));
+        assert_eq!(augmented[1].symbol_name.as_deref(), Some("rare_fn"));
+    }
+
+    #[test]
+    fn bare_filename_query_gets_exact_file_augmentation() {
+        let dir = tempdir().unwrap();
+        let metadata_path = dir.path().join("metadata.db");
+        let store = MetadataStore::open(&metadata_path).unwrap();
+        store
+            .insert_chunks(&[
+                Chunk {
+                    id: "deep:0".to_string(),
+                    file_path: "deep/nested/handler.py".to_string(),
+                    line_start: 1,
+                    line_end: 20,
+                    content: "def handle(): pass".to_string(),
+                    language: Language::Python,
+                    symbol_type: Some(SymbolType::Function),
+                    symbol_name: Some("handle".to_string()),
+                },
+                Chunk {
+                    id: "shallow:0".to_string(),
+                    file_path: "src/handler.py".to_string(),
+                    line_start: 1,
+                    line_end: 20,
+                    content: "def handle(): pass".to_string(),
+                    language: Language::Python,
+                    symbol_type: Some(SymbolType::Function),
+                    symbol_name: Some("handle".to_string()),
+                },
+            ])
+            .unwrap();
+
+        let augmented = augment_multi_query_exact_matches(
+            dir.path(),
+            &["handler.py".to_string()],
+            Vec::new(),
+            &SearchFilters::default(),
+            5,
+        )
+        .unwrap();
+
+        assert!(
+            !augmented.is_empty(),
+            "a bare filename query must inject exact file chunks"
+        );
+        assert_eq!(augmented[0].file_path, "src/handler.py");
+    }
 }
