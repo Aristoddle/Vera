@@ -81,6 +81,19 @@ fn assert_chunk_metadata(
     assert!(!chunk.id.is_empty(), "chunk id must not be empty");
 }
 
+/// Parse `source` with the default config, panicking on failure.
+fn parse(source: &str, path: &str, lang: Language) -> Vec<crate::types::Chunk> {
+    parse_and_chunk(source, path, lang, &default_config()).unwrap()
+}
+
+/// Find the chunk named `name`, panicking with a clear message if absent.
+fn find_chunk<'a>(chunks: &'a [crate::types::Chunk], name: &str) -> &'a crate::types::Chunk {
+    chunks
+        .iter()
+        .find(|c| c.symbol_name.as_deref() == Some(name))
+        .unwrap_or_else(|| panic!("should find chunk named '{name}'"))
+}
+
 // =========================================================
 // Sample 1: Rust — function with symbol_name exact match
 // =========================================================
@@ -91,12 +104,9 @@ fn metadata_sample_01_rust_function() {
 fn factorial(n: u64) -> u64 {
     if n <= 1 { 1 } else { n * factorial(n - 1) }
 }"#;
-    let chunks = parse_and_chunk(source, "src/math.rs", Language::Rust, &default_config()).unwrap();
+    let chunks = parse(source, "src/math.rs", Language::Rust);
 
-    let func = chunks
-        .iter()
-        .find(|c| c.symbol_name.as_deref() == Some("factorial"))
-        .expect("should find function 'factorial'");
+    let func = find_chunk(&chunks, "factorial");
 
     assert_chunk_metadata(
         func,
@@ -120,13 +130,9 @@ pub struct Point2D {
     pub x: f64,
     pub y: f64,
 }"#;
-    let chunks =
-        parse_and_chunk(source, "src/geometry.rs", Language::Rust, &default_config()).unwrap();
+    let chunks = parse(source, "src/geometry.rs", Language::Rust);
 
-    let struc = chunks
-        .iter()
-        .find(|c| c.symbol_name.as_deref() == Some("Point2D"))
-        .expect("should find struct 'Point2D'");
+    let struc = find_chunk(&chunks, "Point2D");
 
     assert_chunk_metadata(
         struc,
@@ -154,13 +160,9 @@ fn metadata_sample_03_rust_method() {
         self.y += dy;
     }
 }"#;
-    let chunks =
-        parse_and_chunk(source, "src/geometry.rs", Language::Rust, &default_config()).unwrap();
+    let chunks = parse(source, "src/geometry.rs", Language::Rust);
 
-    let mag = chunks
-        .iter()
-        .find(|c| c.symbol_name.as_deref() == Some("magnitude"))
-        .expect("should find method 'magnitude'");
+    let mag = find_chunk(&chunks, "magnitude");
     assert_chunk_metadata(
         mag,
         "src/geometry.rs",
@@ -170,10 +172,7 @@ fn metadata_sample_03_rust_method() {
     );
     assert_content_matches_source(source, mag);
 
-    let translate = chunks
-        .iter()
-        .find(|c| c.symbol_name.as_deref() == Some("translate"))
-        .expect("should find method 'translate'");
+    let translate = find_chunk(&chunks, "translate");
     assert_chunk_metadata(
         translate,
         "src/geometry.rs",
@@ -196,12 +195,9 @@ pub enum HttpStatus {
     NotFound,
     InternalError,
 }"#;
-    let chunks = parse_and_chunk(source, "src/http.rs", Language::Rust, &default_config()).unwrap();
+    let chunks = parse(source, "src/http.rs", Language::Rust);
 
-    let enm = chunks
-        .iter()
-        .find(|c| c.symbol_name.as_deref() == Some("HttpStatus"))
-        .expect("should find enum 'HttpStatus'");
+    let enm = find_chunk(&chunks, "HttpStatus");
 
     assert_chunk_metadata(
         enm,
@@ -223,13 +219,9 @@ fn metadata_sample_05_rust_trait() {
     fn serialize(&self) -> Vec<u8>;
     fn deserialize(data: &[u8]) -> Self;
 }"#;
-    let chunks =
-        parse_and_chunk(source, "src/traits.rs", Language::Rust, &default_config()).unwrap();
+    let chunks = parse(source, "src/traits.rs", Language::Rust);
 
-    let trt = chunks
-        .iter()
-        .find(|c| c.symbol_name.as_deref() == Some("Serializable"))
-        .expect("should find trait 'Serializable'");
+    let trt = find_chunk(&chunks, "Serializable");
 
     assert_chunk_metadata(
         trt,
@@ -252,13 +244,9 @@ fn metadata_sample_06_python_function() {
     dx = x2 - x1
     dy = y2 - y1
     return (dx ** 2 + dy ** 2) ** 0.5"#;
-    let chunks =
-        parse_and_chunk(source, "utils/math.py", Language::Python, &default_config()).unwrap();
+    let chunks = parse(source, "utils/math.py", Language::Python);
 
-    let func = chunks
-        .iter()
-        .find(|c| c.symbol_name.as_deref() == Some("calculate_distance"))
-        .expect("should find function 'calculate_distance'");
+    let func = find_chunk(&chunks, "calculate_distance");
 
     assert_chunk_metadata(
         func,
@@ -296,10 +284,7 @@ fn metadata_sample_07_python_class_methods_split() {
     .unwrap();
 
     // Python class methods are now extracted as separate Method chunks.
-    let init = chunks
-        .iter()
-        .find(|c| c.symbol_name.as_deref() == Some("__init__"))
-        .expect("should find method '__init__'");
+    let init = find_chunk(&chunks, "__init__");
     assert_chunk_metadata(
         init,
         "db/connection.py",
@@ -308,10 +293,7 @@ fn metadata_sample_07_python_class_methods_split() {
         Some("__init__"),
     );
 
-    let connect = chunks
-        .iter()
-        .find(|c| c.symbol_name.as_deref() == Some("connect"))
-        .expect("should find method 'connect'");
+    let connect = find_chunk(&chunks, "connect");
     assert_chunk_metadata(
         connect,
         "db/connection.py",
@@ -320,10 +302,7 @@ fn metadata_sample_07_python_class_methods_split() {
         Some("connect"),
     );
 
-    let disconnect = chunks
-        .iter()
-        .find(|c| c.symbol_name.as_deref() == Some("disconnect"))
-        .expect("should find method 'disconnect'");
+    let disconnect = find_chunk(&chunks, "disconnect");
     assert_chunk_metadata(
         disconnect,
         "db/connection.py",
@@ -354,10 +333,7 @@ fn metadata_sample_08_typescript_function() {
     )
     .unwrap();
 
-    let func = chunks
-        .iter()
-        .find(|c| c.symbol_name.as_deref() == Some("parseConfig"))
-        .expect("should find function 'parseConfig'");
+    let func = find_chunk(&chunks, "parseConfig");
 
     assert_chunk_metadata(
         func,
@@ -389,10 +365,7 @@ fn metadata_sample_09_typescript_interface() {
     )
     .unwrap();
 
-    let iface = chunks
-        .iter()
-        .find(|c| c.symbol_name.as_deref() == Some("ApiResponse"))
-        .expect("should find interface 'ApiResponse'");
+    let iface = find_chunk(&chunks, "ApiResponse");
 
     assert_chunk_metadata(
         iface,
@@ -431,10 +404,7 @@ fn metadata_sample_10_typescript_class() {
     )
     .unwrap();
 
-    let cls = chunks
-        .iter()
-        .find(|c| c.symbol_name.as_deref() == Some("EventEmitter"))
-        .expect("should find class 'EventEmitter'");
+    let cls = find_chunk(&chunks, "EventEmitter");
 
     assert_chunk_metadata(
         cls,
@@ -466,10 +436,7 @@ func HandleRequest(w http.ResponseWriter, r *http.Request) {
     )
     .unwrap();
 
-    let func = chunks
-        .iter()
-        .find(|c| c.symbol_name.as_deref() == Some("HandleRequest"))
-        .expect("should find function 'HandleRequest'");
+    let func = find_chunk(&chunks, "HandleRequest");
 
     assert_chunk_metadata(
         func,
@@ -499,13 +466,9 @@ type Repository interface {
     FindByID(id int) (*User, error)
     Save(user *User) error
 }"#;
-    let chunks =
-        parse_and_chunk(source, "models/user.go", Language::Go, &default_config()).unwrap();
+    let chunks = parse(source, "models/user.go", Language::Go);
 
-    let struc = chunks
-        .iter()
-        .find(|c| c.symbol_name.as_deref() == Some("User"))
-        .expect("should find struct 'User'");
+    let struc = find_chunk(&chunks, "User");
     assert_chunk_metadata(
         struc,
         "models/user.go",
@@ -515,10 +478,7 @@ type Repository interface {
     );
     assert_content_matches_source(source, struc);
 
-    let iface = chunks
-        .iter()
-        .find(|c| c.symbol_name.as_deref() == Some("Repository"))
-        .expect("should find interface 'Repository'");
+    let iface = find_chunk(&chunks, "Repository");
     assert_chunk_metadata(
         iface,
         "models/user.go",
@@ -554,10 +514,7 @@ fn metadata_sample_13_java_class() {
     )
     .unwrap();
 
-    let cls = chunks
-        .iter()
-        .find(|c| c.symbol_name.as_deref() == Some("UserService"))
-        .expect("should find class 'UserService'");
+    let cls = find_chunk(&chunks, "UserService");
 
     assert_chunk_metadata(
         cls,
@@ -585,12 +542,9 @@ fn metadata_sample_14_c_function() {
     }
     return -1;
 }"#;
-    let chunks = parse_and_chunk(source, "src/search.c", Language::C, &default_config()).unwrap();
+    let chunks = parse(source, "src/search.c", Language::C);
 
-    let func = chunks
-        .iter()
-        .find(|c| c.symbol_name.as_deref() == Some("binary_search"))
-        .expect("should find function 'binary_search'");
+    let func = find_chunk(&chunks, "binary_search");
 
     assert_chunk_metadata(
         func,
@@ -628,8 +582,7 @@ private:
     Node* head;
     int size;
 };"#;
-    let chunks =
-        parse_and_chunk(source, "include/list.hpp", Language::Cpp, &default_config()).unwrap();
+    let chunks = parse(source, "include/list.hpp", Language::Cpp);
 
     let cls = chunks
         .iter()
@@ -674,10 +627,7 @@ class FormValidator {
     )
     .unwrap();
 
-    let func = chunks
-        .iter()
-        .find(|c| c.symbol_name.as_deref() == Some("validateEmail"))
-        .expect("should find function 'validateEmail'");
+    let func = find_chunk(&chunks, "validateEmail");
     assert_chunk_metadata(
         func,
         "lib/validation.js",
@@ -687,10 +637,7 @@ class FormValidator {
     );
     assert_content_matches_source(source, func);
 
-    let cls = chunks
-        .iter()
-        .find(|c| c.symbol_name.as_deref() == Some("FormValidator"))
-        .expect("should find class 'FormValidator'");
+    let cls = find_chunk(&chunks, "FormValidator");
     assert_chunk_metadata(
         cls,
         "lib/validation.js",
@@ -710,8 +657,7 @@ fn metadata_sample_17_rust_type_alias_and_const() {
     let source = r#"type Result<T> = std::result::Result<T, AppError>;
 
 const MAX_RETRIES: u32 = 5;"#;
-    let chunks =
-        parse_and_chunk(source, "src/types.rs", Language::Rust, &default_config()).unwrap();
+    let chunks = parse(source, "src/types.rs", Language::Rust);
 
     let ta = chunks
         .iter()
@@ -751,13 +697,9 @@ fn metadata_sample_18_go_method() {
 func (u *User) FullName() string {
     return u.FirstName + " " + u.LastName
 }"#;
-    let chunks =
-        parse_and_chunk(source, "models/user.go", Language::Go, &default_config()).unwrap();
+    let chunks = parse(source, "models/user.go", Language::Go);
 
-    let method = chunks
-        .iter()
-        .find(|c| c.symbol_name.as_deref() == Some("FullName"))
-        .expect("should find method 'FullName'");
+    let method = find_chunk(&chunks, "FullName");
 
     assert_chunk_metadata(
         method,
@@ -833,7 +775,7 @@ fn all_chunks_have_required_metadata_fields() {
     ];
 
     for (source, path, lang) in test_cases {
-        let chunks = parse_and_chunk(source, path, lang, &default_config()).unwrap();
+        let chunks = parse(source, path, lang);
 
         for chunk in &chunks {
             // file_path present and matches input
@@ -923,7 +865,7 @@ func Sub(a, b int) int {
     ];
 
     for (source, path, lang) in test_cases {
-        let chunks = parse_and_chunk(source, path, lang, &default_config()).unwrap();
+        let chunks = parse(source, path, lang);
 
         for chunk in &chunks {
             // For every chunk, verify content matches source at declared lines
@@ -998,7 +940,7 @@ fn symbol_name_exact_match_across_languages() {
     ];
 
     for (source, path, lang, expected_names) in test_cases {
-        let chunks = parse_and_chunk(source, path, lang, &default_config()).unwrap();
+        let chunks = parse(source, path, lang);
 
         for name in &expected_names {
             let found = chunks
