@@ -399,11 +399,15 @@ async fn setup_test_index(tmp: &std::path::Path) -> (std::path::PathBuf, usize) 
 // `vector_query` never makes Tantivy parse `intent:` as a missing field.
 #[tokio::test]
 async fn search_hybrid_keeps_intent_out_of_bm25() {
+    use crate::embedding::EmbeddingError;
     use crate::embedding::test_helpers::MockProvider;
 
     let tmp = tempfile::tempdir().unwrap();
     let (index_dir, dim) = setup_test_index(tmp.path()).await;
-    let provider = MockProvider::new(dim);
+    // Fail vector search so a successful result can only come from BM25.
+    let provider = MockProvider::failing(EmbeddingError::ConnectionError {
+        message: "vector search disabled for this regression test".to_string(),
+    });
 
     // bm25_query is the raw user query; vector_query carries the intent prefix.
     let (results, _timings) = search_hybrid(
@@ -421,8 +425,10 @@ async fn search_hybrid_keeps_intent_out_of_bm25() {
     .expect("hybrid search must not error when intent prefix is present");
 
     assert!(
-        !results.is_empty(),
-        "BM25 should contribute results for the raw query 'authenticate'"
+        results.iter().any(|result| {
+            result.file_path == "auth.rs" && result.content.contains("authenticate")
+        }),
+        "BM25 should return the authenticate chunk for the raw query"
     );
 }
 
@@ -557,7 +563,7 @@ async fn search_hybrid_reranked_degrades_on_reranker_failure() {
     });
 
     // Should NOT return an error — graceful degradation returns unreranked results.
-    let (results, _timings) = search_hybrid_reranked(
+    let (results, timings) = search_hybrid_reranked(
         &index_dir,
         &provider,
         &reranker,
@@ -565,7 +571,7 @@ async fn search_hybrid_reranked_degrades_on_reranker_failure() {
         "authenticate",
         &SearchFilters::default(),
         5,
-        5,
+        1,
         60.0,
         dim,
         10,
@@ -574,6 +580,10 @@ async fn search_hybrid_reranked_degrades_on_reranker_failure() {
     .await
     .unwrap();
 
+    assert!(
+        timings.reranking.is_some(),
+        "the failing reranker must be attempted when the result limit is below the candidate pool"
+    );
     assert!(
         !results.is_empty(),
         "should return unreranked results when reranker fails"

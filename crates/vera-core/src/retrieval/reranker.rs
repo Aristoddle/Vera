@@ -211,6 +211,7 @@ impl ApiReranker {
         query: &str,
         documents: &[String],
         top_n: usize,
+        cancel: &CancellationToken,
     ) -> Result<Vec<RerankScore>, RerankerError> {
         let url = self.endpoint_url();
         let top = if self.is_voyage {
@@ -228,6 +229,10 @@ impl ApiReranker {
 
         let mut last_err = None;
         for attempt in 0..=self.config.max_retries {
+            if cancel.is_cancelled() {
+                return Err(RerankerError::Cancelled);
+            }
+
             if attempt > 0 {
                 let delay = Duration::from_millis(500 * 2u64.pow(attempt.min(4) - 1));
                 debug!(
@@ -235,10 +240,18 @@ impl ApiReranker {
                     delay_ms = delay.as_millis(),
                     "retrying reranker API"
                 );
-                tokio::time::sleep(delay).await;
+                tokio::select! {
+                    _ = cancel.cancelled() => return Err(RerankerError::Cancelled),
+                    _ = tokio::time::sleep(delay) => {}
+                }
             }
 
-            match self.send_request(&url, &body).await {
+            let request = tokio::select! {
+                _ = cancel.cancelled() => return Err(RerankerError::Cancelled),
+                result = self.send_request(&url, &body) => result,
+            };
+
+            match request {
                 Ok(scores) => return Ok(scores),
                 Err(e) => {
                     // Don't retry auth errors.
@@ -338,16 +351,18 @@ impl ApiReranker {
 
         Ok(scores)
     }
-}
 
-impl Reranker for ApiReranker {
-    async fn rerank(
+    async fn rerank_inner(
         &self,
         query: &str,
         documents: &[String],
+        cancel: &CancellationToken,
     ) -> Result<Vec<RerankScore>, RerankerError> {
         if documents.is_empty() {
             return Ok(Vec::new());
+        }
+        if cancel.is_cancelled() {
+            return Err(RerankerError::Cancelled);
         }
 
         // Truncate documents that exceed the reranker's context window.
@@ -359,14 +374,19 @@ impl Reranker for ApiReranker {
 
         let batch_size = self.max_rerank_batch;
         if batch_size == 0 || documents.len() <= batch_size {
-            return self.call_api(query, documents, documents.len()).await;
+            return self
+                .call_api(query, documents, documents.len(), cancel)
+                .await;
         }
 
         // Partition into batches, rerank each, merge with corrected indices.
         let mut all_scores = Vec::with_capacity(documents.len());
         for (batch_idx, batch) in documents.chunks(batch_size).enumerate() {
+            if cancel.is_cancelled() {
+                return Err(RerankerError::Cancelled);
+            }
             let offset = batch_idx * batch_size;
-            let scores = self.call_api(query, batch, batch.len()).await?;
+            let scores = self.call_api(query, batch, batch.len(), cancel).await?;
             for s in scores {
                 all_scores.push(RerankScore {
                     index: s.index + offset,
@@ -381,6 +401,26 @@ impl Reranker for ApiReranker {
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
         Ok(all_scores)
+    }
+}
+
+impl Reranker for ApiReranker {
+    async fn rerank(
+        &self,
+        query: &str,
+        documents: &[String],
+    ) -> Result<Vec<RerankScore>, RerankerError> {
+        self.rerank_inner(query, documents, &CancellationToken::new())
+            .await
+    }
+
+    async fn rerank_cancellable(
+        &self,
+        query: &str,
+        documents: &[String],
+        cancel: &CancellationToken,
+    ) -> Result<Vec<RerankScore>, RerankerError> {
+        self.rerank_inner(query, documents, cancel).await
     }
 }
 
@@ -640,6 +680,92 @@ pub(crate) mod test_helpers {
 
             Ok(scores)
         }
+    }
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::sync::Notify;
+
+    #[tokio::test]
+    async fn api_reranker_honors_pre_cancelled_token() {
+        let config = RerankerConfig::new(
+            "http://127.0.0.1:19999".to_string(),
+            "model".to_string(),
+            "key".to_string(),
+        )
+        .with_max_retries(2);
+        let reranker = ApiReranker::new(config).unwrap();
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        let result = reranker
+            .rerank_cancellable("query", &["document".to_string()], &cancel)
+            .await;
+
+        assert!(matches!(result, Err(RerankerError::Cancelled)));
+    }
+
+    #[tokio::test]
+    async fn api_reranker_honors_cancellation_during_retry_backoff() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let first_response = Arc::new(Notify::new());
+        let server_request_count = Arc::clone(&request_count);
+        let server_first_response = Arc::clone(&first_response);
+
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                server_request_count.fetch_add(1, Ordering::SeqCst);
+                let response_ready = Arc::clone(&server_first_response);
+                tokio::spawn(async move {
+                    let mut request = [0_u8; 4096];
+                    let _ = stream.read(&mut request).await;
+                    stream
+                        .write_all(
+                            b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        )
+                        .await
+                        .unwrap();
+                    response_ready.notify_one();
+                });
+            }
+        });
+
+        let config = RerankerConfig::new(
+            format!("http://{address}"),
+            "model".to_string(),
+            "key".to_string(),
+        )
+        .with_timeout(Duration::from_secs(2))
+        .with_max_retries(3);
+        let reranker = ApiReranker::new(config).unwrap();
+        let cancel = CancellationToken::new();
+        let task_cancel = cancel.clone();
+        let task = tokio::spawn(async move {
+            reranker
+                .rerank_cancellable("query", &["document".to_string()], &task_cancel)
+                .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), first_response.notified())
+            .await
+            .expect("reranker should receive the first failed response");
+        cancel.cancel();
+
+        let result = tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("cancellation should stop retry backoff")
+            .expect("reranker task should not panic");
+        assert!(matches!(result, Err(RerankerError::Cancelled)));
+        assert_eq!(request_count.load(Ordering::SeqCst), 1);
+        server.abort();
     }
 }
 

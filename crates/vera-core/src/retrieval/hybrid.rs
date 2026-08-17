@@ -126,6 +126,14 @@ pub async fn search_hybrid(
 
     // Run vector search concurrently on the async runtime.
     let vector_metadata_path = index_dir.join("metadata.db");
+    // Filters are applied after the kNN fetch, so a selective filter can
+    // discard every hit in the default window. Over-fetch when filters are
+    // active so filtered chunks beyond the window can still reach fusion.
+    let vector_fetch = if filters.is_empty() {
+        vector_candidates
+    } else {
+        vector_candidates.saturating_mul(4).max(200)
+    };
     let embed_start = Instant::now();
     let vector_results = match VectorStore::open(&index_dir.join("vectors.db"), stored_dim) {
         Ok(vector_store) => {
@@ -138,7 +146,7 @@ pub async fn search_hybrid(
                         &vector_metadata,
                         provider,
                         vector_query,
-                        vector_candidates,
+                        vector_fetch,
                     )
                     .await
                     {

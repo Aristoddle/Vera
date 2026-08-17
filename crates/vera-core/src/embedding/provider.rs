@@ -610,6 +610,39 @@ impl<P: EmbeddingProvider> EmbeddingProvider for CachedEmbeddingProvider<P> {
         Ok(vectors)
     }
 
+    async fn embed_batch_cancellable(
+        &self,
+        texts: &[String],
+        cancel: &CancellationToken,
+    ) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Query cache hits do not perform provider work, so they can return
+        // immediately even when cancellation has already fired.
+        if texts.len() == 1 {
+            let key = self.make_cache_key(&texts[0]);
+            if let Some(cached) = self.cache.lock().unwrap().get(&key) {
+                debug!("embedding cache hit for query");
+                return Ok(vec![cached.clone()]);
+            }
+        }
+
+        // Preserve cancellation on cache misses so wrapped local providers
+        // can stop between their own inference sub-batches.
+        let vectors = self.inner.embed_batch_cancellable(texts, cancel).await?;
+
+        if texts.len() == 1 && vectors.len() == 1 {
+            let key = self.make_cache_key(&texts[0]);
+            let vector = vectors[0].clone();
+            self.cache.lock().unwrap().insert(key, vector);
+            debug!("embedding cached for query");
+        }
+
+        Ok(vectors)
+    }
+
     fn expected_dim(&self) -> Option<usize> {
         self.inner.expected_dim()
     }
@@ -1160,6 +1193,31 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    struct CancellationAwareProvider;
+
+    impl EmbeddingProvider for CancellationAwareProvider {
+        async fn embed_batch(&self, _texts: &[String]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+            Err(EmbeddingError::ResponseError {
+                message: "non-cancellable path used".to_string(),
+            })
+        }
+
+        async fn embed_batch_cancellable(
+            &self,
+            _texts: &[String],
+            cancel: &CancellationToken,
+        ) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+            if cancel.is_cancelled() {
+                return Err(EmbeddingError::Cancelled);
+            }
+            Ok(vec![vec![1.0]])
+        }
+
+        fn expected_dim(&self) -> Option<usize> {
+            Some(1)
+        }
+    }
+
     #[test]
     fn prepare_query_text_with_prefix() {
         let mut config = EmbeddingProviderConfig::new("http://x".into(), "m".into(), "k".into());
@@ -1176,6 +1234,20 @@ mod tests {
         let config = EmbeddingProviderConfig::new("http://x".into(), "m".into(), "k".into());
         let provider = OpenAiProvider::new(config).unwrap();
         assert_eq!(provider.prepare_query_text("find foo"), "find foo");
+    }
+
+    #[tokio::test]
+    async fn cached_provider_forwards_cancellation_on_cache_miss() {
+        let cached = CachedEmbeddingProvider::new(CancellationAwareProvider, 8);
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        let result = cached
+            .embed_batch_cancellable(&["uncached query".to_string()], &cancel)
+            .await;
+
+        assert!(matches!(result, Err(EmbeddingError::Cancelled)));
+        assert_eq!(cached.cache_size(), 0);
     }
 
     #[test]

@@ -7,6 +7,8 @@ use tokio::task;
 use crate::embedding::provider::{EmbeddingError, EmbeddingProvider};
 use crate::local_models::{POTION_CODE_DIM, POTION_CODE_MAX_LENGTH};
 
+const CANCELLABLE_BATCH_SIZE: usize = 64;
+
 pub struct Model2VecProvider {
     model: Arc<StaticModel>,
     dim: usize,
@@ -58,14 +60,8 @@ impl Model2VecProvider {
         }
         Ok(())
     }
-}
 
-impl EmbeddingProvider for Model2VecProvider {
-    async fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
-        if texts.is_empty() {
-            return Ok(Vec::new());
-        }
-
+    async fn encode_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
         let model = Arc::clone(&self.model);
         let texts = texts.to_vec();
         let input_len = texts.len();
@@ -106,6 +102,39 @@ impl EmbeddingProvider for Model2VecProvider {
                     "potion-code returned {bad_dim}-dim vectors, expected {expected_dim}"
                 ),
             });
+        }
+
+        Ok(vectors)
+    }
+}
+
+impl EmbeddingProvider for Model2VecProvider {
+    async fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.encode_batch(texts).await
+    }
+
+    async fn embed_batch_cancellable(
+        &self,
+        texts: &[String],
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let batch_size = self.batch_size.clamp(1, CANCELLABLE_BATCH_SIZE);
+        let mut vectors = Vec::with_capacity(texts.len());
+        for batch in texts.chunks(batch_size) {
+            if cancel.is_cancelled() {
+                return Err(EmbeddingError::Cancelled);
+            }
+            vectors.extend(self.encode_batch(batch).await?);
+        }
+        if cancel.is_cancelled() {
+            return Err(EmbeddingError::Cancelled);
         }
 
         Ok(vectors)

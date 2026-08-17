@@ -119,10 +119,15 @@ async fn execute_rag_fusion_with_context(
     let mut per_query_results: Vec<Vec<SearchResult>> = vec![Vec::new(); query_count];
     let mut per_query_weights: Vec<f64> = vec![0.0; query_count];
 
-    for (idx, query) in queries.iter().enumerate() {
-        let result = context
-            .search(index_dir, query, intent, config, filters, per_query_limit)
-            .await;
+    // Run the candidate searches concurrently: latency then tracks the
+    // slowest rewrite instead of the sum. Results keep their per-query slots.
+    let outcomes =
+        futures::future::join_all(queries.iter().map(|query| {
+            context.search(index_dir, query, intent, config, filters, per_query_limit)
+        }))
+        .await;
+
+    for (idx, result) in outcomes.into_iter().enumerate() {
         match result {
             Ok((results, timings)) => {
                 merge_timings(&mut aggregated_timings, &timings);
