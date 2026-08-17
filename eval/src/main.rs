@@ -183,12 +183,13 @@ fn load_verified_corpus(corpus_path: &Path) -> Result<VerifiedCorpus> {
 
 /// Filter tasks to only those whose repos are in the corpus manifest.
 ///
-/// When using a subset corpus, tasks for missing repos are silently dropped
-/// so the eval harness can run against any corpus subset.
+/// When using a subset corpus, tasks for missing repos are dropped so the eval
+/// harness can run against any corpus subset. An empty filtered suite is an
+/// error because it cannot produce meaningful metrics.
 fn filter_tasks_to_corpus(
     tasks: Vec<types::BenchmarkTask>,
     repo_paths: &HashMap<String, String>,
-) -> Vec<types::BenchmarkTask> {
+) -> Result<Vec<types::BenchmarkTask>> {
     let before = tasks.len();
     let filtered: Vec<_> = tasks
         .into_iter()
@@ -201,7 +202,10 @@ fn filter_tasks_to_corpus(
             filtered.len()
         );
     }
-    filtered
+    if filtered.is_empty() {
+        anyhow::bail!("No benchmark tasks remain after filtering to the corpus");
+    }
+    Ok(filtered)
 }
 
 fn run_report(
@@ -220,7 +224,7 @@ fn run_report(
         }
         "vera-bm25" => {
             let corpus = load_verified_corpus(corpus_path)?;
-            let tasks = filter_tasks_to_corpus(tasks, &corpus.repo_paths);
+            let tasks = filter_tasks_to_corpus(tasks, &corpus.repo_paths)?;
             let vera = vera_adapter::VeraBm25Adapter::new()?;
             runner::run_benchmark_scoped(
                 &vera,
@@ -257,7 +261,7 @@ fn run_full_adapter(
     backend: InferenceBackend,
 ) -> Result<types::EvalReport> {
     let corpus = load_verified_corpus(corpus_path)?;
-    let tasks = filter_tasks_to_corpus(tasks, &corpus.repo_paths);
+    let tasks = filter_tasks_to_corpus(tasks, &corpus.repo_paths)?;
     let vera = vera_adapter::VeraFullAdapter::new(backend)?;
     Ok(runner::run_benchmark_scoped(
         &vera,

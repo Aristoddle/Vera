@@ -126,17 +126,20 @@ def main():
     repos = fetch_json(REPOS_URL)
     print(f"  Found {len(repos)} repos", file=sys.stderr)
 
+    converted_repos = []
     total_tasks = 0
     per_category = {"symbol_lookup": 0, "intent": 0, "cross_file": 0}
 
     for repo in repos:
         name = repo["name"]
+        out_file = output_dir / f"{name}.json"
         url = f"{ANNOTATIONS_URL}/{name}.json"
         print(f"  Converting {name}...", file=sys.stderr, end=" ")
 
         try:
             annotations = fetch_json(url)
         except Exception as e:
+            out_file.unlink(missing_ok=True)
             print(f"SKIP ({e})", file=sys.stderr)
             continue
 
@@ -147,17 +150,20 @@ def main():
             cat = task["category"]
             per_category[cat] = per_category.get(cat, 0) + 1
 
-        out_file = output_dir / f"{name}.json"
         out_file.write_text(json.dumps(tasks, indent=2) + "\n")
+        converted_repos.append(repo)
         total_tasks += len(tasks)
         print(f"{len(tasks)} tasks", file=sys.stderr)
 
-    print(f"\nTotal: {total_tasks} tasks across {len(repos)} repos", file=sys.stderr)
+    print(
+        f"\nTotal: {total_tasks} tasks across {len(converted_repos)} repos",
+        file=sys.stderr,
+    )
     for cat, count in sorted(per_category.items()):
         print(f"  {cat}: {count}", file=sys.stderr)
 
     corpus_path = Path(args.corpus_output)
-    generate_corpus_toml(repos, corpus_path)
+    generate_corpus_toml(converted_repos, corpus_path)
     print(f"\nCorpus manifest: {corpus_path}", file=sys.stderr)
     print(f"Task files: {output_dir}/", file=sys.stderr)
 

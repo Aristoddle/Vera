@@ -43,6 +43,17 @@ import tomllib, json
 with open('$CORPUS_FILE', 'rb') as f:
     data = tomllib.load(f)
 for repo in data['repos']:
+    name = repo.get('name')
+    if (
+        not isinstance(name, str)
+        or not name
+        or name in {'.', '..'}
+        or '/' in name
+        or chr(92) in name
+    ):
+        raise SystemExit(
+            f"ERROR: repository name must be a single path component: {name!r}"
+        )
     print(json.dumps(repo))
 " | while IFS= read -r repo_json; do
     NAME=$(echo "$repo_json" | python3 -c "import json,sys; print(json.load(sys.stdin)['name'])")
@@ -50,14 +61,21 @@ for repo in data['repos']:
     COMMIT=$(echo "$repo_json" | python3 -c "import json,sys; print(json.load(sys.stdin)['commit'])")
 
     REPO_DIR="$CLONE_ROOT/$NAME"
+    CLONE_ROOT_REAL=$(realpath -m -- "$CLONE_ROOT")
+    REPO_DIR_REAL=$(realpath -m -- "$REPO_DIR")
+    if [[ "$REPO_DIR_REAL" != "$CLONE_ROOT_REAL"/* ]]; then
+        echo "ERROR: repository path escapes clone root: $NAME" >&2
+        exit 1
+    fi
 
     if [[ -d "$REPO_DIR/.git" ]] && [[ "$FORCE" != "true" ]]; then
         CURRENT_SHA=$(git -C "$REPO_DIR" rev-parse HEAD 2>/dev/null || echo "")
         if [[ "$CURRENT_SHA" == "$COMMIT" ]]; then
             continue
         fi
-        rm -rf "$REPO_DIR"
-    elif [[ -d "$REPO_DIR" ]] && [[ "$FORCE" == "true" ]]; then
+    fi
+
+    if [[ -e "$REPO_DIR" || -L "$REPO_DIR" ]]; then
         rm -rf "$REPO_DIR"
     fi
 

@@ -10,6 +10,7 @@ import math
 import os
 import sys
 import time
+import tomllib
 from pathlib import Path
 
 # Add semble to path
@@ -24,6 +25,7 @@ SUBSET_REPOS = [
 ]
 CLONE_ROOT = Path(".bench/semble-repos")
 TASKS_DIR = Path("eval/tasks/semble-subset")
+CORPUS_PATH = Path("eval/semble-subset-corpus.toml")
 K = 10
 
 
@@ -34,6 +36,16 @@ def load_tasks():
         if path.exists():
             tasks.extend(json.loads(path.read_text()))
     return tasks
+
+
+def load_benchmark_roots():
+    with CORPUS_PATH.open("rb") as f:
+        manifest = tomllib.load(f)
+    return {
+        repo["name"]: repo["benchmark_root"]
+        for repo in manifest["repos"]
+        if repo.get("benchmark_root")
+    }
 
 
 def is_match(result_path, gt):
@@ -97,6 +109,20 @@ def ndcg_at_k(results, ground_truth, k):
 def main():
     tasks = load_tasks()
     print(f"Loaded {len(tasks)} tasks", file=sys.stderr)
+    benchmark_roots = load_benchmark_roots()
+
+    missing_repos = [
+        repo_name
+        for repo_name in SUBSET_REPOS
+        if not (CLONE_ROOT / repo_name).is_dir()
+    ]
+    if missing_repos:
+        print(
+            "Missing subset repositories; run eval/setup-semble-corpus.sh: "
+            + ", ".join(missing_repos),
+            file=sys.stderr,
+        )
+        return 1
 
     # Group tasks by repo
     by_repo = {}
@@ -114,13 +140,12 @@ def main():
             continue
 
         repo_path = CLONE_ROOT / repo_name
-        if not repo_path.exists():
-            print(f"  SKIP {repo_name} (not cloned)", file=sys.stderr)
-            continue
+        benchmark_root = benchmark_roots.get(repo_name)
+        index_path = repo_path / benchmark_root if benchmark_root else repo_path
 
         print(f"  {repo_name}: indexing...", file=sys.stderr, end=" ", flush=True)
         t0 = time.monotonic()
-        se = SembleIndex.from_path(str(repo_path))
+        se = SembleIndex.from_path(str(index_path))
         index_time = time.monotonic() - t0
         total_index_time += index_time
         print(f"{index_time:.1f}s, searching {len(repo_tasks)} queries...", file=sys.stderr, end=" ", flush=True)
@@ -157,7 +182,7 @@ def main():
     n = len(all_metrics)
     if n == 0:
         print("No results", file=sys.stderr)
-        return
+        return 1
 
     def avg(key):
         return sum(m[key] for m in all_metrics) / n
@@ -213,4 +238,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

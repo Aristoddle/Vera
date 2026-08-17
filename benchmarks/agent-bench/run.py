@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -86,7 +87,9 @@ def fail(message: str) -> NoReturn:
 
 def lane_slug(model: str, effort: str) -> str:
     """Filesystem-safe tag for a model/effort lane (model IDs may contain '/')."""
-    return re.sub(r"[^A-Za-z0-9._-]+", "-", f"{model}-{effort}")
+    readable = re.sub(r"[^A-Za-z0-9._-]+", "-", f"{model}-{effort}")
+    digest = hashlib.sha256(f"{model}\0{effort}".encode("utf-8")).hexdigest()[:12]
+    return f"{readable}-{digest}"
 
 
 def load_questions(limit: int | None) -> list[dict[str, Any]]:
@@ -326,40 +329,47 @@ def run_question(
     shim_dir = run_dir / "control" / "bin" if arm == "control" else None
     env = environment_for(arm, shim_dir=shim_dir)
     start = time.monotonic()
-    with output_path.open("w", encoding="utf-8") as output, stderr_path.open(
-        "w", encoding="utf-8"
-    ) as errors:
-        result = subprocess.run(
-            [
-                "droid",
-                "exec",
-                "--cwd",
-                str(repo_dir),
-                "--auto",
-                "medium",
-                "-o",
-                "stream-json",
-                "-m",
-                model,
-                "-r",
-                effort,
-                "-f",
-                str(prompt),
-            ],
-            cwd=repo_dir,
-            env=env,
-            text=True,
-            stdout=output,
-            stderr=errors,
-            timeout=7200,
-            check=False,
-        )
+    timeout_s = 7200
+    returncode: int | None = None
+    timed_out = False
+    try:
+        with output_path.open("w", encoding="utf-8") as output, stderr_path.open(
+            "w", encoding="utf-8"
+        ) as errors:
+            result = subprocess.run(
+                [
+                    "droid",
+                    "exec",
+                    "--cwd",
+                    str(repo_dir),
+                    "--auto",
+                    "medium",
+                    "-o",
+                    "stream-json",
+                    "-m",
+                    model,
+                    "-r",
+                    effort,
+                    "-f",
+                    str(prompt),
+                ],
+                cwd=repo_dir,
+                env=env,
+                text=True,
+                stdout=output,
+                stderr=errors,
+                timeout=timeout_s,
+                check=False,
+            )
+            returncode = result.returncode
+    except subprocess.TimeoutExpired:
+        timed_out = True
     wall_s = time.monotonic() - start
-    meta_path.write_text(
-        json.dumps({"returncode": result.returncode, "wall_s": wall_s}, indent=2) + "\n",
-        encoding="utf-8",
-    )
-    status = "ok" if result.returncode == 0 else f"failed ({result.returncode})"
+    metadata = {"returncode": returncode, "wall_s": wall_s}
+    if timed_out:
+        metadata.update({"failed": True, "timed_out": True, "timeout_s": timeout_s})
+    meta_path.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
+    status = "timeout" if timed_out else ("ok" if returncode == 0 else f"failed ({returncode})")
     print(f"  {arm} q{question['number']:02d}: {status}, {wall_s:.1f}s")
 
 
@@ -452,6 +462,7 @@ def parse_jsonl(path: Path, run_meta: Path | None = None) -> dict[str, Any]:
     answer = ""
     duration_ms: float | None = None
     event_count = 0
+    timed_out = False
     for event in json_objects(path):
         event_count += 1
         name = tool_name(event)
@@ -475,6 +486,7 @@ def parse_jsonl(path: Path, run_meta: Path | None = None) -> dict[str, Any]:
         metadata = json.loads(run_meta.read_text(encoding="utf-8"))
         wall_s = metadata.get("wall_s")
         returncode = metadata.get("returncode")
+        timed_out = metadata.get("timed_out") is True
     return {
         "tool_calls": dict(sorted(calls.items())),
         "tokens_in": totals["tokens_in"],
@@ -485,6 +497,7 @@ def parse_jsonl(path: Path, run_meta: Path | None = None) -> dict[str, Any]:
         "duration_ms": duration_ms,
         "answer": answer,
         "event_count": event_count,
+        **({"timed_out": True} if timed_out else {}),
         **({"returncode": returncode} if returncode is not None else {}),
     }
 
@@ -513,7 +526,11 @@ def analyze_run(
             )
             # A nonzero droid exit means the cell is not a valid measurement;
             # mark it so aggregates and judging exclude it.
-            if parsed.get("returncode") not in (None, 0):
+            if (
+                parsed["event_count"] == 0
+                or parsed.get("returncode") not in (None, 0)
+                or parsed.get("timed_out")
+            ):
                 parsed["failed"] = True
             result["questions"][f"q{number:02d}"][arm] = parsed
 

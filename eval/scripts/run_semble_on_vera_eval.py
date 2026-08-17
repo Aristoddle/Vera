@@ -3,11 +3,15 @@
 
 import json
 import math
+import os
 import sys
 import time
 from pathlib import Path
 
-sys.path.insert(0, "/tmp/semble-env/lib/python3.14/site-packages")
+SEMBLE_SITE_PACKAGES = os.environ.get(
+    "SEMBLE_SITE_PACKAGES", "/tmp/semble-env/lib/python3.14/site-packages"
+)
+sys.path.insert(0, SEMBLE_SITE_PACKAGES)
 from semble import SembleIndex  # noqa: E402
 
 CLONE_ROOT = Path(".bench/repos")
