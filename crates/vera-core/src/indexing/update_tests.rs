@@ -22,6 +22,32 @@ fn default_config() -> VeraConfig {
     VeraConfig::default()
 }
 
+/// Create a temp repo with `files`, run the initial index, and return the
+/// repo dir, provider, config, and initial index summary.
+async fn indexed_repo(
+    files: &[(&str, &str)],
+) -> (
+    TempDir,
+    MockProvider,
+    VeraConfig,
+    crate::indexing::IndexSummary,
+) {
+    let dir = TempDir::new().unwrap();
+    for (name, content) in files {
+        let path = dir.path().join(name);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(path, content).unwrap();
+    }
+    let provider = MockProvider::new(8);
+    let config = default_config();
+    let summary = index_repository(dir.path(), &provider, &config, "mock-model")
+        .await
+        .unwrap();
+    (dir, provider, config, summary)
+}
+
 struct BatchBoundProvider {
     max_batch_size: usize,
     largest_batch: AtomicUsize,
@@ -86,20 +112,8 @@ fn content_hash_is_hex_sha256() {
 
 #[tokio::test]
 async fn update_no_changes() {
-    let dir = TempDir::new().unwrap();
-    fs::write(
-        dir.path().join("main.rs"),
-        "fn main() {\n    println!(\"hello\");\n}\n",
-    )
-    .unwrap();
-
-    let provider = MockProvider::new(8);
-    let config = default_config();
-
-    // Initial index.
-    let idx_summary = index_repository(dir.path(), &provider, &config, "mock-model")
-        .await
-        .unwrap();
+    let (dir, provider, config, idx_summary) =
+        indexed_repo(&[("main.rs", "fn main() {\n    println!(\"hello\");\n}\n")]).await;
     assert!(idx_summary.chunks_created > 0);
 
     // Update with no changes.
@@ -177,14 +191,7 @@ async fn update_reports_progress_and_respects_max_in_flight_input_bound() {
 
 #[tokio::test]
 async fn update_max_files_defers_and_resumes_in_path_order() {
-    let dir = TempDir::new().unwrap();
-    fs::write(dir.path().join("main.rs"), "fn main() {}\n").unwrap();
-
-    let provider = MockProvider::new(8);
-    let config = default_config();
-    index_repository(dir.path(), &provider, &config, "mock-model")
-        .await
-        .unwrap();
+    let (dir, provider, config, _) = indexed_repo(&[("main.rs", "fn main() {}\n")]).await;
 
     for name in ["gamma.rs", "alpha.rs", "beta.rs"] {
         fs::write(dir.path().join(name), format!("fn {}() {{}}\n", &name[..4])).unwrap();
@@ -228,15 +235,11 @@ async fn update_max_files_defers_and_resumes_in_path_order() {
 
 #[tokio::test]
 async fn update_max_files_prioritizes_modifications_and_always_deletes() {
-    let dir = TempDir::new().unwrap();
-    fs::write(dir.path().join("modified.rs"), "fn value() -> u8 { 1 }\n").unwrap();
-    fs::write(dir.path().join("deleted.rs"), "fn obsolete() {}\n").unwrap();
-
-    let provider = MockProvider::new(8);
-    let config = default_config();
-    index_repository(dir.path(), &provider, &config, "mock-model")
-        .await
-        .unwrap();
+    let (dir, provider, config, _) = indexed_repo(&[
+        ("modified.rs", "fn value() -> u8 { 1 }\n"),
+        ("deleted.rs", "fn obsolete() {}\n"),
+    ])
+    .await;
 
     let modified_content = "fn value() -> u8 { 2 }\n";
     fs::write(dir.path().join("modified.rs"), modified_content).unwrap();
@@ -274,21 +277,11 @@ async fn update_max_files_prioritizes_modifications_and_always_deletes() {
 
 #[tokio::test]
 async fn update_modified_file() {
-    let dir = TempDir::new().unwrap();
-    fs::write(
-        dir.path().join("main.rs"),
-        "fn main() {\n    println!(\"hello\");\n}\n",
-    )
-    .unwrap();
-    fs::write(dir.path().join("lib.py"), "def greet():\n    print('hi')\n").unwrap();
-
-    let provider = MockProvider::new(8);
-    let config = default_config();
-
-    // Initial index.
-    let idx_summary = index_repository(dir.path(), &provider, &config, "mock-model")
-        .await
-        .unwrap();
+    let (dir, provider, config, idx_summary) = indexed_repo(&[
+        ("main.rs", "fn main() {\n    println!(\"hello\");\n}\n"),
+        ("lib.py", "def greet():\n    print('hi')\n"),
+    ])
+    .await;
     let _initial_chunks = idx_summary.chunks_created as u64;
 
     // Modify one file.
@@ -321,28 +314,17 @@ async fn update_modified_file() {
 
 #[tokio::test]
 async fn update_detects_rst_include_dependency_changes() {
-    let dir = TempDir::new().unwrap();
-    let docs = dir.path().join("docs");
-    let includes = docs.join("includes");
-    fs::create_dir_all(&includes).unwrap();
-
-    fs::write(
-        docs.join("index.rst"),
-        "Guide\n=====\n\n.. include:: includes/common.rst.inc\n",
-    )
-    .unwrap();
-    fs::write(
-        includes.join("common.rst.inc"),
-        "Original include fragment text.\n",
-    )
-    .unwrap();
-
-    let provider = MockProvider::new(8);
-    let config = default_config();
-
-    index_repository(dir.path(), &provider, &config, "mock-model")
-        .await
-        .unwrap();
+    let (dir, provider, config, _) = indexed_repo(&[
+        (
+            "docs/index.rst",
+            "Guide\n=====\n\n.. include:: includes/common.rst.inc\n",
+        ),
+        (
+            "docs/includes/common.rst.inc",
+            "Original include fragment text.\n",
+        ),
+    ])
+    .await;
 
     let idx = index_dir(&dir.path().canonicalize().unwrap());
     let metadata = MetadataStore::open(&idx.join("metadata.db")).unwrap();
@@ -354,7 +336,7 @@ async fn update_detects_rst_include_dependency_changes() {
     );
 
     fs::write(
-        includes.join("common.rst.inc"),
+        dir.path().join("docs/includes/common.rst.inc"),
         "Updated include fragment text from dependency.\n",
     )
     .unwrap();
@@ -381,20 +363,8 @@ async fn update_detects_rst_include_dependency_changes() {
 
 #[tokio::test]
 async fn update_added_file() {
-    let dir = TempDir::new().unwrap();
-    fs::write(
-        dir.path().join("main.rs"),
-        "fn main() {\n    println!(\"hello\");\n}\n",
-    )
-    .unwrap();
-
-    let provider = MockProvider::new(8);
-    let config = default_config();
-
-    // Initial index.
-    let idx_summary = index_repository(dir.path(), &provider, &config, "mock-model")
-        .await
-        .unwrap();
+    let (dir, provider, config, idx_summary) =
+        indexed_repo(&[("main.rs", "fn main() {\n    println!(\"hello\");\n}\n")]).await;
     let initial_chunks = idx_summary.chunks_created as u64;
 
     // Add a new file.
@@ -434,19 +404,11 @@ async fn update_added_file() {
 
 #[tokio::test]
 async fn update_replaces_type_relations_for_modified_file() {
-    let dir = TempDir::new().unwrap();
-    fs::write(
-        dir.path().join("types.ts"),
+    let (dir, provider, config, _) = indexed_repo(&[(
+        "types.ts",
         "interface Loader {}\nclass Repo implements Loader {\n}\n",
-    )
-    .unwrap();
-
-    let provider = MockProvider::new(8);
-    let config = default_config();
-
-    index_repository(dir.path(), &provider, &config, "mock-model")
-        .await
-        .unwrap();
+    )])
+    .await;
 
     fs::write(
         dir.path().join("types.ts"),
@@ -470,21 +432,11 @@ async fn update_replaces_type_relations_for_modified_file() {
 
 #[tokio::test]
 async fn update_deleted_file() {
-    let dir = TempDir::new().unwrap();
-    fs::write(
-        dir.path().join("main.rs"),
-        "fn main() {\n    println!(\"hello\");\n}\n",
-    )
-    .unwrap();
-    fs::write(dir.path().join("lib.py"), "def greet():\n    print('hi')\n").unwrap();
-
-    let provider = MockProvider::new(8);
-    let config = default_config();
-
-    // Initial index.
-    let idx_summary = index_repository(dir.path(), &provider, &config, "mock-model")
-        .await
-        .unwrap();
+    let (dir, provider, config, idx_summary) = indexed_repo(&[
+        ("main.rs", "fn main() {\n    println!(\"hello\");\n}\n"),
+        ("lib.py", "def greet():\n    print('hi')\n"),
+    ])
+    .await;
     let initial_chunks = idx_summary.chunks_created as u64;
 
     // Delete a file.
@@ -541,26 +493,12 @@ async fn update_without_index_fails() {
 
 #[tokio::test]
 async fn update_matches_fresh_index() {
-    let dir = TempDir::new().unwrap();
-    fs::write(
-        dir.path().join("main.rs"),
-        "fn main() {\n    println!(\"hello\");\n}\n",
-    )
-    .unwrap();
-    fs::write(dir.path().join("lib.py"), "def greet():\n    print('hi')\n").unwrap();
-    fs::write(
-        dir.path().join("config.toml"),
-        "[package]\nname = \"test\"\n",
-    )
-    .unwrap();
-
-    let provider = MockProvider::new(8);
-    let config = default_config();
-
-    // Initial index.
-    index_repository(dir.path(), &provider, &config, "mock-model")
-        .await
-        .unwrap();
+    let (dir, provider, config, _) = indexed_repo(&[
+        ("main.rs", "fn main() {\n    println!(\"hello\");\n}\n"),
+        ("lib.py", "def greet():\n    print('hi')\n"),
+        ("config.toml", "[package]\nname = \"test\"\n"),
+    ])
+    .await;
 
     // Apply a sequence of changes.
     // 1. Modify main.rs
@@ -622,18 +560,12 @@ async fn update_matches_fresh_index() {
 
 #[tokio::test]
 async fn update_mixed_add_modify_delete() {
-    let dir = TempDir::new().unwrap();
-    fs::write(dir.path().join("a.rs"), "fn a() {}").unwrap();
-    fs::write(dir.path().join("b.py"), "def b(): pass").unwrap();
-    fs::write(dir.path().join("c.go"), "func c() {}").unwrap();
-
-    let provider = MockProvider::new(8);
-    let config = default_config();
-
-    // Initial index.
-    index_repository(dir.path(), &provider, &config, "mock-model")
-        .await
-        .unwrap();
+    let (dir, provider, config, _) = indexed_repo(&[
+        ("a.rs", "fn a() {}"),
+        ("b.py", "def b(): pass"),
+        ("c.go", "func c() {}"),
+    ])
+    .await;
 
     // Modify a.rs, delete b.py, add d.ts.
     fs::write(dir.path().join("a.rs"), "fn a_updated() { 42 }").unwrap();
@@ -666,20 +598,8 @@ async fn update_mixed_add_modify_delete() {
 
 #[tokio::test]
 async fn update_vector_store_consistent() {
-    let dir = TempDir::new().unwrap();
-    fs::write(
-        dir.path().join("main.rs"),
-        "fn main() { println!(\"hello\"); }",
-    )
-    .unwrap();
-
-    let provider = MockProvider::new(8);
-    let config = default_config();
-
-    // Initial index.
-    index_repository(dir.path(), &provider, &config, "mock-model")
-        .await
-        .unwrap();
+    let (dir, provider, config, _) =
+        indexed_repo(&[("main.rs", "fn main() { println!(\"hello\"); }")]).await;
 
     let idx = index_dir(&dir.path().canonicalize().unwrap());
     let initial_vec_count = VectorStore::open(&idx.join("vectors.db"), 8)
