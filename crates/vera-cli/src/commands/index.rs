@@ -11,6 +11,18 @@ use crate::helpers::{
     cancel_on_signal, load_runtime_config, print_human_summary, wait_for_interrupt,
 };
 
+struct AbortIndexTask {
+    abort_handle: tokio::task::AbortHandle,
+    cancellation: vera_core::CancellationToken,
+}
+
+impl Drop for AbortIndexTask {
+    fn drop(&mut self) {
+        self.cancellation.cancel();
+        self.abort_handle.abort();
+    }
+}
+
 /// Run the `vera index <path>` command.
 #[allow(clippy::too_many_arguments)]
 pub fn run(
@@ -87,10 +99,31 @@ pub fn execute(
 
     // Use progress bar for interactive (non-JSON) output.
     if json_output {
+        let cancellation = vera_core::CancellationToken::new();
+        let task_cancellation = cancellation.clone();
+        let signal_cancellation = cancellation.clone();
+        let task_repo_path = repo_path.to_path_buf();
+        let task = rt.handle().spawn(async move {
+            vera_core::indexing::pipeline::index_repository_with_cancellation(
+                &task_repo_path,
+                &provider,
+                &config,
+                &model_name,
+                &task_cancellation,
+            )
+            .await
+        });
+        let abort_handle = task.abort_handle();
         let summary = rt
             .block_on(cancel_on_signal(
-                vera_core::indexing::index_repository(repo_path, &provider, &config, &model_name),
-                wait_for_interrupt(),
+                async move { task.await.context("indexing task failed")? },
+                async move {
+                    let _task_guard = AbortIndexTask {
+                        abort_handle,
+                        cancellation: signal_cancellation,
+                    };
+                    wait_for_interrupt().await;
+                },
                 "indexing",
             ))
             .context("indexing failed")?;
@@ -98,12 +131,12 @@ pub fn execute(
     }
 
     let multi = cliclack::multi_progress("Indexing...");
-    let spinner = multi.add(cliclack::spinner());
+    let spinner = Arc::new(multi.add(cliclack::spinner()));
     spinner.start("Discovering files...");
     let embed_bar: Arc<cliclack::ProgressBar> = Arc::new(multi.add(cliclack::progress_bar(0)));
     let embed_started = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-    let spinner_ref = &spinner;
+    let spinner_ref = Arc::clone(&spinner);
     let embed_bar_ref = embed_bar.clone();
     let embed_started_ref = embed_started.clone();
 
@@ -130,15 +163,31 @@ pub fn execute(
         IndexProgress::StorageDone => {}
     };
 
-    let result = rt.block_on(cancel_on_signal(
-        vera_core::indexing::index_repository_with_progress(
-            repo_path,
+    let cancellation = vera_core::CancellationToken::new();
+    let task_cancellation = cancellation.clone();
+    let signal_cancellation = cancellation.clone();
+    let task_repo_path = repo_path.to_path_buf();
+    let task = rt.handle().spawn(async move {
+        vera_core::indexing::pipeline::index_repository_with_progress_and_cancellation(
+            &task_repo_path,
             &provider,
             &config,
             &model_name,
             on_progress,
-        ),
-        wait_for_interrupt(),
+            &task_cancellation,
+        )
+        .await
+    });
+    let abort_handle = task.abort_handle();
+    let result = rt.block_on(cancel_on_signal(
+        async move { task.await.context("indexing task failed")? },
+        async move {
+            let _task_guard = AbortIndexTask {
+                abort_handle,
+                cancellation: signal_cancellation,
+            };
+            wait_for_interrupt().await;
+        },
         "indexing",
     ));
     multi.stop();

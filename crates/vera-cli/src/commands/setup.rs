@@ -198,6 +198,7 @@ fn configure_backend_with_api_setup(
             );
             state::save_backend(effective_backend)?;
             state::save_local_embedding_model(&local_embedding_model)?;
+            state::clear_reranker_setup()?;
             state::apply_saved_env_force()?;
             local_embedding_summary = Some(local_embedding_model.display_name());
         }
@@ -208,6 +209,7 @@ fn configure_backend_with_api_setup(
             models_prefetched = vera_core::local_models::inspect_potion_code_model_files()?.len();
             onnx_runtime_ready = None;
             state::save_backend(effective_backend)?;
+            state::clear_reranker_setup()?;
             state::apply_saved_env_force()?;
             local_embedding_summary =
                 Some(vera_core::local_models::potion_code_model_name().to_string());

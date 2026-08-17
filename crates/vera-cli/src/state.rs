@@ -133,6 +133,19 @@ pub fn save_api_setup(embedding: &ApiSetupInput, reranker: Option<&ApiSetupInput
     save_secrets(&secrets)
 }
 
+/// Drop persisted API reranker settings. Called when selecting a local
+/// backend so local mode cannot silently rerank through a stale saved
+/// endpoint; shell-set RERANKER_MODEL_* vars still signal explicit intent.
+pub fn clear_reranker_setup() -> Result<()> {
+    let mut config = load_saved_config()?;
+    config.reranker_api = None;
+    save_config(&config)?;
+
+    let mut secrets = load_saved_secrets()?;
+    secrets.reranker_api_key = None;
+    save_secrets(&secrets)
+}
+
 pub fn load_runtime_config() -> Result<vera_core::config::VeraConfig> {
     let default = vera_core::config::VeraConfig::default();
     Ok(load_saved_config()?.core_config.unwrap_or(default))
