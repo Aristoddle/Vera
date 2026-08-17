@@ -61,15 +61,17 @@ fn resolve_changed_files(repo_root: &Path) -> Result<HashSet<String>> {
         vec![
             "diff",
             "--name-only",
+            "-z",
             "--diff-filter=ACMRTUXB",
             "--cached",
             "--",
         ],
-        vec!["diff", "--name-only", "--diff-filter=ACMRTUXB", "--"],
-        vec!["ls-files", "--others", "--exclude-standard", "--"],
+        vec!["diff", "--name-only", "-z", "--diff-filter=ACMRTUXB", "--"],
+        vec!["ls-files", "--others", "--exclude-standard", "-z", "--"],
     ] {
         files.extend(parse_git_paths(&run_git(repo_root, &args)?));
     }
+    add_platform_path_variants(&mut files);
     Ok(files)
 }
 
@@ -79,12 +81,15 @@ fn resolve_diff_files(repo_root: &Path, revision: &str) -> Result<HashSet<String
         &[
             "diff",
             "--name-only",
+            "-z",
             "--diff-filter=ACMRTUXB",
             revision,
             "--",
         ],
     )?;
-    Ok(parse_git_paths(&output))
+    let mut files = parse_git_paths(&output);
+    add_platform_path_variants(&mut files);
+    Ok(files)
 }
 
 fn run_git(repo_root: &Path, args: &[&str]) -> Result<String> {
@@ -114,12 +119,23 @@ fn run_git(repo_root: &Path, args: &[&str]) -> Result<String> {
 
 fn parse_git_paths(output: &str) -> HashSet<String> {
     output
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(|line| line.replace('\\', "/"))
+        .split('\0')
+        .filter(|path| !path.is_empty())
+        .map(ToOwned::to_owned)
         .collect()
 }
+
+// Git emits repository paths with `/`, while the index stores paths using the
+// platform separator. Keep both spellings at the scope boundary because some
+// callers compare paths directly instead of going through SearchFilters.
+#[cfg(windows)]
+fn add_platform_path_variants(paths: &mut HashSet<String>) {
+    let windows_paths: Vec<String> = paths.iter().map(|path| path.replace('/', "\\")).collect();
+    paths.extend(windows_paths);
+}
+
+#[cfg(not(windows))]
+fn add_platform_path_variants(_paths: &mut HashSet<String>) {}
 
 #[cfg(test)]
 mod tests {
@@ -128,8 +144,17 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn parse_git_paths_skips_empty_lines() {
-        let paths = parse_git_paths("src/main.rs\n\nREADME.md\n");
+    fn parse_git_paths_preserves_nul_delimited_pathnames() {
+        let paths = parse_git_paths(" leading README.md \0\"quoted\".rs\0line\nbreak.py\0");
+        assert!(paths.contains(" leading README.md "));
+        assert!(paths.contains("\"quoted\".rs"));
+        assert!(paths.contains("line\nbreak.py"));
+        assert_eq!(paths.len(), 3);
+    }
+
+    #[test]
+    fn parse_git_paths_skips_empty_records() {
+        let paths = parse_git_paths("src/main.rs\0\0README.md\0");
         assert!(paths.contains("src/main.rs"));
         assert!(paths.contains("README.md"));
         assert_eq!(paths.len(), 2);
@@ -148,6 +173,17 @@ mod tests {
         let paths = resolve_scope(repo.path(), &GitScope::Changed).unwrap();
         assert!(paths.contains("tracked.rs"));
         assert!(paths.contains("new.py"));
+    }
+
+    #[test]
+    fn resolve_changed_scope_preserves_whitespace_and_quotes() {
+        let repo = init_repo();
+        let path = " leading \"quoted\" file.rs ";
+        std::fs::write(repo.path().join(path), "fn changed() {}\n").unwrap();
+
+        let paths = resolve_scope(repo.path(), &GitScope::Changed).unwrap();
+
+        assert!(paths.contains(path));
     }
 
     #[test]
