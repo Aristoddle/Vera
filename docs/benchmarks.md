@@ -25,11 +25,9 @@ All ablations were measured on the full 1,251-task suite against the stated base
 
 Artifacts:
 
-- [2026-08-16-vera-cuda-baseline-full.json](../benchmarks/results/semble/2026-08-16-vera-cuda-baseline-full.json)
-- [2026-08-16-vera-cuda-c1-full.json](../benchmarks/results/semble/2026-08-16-vera-cuda-c1-full.json)
-- [2026-08-16-vera-cuda-c2-full.json](../benchmarks/results/semble/2026-08-16-vera-cuda-c2-full.json)
-- [2026-08-16-vera-cuda-v1-full.json](../benchmarks/results/semble/2026-08-16-vera-cuda-v1-full.json)
-- [2026-08-16-vera-cuda-ga-full.json](../benchmarks/results/semble/2026-08-16-vera-cuda-ga-full.json)
+- [2026-08-16-vera-cuda-v1-full.json](../benchmarks/results/semble/2026-08-16-vera-cuda-v1-full.json) (shipped configuration, full suite)
+
+The baseline, C1, C2, and GA variant JSONs were pruned from the tree; they remain in git history.
 
 ### Agent-Level Benchmark
 
@@ -74,12 +72,7 @@ From `v0.4.0` to `v0.7.0`, Vera improved by:
 - `+0.4079` MRR@10
 - `+0.3791` nDCG@10
 
-Committed artifacts:
-
-- [v0.4.0 benchmark](../benchmarks/results/local-binaries/v0.4.0-jina-cuda-onnx.json)
-- [v0.5.0 benchmark](../benchmarks/results/local-binaries/v0.5.0-jina-cuda-onnx.json)
-- [v0.7.0 benchmark](../benchmarks/results/local-binaries/v0.7.0-jina-cuda-onnx.json)
-- [`v0.7.0` accuracy improvements](./releases/v0.7.0-accuracy-improvements.md)
+The raw per-version JSONs were pruned from the tree; they remain in git history. See [`v0.7.0` accuracy improvements](./releases/v0.7.0-accuracy-improvements.md) for the per-version breakdown.
 
 ### Current Performance Snapshot
 
@@ -172,16 +165,7 @@ Scoped-filtered BM25 expands the raw Tantivy pool only when search filters are a
 
 The Jina CUDA run uses CUDA ONNX Runtime via `ORT_DYLIB_PATH`. Do not run this lane against the CPU ONNX Runtime when comparing latency.
 
-Artifacts:
-
-- [Semble subset baseline](../benchmarks/results/semble/2026-04-29-semble-subset.json)
-- [Vera BM25 scoped-filter subset](../benchmarks/results/semble/2026-05-13-vera-bm25-filtered-subset.json)
-- [Vera BM25 subset v4](../benchmarks/results/semble/2026-05-12-vera-bm25-v4-subset.json)
-- [Vera Potion CPU subset v5](../benchmarks/results/semble/2026-05-13-vera-potion-v5-subset.json)
-- [Vera Potion CPU subset v4](../benchmarks/results/semble/2026-05-12-vera-potion-v4-subset.json)
-- [Vera Jina CUDA subset](../benchmarks/results/semble/2026-05-01-vera-cuda-subset.json)
-
-Superseded May full-suite JSONs (v3, v4, scoped-filter) were pruned from the tree; they remain in git history.
+The May subset and full-suite JSONs were pruned from the tree; they remain in git history.
 
 ### Optional CodeRankEmbed Preset
 
