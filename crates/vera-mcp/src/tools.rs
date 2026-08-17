@@ -86,6 +86,71 @@ fn compact_results_json(
     serde_json::to_string(&compact)
 }
 
+/// Git-scope filter properties shared by tool schemas: `changed`, `since`,
+/// `base`. `what` names the restricted operation (e.g. "search").
+fn git_scope_properties(what: &str) -> serde_json::Map<String, Value> {
+    serde_json::json!({
+        "changed": {
+            "type": "boolean",
+            "description": format!("Restrict {what} to modified, staged, and untracked files.")
+        },
+        "since": {
+            "type": "string",
+            "description": format!("Restrict {what} to files changed since the given revision.")
+        },
+        "base": {
+            "type": "string",
+            "description": format!("Restrict {what} to files changed since merge-base(HEAD, revision).")
+        }
+    })
+    .as_object()
+    .expect("git scope properties")
+    .clone()
+}
+
+/// Merge the shared git-scope properties into a tool schema's `properties`.
+fn with_git_scope(mut schema: Value, what: &str) -> Value {
+    schema
+        .pointer_mut("/properties")
+        .and_then(Value::as_object_mut)
+        .expect("tool schema properties")
+        .extend(git_scope_properties(what));
+    schema
+}
+
+/// Shared `scope` filter property (source/docs/runtime corpus selection).
+fn scope_prop() -> Value {
+    serde_json::json!({
+        "type": "string",
+        "enum": ["source", "docs", "runtime", "all"],
+        "description": "Coarse corpus scope. Defaults to source-first behavior."
+    })
+}
+
+/// Shared `include_generated` filter property.
+fn include_generated_prop() -> Value {
+    serde_json::json!({
+        "type": "boolean",
+        "description": "Include generated or minified files such as dist bundles."
+    })
+}
+
+/// Shared `path` property naming the project directory.
+fn project_path_prop() -> Value {
+    serde_json::json!({
+        "type": "string",
+        "description": "Path to the project directory (default: current dir)"
+    })
+}
+
+/// Shared `limit` property; `what` is the counted noun ("results", "matches").
+fn limit_prop(what: &str, default: usize) -> Value {
+    serde_json::json!({
+        "type": "integer",
+        "description": format!("Maximum number of {what} (default: {default})")
+    })
+}
+
 /// Return the list of tools the server advertises.
 pub fn tool_definitions() -> Vec<ToolDefinition> {
     vec![
@@ -105,7 +170,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                           you are looking for. Set intent to describe your higher-level goal \
                           for better reranking."
                 .to_string(),
-            input_schema: serde_json::json!({
+            input_schema: with_git_scope(serde_json::json!({
                 "type": "object",
                 "properties": {
                     "query": {
@@ -134,38 +199,16 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                         "type": "string",
                         "description": "Filter by symbol type (function, struct, class, etc.)"
                     },
-                    "scope": {
-                        "type": "string",
-                        "enum": ["source", "docs", "runtime", "all"],
-                        "description": "Coarse corpus scope. Defaults to source-first behavior."
-                    },
-                    "include_generated": {
-                        "type": "boolean",
-                        "description": "Include generated or minified files such as dist bundles."
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "description": "Maximum number of results (default: 5)"
-                    },
-                    "changed": {
-                        "type": "boolean",
-                        "description": "Restrict search to modified, staged, and untracked files."
-                    },
-                    "since": {
-                        "type": "string",
-                        "description": "Restrict search to files changed since the given revision."
-                    },
-                    "base": {
-                        "type": "string",
-                        "description": "Restrict search to files changed since merge-base(HEAD, revision)."
-                    },
+                    "scope": scope_prop(),
+                    "include_generated": include_generated_prop(),
+                    "limit": limit_prop("results", 5),
                     "compact": {
                         "type": "boolean",
                         "description": "Return only function/class signatures (omit bodies). Use for broad exploration; fits more results in fewer tokens."
                     }
                 },
                 "anyOf": [{"required": ["query"]}, {"required": ["queries"]}]
-            }),
+            }), "search"),
         },
         ToolDefinition {
             name: "get_stats".to_string(),
@@ -175,10 +218,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "Path to the project directory (default: current dir)"
-                    }
+                    "path": project_path_prop()
                 }
             }),
         },
@@ -189,27 +229,12 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                           and detected project conventions (frameworks, patterns, config files). \
                           Useful for onboarding and understanding project structure."
                 .to_string(),
-            input_schema: serde_json::json!({
+            input_schema: with_git_scope(serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "Path to the project directory (default: current dir)"
-                    },
-                    "changed": {
-                        "type": "boolean",
-                        "description": "Restrict overview to modified, staged, and untracked files."
-                    },
-                    "since": {
-                        "type": "string",
-                        "description": "Restrict overview to files changed since the given revision."
-                    },
-                    "base": {
-                        "type": "string",
-                        "description": "Restrict overview to files changed since merge-base(HEAD, revision)."
-                    }
+                    "path": project_path_prop(),
                 }
-            }),
+            }), "regex search"),
         },
         ToolDefinition {
             name: "regex_search".to_string(),
@@ -221,17 +246,14 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                           WHEN NOT TO USE: conceptual or behavioral queries. Use search_code \
                           for those."
                 .to_string(),
-            input_schema: serde_json::json!({
+            input_schema: with_git_scope(serde_json::json!({
                 "type": "object",
                 "properties": {
                     "pattern": {
                         "type": "string",
                         "description": "Regex pattern to search for"
                     },
-                    "limit": {
-                        "type": "integer",
-                        "description": "Maximum number of matches (default: 20)"
-                    },
+                    "limit": limit_prop("matches", 20),
                     "ignore_case": {
                         "type": "boolean",
                         "description": "Case-insensitive matching (default: false)"
@@ -240,34 +262,15 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                         "type": "integer",
                         "description": "Context lines before and after each match (default: 2)"
                     },
-                    "scope": {
-                        "type": "string",
-                        "enum": ["source", "docs", "runtime", "all"],
-                        "description": "Coarse corpus scope. Defaults to source-first behavior."
-                    },
-                    "include_generated": {
-                        "type": "boolean",
-                        "description": "Include generated or minified files such as dist bundles."
-                    },
-                    "changed": {
-                        "type": "boolean",
-                        "description": "Restrict regex search to modified, staged, and untracked files."
-                    },
-                    "since": {
-                        "type": "string",
-                        "description": "Restrict regex search to files changed since the given revision."
-                    },
-                    "base": {
-                        "type": "string",
-                        "description": "Restrict regex search to files changed since merge-base(HEAD, revision)."
-                    },
+                    "scope": scope_prop(),
+                    "include_generated": include_generated_prop(),
                     "compact": {
                         "type": "boolean",
                         "description": "Return only function/class signatures (omit bodies). Use for broad exploration."
                     }
                 },
                 "required": ["pattern"]
-            }),
+            }), "search"),
         },
         ToolDefinition {
             name: "structural_search".to_string(),
@@ -279,7 +282,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                           WHEN NOT TO USE: conceptual behavior queries or exact caller/callee \
                           lookups. Use search_code or find_references for those."
                 .to_string(),
-            input_schema: serde_json::json!({
+            input_schema: with_git_scope(serde_json::json!({
                 "type": "object",
                 "properties": {
                     "kind": {
@@ -304,38 +307,16 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                         "type": "string",
                         "description": "Filter by enclosing symbol type (function, class, method, etc.)"
                     },
-                    "scope": {
-                        "type": "string",
-                        "enum": ["source", "docs", "runtime", "all"],
-                        "description": "Coarse corpus scope. Defaults to source-first behavior."
-                    },
-                    "include_generated": {
-                        "type": "boolean",
-                        "description": "Include generated or minified files such as dist bundles."
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "description": "Maximum number of results (default: 20)"
-                    },
-                    "changed": {
-                        "type": "boolean",
-                        "description": "Restrict search to modified, staged, and untracked files."
-                    },
-                    "since": {
-                        "type": "string",
-                        "description": "Restrict search to files changed since the given revision."
-                    },
-                    "base": {
-                        "type": "string",
-                        "description": "Restrict search to files changed since merge-base(HEAD, revision)."
-                    },
+                    "scope": scope_prop(),
+                    "include_generated": include_generated_prop(),
+                    "limit": limit_prop("results", 20),
                     "compact": {
                         "type": "boolean",
                         "description": "Return only function/class signatures (omit bodies)."
                     }
                 },
                 "required": ["kind"]
-            }),
+            }), "references"),
         },
         ToolDefinition {
             name: "find_references".to_string(),
@@ -346,7 +327,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                           WHEN NOT TO USE: conceptual behavior queries or heuristic structural \
                           scans. Use search_code or structural_search for those."
                 .to_string(),
-            input_schema: serde_json::json!({
+            input_schema: with_git_scope(serde_json::json!({
                 "type": "object",
                 "properties": {
                     "symbol": {
@@ -357,29 +338,14 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                         "type": "boolean",
                         "description": "Return what the symbol calls instead of who calls it."
                     },
-                    "limit": {
-                        "type": "integer",
-                        "description": "Maximum number of results (default: 20)"
-                    },
-                    "changed": {
-                        "type": "boolean",
-                        "description": "Restrict references to modified, staged, and untracked files."
-                    },
-                    "since": {
-                        "type": "string",
-                        "description": "Restrict references to files changed since the given revision."
-                    },
-                    "base": {
-                        "type": "string",
-                        "description": "Restrict references to files changed since merge-base(HEAD, revision)."
-                    },
+                    "limit": limit_prop("results", 20),
                     "compact": {
                         "type": "boolean",
                         "description": "For caller lookups, return only function/class signatures."
                     }
                 },
                 "required": ["symbol"]
-            }),
+            }), "references"),
         },
         ToolDefinition {
             name: "explain_path".to_string(),
