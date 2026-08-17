@@ -57,45 +57,26 @@ impl ToolAdapter for VeraBm25Adapter {
         repo_path: &str,
         path_scope: Option<&str>,
     ) -> Vec<RetrievalResult> {
-        let repo_path = Path::new(repo_path);
-        if repo_path.as_os_str().is_empty() {
-            return Vec::new();
-        }
-
-        let mut filters = SearchFilters::default();
-        if let Some(scope) = path_scope {
-            filters.path_glob = vec![format!("{scope}/**")];
-        }
-
-        match self.runtime.block_on(self.search_context.search(
-            &index_dir(repo_path),
-            query,
-            None,
+        search_with(
+            &self.runtime,
+            &self.search_context,
             &self.config,
-            &filters,
-            RESULT_LIMIT,
-        )) {
-            Ok((results, _)) => results.into_iter().map(into_retrieval_result).collect(),
-            // Abort rather than return empty results: a failed search would
-            // otherwise be scored as a legitimate zero and skew aggregates.
-            Err(err) => panic!("vera-bm25 search failed for {}: {err}", repo_path.display()),
-        }
+            query,
+            repo_path,
+            path_scope,
+            "vera-bm25",
+        )
     }
 
     fn index(&self, repo_path: &str) -> (f64, u64) {
-        let repo_path = Path::new(repo_path);
-        let provider = HashEmbeddingProvider;
-        let indexed = self.runtime.block_on(index_repository(
-            repo_path,
-            &provider,
+        index_with(
+            &self.runtime,
             &self.config,
+            Path::new(repo_path),
+            &HashEmbeddingProvider,
             MODEL_NAME,
-        ));
-
-        match indexed {
-            Ok(summary) => (summary.elapsed_secs, dir_size(&index_dir(repo_path))),
-            Err(err) => panic!("vera-bm25 index failed for {}: {err}", repo_path.display()),
-        }
+            "vera-bm25",
+        )
     }
 }
 
@@ -139,6 +120,55 @@ fn normalize(vector: &mut [f32]) {
         for value in vector {
             *value /= norm;
         }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn search_with(
+    runtime: &Runtime,
+    search_context: &SearchContext,
+    config: &VeraConfig,
+    query: &str,
+    repo_path: &str,
+    path_scope: Option<&str>,
+    label: &str,
+) -> Vec<RetrievalResult> {
+    let repo_path = Path::new(repo_path);
+    if repo_path.as_os_str().is_empty() {
+        return Vec::new();
+    }
+
+    let mut filters = SearchFilters::default();
+    if let Some(scope) = path_scope {
+        filters.path_glob = vec![format!("{scope}/**")];
+    }
+
+    match runtime.block_on(search_context.search(
+        &index_dir(repo_path),
+        query,
+        None,
+        config,
+        &filters,
+        RESULT_LIMIT,
+    )) {
+        Ok((results, _)) => results.into_iter().map(into_retrieval_result).collect(),
+        // Abort rather than return empty results: a failed search would
+        // otherwise be scored as a legitimate zero and skew aggregates.
+        Err(err) => panic!("{label} search failed for {}: {err}", repo_path.display()),
+    }
+}
+
+fn index_with<P: EmbeddingProvider>(
+    runtime: &Runtime,
+    config: &VeraConfig,
+    repo_path: &Path,
+    provider: &P,
+    model_name: &str,
+    label: &str,
+) -> (f64, u64) {
+    match runtime.block_on(index_repository(repo_path, provider, config, model_name)) {
+        Ok(summary) => (summary.elapsed_secs, dir_size(&index_dir(repo_path))),
+        Err(err) => panic!("{label} index failed for {}: {err}", repo_path.display()),
     }
 }
 
@@ -207,52 +237,32 @@ impl ToolAdapter for VeraFullAdapter {
         repo_path: &str,
         path_scope: Option<&str>,
     ) -> Vec<RetrievalResult> {
-        let repo_path = Path::new(repo_path);
-        if repo_path.as_os_str().is_empty() {
-            return Vec::new();
-        }
-
-        let mut filters = SearchFilters::default();
-        if let Some(scope) = path_scope {
-            filters.path_glob = vec![format!("{scope}/**")];
-        }
-
-        match self.runtime.block_on(self.search_context.search(
-            &index_dir(repo_path),
-            query,
-            None,
+        search_with(
+            &self.runtime,
+            &self.search_context,
             &self.config,
-            &filters,
-            RESULT_LIMIT,
-        )) {
-            Ok((results, _)) => results.into_iter().map(into_retrieval_result).collect(),
-            // Abort rather than return empty results: a failed search would
-            // otherwise be scored as a legitimate zero and skew aggregates.
-            Err(err) => panic!("vera-full search failed for {}: {err}", repo_path.display()),
-        }
+            query,
+            repo_path,
+            path_scope,
+            "vera-full",
+        )
     }
 
     fn index(&self, repo_path: &str) -> (f64, u64) {
-        let repo_path = Path::new(repo_path);
-
         let Some(provider) = self.search_context.embedding_provider() else {
             panic!("embedding provider unavailable for {}", self.backend);
         };
         let Some(model_name) = self.search_context.model_name() else {
             panic!("embedding model name unavailable for {}", self.backend);
         };
-
-        let indexed = self.runtime.block_on(index_repository(
-            repo_path,
-            provider,
+        index_with(
+            &self.runtime,
             &self.config,
+            Path::new(repo_path),
+            provider,
             model_name,
-        ));
-
-        match indexed {
-            Ok(summary) => (summary.elapsed_secs, dir_size(&index_dir(repo_path))),
-            Err(err) => panic!("vera-full index failed for {}: {err}", repo_path.display()),
-        }
+            "vera-full",
+        )
     }
 }
 
