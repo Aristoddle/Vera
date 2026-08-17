@@ -143,7 +143,9 @@ pub async fn search_hybrid(
                     .await
                     {
                         Ok(mut results) => {
-                            filter_results(&mut results, filters);
+                            if !filters.is_empty() {
+                                results.retain(|result| filters.matches(result));
+                            }
                             Ok(results)
                         }
                         Err(err) => Err(err),
@@ -351,12 +353,6 @@ pub(crate) async fn search_hybrid_reranked_with_augmentation(
             results.truncate(fetch_limit);
             Ok((results, timings))
         }
-    }
-}
-
-fn filter_results(results: &mut Vec<SearchResult>, filters: &SearchFilters) {
-    if !filters.is_empty() {
-        results.retain(|result| filters.matches(result));
     }
 }
 

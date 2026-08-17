@@ -138,34 +138,42 @@ impl Default for LocalEmbeddingModelConfig {
 }
 
 impl LocalEmbeddingModelConfig {
-    pub fn jina() -> Self {
+    fn preset(
+        repo: &str,
+        onnx_data_file: Option<&str>,
+        pooling: LocalEmbeddingPooling,
+        query_prefix: Option<&str>,
+    ) -> Self {
         Self {
             source: LocalEmbeddingSource::HuggingFace {
-                repo: EMBEDDING_REPO.to_string(),
+                repo: repo.to_string(),
             },
             onnx_file: EMBEDDING_ONNX_FILE.to_string(),
-            onnx_data_file: Some(EMBEDDING_ONNX_DATA_FILE.to_string()),
+            onnx_data_file: onnx_data_file.map(str::to_string),
             tokenizer_file: EMBEDDING_TOKENIZER_FILE.to_string(),
             embedding_dim: EMBEDDING_DIM,
-            pooling: LocalEmbeddingPooling::Mean,
+            pooling,
             max_length: EMBEDDING_MAX_LENGTH,
-            query_prefix: None,
+            query_prefix: query_prefix.map(str::to_string),
         }
     }
 
+    pub fn jina() -> Self {
+        Self::preset(
+            EMBEDDING_REPO,
+            Some(EMBEDDING_ONNX_DATA_FILE),
+            LocalEmbeddingPooling::Mean,
+            None,
+        )
+    }
+
     pub fn coderankembed() -> Self {
-        Self {
-            source: LocalEmbeddingSource::HuggingFace {
-                repo: CODERANK_EMBEDDING_REPO.to_string(),
-            },
-            onnx_file: EMBEDDING_ONNX_FILE.to_string(),
-            onnx_data_file: None,
-            tokenizer_file: EMBEDDING_TOKENIZER_FILE.to_string(),
-            embedding_dim: EMBEDDING_DIM,
-            pooling: LocalEmbeddingPooling::Cls,
-            max_length: EMBEDDING_MAX_LENGTH,
-            query_prefix: Some(CODERANK_QUERY_PREFIX.to_string()),
-        }
+        Self::preset(
+            CODERANK_EMBEDDING_REPO,
+            None,
+            LocalEmbeddingPooling::Cls,
+            Some(CODERANK_QUERY_PREFIX),
+        )
     }
 
     pub fn from_huggingface_repo(repo: impl Into<String>) -> Self {
@@ -494,6 +502,14 @@ pub fn vera_home_dir() -> Result<PathBuf> {
     }
 
     Ok(legacy)
+}
+
+/// `ORT_DYLIB_PATH` override, if set to a non-empty value.
+fn ort_dylib_path_from_env() -> Option<PathBuf> {
+    std::env::var("ORT_DYLIB_PATH")
+        .ok()
+        .filter(|p| !p.is_empty())
+        .map(PathBuf::from)
 }
 
 /// Get the platform-specific ONNX Runtime shared library filename.
@@ -1269,10 +1285,8 @@ async fn copy_so_files_from_dir(
 /// 2. Direct wheel download from PyPI
 /// 3. Bail with manual instructions
 pub async fn ensure_ort_library_for_ep(ep: OnnxExecutionProvider) -> Result<PathBuf> {
-    if let Ok(path) = std::env::var("ORT_DYLIB_PATH") {
-        if !path.is_empty() {
-            return ensure_ort_library_for_ep_with_cuda_major(ep, None).await;
-        }
+    if ort_dylib_path_from_env().is_some() {
+        return ensure_ort_library_for_ep_with_cuda_major(ep, None).await;
     }
 
     let detected_cuda_major = match ep {
@@ -1288,10 +1302,8 @@ async fn ensure_ort_library_for_ep_with_cuda_major(
     detected_cuda_major: Option<u32>,
 ) -> Result<PathBuf> {
     let target_path = ort_library_path_for_ep_with_cuda_major(ep, detected_cuda_major)?;
-    if let Ok(path) = std::env::var("ORT_DYLIB_PATH") {
-        if !path.is_empty() {
-            return Ok(target_path);
-        }
+    if ort_dylib_path_from_env().is_some() {
+        return Ok(target_path);
     }
 
     if target_path.exists() {
@@ -1386,10 +1398,8 @@ async fn ensure_ort_library_for_ep_with_cuda_major(
 /// `vera setup` and `vera repair` call this for CUDA so switching between CUDA
 /// toolkits refreshes the downloaded ORT build instead of reusing a stale one.
 pub async fn refresh_ort_library_for_ep(ep: OnnxExecutionProvider) -> Result<PathBuf> {
-    if let Ok(path) = std::env::var("ORT_DYLIB_PATH") {
-        if !path.is_empty() {
-            return Ok(PathBuf::from(path));
-        }
+    if let Some(path) = ort_dylib_path_from_env() {
+        return Ok(path);
     }
 
     let detected_cuda_major = detected_cuda_major_for_ep(ep);
@@ -1541,10 +1551,8 @@ async fn ensure_ort_via_pip_chain(
 }
 
 pub fn ort_library_path_for_ep(ep: OnnxExecutionProvider) -> Result<PathBuf> {
-    if let Ok(path) = std::env::var("ORT_DYLIB_PATH") {
-        if !path.is_empty() {
-            return Ok(PathBuf::from(path));
-        }
+    if let Some(path) = ort_dylib_path_from_env() {
+        return Ok(path);
     }
 
     let detected_cuda_major = match ep {
@@ -1595,10 +1603,8 @@ fn preferred_ort_library_path_for_ep_with_cuda_major(
     ep: OnnxExecutionProvider,
     detected_cuda_major: Option<u32>,
 ) -> Result<PathBuf> {
-    if let Ok(path) = std::env::var("ORT_DYLIB_PATH") {
-        if !path.is_empty() {
-            return Ok(PathBuf::from(path));
-        }
+    if let Some(path) = ort_dylib_path_from_env() {
+        return Ok(path);
     }
 
     let vera_home = vera_home_dir()?;
@@ -1613,10 +1619,8 @@ fn ort_library_path_for_ep_with_cuda_major(
     ep: OnnxExecutionProvider,
     detected_cuda_major: Option<u32>,
 ) -> Result<PathBuf> {
-    if let Ok(path) = std::env::var("ORT_DYLIB_PATH") {
-        if !path.is_empty() {
-            return Ok(PathBuf::from(path));
-        }
+    if let Some(path) = ort_dylib_path_from_env() {
+        return Ok(path);
     }
 
     let vera_home = vera_home_dir()?;

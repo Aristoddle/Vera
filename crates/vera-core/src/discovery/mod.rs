@@ -626,6 +626,20 @@ fn build_overrides(root: &Path, config: &IndexingConfig) -> Result<Override> {
         .context("failed to build override patterns")
 }
 
+fn simple_explanation(
+    reason: PathReason,
+    source: &str,
+    pattern: &str,
+    details: &str,
+) -> IgnoreMatchExplanation {
+    IgnoreMatchExplanation {
+        reason,
+        source: Some(source.to_string()),
+        pattern: Some(pattern.to_string()),
+        details: Some(details.to_string()),
+    }
+}
+
 fn explain_override_match(
     root: &Path,
     relative: &Path,
@@ -641,12 +655,12 @@ fn explain_override_match(
                 .build()
                 .context("failed to build override matcher")?;
             if override_matches_path_or_any_parents(&matcher, relative) {
-                return Ok(Some(IgnoreMatchExplanation {
-                    reason: PathReason::DefaultExclude,
-                    source: Some("default excludes".to_string()),
-                    pattern: Some(pattern.clone()),
-                    details: Some("matched Vera's built-in indexing exclusions".to_string()),
-                }));
+                return Ok(Some(simple_explanation(
+                    PathReason::DefaultExclude,
+                    "default excludes",
+                    pattern,
+                    "matched Vera's built-in indexing exclusions",
+                )));
             }
         }
 
@@ -656,12 +670,12 @@ fn explain_override_match(
             .build()
             .context("failed to build .veraignore override")?;
         if override_matches_path_or_any_parents(&matcher, relative) {
-            return Ok(Some(IgnoreMatchExplanation {
-                reason: PathReason::DefaultExclude,
-                source: Some("default excludes".to_string()),
-                pattern: Some(".veraignore".to_string()),
-                details: Some("the .veraignore file itself is never indexed".to_string()),
-            }));
+            return Ok(Some(simple_explanation(
+                PathReason::DefaultExclude,
+                "default excludes",
+                ".veraignore",
+                "the .veraignore file itself is never indexed",
+            )));
         }
     }
 
@@ -674,12 +688,12 @@ fn explain_override_match(
             .build()
             .context("failed to build CLI override matcher")?;
         if override_matches_path_or_any_parents(&matcher, relative) {
-            return Ok(Some(IgnoreMatchExplanation {
-                reason: PathReason::CliExclude,
-                source: Some("--exclude".to_string()),
-                pattern: Some(pattern.clone()),
-                details: Some("matched a CLI exclusion pattern".to_string()),
-            }));
+            return Ok(Some(simple_explanation(
+                PathReason::CliExclude,
+                "--exclude",
+                pattern,
+                "matched a CLI exclusion pattern",
+            )));
         }
     }
 
