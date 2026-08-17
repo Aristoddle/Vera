@@ -252,8 +252,10 @@ mod tests {
         std::fs::create_dir_all(&index_dir).unwrap();
         let metadata = MetadataStore::open(&index_dir.join("metadata.db")).unwrap();
 
-        let mut saved_config = IndexingConfig::default();
-        saved_config.extra_excludes = vec!["generated/**".to_string()];
+        let saved_config = IndexingConfig {
+            extra_excludes: vec!["generated/**".to_string()],
+            ..Default::default()
+        };
         record_index_snapshot(&metadata, &saved_config).unwrap();
 
         let freshness = detect_staleness(dir.path(), &IndexingConfig::default()).unwrap();

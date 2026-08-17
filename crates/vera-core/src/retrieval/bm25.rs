@@ -42,28 +42,6 @@ pub fn search_bm25(index_dir: &Path, query: &str, limit: usize) -> Result<Vec<Se
     search_bm25_with_stores(&bm25_index, &metadata_store, query, limit)
 }
 
-/// Perform a filtered BM25 keyword search over the indexed chunks.
-///
-/// When filters are active, this scans a larger raw Tantivy pool before
-/// hydration so scoped searches are not starved by high-scoring off-scope
-/// chunks. Unfiltered calls keep the same candidate behavior as
-/// [`search_bm25`].
-pub fn search_bm25_with_filters(
-    index_dir: &Path,
-    query: &str,
-    filters: &SearchFilters,
-    limit: usize,
-) -> Result<Vec<SearchResult>> {
-    let bm25_dir = index_dir.join("bm25");
-    let metadata_path = index_dir.join("metadata.db");
-
-    let bm25_index = Bm25Index::open(&bm25_dir).context("failed to open BM25 index for search")?;
-    let metadata_store =
-        MetadataStore::open(&metadata_path).context("failed to open metadata store for search")?;
-
-    search_bm25_with_stores_and_filters(&bm25_index, &metadata_store, query, filters, limit)
-}
-
 /// Perform BM25 search using pre-opened stores (useful for testing and reuse).
 ///
 /// Searches the BM25 index for the given query, then hydrates each result
@@ -440,7 +418,7 @@ mod tests {
             .filter(|r| r.file_path == "src/auth.rs")
             .collect();
         assert!(
-            auth_results.len() >= 1,
+            !auth_results.is_empty(),
             "should find at least one result from auth.rs"
         );
     }

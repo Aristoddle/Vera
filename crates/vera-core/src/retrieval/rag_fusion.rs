@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Result, anyhow};
 use tracing::{debug, warn};
 
-use crate::config::{InferenceBackend, VeraConfig};
+use crate::config::VeraConfig;
 use crate::retrieval::bm25::search_bm25;
 use crate::types::{SearchFilters, SearchResult};
 
@@ -25,28 +25,6 @@ use super::search_service::{SearchContext, SearchTimings};
 
 /// Execute deep search: RAG-fusion if a completion endpoint is configured,
 /// otherwise fall back to iterative symbol-following search.
-pub fn execute_deep_search(
-    index_dir: &Path,
-    query: &str,
-    intent: Option<&str>,
-    config: &VeraConfig,
-    filters: &SearchFilters,
-    result_limit: usize,
-    backend: InferenceBackend,
-) -> Result<(Vec<SearchResult>, SearchTimings)> {
-    let rt = tokio::runtime::Runtime::new()?;
-    let context = rt.block_on(SearchContext::new(config, backend));
-    rt.block_on(execute_deep_search_with_context(
-        &context,
-        index_dir,
-        query,
-        intent,
-        config,
-        filters,
-        result_limit,
-    ))
-}
-
 pub async fn execute_deep_search_with_context(
     context: &SearchContext,
     index_dir: &Path,

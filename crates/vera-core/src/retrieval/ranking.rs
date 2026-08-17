@@ -190,7 +190,7 @@ impl QueryFeatures {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub(crate) fn apply_query_ranking(
     query: &str,
     results: Vec<SearchResult>,

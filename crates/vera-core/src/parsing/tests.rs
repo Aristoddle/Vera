@@ -445,7 +445,7 @@ namespace geometry {
 "#;
     let chunks = parse_and_chunk(source, "shape.cpp", Language::Cpp, &default_config()).unwrap();
     assert!(
-        chunks.len() >= 1,
+        !chunks.is_empty(),
         "expected at least class or namespace chunks"
     );
 

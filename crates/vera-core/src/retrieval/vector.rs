@@ -6,8 +6,6 @@
 //! metadata store. Finds semantically related code even when query terms
 //! don't appear literally in results (e.g., "memory allocation" finds `alloc`).
 
-use std::path::Path;
-
 use anyhow::Result;
 use tracing::debug;
 
@@ -29,40 +27,6 @@ pub enum VectorSearchError {
     /// Storage or metadata error.
     #[error("storage error: {0}")]
     StorageError(#[from] anyhow::Error),
-}
-
-/// Perform a vector similarity search over the indexed chunks.
-///
-/// Opens the vector store and metadata store from the index directory,
-/// generates a query embedding via the provider, performs nearest-neighbor
-/// search, and returns hydrated results sorted by similarity (descending).
-///
-/// # Arguments
-/// - `index_dir` — Path to the `.vera` index directory
-/// - `provider` — Embedding provider for generating the query vector
-/// - `query` — The search query text
-/// - `limit` — Maximum number of results to return
-/// - `stored_dim` — Dimensionality of stored vectors (for truncation matching)
-///
-/// # Returns
-/// A vector of `SearchResult` with full chunk metadata, sorted by similarity
-/// score descending.
-pub async fn search_vector(
-    index_dir: &Path,
-    provider: &impl EmbeddingProvider,
-    query: &str,
-    limit: usize,
-    stored_dim: usize,
-) -> Result<Vec<SearchResult>, VectorSearchError> {
-    let vector_path = index_dir.join("vectors.db");
-    let metadata_path = index_dir.join("metadata.db");
-
-    let vector_store = VectorStore::open(&vector_path, stored_dim)
-        .map_err(|e| VectorSearchError::StorageError(e.context("failed to open vector store")))?;
-    let metadata_store = MetadataStore::open(&metadata_path)
-        .map_err(|e| VectorSearchError::StorageError(e.context("failed to open metadata store")))?;
-
-    search_vector_with_stores(&vector_store, &metadata_store, provider, query, limit).await
 }
 
 /// Perform vector search using pre-opened stores (useful for testing and reuse).

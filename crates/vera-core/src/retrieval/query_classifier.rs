@@ -68,8 +68,9 @@ pub fn classify_query(query: &str) -> QueryType {
     let words: Vec<&str> = trimmed.split_whitespace().collect();
 
     if words.len() == 1 {
-        // Single token — check for identifier patterns.
-        return classify_single_token(trimmed);
+        // Single token (word or compound identifier) — treat as identifier
+        // since it's more likely a symbol search.
+        return QueryType::Identifier;
     }
 
     // Multi-word: check for identifier-like patterns first.
@@ -106,17 +107,6 @@ pub fn params_for_query_type(query_type: QueryType) -> QueryParams {
         QueryType::NaturalLanguage => NL_PARAMS,
         QueryType::Identifier => IDENTIFIER_PARAMS,
     }
-}
-
-/// Classify a single token (no spaces).
-fn classify_single_token(token: &str) -> QueryType {
-    if is_compound_identifier(token) {
-        return QueryType::Identifier;
-    }
-
-    // Single plain word (e.g., "error", "config") — treat as identifier
-    // since it's more likely a symbol search.
-    QueryType::Identifier
 }
 
 /// Check if a token looks like a compound identifier.

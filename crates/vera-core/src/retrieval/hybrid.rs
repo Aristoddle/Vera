@@ -369,12 +369,12 @@ pub fn fuse_rrf(
     rrf_k: f64,
     limit: usize,
 ) -> Vec<SearchResult> {
-    fuse_rrf_multi(&[bm25_results, vector_results], rrf_k, limit)
+    fuse_rrf_multi_weighted(&[bm25_results, vector_results], &[1.0, 1.0], rrf_k, limit)
 }
 
 /// Fuse BM25 and vector results with explicit per-source weights.
 ///
-/// Identifier queries pass a higher BM25 weight (1.5) so lexical matches
+/// Identifier queries pass a higher BM25 weight (2.5) so lexical matches
 /// dominate; NL queries use equal weights (1.0, 1.0).
 pub fn fuse_rrf_weighted(
     bm25_results: &[SearchResult],
@@ -390,16 +390,6 @@ pub fn fuse_rrf_weighted(
         rrf_k,
         limit,
     )
-}
-
-/// Fuse multiple ranked result lists with reciprocal rank fusion (RRF).
-pub fn fuse_rrf_multi(
-    result_sets: &[&[SearchResult]],
-    rrf_k: f64,
-    limit: usize,
-) -> Vec<SearchResult> {
-    let weights = vec![1.0; result_sets.len()];
-    fuse_rrf_multi_weighted(result_sets, &weights, rrf_k, limit)
 }
 
 /// Fuse multiple ranked result lists with weighted reciprocal rank fusion.

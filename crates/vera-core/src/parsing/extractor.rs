@@ -2050,7 +2050,7 @@ double distance(struct Point* p) {
 "#;
         let symbols = parse_and_extract(source, Language::C);
         assert!(
-            symbols.len() >= 1,
+            !symbols.is_empty(),
             "expected >= 1 symbol, got {}",
             symbols.len()
         );
@@ -2078,7 +2078,7 @@ namespace geometry {
 "#;
         let symbols = parse_and_extract(source, Language::Cpp);
         assert!(
-            symbols.len() >= 1,
+            !symbols.is_empty(),
             "expected >= 1 symbol, got {}",
             symbols.len()
         );

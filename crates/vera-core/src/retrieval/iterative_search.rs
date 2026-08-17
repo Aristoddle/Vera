@@ -7,42 +7,17 @@ use std::path::Path;
 
 use anyhow::Result;
 
-use crate::config::{InferenceBackend, VeraConfig};
+use crate::config::VeraConfig;
 use crate::types::{SearchFilters, SearchResult};
 
 use super::search_service::{SearchContext, SearchTimings};
 
 /// Run an iterative (multi-hop) search.
 ///
-/// 1. Execute the initial query via `execute_search`.
+/// 1. Execute the initial query via `context.search`.
 /// 2. Extract unique symbol names from the top results.
 /// 3. Run follow-up searches for each extracted symbol.
 /// 4. Merge and deduplicate, preserving the original result order first.
-#[allow(clippy::too_many_arguments)]
-pub fn execute_iterative_search(
-    index_dir: &Path,
-    query: &str,
-    intent: Option<&str>,
-    config: &VeraConfig,
-    filters: &SearchFilters,
-    result_limit: usize,
-    backend: InferenceBackend,
-    hops: usize,
-) -> Result<(Vec<SearchResult>, SearchTimings)> {
-    let rt = tokio::runtime::Runtime::new()?;
-    let context = rt.block_on(SearchContext::new(config, backend));
-    rt.block_on(execute_iterative_search_with_context(
-        &context,
-        index_dir,
-        query,
-        intent,
-        config,
-        filters,
-        result_limit,
-        hops,
-    ))
-}
-
 #[allow(clippy::too_many_arguments)]
 pub async fn execute_iterative_search_with_context(
     context: &SearchContext,

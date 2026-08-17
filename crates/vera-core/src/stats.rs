@@ -163,15 +163,11 @@ pub fn collect_stats(repo_path: &Path) -> Result<IndexStats> {
     })
 }
 
-/// Collect an architecture overview of the indexed repository.
+/// Collect an architecture overview of the indexed repository, optionally
+/// filtered to an exact set of file paths.
 ///
 /// Returns a high-level summary: languages, directories, entry points,
 /// symbol types, and complexity hotspots. Designed for agent onboarding.
-pub fn collect_overview(repo_path: &Path) -> Result<ProjectOverview> {
-    collect_overview_filtered(repo_path, None)
-}
-
-/// Collect an architecture overview filtered to an exact set of file paths.
 pub fn collect_overview_filtered(
     repo_path: &Path,
     exact_paths: Option<&HashSet<String>>,
