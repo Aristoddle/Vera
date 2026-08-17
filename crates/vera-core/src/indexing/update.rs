@@ -389,18 +389,10 @@ where
     let mut parse_errors = Vec::new();
 
     if !files_to_index.is_empty() {
-        // For modified files, first remove old data.
-        if !modified.is_empty() {
-            let vector_path = idx_dir.join("vectors.db");
-            let vector_store = VectorStore::open(&vector_path, stored_dim)
-                .context("failed to open vector store for modification")?;
-            let bm25_dir = idx_dir.join("bm25");
-            let bm25_index =
-                Bm25Index::open(&bm25_dir).context("failed to open BM25 index for modification")?;
-
-            for (file_path, _, _) in &modified {
-                remove_file_from_index(&metadata_store, &vector_store, &bm25_index, file_path)?;
-            }
+        // References and type relations are re-inserted during parsing, so
+        // clear the previous rows for modified files first.
+        for (file_path, _, _) in &modified {
+            remove_file_parse_data(&metadata_store, file_path)?;
         }
 
         // Parse and chunk new/modified files.
@@ -580,6 +572,21 @@ where
             // Truncate if needed.
             let final_stored_dim = super::truncate_embeddings(&mut embeddings, stored_dim);
 
+            // Replace old chunk data for modified files only after embedding
+            // succeeded, so a failure leaves the previous index entries intact.
+            if !modified.is_empty() {
+                let vector_path = idx_dir.join("vectors.db");
+                let vector_store = VectorStore::open(&vector_path, stored_dim)
+                    .context("failed to open vector store for modification")?;
+                let bm25_dir = idx_dir.join("bm25");
+                let bm25_index = Bm25Index::open(&bm25_dir)
+                    .context("failed to open BM25 index for modification")?;
+
+                for (file_path, _, _) in &modified {
+                    remove_file_chunk_data(&metadata_store, &vector_store, &bm25_index, file_path)?;
+                }
+            }
+
             // Store metadata.
             metadata_store
                 .insert_chunks(&all_chunks)
@@ -684,19 +691,25 @@ where
     Ok(summary)
 }
 
-/// Remove all data for a file from the index stores.
-fn remove_file_from_index(
-    metadata_store: &MetadataStore,
-    vector_store: &VectorStore,
-    bm25_index: &Bm25Index,
-    file_path: &str,
-) -> Result<()> {
+/// Remove parse-phase rows (references, type relations) for a file.
+/// Modified files re-insert these during parsing, so stale rows go first.
+fn remove_file_parse_data(metadata_store: &MetadataStore, file_path: &str) -> Result<()> {
     metadata_store
         .delete_references_by_file(file_path)
         .context("failed to delete references for file")?;
     metadata_store
         .delete_type_relations_by_file(file_path)
         .context("failed to delete type relations for file")?;
+    Ok(())
+}
+
+/// Remove chunk data (chunk metadata, vectors, BM25 entries) for a file.
+fn remove_file_chunk_data(
+    metadata_store: &MetadataStore,
+    vector_store: &VectorStore,
+    bm25_index: &Bm25Index,
+    file_path: &str,
+) -> Result<()> {
     // Get chunk IDs for this file (needed for vector/BM25 deletion).
     let chunks = metadata_store
         .get_chunks_by_file(file_path)
@@ -718,6 +731,25 @@ fn remove_file_from_index(
         .delete_chunks_by_file(file_path)
         .with_context(|| format!("failed to delete metadata for {file_path}"))?;
 
+    debug!(
+        file = %file_path,
+        chunks = chunks.len(),
+        "removed file chunk data from index"
+    );
+
+    Ok(())
+}
+
+/// Remove all data for a file from the index stores.
+fn remove_file_from_index(
+    metadata_store: &MetadataStore,
+    vector_store: &VectorStore,
+    bm25_index: &Bm25Index,
+    file_path: &str,
+) -> Result<()> {
+    remove_file_parse_data(metadata_store, file_path)?;
+    remove_file_chunk_data(metadata_store, vector_store, bm25_index, file_path)?;
+
     // Delete file hash.
     metadata_store
         .delete_file_hash(file_path)
@@ -725,12 +757,6 @@ fn remove_file_from_index(
     metadata_store
         .delete_file_state(file_path)
         .with_context(|| format!("failed to delete file state for {file_path}"))?;
-
-    debug!(
-        file = %file_path,
-        chunks = chunks.len(),
-        "removed file from index"
-    );
 
     Ok(())
 }

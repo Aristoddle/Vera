@@ -96,7 +96,9 @@ impl SearchFilters {
         }
 
         if let Some(ref exact_paths) = self.exact_paths {
-            if !exact_paths.contains(file_path) {
+            // Git-scope paths are `/`-normalized; indexed paths may use `\`
+            // on Windows.
+            if !exact_paths.contains(file_path.replace('\\', "/").as_str()) {
                 return false;
             }
         }
@@ -1425,6 +1427,11 @@ mod tests {
         let blocked = make_test_result("src/main.rs", Language::Rust, None, None);
         assert!(filters.matches(&allowed));
         assert!(!filters.matches(&blocked));
+
+        // Git-scope paths are `/`-normalized; indexed paths may use `\` on
+        // Windows. The filter must match either separator.
+        let windows_allowed = make_test_result("src\\lib.rs", Language::Rust, None, None);
+        assert!(filters.matches(&windows_allowed));
     }
 
     #[test]

@@ -23,8 +23,12 @@ pub fn resolve_scope(repo_root: &Path, scope: &GitScope) -> Result<HashSet<Strin
 
     match scope {
         GitScope::Changed => resolve_changed_files(repo_root),
-        GitScope::Since(rev) => resolve_diff_files(repo_root, rev),
+        GitScope::Since(rev) => {
+            validate_revision(rev)?;
+            resolve_diff_files(repo_root, rev)
+        }
         GitScope::Base(rev) => {
+            validate_revision(rev)?;
             let merge_base = run_git(repo_root, &["merge-base", "HEAD", rev])?;
             let merge_base = merge_base.trim();
             if merge_base.is_empty() {
@@ -33,6 +37,16 @@ pub fn resolve_scope(repo_root: &Path, scope: &GitScope) -> Result<HashSet<Strin
             resolve_diff_files(repo_root, merge_base)
         }
     }
+}
+
+/// Reject revisions that git would parse as options (e.g. `--output=...`).
+/// Callers can come from MCP requests, so never pass raw input to git argv.
+fn validate_revision(rev: &str) -> Result<()> {
+    anyhow::ensure!(
+        !rev.trim_start().starts_with('-'),
+        "invalid git revision: {rev}"
+    );
+    Ok(())
 }
 
 fn ensure_git_repo(repo_root: &Path) -> Result<()> {
@@ -163,6 +177,18 @@ mod tests {
 
         let paths = resolve_scope(repo.path(), &GitScope::Base("HEAD~1".to_string())).unwrap();
         assert!(paths.contains("tracked.rs"));
+    }
+
+    #[test]
+    fn resolve_scope_rejects_option_like_revisions() {
+        let repo = init_repo();
+        let since = resolve_scope(
+            repo.path(),
+            &GitScope::Since("--output=/tmp/vera-pwn".to_string()),
+        );
+        assert!(since.is_err());
+        let base = resolve_scope(repo.path(), &GitScope::Base("--all".to_string()));
+        assert!(base.is_err());
     }
 
     fn init_repo() -> TempDir {
