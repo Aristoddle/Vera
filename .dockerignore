@@ -4,6 +4,5 @@ target/
 .junie/
 .agents/
 benchmarks/results/
-spikes/
 secrets.env
 .output.txt

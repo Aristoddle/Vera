@@ -10,8 +10,7 @@ response.md
 .bench/
 target/
 .vera/
-spikes/*/Cargo.lock
-spikes/*/node_modules/
+__pycache__/
 
 # Vendored tree-sitter grammars (downloaded by scripts/bootstrap-vendored-grammars.sh)
 crates/tree-sitter-scss/

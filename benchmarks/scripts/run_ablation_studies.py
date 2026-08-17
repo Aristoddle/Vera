@@ -11,7 +11,7 @@ Produces 4 ablation analyses with per-category breakdowns and formatted tables:
 Data sources:
   - Final benchmark results: benchmarks/results/final-suite/
   - Competitor baselines (vector-only): benchmarks/results/competitor-baselines/
-  - M1 embedding spikes: spikes/embedding-chunking/results/
+  - M1 embedding spikes: benchmarks/results/embedding-spikes/
 
 Usage:
     python3 benchmarks/scripts/run_ablation_studies.py
@@ -27,7 +27,7 @@ FINAL_RESULTS = REPO_ROOT / "benchmarks" / "results" / "final-suite"
 BASELINES_FILE = (
     REPO_ROOT / "benchmarks" / "results" / "competitor-baselines" / "all_baselines.json"
 )
-EMBEDDING_RESULTS_DIR = REPO_ROOT / "spikes" / "embedding-chunking" / "results"
+EMBEDDING_RESULTS_DIR = REPO_ROOT / "benchmarks" / "results" / "embedding-spikes"
 RESULTS_DIR = REPO_ROOT / "benchmarks" / "results" / "ablation-studies"
 REPORTS_DIR = REPO_ROOT / "benchmarks" / "reports"
 
@@ -712,7 +712,7 @@ def generate_full_report(
     add()
     add("- `benchmarks/results/final-suite/combined_results.json`")
     add("- `benchmarks/results/competitor-baselines/all_baselines.json`")
-    add("- `spikes/embedding-chunking/results/embedding_*.json`")
+    add("- `benchmarks/results/embedding-spikes/embedding_*.json`")
     add("- `benchmarks/results/ablation-studies/ablation_results.json`")
     add()
 

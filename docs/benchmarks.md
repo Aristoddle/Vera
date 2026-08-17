@@ -176,13 +176,12 @@ Artifacts:
 
 - [Semble subset baseline](../benchmarks/results/semble/2026-04-29-semble-subset.json)
 - [Vera BM25 scoped-filter subset](../benchmarks/results/semble/2026-05-13-vera-bm25-filtered-subset.json)
-- [Vera BM25 scoped-filter full suite](../benchmarks/results/semble/2026-05-13-vera-bm25-filtered-full.json)
 - [Vera BM25 subset v4](../benchmarks/results/semble/2026-05-12-vera-bm25-v4-subset.json)
-- [Vera BM25 full suite v4](../benchmarks/results/semble/2026-05-12-vera-bm25-v4-full.json)
 - [Vera Potion CPU subset v5](../benchmarks/results/semble/2026-05-13-vera-potion-v5-subset.json)
 - [Vera Potion CPU subset v4](../benchmarks/results/semble/2026-05-12-vera-potion-v4-subset.json)
-- [Vera BM25 full suite v3](../benchmarks/results/semble/2026-05-11-vera-bm25-v3-full.json)
 - [Vera Jina CUDA subset](../benchmarks/results/semble/2026-05-01-vera-cuda-subset.json)
+
+Superseded May full-suite JSONs (v3, v4, scoped-filter) were pruned from the tree; they remain in git history.
 
 ### Optional CodeRankEmbed Preset
 

@@ -10,4 +10,4 @@ These are the main technical choices behind Vera's current architecture. Earlier
 | Chunking | Symbol-aware via tree-sitter AST | [004](004-chunking-strategy.md) |
 | Retrieval | BM25 + Vector + RRF + Query-aware ranking + Reranking | [005](005-query-aware-retrieval.md) |
 
-Spike code lives in `spikes/`.
+Early spike code was removed from the tree before v1.0; it remains in git history under `spikes/`.
