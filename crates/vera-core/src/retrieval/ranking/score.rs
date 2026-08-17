@@ -1,273 +1,18 @@
-//! Query-aware ranking heuristics layered on top of dense + lexical retrieval.
-//!
-//! These heuristics intentionally stay simple and deterministic. They target
-//! recurring benchmark failures that single-vector retrieval struggles with:
-//! config files at repo root, test/docs noise, symbol-type disambiguation, and
-//! same-file crowding for multi-file questions.
+//! Prior scoring and result-shaping heuristics.
 
 use crate::chunk_text::file_name;
-use crate::corpus::{ContentClass, classify_content, classify_path, content_class_label};
-use crate::retrieval::query_classifier::{QueryType, classify_query};
+use crate::corpus::{ContentClass, classify_content};
+use crate::retrieval::query_classifier::QueryType;
 use crate::retrieval::query_utils::{
-    content_declares_public_symbol, content_starts_with_impl, looks_like_compound_identifier,
-    looks_like_filename, path_depth, trim_query_token,
+    content_declares_public_symbol, content_starts_with_impl, path_depth, trim_query_token,
 };
-use crate::types::{Language, SearchFilters, SearchResult, SymbolType};
+use crate::types::{SearchFilters, SearchResult, SymbolType};
 use std::collections::HashMap;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RankingStage {
-    Initial,
-    PostRerank,
-}
+use super::query::*;
+use super::*;
 
-#[derive(Debug, Clone)]
-struct QueryFeatures {
-    query_word_count: usize,
-    path_fragment: Option<String>,
-    exact_filename: Option<String>,
-    exact_identifier_case: Option<String>,
-    exact_identifier: Option<String>,
-    keywords: Vec<String>,
-    /// CamelCase/snake_case identifiers embedded in NL queries.
-    /// E.g., "How does StateManager handle transitions" yields ["StateManager"].
-    embedded_symbols: Vec<String>,
-    requested_symbol_types: Vec<SymbolType>,
-    query_type: QueryType,
-    wants_test_paths: bool,
-    wants_docs_paths: bool,
-    wants_example_paths: bool,
-    wants_config_paths: bool,
-    wants_runtime_paths: bool,
-    wants_archive_paths: bool,
-    wants_compat_paths: bool,
-    wants_type_declarations: bool,
-    requested_versions: Vec<String>,
-    wants_multi_file_diversity: bool,
-    mentions_implementation: bool,
-    mentions_definition: bool,
-}
-
-impl QueryFeatures {
-    fn from_query(query: &str) -> Self {
-        let lower = query.trim().to_ascii_lowercase();
-        let query_type = classify_query(query);
-        let raw_tokens: Vec<&str> = query.split_whitespace().collect();
-        let cleaned_tokens: Vec<String> = query
-            .split_whitespace()
-            .map(clean_query_token)
-            .filter(|token| !token.is_empty())
-            .collect();
-        let path_fragment = cleaned_tokens
-            .iter()
-            .find(|token| looks_like_path_fragment(token))
-            .cloned();
-        let exact_filename = cleaned_tokens
-            .iter()
-            .find(|token| looks_like_filename(token))
-            .map(|token| file_name(token).to_string());
-        let exact_identifier = raw_tokens
-            .iter()
-            .map(|token| trim_query_token(token))
-            .find(|token| {
-                !token.is_empty()
-                    && !looks_like_filename(&token.to_ascii_lowercase())
-                    && looks_like_compound_identifier(token)
-            })
-            .map(|token| token.to_ascii_lowercase())
-            .or_else(|| {
-                if query_type == QueryType::Identifier && cleaned_tokens.len() == 1 {
-                    cleaned_tokens
-                        .first()
-                        .filter(|token| !looks_like_filename(token))
-                        .cloned()
-                } else {
-                    None
-                }
-            });
-        let exact_identifier_case = exact_identifier.as_ref().and_then(|_| {
-            raw_tokens
-                .iter()
-                .map(|token| trim_query_token(token))
-                .find(|token| {
-                    !token.is_empty()
-                        && !looks_like_filename(&token.to_ascii_lowercase())
-                        && looks_like_compound_identifier(token)
-                })
-                .map(ToString::to_string)
-        });
-        let keywords = cleaned_tokens
-            .iter()
-            .filter(|token| !looks_like_filename(token) && !is_query_stopword(token))
-            .map(|token| normalize_token(token))
-            .filter(|token| !token.is_empty())
-            .collect();
-        let requested_symbol_types = requested_symbol_types(&lower);
-
-        // Extract CamelCase/snake_case identifiers embedded in NL queries.
-        // "How does StateManager handle transitions" → ["statemanager"]
-        let embedded_symbols = if query_type == QueryType::NaturalLanguage {
-            extract_embedded_symbols(&raw_tokens, exact_identifier.as_deref())
-        } else {
-            Vec::new()
-        };
-
-        Self {
-            query_word_count: raw_tokens.len(),
-            path_fragment,
-            exact_identifier_case,
-            wants_test_paths: mentions_any(&lower, &["test", "tests", "spec", "__tests__"]),
-            wants_docs_paths: mentions_any(&lower, &["docs", "documentation", "readme"]),
-            wants_example_paths: mentions_any(&lower, &["example", "examples", "demo", "sample"]),
-            wants_config_paths: is_path_weighted_query(query)
-                || mentions_any(
-                    &lower,
-                    &["configuration", "config", "workspace", "settings"],
-                ),
-            wants_runtime_paths: mentions_any(
-                &lower,
-                &[
-                    "runtime",
-                    "bundle",
-                    "bundles",
-                    "minified",
-                    "minify",
-                    "extract",
-                    "extracted",
-                    "asar",
-                    "dist",
-                ],
-            ),
-            wants_archive_paths: mentions_any(
-                &lower,
-                &["archive", "archived", "legacy", "snapshot", "deprecated"],
-            ),
-            wants_compat_paths: mentions_any(
-                &lower,
-                &[
-                    "compat",
-                    "compatibility",
-                    "legacy",
-                    "shim",
-                    "polyfill",
-                    "adapter",
-                ],
-            ),
-            wants_type_declarations: mentions_any(
-                &lower,
-                &["declaration", "declarations", ".d.ts", "types", "typings"],
-            ),
-            requested_versions: requested_versions(&cleaned_tokens),
-            wants_multi_file_diversity: !is_path_weighted_query(query)
-                && (query_type == QueryType::NaturalLanguage
-                    || (exact_identifier.is_some() && raw_tokens.len() <= 2)),
-            mentions_implementation: mentions_any(
-                &lower,
-                &[
-                    "implementation",
-                    "implementations",
-                    "impl",
-                    "mounted",
-                    "registration",
-                ],
-            ),
-            mentions_definition: mentions_any(
-                &lower,
-                &[
-                    "definition",
-                    "definitions",
-                    "define",
-                    "declared",
-                    "declaration",
-                ],
-            ),
-            exact_filename,
-            exact_identifier,
-            keywords,
-            embedded_symbols,
-            requested_symbol_types,
-            query_type,
-        }
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn apply_query_ranking(
-    query: &str,
-    results: Vec<SearchResult>,
-    stage: RankingStage,
-) -> Vec<SearchResult> {
-    apply_query_ranking_with_filters(query, results, stage, &SearchFilters::default())
-}
-
-pub(crate) fn apply_query_ranking_with_filters(
-    query: &str,
-    results: Vec<SearchResult>,
-    stage: RankingStage,
-    filters: &SearchFilters,
-) -> Vec<SearchResult> {
-    if results.len() <= 1 {
-        return results;
-    }
-
-    let features = QueryFeatures::from_query(query);
-    let file_relevance = file_relevance_counts(&features, &results);
-    let len = results.len() as f64;
-    let mut scored: Vec<(f64, usize, SearchResult)> = results
-        .into_iter()
-        .enumerate()
-        .map(|(idx, mut result)| {
-            let base_rank = 1.0 - (idx as f64 / len);
-            let same_file_hits = file_relevance
-                .get(&result.file_path)
-                .copied()
-                .unwrap_or_default();
-            let prior = score_prior(&features, &result, stage, filters, same_file_hits);
-            let combined = base_rank + prior;
-            result.score = combined;
-            (combined, idx, result)
-        })
-        .collect();
-
-    scored.sort_by(|a, b| {
-        b.0.partial_cmp(&a.0)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then(a.1.cmp(&b.1))
-    });
-
-    let reranked = scored.into_iter().map(|(_, _, result)| result).collect();
-    let reranked = if features.wants_multi_file_diversity {
-        diversify_by_file(reranked)
-    } else {
-        reranked
-    };
-    stamp_rank_scores(reranked)
-}
-
-pub(crate) fn classify_file_role(file_path: &str, language: Language) -> ContentClass {
-    classify_path(file_path, language)
-}
-
-pub(crate) fn file_role_label(file_path: &str, language: Language) -> &'static str {
-    content_class_label(classify_file_role(file_path, language))
-}
-
-pub(crate) fn is_path_weighted_query(query: &str) -> bool {
-    let lower = query.trim().to_ascii_lowercase();
-    lower.contains('/')
-        || lower.contains('\\')
-        || lower.contains(".toml")
-        || lower.contains(".json")
-        || lower.contains(".yaml")
-        || lower.contains(".yml")
-        || lower.contains(".ini")
-        || lower.contains(".conf")
-        || lower.contains("dockerfile")
-        || lower.contains("makefile")
-        || lower.contains("cmakelists.txt")
-}
-
-fn score_prior(
+pub(super) fn score_prior(
     features: &QueryFeatures,
     result: &SearchResult,
     stage: RankingStage,
@@ -646,7 +391,7 @@ fn score_prior(
     bonus
 }
 
-fn prefers_source_over_docs(features: &QueryFeatures) -> bool {
+pub(super) fn prefers_source_over_docs(features: &QueryFeatures) -> bool {
     features.query_type == QueryType::NaturalLanguage
         && features.query_word_count >= 4
         && !features.wants_config_paths
@@ -654,7 +399,7 @@ fn prefers_source_over_docs(features: &QueryFeatures) -> bool {
         && !features.wants_archive_paths
 }
 
-fn requested_symbol_types(query: &str) -> Vec<SymbolType> {
+pub(super) fn requested_symbol_types(query: &str) -> Vec<SymbolType> {
     let mut symbol_types = Vec::new();
     if query.contains("trait") {
         symbol_types.push(SymbolType::Trait);
@@ -680,7 +425,7 @@ fn requested_symbol_types(query: &str) -> Vec<SymbolType> {
     symbol_types
 }
 
-fn requested_versions(tokens: &[String]) -> Vec<String> {
+pub(super) fn requested_versions(tokens: &[String]) -> Vec<String> {
     tokens
         .iter()
         .filter(|token| {
@@ -692,7 +437,7 @@ fn requested_versions(tokens: &[String]) -> Vec<String> {
         .collect()
 }
 
-fn file_relevance_counts(
+pub(super) fn file_relevance_counts(
     features: &QueryFeatures,
     results: &[SearchResult],
 ) -> HashMap<String, usize> {
@@ -705,7 +450,10 @@ fn file_relevance_counts(
     counts
 }
 
-fn result_matches_query_features(features: &QueryFeatures, result: &SearchResult) -> bool {
+pub(super) fn result_matches_query_features(
+    features: &QueryFeatures,
+    result: &SearchResult,
+) -> bool {
     if let Some(identifier) = features.exact_identifier.as_deref() {
         if result
             .symbol_name
@@ -742,14 +490,14 @@ fn result_matches_query_features(features: &QueryFeatures, result: &SearchResult
 }
 
 /// Maximum chunks from the same file before saturation decay kicks in.
-const FILE_SATURATION_THRESHOLD: usize = 1;
+pub(super) const FILE_SATURATION_THRESHOLD: usize = 1;
 
 /// Multiplicative penalty per extra chunk from the same file beyond the threshold.
 /// 0.35 means each successive same-file chunk keeps 35% of its score, pushing
 /// it below results from other files in most cases.
-const FILE_SATURATION_DECAY: f64 = 0.35;
+pub(super) const FILE_SATURATION_DECAY: f64 = 0.35;
 
-fn diversify_by_file(results: Vec<SearchResult>) -> Vec<SearchResult> {
+pub(super) fn diversify_by_file(results: Vec<SearchResult>) -> Vec<SearchResult> {
     if results.len() <= 1 {
         return results;
     }
@@ -782,7 +530,7 @@ fn diversify_by_file(results: Vec<SearchResult>) -> Vec<SearchResult> {
     scored.into_iter().map(|(_, _, result)| result).collect()
 }
 
-fn stamp_rank_scores(mut results: Vec<SearchResult>) -> Vec<SearchResult> {
+pub(super) fn stamp_rank_scores(mut results: Vec<SearchResult>) -> Vec<SearchResult> {
     let len = results.len().max(1) as f64;
     for (idx, result) in results.iter_mut().enumerate() {
         result.score = 1.0 - (idx as f64 / len);
@@ -790,19 +538,19 @@ fn stamp_rank_scores(mut results: Vec<SearchResult>) -> Vec<SearchResult> {
     results
 }
 
-fn looks_like_path_fragment(token: &str) -> bool {
+pub(super) fn looks_like_path_fragment(token: &str) -> bool {
     token.contains('/') || token.contains('\\')
 }
 
-fn clean_query_token(token: &str) -> String {
+pub(super) fn clean_query_token(token: &str) -> String {
     trim_query_token(token).to_ascii_lowercase()
 }
 
-fn mentions_any(query: &str, needles: &[&str]) -> bool {
+pub(super) fn mentions_any(query: &str, needles: &[&str]) -> bool {
     needles.iter().any(|needle| query.contains(needle))
 }
 
-fn is_query_stopword(token: &str) -> bool {
+pub(super) fn is_query_stopword(token: &str) -> bool {
     matches!(
         token,
         "and"
@@ -824,7 +572,7 @@ fn is_query_stopword(token: &str) -> bool {
     )
 }
 
-fn normalize_token(token: &str) -> String {
+pub(super) fn normalize_token(token: &str) -> String {
     let token = token.to_ascii_lowercase();
     let trimmed = token.trim_end_matches('s');
     if trimmed.len() >= 3 {
@@ -834,26 +582,26 @@ fn normalize_token(token: &str) -> String {
     }
 }
 
-fn tokenize_path(path: &str) -> Vec<&str> {
+pub(super) fn tokenize_path(path: &str) -> Vec<&str> {
     path.split(|ch: char| !ch.is_ascii_alphanumeric())
         .filter(|part| !part.is_empty())
         .collect()
 }
 
-fn contains_token(tokens: &[&str], expected: &[&str]) -> bool {
+pub(super) fn contains_token(tokens: &[&str], expected: &[&str]) -> bool {
     tokens.iter().any(|token| expected.contains(token))
 }
 
-fn is_internal_definition_path(path: &str) -> bool {
+pub(super) fn is_internal_definition_path(path: &str) -> bool {
     let tokens = tokenize_path(path);
     contains_token(&tokens, &["sansio", "internal", "bindings"])
 }
 
-fn path_matches_fragment(path: &str, fragment: &str) -> bool {
+pub(super) fn path_matches_fragment(path: &str, fragment: &str) -> bool {
     path == fragment || path.ends_with(fragment) || path.contains(fragment)
 }
 
-fn file_stem(filename: &str) -> &str {
+pub(super) fn file_stem(filename: &str) -> &str {
     filename
         .rsplit_once('.')
         .map(|(stem, _)| stem)
@@ -863,7 +611,7 @@ fn file_stem(filename: &str) -> &str {
 /// Check if a file stem shares a 6+ char prefix with an identifier.
 /// Strips namespace prefixes (e.g. "sinatra::showexceptions" → "showexceptions")
 /// so that "format" matches "formatter" but "sinatra" doesn't match "sinatra::ShowExceptions".
-fn file_stem_prefix_matches_identifier(stem: &str, identifier: &str) -> bool {
+pub(super) fn file_stem_prefix_matches_identifier(stem: &str, identifier: &str) -> bool {
     let stem_lower = stem.to_ascii_lowercase();
     let ident_lower = identifier.to_ascii_lowercase();
     let bare_ident = ident_lower
@@ -873,13 +621,13 @@ fn file_stem_prefix_matches_identifier(stem: &str, identifier: &str) -> bool {
     common_prefix_len(&stem_lower, bare_ident) >= 6
 }
 
-fn identifier_matches_parent_dir(identifier: &str, path: &str) -> bool {
+pub(super) fn identifier_matches_parent_dir(identifier: &str, path: &str) -> bool {
     parent_dir_stems(path)
         .iter()
         .any(|stem| stem.eq_ignore_ascii_case(identifier))
 }
 
-fn parent_dir_keyword_bonus(path: &str, keywords: &[String]) -> f64 {
+pub(super) fn parent_dir_keyword_bonus(path: &str, keywords: &[String]) -> f64 {
     let stems = parent_dir_stems(path);
     if stems.is_empty() || keywords.is_empty() {
         return 0.0;
@@ -903,7 +651,7 @@ fn parent_dir_keyword_bonus(path: &str, keywords: &[String]) -> f64 {
     0.15 + ratio * 0.35
 }
 
-fn parent_dir_stems(path: &str) -> Vec<String> {
+pub(super) fn parent_dir_stems(path: &str) -> Vec<String> {
     let Some((dirs, _)) = path.rsplit_once('/') else {
         return Vec::new();
     };
@@ -914,15 +662,15 @@ fn parent_dir_stems(path: &str) -> Vec<String> {
         .collect()
 }
 
-fn is_public_symbol(result: &SearchResult) -> bool {
+pub(super) fn is_public_symbol(result: &SearchResult) -> bool {
     content_declares_public_symbol(&result.content)
 }
 
-fn looks_like_impl_block(result: &SearchResult) -> bool {
+pub(super) fn looks_like_impl_block(result: &SearchResult) -> bool {
     content_starts_with_impl(&result.content)
 }
 
-fn shares_keyword_stem(left: &str, right: &str) -> bool {
+pub(super) fn shares_keyword_stem(left: &str, right: &str) -> bool {
     // Use minimum 4-char prefix overlap so short stems like "route" match
     // "routing" and "depend" matches "dependency". Longer words use longer
     // thresholds to avoid false positives.
@@ -931,14 +679,14 @@ fn shares_keyword_stem(left: &str, right: &str) -> bool {
     common_prefix_len(left, right) >= threshold
 }
 
-fn common_prefix_len(left: &str, right: &str) -> usize {
+pub(super) fn common_prefix_len(left: &str, right: &str) -> usize {
     left.chars()
         .zip(right.chars())
         .take_while(|(l, r)| l == r)
         .count()
 }
 
-fn symbol_keyword_bonus(symbol_name: &str, keywords: &[String]) -> f64 {
+pub(super) fn symbol_keyword_bonus(symbol_name: &str, keywords: &[String]) -> f64 {
     let tokens = identifier_stems(symbol_name);
 
     if tokens.is_empty() {
@@ -963,7 +711,7 @@ fn symbol_keyword_bonus(symbol_name: &str, keywords: &[String]) -> f64 {
     0.0
 }
 
-fn identifier_stems(value: &str) -> Vec<String> {
+pub(super) fn identifier_stems(value: &str) -> Vec<String> {
     value
         .split(|ch: char| !ch.is_ascii_alphanumeric())
         .flat_map(split_camel_identifier)
@@ -972,7 +720,7 @@ fn identifier_stems(value: &str) -> Vec<String> {
         .collect()
 }
 
-fn split_camel_identifier(value: &str) -> Vec<String> {
+pub(super) fn split_camel_identifier(value: &str) -> Vec<String> {
     if value.is_empty() {
         return Vec::new();
     }
@@ -995,7 +743,7 @@ fn split_camel_identifier(value: &str) -> Vec<String> {
     parts
 }
 
-fn is_definition_symbol(symbol_type: Option<SymbolType>) -> bool {
+pub(super) fn is_definition_symbol(symbol_type: Option<SymbolType>) -> bool {
     matches!(
         symbol_type,
         Some(
@@ -1011,7 +759,7 @@ fn is_definition_symbol(symbol_type: Option<SymbolType>) -> bool {
     )
 }
 
-fn is_compat_path(path: &str) -> bool {
+pub(super) fn is_compat_path(path: &str) -> bool {
     let tokens = tokenize_path(path);
     contains_token(
         &tokens,
@@ -1027,11 +775,11 @@ fn is_compat_path(path: &str) -> bool {
     )
 }
 
-fn is_typescript_declaration(path: &str) -> bool {
+pub(super) fn is_typescript_declaration(path: &str) -> bool {
     path.ends_with(".d.ts") || path.ends_with(".d.mts") || path.ends_with(".d.cts")
 }
 
-fn is_reexport_barrel(result: &SearchResult) -> bool {
+pub(super) fn is_reexport_barrel(result: &SearchResult) -> bool {
     let filename = file_name(&result.file_path).to_ascii_lowercase();
     if !matches!(
         filename.as_str(),
@@ -1062,7 +810,7 @@ fn is_reexport_barrel(result: &SearchResult) -> bool {
     reexports > 0 && reexports * 4 >= non_empty.len() * 3
 }
 
-fn version_path_bonus(features: &QueryFeatures, path: &str) -> f64 {
+pub(super) fn version_path_bonus(features: &QueryFeatures, path: &str) -> f64 {
     if features.requested_versions.is_empty() {
         return 0.0;
     }
@@ -1088,14 +836,14 @@ fn version_path_bonus(features: &QueryFeatures, path: &str) -> f64 {
     -0.08
 }
 
-fn prefers_structural_chunks(features: &QueryFeatures) -> bool {
+pub(super) fn prefers_structural_chunks(features: &QueryFeatures) -> bool {
     features.query_type == QueryType::NaturalLanguage
         && features.exact_identifier.is_none()
         && features.query_word_count >= 4
         && !features.wants_config_paths
 }
 
-fn structural_chunk_bias(result: &SearchResult) -> f64 {
+pub(super) fn structural_chunk_bias(result: &SearchResult) -> f64 {
     let lines = chunk_line_span(result);
     let mut bonus = 0.0;
 
@@ -1129,7 +877,7 @@ fn structural_chunk_bias(result: &SearchResult) -> f64 {
     bonus
 }
 
-fn chunk_line_span(result: &SearchResult) -> u32 {
+pub(super) fn chunk_line_span(result: &SearchResult) -> u32 {
     result.line_end.saturating_sub(result.line_start) + 1
 }
 
@@ -1140,7 +888,10 @@ fn chunk_line_span(result: &SearchResult) -> u32 {
 ///
 /// These are compound identifiers that contain mixed case transitions,
 /// indicating a specific code symbol the user is asking about.
-fn extract_embedded_symbols(raw_tokens: &[&str], exact_identifier: Option<&str>) -> Vec<String> {
+pub(super) fn extract_embedded_symbols(
+    raw_tokens: &[&str],
+    exact_identifier: Option<&str>,
+) -> Vec<String> {
     let exact_lower = exact_identifier.map(|s| s.to_ascii_lowercase());
     raw_tokens
         .iter()
@@ -1173,7 +924,7 @@ fn extract_embedded_symbols(raw_tokens: &[&str], exact_identifier: Option<&str>)
 /// by a symbol name that matches query keywords. This is stronger than just
 /// checking symbol_type metadata because it confirms the chunk is the actual
 /// definition site, not just a reference.
-fn content_defines_query_keyword(content: &str, keywords: &[String]) -> bool {
+pub(super) fn content_defines_query_keyword(content: &str, keywords: &[String]) -> bool {
     static DEFINITION_PREFIXES: &[&str] = &[
         "class ",
         "struct ",
@@ -1241,580 +992,4 @@ fn content_defines_query_keyword(content: &str, keywords: &[String]) -> bool {
         }
     }
     false
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn make_result(
-        file_path: &str,
-        symbol_name: Option<&str>,
-        symbol_type: Option<SymbolType>,
-        content: &str,
-    ) -> SearchResult {
-        SearchResult {
-            file_path: file_path.to_string(),
-            line_start: 1,
-            line_end: 20,
-            content: content.to_string(),
-            language: Language::Rust,
-            score: 1.0,
-            symbol_name: symbol_name.map(ToString::to_string),
-            symbol_type,
-        }
-    }
-
-    #[test]
-    fn root_config_file_beats_nested_match() {
-        let results = vec![
-            make_result(
-                "fuzz/Cargo.toml",
-                Some("Cargo.toml"),
-                Some(SymbolType::Block),
-                "[package]\nname = \"fuzz\"",
-            ),
-            make_result(
-                "Cargo.toml",
-                Some("Cargo.toml"),
-                Some(SymbolType::Block),
-                "[workspace]\nmembers = [\"crates/vera-core\"]",
-            ),
-        ];
-
-        let ranked = apply_query_ranking(
-            "Cargo.toml workspace configuration",
-            results,
-            RankingStage::Initial,
-        );
-
-        assert_eq!(ranked[0].file_path, "Cargo.toml");
-    }
-
-    #[test]
-    fn test_paths_are_demoted_for_non_test_queries() {
-        let results = vec![
-            make_result(
-                "tests/validation.test.ts",
-                Some("validation"),
-                Some(SymbolType::Function),
-                "export function validation() {}",
-            ),
-            make_result(
-                "src/validation.ts",
-                Some("validateRequest"),
-                Some(SymbolType::Function),
-                "export function validateRequest() {}",
-            ),
-        ];
-
-        let ranked = apply_query_ranking(
-            "request validation and schema enforcement",
-            results,
-            RankingStage::Initial,
-        );
-
-        assert_eq!(ranked[0].file_path, "src/validation.ts");
-    }
-
-    #[test]
-    fn requested_symbol_type_gets_priority() {
-        let results = vec![
-            make_result(
-                "src/blueprint_methods.py",
-                Some("register"),
-                Some(SymbolType::Method),
-                "def register(self): pass",
-            ),
-            make_result(
-                "src/blueprint.py",
-                Some("Blueprint"),
-                Some(SymbolType::Class),
-                "class Blueprint:\n    pass",
-            ),
-        ];
-
-        let ranked =
-            apply_query_ranking("Blueprint class definition", results, RankingStage::Initial);
-
-        assert_eq!(ranked[0].symbol_type, Some(SymbolType::Class));
-    }
-
-    #[test]
-    fn case_exact_identifier_beats_lowercase_method() {
-        let results = vec![
-            make_result(
-                "src/server.rs",
-                Some("run"),
-                Some(SymbolType::Method),
-                "fn run(&self) {}",
-            ),
-            make_result(
-                "src/run/mod.rs",
-                Some("Run"),
-                Some(SymbolType::Struct),
-                "pub struct Run {}",
-            ),
-        ];
-
-        let ranked = apply_query_ranking("Run struct definition", results, RankingStage::Initial);
-
-        assert_eq!(ranked[0].symbol_name.as_deref(), Some("Run"));
-    }
-
-    #[test]
-    fn public_class_definition_beats_internal_variant() {
-        let results = vec![
-            make_result(
-                "src/flask/sansio/blueprints.py",
-                Some("Blueprint"),
-                Some(SymbolType::Class),
-                "class Blueprint:\n    pass",
-            ),
-            make_result(
-                "src/flask/blueprints.py",
-                Some("Blueprint"),
-                Some(SymbolType::Class),
-                "class Blueprint:\n    pass",
-            ),
-        ];
-
-        let ranked =
-            apply_query_ranking("Blueprint class definition", results, RankingStage::Initial);
-
-        assert_eq!(ranked[0].file_path, "src/flask/blueprints.py");
-    }
-
-    #[test]
-    fn natural_language_queries_promote_file_diversity() {
-        // When multiple files have similar relevance, diversity should
-        // interleave them rather than clustering same-file results.
-        let results = vec![
-            make_result(
-                "src/router.ts",
-                Some("register_routes"),
-                Some(SymbolType::Function),
-                "export function register_routes() {}",
-            ),
-            make_result(
-                "src/router.ts",
-                Some("add_route"),
-                Some(SymbolType::Function),
-                "export function add_route() {}",
-            ),
-            make_result(
-                "src/blueprint.ts",
-                Some("create_blueprint"),
-                Some(SymbolType::Function),
-                "export function create_blueprint() {}",
-            ),
-        ];
-
-        let ranked = apply_query_ranking(
-            "Blueprint registration and route mounting",
-            results,
-            RankingStage::Initial,
-        );
-
-        // blueprint.ts matches the query keyword "blueprint", so diversity
-        // should interleave it between the two router.ts chunks.
-        assert_eq!(ranked[0].file_path, "src/router.ts");
-        assert_eq!(ranked[1].file_path, "src/blueprint.ts");
-    }
-
-    #[test]
-    fn explicit_path_fragment_beats_root_config_bias() {
-        let results = vec![
-            make_result(
-                "Cargo.toml",
-                Some("Cargo.toml"),
-                Some(SymbolType::Block),
-                "[workspace]\nmembers = [\"crates/vera-core\"]",
-            ),
-            make_result(
-                "fuzz/Cargo.toml",
-                Some("Cargo.toml"),
-                Some(SymbolType::Block),
-                "[package]\nname = \"fuzz\"",
-            ),
-        ];
-
-        let ranked = apply_query_ranking(
-            "fuzz/Cargo.toml package manifest",
-            results,
-            RankingStage::Initial,
-        );
-
-        assert_eq!(ranked[0].file_path, "fuzz/Cargo.toml");
-    }
-
-    #[test]
-    fn testing_module_is_treated_like_test_noise() {
-        let results = vec![
-            make_result(
-                "src/flask/testing.py",
-                Some("session_transaction"),
-                Some(SymbolType::Method),
-                "def session_transaction(self): pass",
-            ),
-            make_result(
-                "src/flask/sessions.py",
-                Some("save_session"),
-                Some(SymbolType::Method),
-                "def save_session(self): pass",
-            ),
-        ];
-
-        let ranked = apply_query_ranking(
-            "session management and cookie handling",
-            results,
-            RankingStage::Initial,
-        );
-
-        assert_eq!(ranked[0].file_path, "src/flask/sessions.py");
-    }
-
-    #[test]
-    fn broad_code_queries_prefer_source_over_docs() {
-        let results = vec![
-            make_result(
-                "docs/Reference/Validation-and-Serialization.md",
-                None,
-                None,
-                "Validation and serialization documentation.",
-            ),
-            make_result(
-                "lib/validation.js",
-                Some("validate"),
-                Some(SymbolType::Function),
-                "function validateRequestSchema () {}",
-            ),
-        ];
-
-        let ranked = apply_query_ranking(
-            "request validation and schema enforcement",
-            results,
-            RankingStage::Initial,
-        );
-
-        assert_eq!(ranked[0].file_path, "lib/validation.js");
-    }
-
-    #[test]
-    fn archived_docs_are_demoted_for_exact_queries() {
-        let results = vec![
-            make_result(
-                "archive/docs/hotkeys.md",
-                None,
-                None,
-                "keybind guide and notes",
-            ),
-            make_result(
-                "src/mod_content/hotkeys.ts",
-                Some("registerHotkeys"),
-                Some(SymbolType::Function),
-                "export function registerHotkeys() {}",
-            ),
-        ];
-
-        let ranked = apply_query_ranking("hotkeys keybind", results, RankingStage::Initial);
-
-        assert_eq!(ranked[0].file_path, "src/mod_content/hotkeys.ts");
-    }
-
-    #[test]
-    fn runtime_queries_can_prefer_runtime_extracts() {
-        let results = vec![
-            make_result(
-                "src/mod_loader.ts",
-                Some("loadMod"),
-                Some(SymbolType::Function),
-                "export function loadMod() {}",
-            ),
-            make_result(
-                "/tmp/installed-game-runtime/Game.pretty.js",
-                Some("loadMod"),
-                Some(SymbolType::Function),
-                "function loadMod() {}",
-            ),
-        ];
-
-        let ranked =
-            apply_query_ranking("runtime mod loader extract", results, RankingStage::Initial);
-
-        assert_eq!(
-            ranked[0].file_path,
-            "/tmp/installed-game-runtime/Game.pretty.js"
-        );
-    }
-
-    #[test]
-    fn filename_stem_match_beats_incidental_request_helper() {
-        let results = vec![
-            make_result(
-                "lib/handle-request.js",
-                None,
-                Some(SymbolType::Variable),
-                "const validateSchema = require('./validation')",
-            ),
-            make_result(
-                "lib/validation.js",
-                None,
-                Some(SymbolType::Variable),
-                "function validate () {}",
-            ),
-        ];
-
-        let ranked = apply_query_ranking(
-            "request validation and schema enforcement",
-            results,
-            RankingStage::Initial,
-        );
-
-        assert_eq!(ranked[0].file_path, "lib/validation.js");
-    }
-
-    #[test]
-    fn fuzzy_filename_stem_match_beats_unrelated_chunk() {
-        let results = vec![
-            make_result(
-                "src/flask/sansio/blueprints.py",
-                Some("BlueprintSetupState"),
-                Some(SymbolType::Class),
-                "class BlueprintSetupState:\n    pass",
-            ),
-            make_result(
-                "src/flask/templating.py",
-                Some("render_template"),
-                Some(SymbolType::Function),
-                "def render_template(template_name_or_list, **context):\n    return _render(...)",
-            ),
-        ];
-
-        let ranked = apply_query_ranking(
-            "template rendering pipeline",
-            results,
-            RankingStage::Initial,
-        );
-
-        assert_eq!(ranked[0].file_path, "src/flask/templating.py");
-    }
-
-    #[test]
-    fn file_stem_prefix_match_ignores_namespace_prefixes() {
-        assert!(file_stem_prefix_matches_identifier("format", "formatter"));
-        assert!(!file_stem_prefix_matches_identifier(
-            "sinatra",
-            "sinatra::showexceptions"
-        ));
-    }
-
-    #[test]
-    fn explicit_symbol_type_penalizes_mismatched_results() {
-        let results = vec![
-            make_result(
-                "src/run.rs",
-                Some("run"),
-                Some(SymbolType::Function),
-                "pub fn run() {}",
-            ),
-            make_result(
-                "src/run/mod.rs",
-                Some("Run"),
-                Some(SymbolType::Struct),
-                "pub struct Run {}",
-            ),
-        ];
-
-        let ranked = apply_query_ranking("Run struct definition", results, RankingStage::Initial);
-
-        assert_eq!(ranked[0].symbol_type, Some(SymbolType::Struct));
-    }
-
-    #[test]
-    fn broad_intent_queries_prefer_structural_chunks() {
-        let results = vec![
-            SearchResult {
-                file_path: "crates/ignore/src/types.rs".to_string(),
-                line_start: 132,
-                line_end: 137,
-                content:
-                    "pub fn file_type_def(&self) -> Option<&FileTypeDef> {\n    match self {\n        _ => None,\n    }\n}"
-                        .to_string(),
-                language: Language::Rust,
-                score: 1.0,
-                symbol_name: Some("file_type_def".to_string()),
-                symbol_type: Some(SymbolType::Method),
-            },
-            SearchResult {
-                file_path: "crates/ignore/src/types.rs".to_string(),
-                line_start: 165,
-                line_end: 181,
-                content: "pub struct Types {\n    defs: Vec<FileTypeDef>,\n    selections: Vec<String>,\n    set: GlobSet,\n}"
-                    .to_string(),
-                language: Language::Rust,
-                score: 1.0,
-                symbol_name: Some("Types".to_string()),
-                symbol_type: Some(SymbolType::Struct),
-            },
-        ];
-
-        let ranked = apply_query_ranking(
-            "file type detection and filtering",
-            results,
-            RankingStage::Initial,
-        );
-
-        assert_eq!(ranked[0].symbol_name.as_deref(), Some("Types"));
-    }
-
-    #[test]
-    fn file_coherence_boost_promotes_repeated_relevant_file() {
-        let results = vec![
-            make_result(
-                "src/misc.rs",
-                Some("misc"),
-                Some(SymbolType::Function),
-                "pub fn misc() {}",
-            ),
-            make_result(
-                "src/auth/session.rs",
-                Some("renewSession"),
-                Some(SymbolType::Function),
-                "pub fn renew_session() {}",
-            ),
-            make_result(
-                "src/auth/session.rs",
-                Some("validateSession"),
-                Some(SymbolType::Function),
-                "pub fn validate_session() {}",
-            ),
-        ];
-
-        let ranked = apply_query_ranking(
-            "session renewal and validation flow",
-            results,
-            RankingStage::Initial,
-        );
-
-        assert_eq!(ranked[0].file_path, "src/auth/session.rs");
-    }
-
-    #[test]
-    fn parent_directory_stem_match_beats_flat_unrelated_file() {
-        let results = vec![
-            make_result(
-                "src/router.rs",
-                Some("route"),
-                Some(SymbolType::Function),
-                "pub fn route() {}",
-            ),
-            make_result(
-                "src/auth/middleware.rs",
-                Some("middleware"),
-                Some(SymbolType::Function),
-                "pub fn middleware() {}",
-            ),
-        ];
-
-        let ranked = apply_query_ranking("auth middleware routing", results, RankingStage::Initial);
-
-        assert_eq!(ranked[0].file_path, "src/auth/middleware.rs");
-    }
-
-    #[test]
-    fn compatibility_paths_are_demoted_unless_requested() {
-        let results = vec![
-            make_result(
-                "src/compat/session.rs",
-                Some("session"),
-                Some(SymbolType::Function),
-                "pub fn session() {}",
-            ),
-            make_result(
-                "src/session.rs",
-                Some("session"),
-                Some(SymbolType::Function),
-                "pub fn session() {}",
-            ),
-        ];
-
-        let ranked = apply_query_ranking("session handling", results, RankingStage::Initial);
-        assert_eq!(ranked[0].file_path, "src/session.rs");
-
-        let ranked = apply_query_ranking("legacy compat session", ranked, RankingStage::Initial);
-        assert_eq!(ranked[0].file_path, "src/compat/session.rs");
-    }
-
-    #[test]
-    fn version_intent_prefers_matching_path() {
-        let results = vec![
-            make_result(
-                "src/v3/router.rs",
-                Some("router"),
-                Some(SymbolType::Function),
-                "pub fn router() {}",
-            ),
-            make_result(
-                "src/v4/router.rs",
-                Some("router"),
-                Some(SymbolType::Function),
-                "pub fn router() {}",
-            ),
-        ];
-
-        let ranked = apply_query_ranking("v4 router", results, RankingStage::Initial);
-
-        assert_eq!(ranked[0].file_path, "src/v4/router.rs");
-    }
-
-    #[test]
-    fn declaration_files_and_reexport_barrels_are_demoted() {
-        let results = vec![
-            make_result(
-                "src/index.ts",
-                Some("index"),
-                Some(SymbolType::Module),
-                "export { Session } from './session'\nexport { Auth } from './auth'",
-            ),
-            make_result(
-                "src/session.d.ts",
-                Some("Session"),
-                Some(SymbolType::Interface),
-                "export interface Session {}",
-            ),
-            make_result(
-                "src/session.ts",
-                Some("Session"),
-                Some(SymbolType::Class),
-                "export class Session {}",
-            ),
-        ];
-
-        let ranked = apply_query_ranking("session implementation", results, RankingStage::Initial);
-
-        assert_eq!(ranked[0].file_path, "src/session.ts");
-    }
-
-    #[test]
-    fn definition_queries_boost_symbol_definitions() {
-        let results = vec![
-            make_result(
-                "src/parser.rs",
-                Some("PARSER"),
-                Some(SymbolType::Variable),
-                "static PARSER: Parser = Parser::new();",
-            ),
-            make_result(
-                "src/parser.rs",
-                Some("Parser"),
-                Some(SymbolType::Struct),
-                "pub struct Parser {}",
-            ),
-        ];
-
-        let ranked = apply_query_ranking("Parser definition", results, RankingStage::Initial);
-
-        assert_eq!(ranked[0].symbol_type, Some(SymbolType::Struct));
-    }
 }
