@@ -18,6 +18,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use vera_core::config::{InferenceBackend, OnnxExecutionProvider};
 
 #[derive(Parser)]
 #[command(name = "vera-eval", about = "Vera evaluation harness")]
@@ -229,50 +230,17 @@ fn run_report(
                 &corpus.benchmark_roots,
             )
         }
-        "vera-cuda" => {
-            let corpus = load_verified_corpus(corpus_path)?;
-            let tasks = filter_tasks_to_corpus(tasks, &corpus.repo_paths);
-            let backend = vera_core::config::InferenceBackend::OnnxJina(
-                vera_core::config::OnnxExecutionProvider::Cuda,
-            );
-            let vera = vera_adapter::VeraFullAdapter::new(backend)?;
-            runner::run_benchmark_scoped(
-                &vera,
-                &tasks,
-                &corpus.repo_paths,
-                &corpus.repo_shas,
-                &corpus.benchmark_roots,
-            )
-        }
-        "vera-cpu" => {
-            let corpus = load_verified_corpus(corpus_path)?;
-            let tasks = filter_tasks_to_corpus(tasks, &corpus.repo_paths);
-            let backend = vera_core::config::InferenceBackend::OnnxJina(
-                vera_core::config::OnnxExecutionProvider::Cpu,
-            );
-            let vera = vera_adapter::VeraFullAdapter::new(backend)?;
-            runner::run_benchmark_scoped(
-                &vera,
-                &tasks,
-                &corpus.repo_paths,
-                &corpus.repo_shas,
-                &corpus.benchmark_roots,
-            )
-        }
-        "vera-potion" => {
-            let corpus = load_verified_corpus(corpus_path)?;
-            let tasks = filter_tasks_to_corpus(tasks, &corpus.repo_paths);
-            let vera = vera_adapter::VeraFullAdapter::new(
-                vera_core::config::InferenceBackend::PotionCode,
-            )?;
-            runner::run_benchmark_scoped(
-                &vera,
-                &tasks,
-                &corpus.repo_paths,
-                &corpus.repo_shas,
-                &corpus.benchmark_roots,
-            )
-        }
+        "vera-cuda" => run_full_adapter(
+            tasks,
+            corpus_path,
+            InferenceBackend::OnnxJina(OnnxExecutionProvider::Cuda),
+        )?,
+        "vera-cpu" => run_full_adapter(
+            tasks,
+            corpus_path,
+            InferenceBackend::OnnxJina(OnnxExecutionProvider::Cpu),
+        )?,
+        "vera-potion" => run_full_adapter(tasks, corpus_path, InferenceBackend::PotionCode)?,
         other => {
             anyhow::bail!(
                 "Unknown tool '{}'. Available: vera-bm25, vera-cuda, vera-cpu, vera-potion, mock-perfect, mock-partial.",
@@ -282,4 +250,20 @@ fn run_report(
     })
 }
 
-
+/// Run the full Vera pipeline (embedding + reranking) with the given backend.
+fn run_full_adapter(
+    tasks: Vec<types::BenchmarkTask>,
+    corpus_path: &Path,
+    backend: InferenceBackend,
+) -> Result<types::EvalReport> {
+    let corpus = load_verified_corpus(corpus_path)?;
+    let tasks = filter_tasks_to_corpus(tasks, &corpus.repo_paths);
+    let vera = vera_adapter::VeraFullAdapter::new(backend)?;
+    Ok(runner::run_benchmark_scoped(
+        &vera,
+        &tasks,
+        &corpus.repo_paths,
+        &corpus.repo_shas,
+        &corpus.benchmark_roots,
+    ))
+}
