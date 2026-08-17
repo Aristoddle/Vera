@@ -9,6 +9,7 @@
 //! - Graceful degradation when services are unavailable
 
 pub mod bm25;
+pub(crate) mod exact_matches;
 pub(crate) mod graph_augmentation;
 pub mod hybrid;
 pub mod query_classifier;
