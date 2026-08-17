@@ -28,652 +28,585 @@ pub struct RawSymbol {
 /// Returns `None` if the node kind is not a top-level symbol we extract.
 pub fn classify_node(lang: Language, kind: &str) -> Option<SymbolType> {
     match lang {
-        Language::Rust => classify_rust(kind),
-        Language::TypeScript | Language::JavaScript => classify_typescript(kind),
-        Language::Python => classify_python(kind),
-        Language::Go => classify_go(kind),
-        Language::Java => classify_java(kind),
-        Language::C => classify_c(kind),
-        Language::Cpp => classify_cpp(kind),
-        Language::Ruby => classify_ruby(kind),
-        Language::Bash => classify_bash(kind),
-        Language::Kotlin => classify_kotlin(kind),
-        Language::Swift => classify_swift(kind),
-        Language::Zig => classify_zig(kind),
-        Language::Lua => classify_lua(kind),
-        Language::Scala => classify_scala(kind),
-        Language::CSharp => classify_csharp(kind),
-        Language::Php => classify_php(kind),
-        Language::Haskell => classify_haskell(kind),
-        Language::Elixir => classify_elixir(kind),
-        Language::Dart => classify_dart(kind),
-        Language::Sql => classify_sql(kind),
-        Language::Hcl => classify_hcl(kind),
-        Language::Protobuf => classify_protobuf(kind),
-        Language::Html => classify_html(kind),
-        Language::Css => classify_css(kind),
-        Language::Scss => classify_scss(kind),
-        Language::Vue => classify_vue(kind),
-        Language::GraphQl => classify_graphql(kind),
-        Language::CMake => classify_cmake(kind),
-        Language::Dockerfile => classify_dockerfile(kind),
-        Language::Xml => classify_xml(kind),
-        Language::ObjectiveC => classify_objectivec(kind),
-        Language::Perl => classify_perl(kind),
-        Language::Julia => classify_julia(kind),
-        Language::Nix => classify_nix(kind),
-        Language::OCaml => classify_ocaml(kind),
-        Language::Groovy => classify_groovy(kind),
-        Language::Clojure => classify_clojure(kind),
-        Language::CommonLisp => classify_commonlisp(kind),
-        Language::Erlang => classify_erlang(kind),
-        Language::FSharp => classify_fsharp(kind),
-        Language::Fortran => classify_fortran(kind),
-        Language::PowerShell => classify_powershell(kind),
-        Language::R => classify_r(kind),
-        Language::Matlab => classify_matlab(kind),
-        Language::DLang => classify_dlang(kind),
-        Language::Fish => classify_fish(kind),
-        Language::Zsh => classify_zsh(kind),
-        Language::Luau => classify_luau(kind),
-        Language::Scheme => classify_scheme(kind),
-        Language::Racket => classify_racket(kind),
-        Language::Elm => classify_elm(kind),
-        Language::Glsl => classify_glsl(kind),
-        Language::Hlsl => classify_hlsl(kind),
-        Language::Svelte => classify_svelte(kind),
-        Language::Astro => classify_astro(kind),
-        Language::Makefile => classify_makefile(kind),
-        Language::Ini => classify_ini(kind),
-        Language::Nginx => classify_nginx(kind),
-        Language::Prisma => classify_prisma(kind),
+        Language::Rust => classify_with(RUST_KINDS, kind),
+        Language::TypeScript | Language::JavaScript => classify_with(TYPESCRIPT_KINDS, kind),
+        Language::Python => classify_with(PYTHON_KINDS, kind),
+        Language::Go => classify_with(GO_KINDS, kind),
+        Language::Java => classify_with(JAVA_KINDS, kind),
+        Language::C => classify_with(C_KINDS, kind),
+        Language::Cpp => classify_with(CPP_KINDS, kind),
+        Language::Ruby => classify_with(RUBY_KINDS, kind),
+        Language::Bash => classify_with(BASH_KINDS, kind),
+        Language::Kotlin => classify_with(KOTLIN_KINDS, kind),
+        Language::Swift => classify_with(SWIFT_KINDS, kind),
+        Language::Zig => classify_with(ZIG_KINDS, kind),
+        Language::Lua => classify_with(LUA_KINDS, kind),
+        Language::Scala => classify_with(SCALA_KINDS, kind),
+        Language::CSharp => classify_with(CSHARP_KINDS, kind),
+        Language::Php => classify_with(PHP_KINDS, kind),
+        Language::Haskell => classify_with(HASKELL_KINDS, kind),
+        Language::Dart => classify_with(DART_KINDS, kind),
+        Language::Sql => classify_with(SQL_KINDS, kind),
+        Language::Hcl => classify_with(HCL_KINDS, kind),
+        Language::Protobuf => classify_with(PROTOBUF_KINDS, kind),
+        Language::Html => classify_with(HTML_KINDS, kind),
+        Language::Css => classify_with(CSS_KINDS, kind),
+        Language::Scss => classify_with(SCSS_KINDS, kind),
+        Language::Vue => classify_with(VUE_KINDS, kind),
+        Language::GraphQl => classify_with(GRAPHQL_KINDS, kind),
+        Language::CMake => classify_with(CMAKE_KINDS, kind),
+        Language::Dockerfile => classify_with(DOCKERFILE_KINDS, kind),
+        Language::Xml => classify_with(XML_KINDS, kind),
+        Language::ObjectiveC => classify_with(OBJECTIVEC_KINDS, kind),
+        Language::Perl => classify_with(PERL_KINDS, kind),
+        Language::Julia => classify_with(JULIA_KINDS, kind),
+        Language::Nix => classify_with(NIX_KINDS, kind),
+        Language::OCaml => classify_with(OCAML_KINDS, kind),
+        Language::Groovy => classify_with(GROOVY_KINDS, kind),
+        Language::Clojure => classify_with(CLOJURE_KINDS, kind),
+        Language::CommonLisp => classify_with(COMMONLISP_KINDS, kind),
+        Language::Erlang => classify_with(ERLANG_KINDS, kind),
+        Language::FSharp => classify_with(FSHARP_KINDS, kind),
+        Language::Fortran => classify_with(FORTRAN_KINDS, kind),
+        Language::PowerShell => classify_with(POWERSHELL_KINDS, kind),
+        Language::R => classify_with(R_KINDS, kind),
+        Language::Matlab => classify_with(MATLAB_KINDS, kind),
+        Language::DLang => classify_with(DLANG_KINDS, kind),
+        Language::Fish => classify_with(FISH_KINDS, kind),
+        Language::Zsh => classify_with(ZSH_KINDS, kind),
+        Language::Luau => classify_with(LUAU_KINDS, kind),
+        Language::Scheme => classify_with(SCHEME_KINDS, kind),
+        Language::Racket => classify_with(RACKET_KINDS, kind),
+        Language::Elm => classify_with(ELM_KINDS, kind),
+        Language::Glsl => classify_with(GLSL_KINDS, kind),
+        Language::Hlsl => classify_with(HLSL_KINDS, kind),
+        Language::Svelte => classify_with(SVELTE_KINDS, kind),
+        Language::Astro => classify_with(ASTRO_KINDS, kind),
+        Language::Makefile => classify_with(MAKEFILE_KINDS, kind),
+        Language::Ini => classify_with(INI_KINDS, kind),
+        Language::Nginx => classify_with(NGINX_KINDS, kind),
+        Language::Prisma => classify_with(PRISMA_KINDS, kind),
         _ => None,
     }
 }
 
-fn classify_sql(kind: &str) -> Option<SymbolType> {
-    match kind {
-        "create_table" | "create_table_statement" | "table_definition" => Some(SymbolType::Struct),
-        "create_function"
-        | "create_function_statement"
-        | "function_definition"
-        | "create_procedure_statement"
-        | "create_procedure"
-        | "create_view"
-        | "create_view_statement"
-        | "view_definition" => Some(SymbolType::Function),
-        _ => None,
-    }
+/// Look up a tree-sitter node kind in a per-language symbol table.
+fn classify_with(table: &[(&[&str], SymbolType)], kind: &str) -> Option<SymbolType> {
+    table
+        .iter()
+        .find_map(|(kinds, ty)| kinds.contains(&kind).then_some(*ty))
 }
 
-fn classify_hcl(kind: &str) -> Option<SymbolType> {
-    match kind {
-        "block" => Some(SymbolType::Struct),
-        _ => None,
-    }
-}
+const SQL_KINDS: &[(&[&str], SymbolType)] = &[
+    (
+        &["create_table", "create_table_statement", "table_definition"],
+        SymbolType::Struct,
+    ),
+    (
+        &[
+            "create_function",
+            "create_function_statement",
+            "function_definition",
+            "create_procedure_statement",
+            "create_procedure",
+            "create_view",
+            "create_view_statement",
+            "view_definition",
+        ],
+        SymbolType::Function,
+    ),
+];
 
-fn classify_protobuf(kind: &str) -> Option<SymbolType> {
-    match kind {
-        "message" | "message_definition" => Some(SymbolType::Struct),
-        "enum" | "enum_definition" => Some(SymbolType::Enum),
-        "service" | "service_definition" => Some(SymbolType::Class),
-        "rpc" | "rpc_definition" | "rpc_declaration" => Some(SymbolType::Method),
-        _ => None,
-    }
-}
+const HCL_KINDS: &[(&[&str], SymbolType)] = &[(&["block"], SymbolType::Struct)];
 
-fn classify_html(kind: &str) -> Option<SymbolType> {
-    match kind {
-        "element" | "script_element" | "style_element" => Some(SymbolType::Block),
-        _ => None,
-    }
-}
+const PROTOBUF_KINDS: &[(&[&str], SymbolType)] = &[
+    (&["message", "message_definition"], SymbolType::Struct),
+    (&["enum", "enum_definition"], SymbolType::Enum),
+    (&["service", "service_definition"], SymbolType::Class),
+    (
+        &["rpc", "rpc_definition", "rpc_declaration"],
+        SymbolType::Method,
+    ),
+];
 
-fn classify_css(kind: &str) -> Option<SymbolType> {
-    match kind {
-        "rule_set" => Some(SymbolType::Block),
-        "media_statement" => Some(SymbolType::Block),
-        "keyframes_statement" => Some(SymbolType::Block),
-        "import_statement" => Some(SymbolType::Variable),
-        _ => None,
-    }
-}
+const HTML_KINDS: &[(&[&str], SymbolType)] = &[(
+    &["element", "script_element", "style_element"],
+    SymbolType::Block,
+)];
 
-fn classify_scss(kind: &str) -> Option<SymbolType> {
-    match kind {
-        "rule_set" => Some(SymbolType::Block),
-        "mixin_statement" => Some(SymbolType::Function),
-        "function_statement" => Some(SymbolType::Function),
-        "include_statement" => Some(SymbolType::Variable),
-        "media_statement" => Some(SymbolType::Block),
-        "keyframes_statement" => Some(SymbolType::Block),
-        _ => None,
-    }
-}
+const CSS_KINDS: &[(&[&str], SymbolType)] = &[
+    (&["rule_set"], SymbolType::Block),
+    (&["media_statement"], SymbolType::Block),
+    (&["keyframes_statement"], SymbolType::Block),
+    (&["import_statement"], SymbolType::Variable),
+];
 
-fn classify_vue(kind: &str) -> Option<SymbolType> {
-    match kind {
-        "template_element" => Some(SymbolType::Block),
-        "script_element" => Some(SymbolType::Block),
-        "style_element" => Some(SymbolType::Block),
-        _ => None,
-    }
-}
+const SCSS_KINDS: &[(&[&str], SymbolType)] = &[
+    (&["rule_set"], SymbolType::Block),
+    (&["mixin_statement"], SymbolType::Function),
+    (&["function_statement"], SymbolType::Function),
+    (&["include_statement"], SymbolType::Variable),
+    (&["media_statement"], SymbolType::Block),
+    (&["keyframes_statement"], SymbolType::Block),
+];
 
-fn classify_graphql(kind: &str) -> Option<SymbolType> {
-    match kind {
-        "object_type_definition" | "input_object_type_definition" => Some(SymbolType::Struct),
-        "interface_type_definition" => Some(SymbolType::Interface),
-        "enum_type_definition" => Some(SymbolType::Enum),
-        "union_type_definition" => Some(SymbolType::TypeAlias),
-        "scalar_type_definition" => Some(SymbolType::TypeAlias),
-        "schema_definition" => Some(SymbolType::Block),
-        "operation_definition" => Some(SymbolType::Function),
-        "fragment_definition" => Some(SymbolType::Function),
-        "directive_definition" => Some(SymbolType::Function),
-        _ => None,
-    }
-}
+const VUE_KINDS: &[(&[&str], SymbolType)] = &[
+    (&["template_element"], SymbolType::Block),
+    (&["script_element"], SymbolType::Block),
+    (&["style_element"], SymbolType::Block),
+];
 
-fn classify_cmake(kind: &str) -> Option<SymbolType> {
-    match kind {
-        "function_def" | "macro_def" => Some(SymbolType::Function),
-        "if_condition" | "foreach_loop" | "while_loop" => Some(SymbolType::Block),
-        "normal_command" => Some(SymbolType::Variable),
-        _ => None,
-    }
-}
+const GRAPHQL_KINDS: &[(&[&str], SymbolType)] = &[
+    (
+        &["object_type_definition", "input_object_type_definition"],
+        SymbolType::Struct,
+    ),
+    (&["interface_type_definition"], SymbolType::Interface),
+    (&["enum_type_definition"], SymbolType::Enum),
+    (&["union_type_definition"], SymbolType::TypeAlias),
+    (&["scalar_type_definition"], SymbolType::TypeAlias),
+    (&["schema_definition"], SymbolType::Block),
+    (&["operation_definition"], SymbolType::Function),
+    (&["fragment_definition"], SymbolType::Function),
+    (&["directive_definition"], SymbolType::Function),
+];
 
-fn classify_dockerfile(kind: &str) -> Option<SymbolType> {
-    match kind {
-        "from_instruction" => Some(SymbolType::Block),
-        "run_instruction" => Some(SymbolType::Block),
-        "copy_instruction" | "add_instruction" => Some(SymbolType::Variable),
-        "cmd_instruction" | "entrypoint_instruction" => Some(SymbolType::Function),
-        "env_instruction" | "arg_instruction" | "label_instruction" => Some(SymbolType::Constant),
-        "expose_instruction" => Some(SymbolType::Variable),
-        "workdir_instruction" | "user_instruction" | "volume_instruction" => {
-            Some(SymbolType::Variable)
-        }
-        _ => None,
-    }
-}
+const CMAKE_KINDS: &[(&[&str], SymbolType)] = &[
+    (&["function_def", "macro_def"], SymbolType::Function),
+    (
+        &["if_condition", "foreach_loop", "while_loop"],
+        SymbolType::Block,
+    ),
+    (&["normal_command"], SymbolType::Variable),
+];
 
-fn classify_xml(kind: &str) -> Option<SymbolType> {
-    match kind {
-        "element" => Some(SymbolType::Block),
-        _ => None,
-    }
-}
+const DOCKERFILE_KINDS: &[(&[&str], SymbolType)] = &[
+    (&["from_instruction"], SymbolType::Block),
+    (&["run_instruction"], SymbolType::Block),
+    (
+        &["copy_instruction", "add_instruction"],
+        SymbolType::Variable,
+    ),
+    (
+        &["cmd_instruction", "entrypoint_instruction"],
+        SymbolType::Function,
+    ),
+    (
+        &["env_instruction", "arg_instruction", "label_instruction"],
+        SymbolType::Constant,
+    ),
+    (&["expose_instruction"], SymbolType::Variable),
+    (
+        &[
+            "workdir_instruction",
+            "user_instruction",
+            "volume_instruction",
+        ],
+        SymbolType::Variable,
+    ),
+];
 
-fn classify_objectivec(kind: &str) -> Option<SymbolType> {
-    match kind {
-        "function_definition" => Some(SymbolType::Function),
-        "method_declaration" | "method_definition" | "implementation_definition" => {
-            Some(SymbolType::Method)
-        }
-        "class_interface" | "class_implementation" => Some(SymbolType::Class),
-        "protocol_declaration" => Some(SymbolType::Interface),
-        "category_interface" | "category_implementation" => Some(SymbolType::Class),
-        _ => None,
-    }
-}
+const XML_KINDS: &[(&[&str], SymbolType)] = &[(&["element"], SymbolType::Block)];
 
-fn classify_perl(kind: &str) -> Option<SymbolType> {
-    match kind {
-        "function_definition" | "subroutine_declaration_statement" => Some(SymbolType::Function),
-        "package_statement" => Some(SymbolType::Module),
-        _ => None,
-    }
-}
+const OBJECTIVEC_KINDS: &[(&[&str], SymbolType)] = &[
+    (&["function_definition"], SymbolType::Function),
+    (
+        &[
+            "method_declaration",
+            "method_definition",
+            "implementation_definition",
+        ],
+        SymbolType::Method,
+    ),
+    (
+        &["class_interface", "class_implementation"],
+        SymbolType::Class,
+    ),
+    (&["protocol_declaration"], SymbolType::Interface),
+    (
+        &["category_interface", "category_implementation"],
+        SymbolType::Class,
+    ),
+];
 
-fn classify_julia(kind: &str) -> Option<SymbolType> {
-    match kind {
-        "function_definition" | "short_function_definition" => Some(SymbolType::Function),
-        "struct_definition" => Some(SymbolType::Struct),
-        "module_definition" => Some(SymbolType::Module),
-        "abstract_definition" => Some(SymbolType::TypeAlias),
-        "macro_definition" => Some(SymbolType::Function),
-        _ => None,
-    }
-}
+const PERL_KINDS: &[(&[&str], SymbolType)] = &[
+    (
+        &["function_definition", "subroutine_declaration_statement"],
+        SymbolType::Function,
+    ),
+    (&["package_statement"], SymbolType::Module),
+];
 
-fn classify_nix(kind: &str) -> Option<SymbolType> {
-    match kind {
-        "function_expression" | "function" => Some(SymbolType::Function),
-        "binding" | "attrset_expression" => Some(SymbolType::Variable),
-        "let_expression" => Some(SymbolType::Block),
-        _ => None,
-    }
-}
+const JULIA_KINDS: &[(&[&str], SymbolType)] = &[
+    (
+        &["function_definition", "short_function_definition"],
+        SymbolType::Function,
+    ),
+    (&["struct_definition"], SymbolType::Struct),
+    (&["module_definition"], SymbolType::Module),
+    (&["abstract_definition"], SymbolType::TypeAlias),
+    (&["macro_definition"], SymbolType::Function),
+];
 
-fn classify_ocaml(kind: &str) -> Option<SymbolType> {
-    match kind {
-        "value_definition" | "let_binding" => Some(SymbolType::Function),
-        "type_definition" => Some(SymbolType::TypeAlias),
-        "module_definition" => Some(SymbolType::Module),
-        "module_type_definition" => Some(SymbolType::Interface),
-        "class_definition" => Some(SymbolType::Class),
-        "external" => Some(SymbolType::Function),
-        _ => None,
-    }
-}
+const NIX_KINDS: &[(&[&str], SymbolType)] = &[
+    (&["function_expression", "function"], SymbolType::Function),
+    (&["binding", "attrset_expression"], SymbolType::Variable),
+    (&["let_expression"], SymbolType::Block),
+];
 
-fn classify_groovy(kind: &str) -> Option<SymbolType> {
-    match kind {
-        "function_definition" | "method_declaration" => Some(SymbolType::Function),
-        "class_definition" | "class_declaration" => Some(SymbolType::Class),
-        "interface_definition" | "interface_declaration" => Some(SymbolType::Interface),
-        _ => None,
-    }
-}
+const OCAML_KINDS: &[(&[&str], SymbolType)] = &[
+    (&["value_definition", "let_binding"], SymbolType::Function),
+    (&["type_definition"], SymbolType::TypeAlias),
+    (&["module_definition"], SymbolType::Module),
+    (&["module_type_definition"], SymbolType::Interface),
+    (&["class_definition"], SymbolType::Class),
+    (&["external"], SymbolType::Function),
+];
 
-fn classify_clojure(kind: &str) -> Option<SymbolType> {
-    match kind {
-        "list_lit" => None, // handled specially — (defn ...) etc
-        "defn" => Some(SymbolType::Function),
-        "ns" => Some(SymbolType::Module),
-        _ => None,
-    }
-}
+const GROOVY_KINDS: &[(&[&str], SymbolType)] = &[
+    (
+        &["function_definition", "method_declaration"],
+        SymbolType::Function,
+    ),
+    (
+        &["class_definition", "class_declaration"],
+        SymbolType::Class,
+    ),
+    (
+        &["interface_definition", "interface_declaration"],
+        SymbolType::Interface,
+    ),
+];
 
-fn classify_commonlisp(kind: &str) -> Option<SymbolType> {
-    match kind {
-        "defun" | "defmacro" | "defgeneric" | "defmethod" => Some(SymbolType::Function),
-        "defclass" => Some(SymbolType::Class),
-        "defvar" | "defparameter" | "defconstant" => Some(SymbolType::Variable),
-        "defpackage" => Some(SymbolType::Module),
-        "list_lit" => None, // handled via recursion
-        _ => None,
-    }
-}
+const CLOJURE_KINDS: &[(&[&str], SymbolType)] = &[
+    // "list_lit" intentionally unmapped: handled specially — (defn ...) etc
+    (&["defn"], SymbolType::Function),
+    (&["ns"], SymbolType::Module),
+];
 
-fn classify_erlang(kind: &str) -> Option<SymbolType> {
-    match kind {
-        "function_clause" | "fun_expr" => Some(SymbolType::Function),
-        "type_declaration" | "record_declaration" => Some(SymbolType::TypeAlias),
-        "module_attribute" => Some(SymbolType::Module),
-        _ => None,
-    }
-}
+const COMMONLISP_KINDS: &[(&[&str], SymbolType)] = &[
+    (
+        &["defun", "defmacro", "defgeneric", "defmethod"],
+        SymbolType::Function,
+    ),
+    (&["defclass"], SymbolType::Class),
+    (
+        &["defvar", "defparameter", "defconstant"],
+        SymbolType::Variable,
+    ),
+    (&["defpackage"], SymbolType::Module),
+    // "list_lit" intentionally unmapped: handled via recursion
+];
 
-fn classify_fsharp(kind: &str) -> Option<SymbolType> {
-    match kind {
-        "function_or_value_defn" | "value_declaration" => Some(SymbolType::Function),
-        "type_definition" | "type_abbrev_defn" => Some(SymbolType::TypeAlias),
-        "module_defn" => Some(SymbolType::Module),
-        "class_defn" => Some(SymbolType::Class),
-        _ => None,
-    }
-}
+const ERLANG_KINDS: &[(&[&str], SymbolType)] = &[
+    (&["function_clause", "fun_expr"], SymbolType::Function),
+    (
+        &["type_declaration", "record_declaration"],
+        SymbolType::TypeAlias,
+    ),
+    (&["module_attribute"], SymbolType::Module),
+];
 
-fn classify_fortran(kind: &str) -> Option<SymbolType> {
-    match kind {
-        "function" | "function_statement" | "function_subprogram" => Some(SymbolType::Function),
-        "subroutine" | "subroutine_statement" | "subroutine_subprogram" => {
-            Some(SymbolType::Function)
-        }
-        "module" | "module_statement" => Some(SymbolType::Module),
-        "derived_type_definition" | "type_statement" => Some(SymbolType::Struct),
-        "program" | "program_statement" => Some(SymbolType::Block),
-        _ => None,
-    }
-}
+const FSHARP_KINDS: &[(&[&str], SymbolType)] = &[
+    (
+        &["function_or_value_defn", "value_declaration"],
+        SymbolType::Function,
+    ),
+    (
+        &["type_definition", "type_abbrev_defn"],
+        SymbolType::TypeAlias,
+    ),
+    (&["module_defn"], SymbolType::Module),
+    (&["class_defn"], SymbolType::Class),
+];
 
-fn classify_powershell(kind: &str) -> Option<SymbolType> {
-    match kind {
-        "function_statement" => Some(SymbolType::Function),
-        "class_statement" => Some(SymbolType::Class),
-        "enum_statement" => Some(SymbolType::Enum),
-        _ => None,
-    }
-}
+const FORTRAN_KINDS: &[(&[&str], SymbolType)] = &[
+    (
+        &["function", "function_statement", "function_subprogram"],
+        SymbolType::Function,
+    ),
+    (
+        &[
+            "subroutine",
+            "subroutine_statement",
+            "subroutine_subprogram",
+        ],
+        SymbolType::Function,
+    ),
+    (&["module", "module_statement"], SymbolType::Module),
+    (
+        &["derived_type_definition", "type_statement"],
+        SymbolType::Struct,
+    ),
+    (&["program", "program_statement"], SymbolType::Block),
+];
 
-fn classify_r(kind: &str) -> Option<SymbolType> {
-    match kind {
-        "function_definition" => Some(SymbolType::Function),
-        _ => None,
-    }
-}
+const POWERSHELL_KINDS: &[(&[&str], SymbolType)] = &[
+    (&["function_statement"], SymbolType::Function),
+    (&["class_statement"], SymbolType::Class),
+    (&["enum_statement"], SymbolType::Enum),
+];
 
-fn classify_matlab(kind: &str) -> Option<SymbolType> {
-    match kind {
-        "function_definition" => Some(SymbolType::Function),
-        "class_definition" => Some(SymbolType::Class),
-        _ => None,
-    }
-}
+const R_KINDS: &[(&[&str], SymbolType)] = &[(&["function_definition"], SymbolType::Function)];
 
-fn classify_dlang(kind: &str) -> Option<SymbolType> {
-    match kind {
-        "function_declaration" | "auto_declaration" => Some(SymbolType::Function),
-        "class_declaration" => Some(SymbolType::Class),
-        "struct_declaration" => Some(SymbolType::Struct),
-        "enum_declaration" => Some(SymbolType::Enum),
-        "interface_declaration" => Some(SymbolType::Interface),
-        "module_declaration" => Some(SymbolType::Module),
-        "template_declaration" => Some(SymbolType::TypeAlias),
-        _ => None,
-    }
-}
+const MATLAB_KINDS: &[(&[&str], SymbolType)] = &[
+    (&["function_definition"], SymbolType::Function),
+    (&["class_definition"], SymbolType::Class),
+];
 
-fn classify_fish(kind: &str) -> Option<SymbolType> {
-    match kind {
-        "function_definition" => Some(SymbolType::Function),
-        _ => None,
-    }
-}
+const DLANG_KINDS: &[(&[&str], SymbolType)] = &[
+    (
+        &["function_declaration", "auto_declaration"],
+        SymbolType::Function,
+    ),
+    (&["class_declaration"], SymbolType::Class),
+    (&["struct_declaration"], SymbolType::Struct),
+    (&["enum_declaration"], SymbolType::Enum),
+    (&["interface_declaration"], SymbolType::Interface),
+    (&["module_declaration"], SymbolType::Module),
+    (&["template_declaration"], SymbolType::TypeAlias),
+];
 
-fn classify_zsh(kind: &str) -> Option<SymbolType> {
-    match kind {
-        "function_definition" => Some(SymbolType::Function),
-        _ => None,
-    }
-}
+const FISH_KINDS: &[(&[&str], SymbolType)] = &[(&["function_definition"], SymbolType::Function)];
 
-fn classify_luau(kind: &str) -> Option<SymbolType> {
-    match kind {
-        "function_declaration" | "local_function" => Some(SymbolType::Function),
-        "type_definition" => Some(SymbolType::TypeAlias),
-        _ => None,
-    }
-}
+const ZSH_KINDS: &[(&[&str], SymbolType)] = &[(&["function_definition"], SymbolType::Function)];
 
-fn classify_scheme(kind: &str) -> Option<SymbolType> {
-    match kind {
-        "define" => Some(SymbolType::Function),
-        "lambda" => Some(SymbolType::Function),
-        _ => None,
-    }
-}
+const LUAU_KINDS: &[(&[&str], SymbolType)] = &[
+    (
+        &["function_declaration", "local_function"],
+        SymbolType::Function,
+    ),
+    (&["type_definition"], SymbolType::TypeAlias),
+];
 
-fn classify_racket(kind: &str) -> Option<SymbolType> {
-    match kind {
-        "define" => Some(SymbolType::Function),
-        "lambda" => Some(SymbolType::Function),
-        "module" => Some(SymbolType::Module),
-        "struct" => Some(SymbolType::Struct),
-        _ => None,
-    }
-}
+const SCHEME_KINDS: &[(&[&str], SymbolType)] = &[
+    (&["define"], SymbolType::Function),
+    (&["lambda"], SymbolType::Function),
+];
 
-fn classify_elm(kind: &str) -> Option<SymbolType> {
-    match kind {
-        "value_declaration" => Some(SymbolType::Function),
-        "type_alias_declaration" => Some(SymbolType::TypeAlias),
-        "type_declaration" => Some(SymbolType::Enum),
-        "module_declaration" => Some(SymbolType::Module),
-        _ => None,
-    }
-}
+const RACKET_KINDS: &[(&[&str], SymbolType)] = &[
+    (&["define"], SymbolType::Function),
+    (&["lambda"], SymbolType::Function),
+    (&["module"], SymbolType::Module),
+    (&["struct"], SymbolType::Struct),
+];
 
-fn classify_glsl(kind: &str) -> Option<SymbolType> {
-    match kind {
-        "function_definition" => Some(SymbolType::Function),
-        "struct_specifier" => Some(SymbolType::Struct),
-        "declaration" => Some(SymbolType::Variable),
-        _ => None,
-    }
-}
+const ELM_KINDS: &[(&[&str], SymbolType)] = &[
+    (&["value_declaration"], SymbolType::Function),
+    (&["type_alias_declaration"], SymbolType::TypeAlias),
+    (&["type_declaration"], SymbolType::Enum),
+    (&["module_declaration"], SymbolType::Module),
+];
 
-fn classify_hlsl(kind: &str) -> Option<SymbolType> {
-    match kind {
-        "function_definition" => Some(SymbolType::Function),
-        "class_specifier" => Some(SymbolType::Class),
-        "struct_specifier" => Some(SymbolType::Struct),
-        "declaration" => Some(SymbolType::Variable),
-        _ => None,
-    }
-}
+const GLSL_KINDS: &[(&[&str], SymbolType)] = &[
+    (&["function_definition"], SymbolType::Function),
+    (&["struct_specifier"], SymbolType::Struct),
+    (&["declaration"], SymbolType::Variable),
+];
 
-fn classify_svelte(kind: &str) -> Option<SymbolType> {
-    match kind {
-        "script_element" => Some(SymbolType::Block),
-        "style_element" => Some(SymbolType::Block),
-        "element" => Some(SymbolType::Block),
-        "if_statement" | "each_statement" | "await_statement" => Some(SymbolType::Block),
-        _ => None,
-    }
-}
+const HLSL_KINDS: &[(&[&str], SymbolType)] = &[
+    (&["function_definition"], SymbolType::Function),
+    (&["class_specifier"], SymbolType::Class),
+    (&["struct_specifier"], SymbolType::Struct),
+    (&["declaration"], SymbolType::Variable),
+];
 
-fn classify_astro(kind: &str) -> Option<SymbolType> {
-    match kind {
-        "frontmatter" => Some(SymbolType::Block),
-        "element" | "script_element" | "style_element" | "component" => Some(SymbolType::Block),
-        _ => None,
-    }
-}
+const SVELTE_KINDS: &[(&[&str], SymbolType)] = &[
+    (&["script_element"], SymbolType::Block),
+    (&["style_element"], SymbolType::Block),
+    (&["element"], SymbolType::Block),
+    (
+        &["if_statement", "each_statement", "await_statement"],
+        SymbolType::Block,
+    ),
+];
 
-fn classify_makefile(kind: &str) -> Option<SymbolType> {
-    match kind {
-        "rule" => Some(SymbolType::Function),
-        "variable_assignment" => Some(SymbolType::Variable),
-        "define_directive" => Some(SymbolType::Function),
-        "include_directive" => Some(SymbolType::Variable),
-        _ => None,
-    }
-}
+const ASTRO_KINDS: &[(&[&str], SymbolType)] = &[
+    (&["frontmatter"], SymbolType::Block),
+    (
+        &["element", "script_element", "style_element", "component"],
+        SymbolType::Block,
+    ),
+];
 
-fn classify_ini(kind: &str) -> Option<SymbolType> {
-    match kind {
-        "section" => Some(SymbolType::Block),
-        "setting" => Some(SymbolType::Variable),
-        _ => None,
-    }
-}
+const MAKEFILE_KINDS: &[(&[&str], SymbolType)] = &[
+    (&["rule"], SymbolType::Function),
+    (&["variable_assignment"], SymbolType::Variable),
+    (&["define_directive"], SymbolType::Function),
+    (&["include_directive"], SymbolType::Variable),
+];
 
-fn classify_nginx(kind: &str) -> Option<SymbolType> {
-    match kind {
-        "block" => Some(SymbolType::Block),
-        "directive" => Some(SymbolType::Variable),
-        _ => None,
-    }
-}
+const INI_KINDS: &[(&[&str], SymbolType)] = &[
+    (&["section"], SymbolType::Block),
+    (&["setting"], SymbolType::Variable),
+];
 
-fn classify_prisma(kind: &str) -> Option<SymbolType> {
-    match kind {
-        "model_declaration" => Some(SymbolType::Struct),
-        "enum_declaration" => Some(SymbolType::Enum),
-        "generator_declaration" | "datasource_declaration" => Some(SymbolType::Block),
-        "type_declaration" => Some(SymbolType::TypeAlias),
-        _ => None,
-    }
-}
+const NGINX_KINDS: &[(&[&str], SymbolType)] = &[
+    (&["block"], SymbolType::Block),
+    (&["directive"], SymbolType::Variable),
+];
 
-fn classify_rust(kind: &str) -> Option<SymbolType> {
-    match kind {
-        "function_item" => Some(SymbolType::Function),
-        "impl_item" => Some(SymbolType::Block),
-        "struct_item" => Some(SymbolType::Struct),
-        "enum_item" => Some(SymbolType::Enum),
-        "trait_item" => Some(SymbolType::Trait),
-        "type_item" => Some(SymbolType::TypeAlias),
-        "const_item" => Some(SymbolType::Constant),
-        "static_item" => Some(SymbolType::Constant),
-        "mod_item" => Some(SymbolType::Module),
-        _ => None,
-    }
-}
+const PRISMA_KINDS: &[(&[&str], SymbolType)] = &[
+    (&["model_declaration"], SymbolType::Struct),
+    (&["enum_declaration"], SymbolType::Enum),
+    (
+        &["generator_declaration", "datasource_declaration"],
+        SymbolType::Block,
+    ),
+    (&["type_declaration"], SymbolType::TypeAlias),
+];
 
-fn classify_typescript(kind: &str) -> Option<SymbolType> {
-    match kind {
-        "function_declaration" => Some(SymbolType::Function),
-        "class_declaration" => Some(SymbolType::Class),
-        "interface_declaration" => Some(SymbolType::Interface),
-        "type_alias_declaration" => Some(SymbolType::TypeAlias),
-        "enum_declaration" => Some(SymbolType::Enum),
-        // `method_signature` covers TS interface methods and abstract class
-        // members (`abstract_method_signature`): body-less declarations that
-        // still name a callable member.
-        "method_definition" | "method_signature" | "abstract_method_signature" => {
-            Some(SymbolType::Method)
-        }
-        "lexical_declaration" | "variable_declaration" => Some(SymbolType::Variable),
-        "export_statement" => None, // recurse into children
-        _ => None,
-    }
-}
+const RUST_KINDS: &[(&[&str], SymbolType)] = &[
+    (&["function_item"], SymbolType::Function),
+    (&["impl_item"], SymbolType::Block),
+    (&["struct_item"], SymbolType::Struct),
+    (&["enum_item"], SymbolType::Enum),
+    (&["trait_item"], SymbolType::Trait),
+    (&["type_item"], SymbolType::TypeAlias),
+    (&["const_item"], SymbolType::Constant),
+    (&["static_item"], SymbolType::Constant),
+    (&["mod_item"], SymbolType::Module),
+];
 
-fn classify_python(kind: &str) -> Option<SymbolType> {
-    match kind {
-        "function_definition" => Some(SymbolType::Function),
-        "class_definition" => Some(SymbolType::Class),
-        "decorated_definition" => None, // recurse into children
-        _ => None,
-    }
-}
+const TYPESCRIPT_KINDS: &[(&[&str], SymbolType)] = &[
+    (&["function_declaration"], SymbolType::Function),
+    (&["class_declaration"], SymbolType::Class),
+    (&["interface_declaration"], SymbolType::Interface),
+    (&["type_alias_declaration"], SymbolType::TypeAlias),
+    (&["enum_declaration"], SymbolType::Enum),
+    // `method_signature` covers TS interface methods and abstract class
+    // members (`abstract_method_signature`): body-less declarations that
+    // still name a callable member.
+    (
+        &[
+            "method_definition",
+            "method_signature",
+            "abstract_method_signature",
+        ],
+        SymbolType::Method,
+    ),
+    (
+        &["lexical_declaration", "variable_declaration"],
+        SymbolType::Variable,
+    ),
+    // "export_statement" intentionally unmapped: recurse into children
+];
 
-fn classify_go(kind: &str) -> Option<SymbolType> {
-    match kind {
-        "function_declaration" => Some(SymbolType::Function),
-        "method_declaration" => Some(SymbolType::Method),
-        "type_declaration" => None, // contains type_spec children
-        "type_spec" => Some(SymbolType::TypeAlias), // refined by child kind
-        _ => None,
-    }
-}
+const PYTHON_KINDS: &[(&[&str], SymbolType)] = &[
+    (&["function_definition"], SymbolType::Function),
+    (&["class_definition"], SymbolType::Class),
+    // "decorated_definition" intentionally unmapped: recurse into children
+];
 
-fn classify_java(kind: &str) -> Option<SymbolType> {
-    match kind {
-        "method_declaration" => Some(SymbolType::Method),
-        "class_declaration" => Some(SymbolType::Class),
-        "interface_declaration" => Some(SymbolType::Interface),
-        "enum_declaration" => Some(SymbolType::Enum),
-        "constructor_declaration" => Some(SymbolType::Method),
-        _ => None,
-    }
-}
+const GO_KINDS: &[(&[&str], SymbolType)] = &[
+    (&["function_declaration"], SymbolType::Function),
+    (&["method_declaration"], SymbolType::Method),
+    // "type_declaration" intentionally unmapped: contains type_spec children
+    (&["type_spec"], SymbolType::TypeAlias), // refined by child kind
+];
 
-fn classify_c(kind: &str) -> Option<SymbolType> {
-    match kind {
-        "function_definition" => Some(SymbolType::Function),
-        "struct_specifier" => Some(SymbolType::Struct),
-        "enum_specifier" => Some(SymbolType::Enum),
-        "type_definition" => Some(SymbolType::TypeAlias),
-        "declaration" => Some(SymbolType::Variable),
-        _ => None,
-    }
-}
+const JAVA_KINDS: &[(&[&str], SymbolType)] = &[
+    (&["method_declaration"], SymbolType::Method),
+    (&["class_declaration"], SymbolType::Class),
+    (&["interface_declaration"], SymbolType::Interface),
+    (&["enum_declaration"], SymbolType::Enum),
+    (&["constructor_declaration"], SymbolType::Method),
+];
 
-fn classify_cpp(kind: &str) -> Option<SymbolType> {
-    match kind {
-        "function_definition" => Some(SymbolType::Function),
-        "class_specifier" => Some(SymbolType::Class),
-        "struct_specifier" => Some(SymbolType::Struct),
-        "enum_specifier" => Some(SymbolType::Enum),
-        "type_definition" => Some(SymbolType::TypeAlias),
-        "namespace_definition" => Some(SymbolType::Module),
-        "template_declaration" => None, // recurse into children
-        "declaration" => Some(SymbolType::Variable),
-        _ => None,
-    }
-}
+const C_KINDS: &[(&[&str], SymbolType)] = &[
+    (&["function_definition"], SymbolType::Function),
+    (&["struct_specifier"], SymbolType::Struct),
+    (&["enum_specifier"], SymbolType::Enum),
+    (&["type_definition"], SymbolType::TypeAlias),
+    (&["declaration"], SymbolType::Variable),
+];
 
-fn classify_ruby(kind: &str) -> Option<SymbolType> {
-    match kind {
-        "method" | "singleton_method" => Some(SymbolType::Function),
-        "class" => Some(SymbolType::Class),
-        "module" => Some(SymbolType::Module),
-        _ => None,
-    }
-}
+const CPP_KINDS: &[(&[&str], SymbolType)] = &[
+    (&["function_definition"], SymbolType::Function),
+    (&["class_specifier"], SymbolType::Class),
+    (&["struct_specifier"], SymbolType::Struct),
+    (&["enum_specifier"], SymbolType::Enum),
+    (&["type_definition"], SymbolType::TypeAlias),
+    (&["namespace_definition"], SymbolType::Module),
+    // "template_declaration" intentionally unmapped: recurse into children
+    (&["declaration"], SymbolType::Variable),
+];
 
-fn classify_bash(kind: &str) -> Option<SymbolType> {
-    match kind {
-        "function_definition" => Some(SymbolType::Function),
-        _ => None,
-    }
-}
+const RUBY_KINDS: &[(&[&str], SymbolType)] = &[
+    (&["method", "singleton_method"], SymbolType::Function),
+    (&["class"], SymbolType::Class),
+    (&["module"], SymbolType::Module),
+];
 
-fn classify_kotlin(kind: &str) -> Option<SymbolType> {
-    match kind {
-        "function_declaration" => Some(SymbolType::Function),
-        "class_declaration" => Some(SymbolType::Class), // refined later
-        "object_declaration" => Some(SymbolType::Class), // objects treated as classes/singletons
-        _ => None,
-    }
-}
+const BASH_KINDS: &[(&[&str], SymbolType)] = &[(&["function_definition"], SymbolType::Function)];
 
-fn classify_swift(kind: &str) -> Option<SymbolType> {
-    match kind {
-        "function_declaration" => Some(SymbolType::Function),
-        "class_declaration" => Some(SymbolType::Class), // refined later
-        "protocol_declaration" => Some(SymbolType::Interface),
-        _ => None,
-    }
-}
+const KOTLIN_KINDS: &[(&[&str], SymbolType)] = &[
+    (&["function_declaration"], SymbolType::Function),
+    (&["class_declaration"], SymbolType::Class), // refined later
+    (&["object_declaration"], SymbolType::Class), // objects treated as classes/singletons
+];
 
-fn classify_zig(kind: &str) -> Option<SymbolType> {
-    match kind {
-        "function_declaration" => Some(SymbolType::Function),
-        // variable_declaration handled in collect_symbols to extract structs
-        _ => None,
-    }
-}
+const SWIFT_KINDS: &[(&[&str], SymbolType)] = &[
+    (&["function_declaration"], SymbolType::Function),
+    (&["class_declaration"], SymbolType::Class), // refined later
+    (&["protocol_declaration"], SymbolType::Interface),
+];
 
-fn classify_lua(kind: &str) -> Option<SymbolType> {
-    match kind {
-        "function_declaration" => Some(SymbolType::Function),
-        _ => None,
-    }
-}
+const ZIG_KINDS: &[(&[&str], SymbolType)] = &[(&["function_declaration"], SymbolType::Function)];
 
-fn classify_scala(kind: &str) -> Option<SymbolType> {
-    match kind {
-        "function_definition" => Some(SymbolType::Function),
-        "class_definition" => Some(SymbolType::Class),
-        "trait_definition" => Some(SymbolType::Trait),
-        "object_definition" => Some(SymbolType::Module), // objects map well to modules in scala
-        _ => None,
-    }
-}
+const LUA_KINDS: &[(&[&str], SymbolType)] = &[(&["function_declaration"], SymbolType::Function)];
 
-fn classify_csharp(kind: &str) -> Option<SymbolType> {
-    match kind {
-        "class_declaration" => Some(SymbolType::Class),
-        "interface_declaration" => Some(SymbolType::Interface),
-        "struct_declaration" => Some(SymbolType::Struct),
-        "enum_declaration" => Some(SymbolType::Enum),
-        "method_declaration" | "local_function_statement" => Some(SymbolType::Method),
-        "namespace_declaration" | "file_scoped_namespace_declaration" => Some(SymbolType::Module),
-        _ => None,
-    }
-}
+const SCALA_KINDS: &[(&[&str], SymbolType)] = &[
+    (&["function_definition"], SymbolType::Function),
+    (&["class_definition"], SymbolType::Class),
+    (&["trait_definition"], SymbolType::Trait),
+    (&["object_definition"], SymbolType::Module), // objects map well to modules in scala
+];
 
-fn classify_php(kind: &str) -> Option<SymbolType> {
-    match kind {
-        "function_definition" => Some(SymbolType::Function),
-        "class_declaration" => Some(SymbolType::Class),
-        "interface_declaration" => Some(SymbolType::Interface),
-        "method_declaration" => Some(SymbolType::Method),
-        _ => None,
-    }
-}
+const CSHARP_KINDS: &[(&[&str], SymbolType)] = &[
+    (&["class_declaration"], SymbolType::Class),
+    (&["interface_declaration"], SymbolType::Interface),
+    (&["struct_declaration"], SymbolType::Struct),
+    (&["enum_declaration"], SymbolType::Enum),
+    (
+        &["method_declaration", "local_function_statement"],
+        SymbolType::Method,
+    ),
+    (
+        &["namespace_declaration", "file_scoped_namespace_declaration"],
+        SymbolType::Module,
+    ),
+];
 
-fn classify_haskell(kind: &str) -> Option<SymbolType> {
-    match kind {
-        "function" | "signature" => Some(SymbolType::Function),
-        "data_type" => Some(SymbolType::Struct),
-        "type_alias" | "type_synomym" => Some(SymbolType::TypeAlias),
-        "newtype" => Some(SymbolType::TypeAlias),
-        _ => None,
-    }
-}
+const PHP_KINDS: &[(&[&str], SymbolType)] = &[
+    (&["function_definition"], SymbolType::Function),
+    (&["class_declaration"], SymbolType::Class),
+    (&["interface_declaration"], SymbolType::Interface),
+    (&["method_declaration"], SymbolType::Method),
+];
 
-fn classify_elixir(_kind: &str) -> Option<SymbolType> {
-    None
-}
+const HASKELL_KINDS: &[(&[&str], SymbolType)] = &[
+    (&["function", "signature"], SymbolType::Function),
+    (&["data_type"], SymbolType::Struct),
+    (&["type_alias", "type_synomym"], SymbolType::TypeAlias),
+    (&["newtype"], SymbolType::TypeAlias),
+];
 
-fn classify_dart(kind: &str) -> Option<SymbolType> {
-    match kind {
-        "class_declaration" | "class_definition" => Some(SymbolType::Class),
-        "enum_declaration" => Some(SymbolType::Enum),
-        "function_signature" | "function_definition" => Some(SymbolType::Function),
-        "method_signature" | "method_definition" => Some(SymbolType::Method),
-        _ => None,
-    }
-}
+const DART_KINDS: &[(&[&str], SymbolType)] = &[
+    (
+        &["class_declaration", "class_definition"],
+        SymbolType::Class,
+    ),
+    (&["enum_declaration"], SymbolType::Enum),
+    (
+        &["function_signature", "function_definition"],
+        SymbolType::Function,
+    ),
+    (
+        &["method_signature", "method_definition"],
+        SymbolType::Method,
+    ),
+];
 
 /// Extract the name of a symbol from a tree-sitter node.
 ///
@@ -2275,7 +2208,6 @@ class User {}
 trait Logger {}
 "#;
         let symbols = parse_and_extract(source, Language::Scala);
-        println!("Scala symbols: {:#?}", symbols);
         assert!(symbols
             .iter()
             .any(|s| s.symbol_type == SymbolType::Function && s.name.as_deref() == Some("main")));
@@ -2304,7 +2236,6 @@ namespace MyApp {
 }
 "#;
         let symbols = parse_and_extract(source, Language::CSharp);
-        println!("CSharp symbols: {:#?}", symbols);
         assert!(symbols.iter().any(|s| s.symbol_type == SymbolType::Module));
         assert!(symbols.iter().any(|s| s.symbol_type == SymbolType::Class));
         assert!(symbols.iter().any(|s| s.symbol_type == SymbolType::Method));
@@ -2328,7 +2259,6 @@ class Bar {
 interface Qux {}
 "#;
         let symbols = parse_and_extract(source, Language::Php);
-        println!("PHP symbols: {:#?}", symbols);
         assert!(
             symbols
                 .iter()
@@ -2352,7 +2282,6 @@ add :: Int -> Int -> Int
 add x y = x + y
 "#;
         let symbols = parse_and_extract(source, Language::Haskell);
-        println!("Haskell symbols: {:#?}", symbols);
         assert!(symbols.iter().any(|s| s.symbol_type == SymbolType::Struct));
         assert!(
             symbols
@@ -2379,7 +2308,6 @@ defmodule Math do
 end
 "#;
         let symbols = parse_and_extract(source, Language::Elixir);
-        println!("Elixir symbols: {:#?}", symbols);
         assert!(
             symbols
                 .iter()
@@ -2414,7 +2342,6 @@ variable "image_id" {}
 output "instance_ip" {}
 "#;
         let symbols = parse_and_extract(source, Language::Hcl);
-        println!("HCL symbols: {:#?}", symbols);
         assert!(
             symbols.iter().any(|s| s.symbol_type == SymbolType::Struct
                 && s.name.as_deref() == Some("aws_instance"))
@@ -2449,7 +2376,6 @@ CREATE VIEW active_users AS SELECT * FROM users;
 CREATE PROCEDURE my_proc() LANGUAGE SQL AS $$ $$;
 "#;
         let symbols = parse_and_extract(source, Language::Sql);
-        println!("SQL symbols: {:#?}", symbols);
         assert!(!symbols.is_empty());
     }
 
@@ -2462,7 +2388,6 @@ enum Status { ACTIVE = 0; }
 service AuthService { rpc Login(User) returns (User); }
 "#;
         let symbols = parse_and_extract(source, Language::Protobuf);
-        println!("Protobuf symbols: {:#?}", symbols);
         assert!(!symbols.is_empty());
         assert!(
             symbols
@@ -2749,7 +2674,6 @@ sub world {
 1;
 "#;
         let symbols = parse_and_extract(source, Language::Perl);
-        println!("Perl symbols: {:#?}", symbols);
         assert!(!symbols.is_empty(), "Perl should extract symbols");
         assert!(
             symbols
@@ -2775,7 +2699,6 @@ module MyModule
 end
 "#;
         let symbols = parse_and_extract(source, Language::Julia);
-        println!("Julia symbols: {:#?}", symbols);
         assert!(!symbols.is_empty(), "Julia should extract symbols");
         assert!(
             symbols
@@ -2798,7 +2721,6 @@ end
 }
 "#;
         let symbols = parse_and_extract(source, Language::Nix);
-        println!("Nix symbols: {:#?}", symbols);
         assert!(!symbols.is_empty(), "Nix should extract symbols");
     }
 
@@ -2812,7 +2734,6 @@ type point = { x: float; y: float }
 module MyModule = struct end
 "#;
         let symbols = parse_and_extract(source, Language::OCaml);
-        println!("OCaml symbols: {:#?}", symbols);
         assert!(!symbols.is_empty(), "OCaml should extract symbols");
         assert!(
             symbols
@@ -2836,7 +2757,6 @@ def hello() {
 }
 "#;
         let symbols = parse_and_extract(source, Language::Groovy);
-        println!("Groovy symbols: {:#?}", symbols);
         assert!(!symbols.is_empty(), "Groovy should extract symbols");
     }
 
@@ -2852,7 +2772,6 @@ def hello() {
   (+ a b))
 "#;
         let symbols = parse_and_extract(source, Language::Clojure);
-        println!("Clojure symbols: {:#?}", symbols);
         assert!(
             symbols.len() >= 3,
             "Clojure should extract at least 3 symbols (ns + 2 defn), got {}",
@@ -2883,7 +2802,6 @@ def hello() {
     fn clojure_extracts_defmacro() {
         let source = "(defmacro my-when [test & body]\n  `(if ~test (do ~@body)))\n";
         let symbols = parse_and_extract(source, Language::Clojure);
-        println!("Clojure macro symbols: {:#?}", symbols);
         assert!(
             symbols
                 .iter()
@@ -2897,7 +2815,6 @@ def hello() {
     fn clojure_extracts_def() {
         let source = "(def pi 3.14159)\n";
         let symbols = parse_and_extract(source, Language::Clojure);
-        println!("Clojure def symbols: {:#?}", symbols);
         assert!(
             symbols
                 .iter()
@@ -2920,7 +2837,6 @@ def hello() {
    (y :initarg :y)))
 "#;
         let symbols = parse_and_extract(source, Language::CommonLisp);
-        println!("Common Lisp symbols: {:#?}", symbols);
         assert!(
             symbols.len() >= 3,
             "CL should extract at least 3 symbols (2 defun + defclass), got {}",
@@ -2950,7 +2866,6 @@ def hello() {
     fn commonlisp_extracts_defvar() {
         let source = "(defvar *my-var* 42)\n";
         let symbols = parse_and_extract(source, Language::CommonLisp);
-        println!("CL defvar symbols: {:#?}", symbols);
         assert!(
             symbols
                 .iter()
@@ -2971,7 +2886,6 @@ hello() -> ok.
 add(A, B) -> A + B.
 "#;
         let symbols = parse_and_extract(source, Language::Erlang);
-        println!("Erlang symbols: {:#?}", symbols);
         assert!(!symbols.is_empty(), "Erlang should extract symbols");
         assert!(
             symbols
@@ -2991,7 +2905,6 @@ let add a b = a + b
 type Point = { X: float; Y: float }
 "#;
         let symbols = parse_and_extract(source, Language::FSharp);
-        println!("F# symbols: {:#?}", symbols);
         assert!(!symbols.is_empty(), "F# should extract symbols");
     }
 
@@ -3014,7 +2927,6 @@ function add(a, b) result(c)
 end function add
 "#;
         let symbols = parse_and_extract(source, Language::Fortran);
-        println!("Fortran symbols: {:#?}", symbols);
         assert!(!symbols.is_empty(), "Fortran should extract symbols");
     }
 
@@ -3037,7 +2949,6 @@ class Calculator {
 }
 "#;
         let symbols = parse_and_extract(source, Language::PowerShell);
-        println!("PowerShell symbols: {:#?}", symbols);
         assert!(!symbols.is_empty(), "PowerShell should extract symbols");
         assert!(
             symbols
@@ -3086,7 +2997,6 @@ function result = add(a, b)
 end
 "#;
         let symbols = parse_and_extract(source, Language::Matlab);
-        println!("MATLAB symbols: {:#?}", symbols);
         assert!(!symbols.is_empty(), "MATLAB should extract symbols");
         assert!(
             symbols
@@ -3112,7 +3022,6 @@ struct Point {
 }
 "#;
         let symbols = parse_and_extract(source, Language::DLang);
-        println!("D symbols: {:#?}", symbols);
         assert!(!symbols.is_empty(), "D should extract symbols");
         assert!(
             symbols
@@ -3134,7 +3043,6 @@ function greet -a name
 end
 "#;
         let symbols = parse_and_extract(source, Language::Fish);
-        println!("Fish symbols: {:#?}", symbols);
         assert!(!symbols.is_empty(), "Fish should extract symbols");
         assert!(
             symbols
@@ -3156,7 +3064,6 @@ greet() {
 }
 "#;
         let symbols = parse_and_extract(source, Language::Zsh);
-        println!("Zsh symbols: {:#?}", symbols);
         assert!(!symbols.is_empty(), "Zsh should extract symbols");
         assert!(
             symbols
@@ -3178,7 +3085,6 @@ function greet(name: string)
 end
 "#;
         let symbols = parse_and_extract(source, Language::Luau);
-        println!("Luau symbols: {:#?}", symbols);
         assert!(!symbols.is_empty(), "Luau should extract symbols");
         assert!(
             symbols
@@ -3198,7 +3104,6 @@ end
   (+ a b))
 "#;
         let symbols = parse_and_extract(source, Language::Scheme);
-        println!("Scheme symbols: {:#?}", symbols);
         assert!(
             symbols.len() >= 2,
             "Scheme should extract at least 2 symbols, got {}",
@@ -3222,7 +3127,6 @@ end
     fn scheme_extracts_variable_define() {
         let source = "(define x 42)\n";
         let symbols = parse_and_extract(source, Language::Scheme);
-        println!("Scheme variable symbols: {:#?}", symbols);
         assert!(
             symbols.iter().any(|s| s.name.as_deref() == Some("x")),
             "Scheme should extract variable 'x'"
@@ -3254,7 +3158,6 @@ end
   (+ a b))
 "#;
         let symbols = parse_and_extract(source, Language::Racket);
-        println!("Racket symbols: {:#?}", symbols);
         assert!(
             symbols.len() >= 2,
             "Racket should extract at least 2 symbols, got {}",
@@ -3278,7 +3181,6 @@ end
     fn racket_extracts_struct() {
         let source = "#lang racket\n(struct point (x y))\n";
         let symbols = parse_and_extract(source, Language::Racket);
-        println!("Racket struct symbols: {:#?}", symbols);
         assert!(
             symbols
                 .iter()
@@ -3304,7 +3206,6 @@ main =
     text "hello"
 "#;
         let symbols = parse_and_extract(source, Language::Elm);
-        println!("Elm symbols: {:#?}", symbols);
         assert!(!symbols.is_empty(), "Elm should extract symbols");
     }
 
@@ -3321,7 +3222,6 @@ void main() {
 }
 "#;
         let symbols = parse_and_extract(source, Language::Glsl);
-        println!("GLSL symbols: {:#?}", symbols);
         assert!(!symbols.is_empty(), "GLSL should extract symbols");
         assert!(
             symbols
@@ -3344,7 +3244,6 @@ float4 main(float4 pos : SV_Position) : SV_Target {
 }
 "#;
         let symbols = parse_and_extract(source, Language::Hlsl);
-        println!("HLSL symbols: {:#?}", symbols);
         assert!(!symbols.is_empty(), "HLSL should extract symbols");
         assert!(
             symbols
@@ -3373,7 +3272,6 @@ float4 main(float4 pos : SV_Position) : SV_Target {
 </style>
 "#;
         let symbols = parse_and_extract(source, Language::Svelte);
-        println!("Svelte symbols: {:#?}", symbols);
         assert!(!symbols.is_empty(), "Svelte should extract symbols");
         assert!(
             symbols.iter().any(|s| s.symbol_type == SymbolType::Block),
@@ -3395,7 +3293,6 @@ const items = [1, 2, 3];
 </html>
 "#;
         let symbols = parse_and_extract(source, Language::Astro);
-        println!("Astro symbols: {:#?}", symbols);
         assert!(!symbols.is_empty(), "Astro should extract symbols");
     }
 
@@ -3414,7 +3311,6 @@ clean:
 	rm -f main
 "#;
         let symbols = parse_and_extract(source, Language::Makefile);
-        println!("Makefile symbols: {:#?}", symbols);
         assert!(!symbols.is_empty(), "Makefile should extract symbols");
         assert!(
             symbols
@@ -3435,7 +3331,6 @@ port = 5432
 bind = 0.0.0.0
 "#;
         let symbols = parse_and_extract(source, Language::Ini);
-        println!("INI symbols: {:#?}", symbols);
         assert!(!symbols.is_empty(), "INI should extract symbols");
         assert!(
             symbols.iter().any(|s| s.symbol_type == SymbolType::Block),
@@ -3456,7 +3351,6 @@ server {
 }
 "#;
         let symbols = parse_and_extract(source, Language::Nginx);
-        println!("Nginx symbols: {:#?}", symbols);
         assert!(!symbols.is_empty(), "Nginx should extract symbols");
     }
 
@@ -3492,7 +3386,6 @@ enum Role {
 }
 "#;
         let symbols = parse_and_extract(source, Language::Prisma);
-        println!("Prisma symbols: {:#?}", symbols);
         assert!(!symbols.is_empty(), "Prisma should extract symbols");
         assert!(
             symbols.iter().any(|s| s.symbol_type == SymbolType::Struct),
