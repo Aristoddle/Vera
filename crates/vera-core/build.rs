@@ -32,8 +32,9 @@ fn main() {
     for name in ["dockerfile", "astro", "scss", "vue"] {
         let dir = std::path::PathBuf::from(format!("../tree-sitter-{name}/src"));
         let parser = dir.join("parser.c");
+        let scanner = dir.join("scanner.c");
         assert!(
-            parser.exists(),
+            parser.exists() && scanner.exists(),
             "tree-sitter-{name} grammar not found. Run scripts/bootstrap-vendored-grammars.sh to download it."
         );
         println!("cargo:rerun-if-changed={}", parser.display());
@@ -43,7 +44,6 @@ fn main() {
             .warnings(false)
             .compile(&format!("tree-sitter-{name}-parser"));
 
-        let scanner = dir.join("scanner.c");
         println!("cargo:rerun-if-changed={}", scanner.display());
         cc::Build::new()
             .include(&dir)
