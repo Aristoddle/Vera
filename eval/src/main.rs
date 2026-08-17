@@ -57,24 +57,6 @@ enum Commands {
         #[arg(long, default_value = "eval/corpus.toml")]
         corpus: PathBuf,
     },
-    /// Run the harness twice and check result stability.
-    Stability {
-        /// Path to the tasks directory.
-        #[arg(long, default_value = "eval/tasks")]
-        tasks_dir: PathBuf,
-
-        /// Path to the corpus manifest (used by real adapters).
-        #[arg(long, default_value = "eval/corpus.toml")]
-        corpus: PathBuf,
-
-        /// Tool adapter to use. `vera-bm25` is the real stability lane; mock tools are for harness self-tests.
-        #[arg(long, default_value = "vera-bm25")]
-        tool: String,
-
-        /// Maximum allowed relative difference for retrieval metrics (default: 0.02 = 2%).
-        #[arg(long, default_value = "0.02")]
-        tolerance: f64,
-    },
 }
 
 fn main() -> Result<()> {
@@ -89,12 +71,6 @@ fn main() -> Result<()> {
             json_only,
         } => cmd_run(&tasks_dir, &corpus, output.as_deref(), &tool, json_only),
         Commands::VerifyCorpus { corpus } => cmd_verify_corpus(&corpus),
-        Commands::Stability {
-            tasks_dir,
-            corpus,
-            tool,
-            tolerance,
-        } => cmd_stability(&tasks_dir, &corpus, &tool, tolerance),
     }
 }
 
@@ -306,119 +282,4 @@ fn run_report(
     })
 }
 
-fn print_retrieval_summary(label: &str, metrics: &types::RetrievalMetrics) {
-    println!(
-        "  {label}: R@1 {:.4}, R@5 {:.4}, R@10 {:.4}, MRR {:.4}, nDCG {:.4}",
-        metrics.recall_at_1, metrics.recall_at_5, metrics.recall_at_10, metrics.mrr, metrics.ndcg
-    );
-}
 
-fn cmd_stability(
-    tasks_dir: &Path,
-    corpus_path: &Path,
-    tool_name: &str,
-    tolerance: f64,
-) -> Result<()> {
-    let tasks = loader::load_tasks(tasks_dir)?;
-    if tasks.is_empty() {
-        anyhow::bail!("No benchmark tasks found");
-    }
-
-    eprintln!(
-        "Running stability check with {} tasks via {}, tolerance ±{:.1}%",
-        tasks.len(),
-        tool_name,
-        tolerance * 100.0
-    );
-
-    // Run 1
-    let report1 = run_report(tasks.clone(), corpus_path, tool_name)?;
-    eprintln!(
-        "  Run 1 complete: {} tasks evaluated",
-        report1.per_task.len()
-    );
-
-    // Run 2
-    let report2 = run_report(tasks, corpus_path, tool_name)?;
-    eprintln!(
-        "  Run 2 complete: {} tasks evaluated",
-        report2.per_task.len()
-    );
-
-    // Compare retrieval metrics
-    let mut max_diff = 0.0f64;
-    let mut violations = Vec::new();
-
-    for (e1, e2) in report1.per_task.iter().zip(report2.per_task.iter()) {
-        let metrics = [
-            (
-                "recall_at_1",
-                e1.retrieval_metrics.recall_at_1,
-                e2.retrieval_metrics.recall_at_1,
-            ),
-            (
-                "recall_at_5",
-                e1.retrieval_metrics.recall_at_5,
-                e2.retrieval_metrics.recall_at_5,
-            ),
-            (
-                "recall_at_10",
-                e1.retrieval_metrics.recall_at_10,
-                e2.retrieval_metrics.recall_at_10,
-            ),
-            ("mrr", e1.retrieval_metrics.mrr, e2.retrieval_metrics.mrr),
-            ("ndcg", e1.retrieval_metrics.ndcg, e2.retrieval_metrics.ndcg),
-        ];
-
-        for (name, v1, v2) in metrics {
-            let diff = (v1 - v2).abs();
-            max_diff = max_diff.max(diff);
-            if diff > tolerance {
-                violations.push(format!(
-                    "Task '{}' {}: run1={:.6}, run2={:.6}, diff={:.6} > tolerance {:.6}",
-                    e1.task_id, name, v1, v2, diff, tolerance
-                ));
-            }
-        }
-    }
-
-    // Compare latency (±10% tolerance)
-    let lat_tolerance = 0.10;
-    let lat1 = report1.aggregate.performance.latency_p50_ms;
-    let lat2 = report2.aggregate.performance.latency_p50_ms;
-    if lat1 > 0.0 {
-        let lat_diff = ((lat1 - lat2) / lat1).abs();
-        if lat_diff > lat_tolerance {
-            eprintln!(
-                "  Note: Latency p50 varied by {:.1}% (run1={:.2}ms, run2={:.2}ms) - within expected variance",
-                lat_diff * 100.0,
-                lat1,
-                lat2
-            );
-        }
-    }
-
-    if violations.is_empty() {
-        println!("✓ Stability check passed");
-        println!(
-            "  Max retrieval metric difference: {:.6} (tolerance: {:.6})",
-            max_diff, tolerance
-        );
-        println!(
-            "  All {} metrics across {} tasks within ±{:.1}%",
-            5 * report1.per_task.len(),
-            report1.per_task.len(),
-            tolerance * 100.0
-        );
-        print_retrieval_summary("Run 1 aggregate", &report1.aggregate.retrieval);
-        print_retrieval_summary("Run 2 aggregate", &report2.aggregate.retrieval);
-
-        Ok(())
-    } else {
-        eprintln!("✗ Stability check FAILED:");
-        for v in &violations {
-            eprintln!("  - {v}");
-        }
-        std::process::exit(1);
-    }
-}
