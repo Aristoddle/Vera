@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use futures::StreamExt;
 use reqwest::Client;
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::Ordering;
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
@@ -363,6 +363,9 @@ pub(super) async fn ensure_model_file_impl(
     base_url: &str,
     home_override: Option<&std::path::Path>,
 ) -> Result<PathBuf> {
+    validate_relative_model_path(repo_id, "repository")?;
+    validate_relative_model_path(file_path, "asset")?;
+
     let home_dir = match home_override {
         Some(p) => p.to_path_buf(),
         None => vera_home_dir()?,
@@ -453,4 +456,30 @@ pub(super) async fn ensure_model_file_impl(
     }
 
     Ok(target_path)
+}
+
+fn validate_relative_model_path(value: &str, label: &str) -> Result<()> {
+    let path = Path::new(value);
+    if value.is_empty()
+        || path
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        anyhow::bail!("{label} path must contain only relative path components: {value}");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod finding_tests {
+    use super::*;
+
+    #[test]
+    fn model_paths_reject_parent_and_absolute_components() {
+        assert!(validate_relative_model_path("org/model", "repository").is_ok());
+        assert!(validate_relative_model_path("onnx/model.onnx", "asset").is_ok());
+        assert!(validate_relative_model_path("../outside", "asset").is_err());
+        assert!(validate_relative_model_path("/outside", "asset").is_err());
+        assert!(validate_relative_model_path("", "asset").is_err());
+    }
 }

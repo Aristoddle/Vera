@@ -210,7 +210,11 @@ impl LocalEmbeddingModelConfig {
                 return;
             }
         }
-        if self.onnx_file == EMBEDDING_ONNX_FILE {
+        if matches!(
+            &self.source,
+            LocalEmbeddingSource::HuggingFace { repo } if repo == EMBEDDING_REPO
+        ) && self.onnx_file == EMBEDDING_ONNX_FILE
+        {
             tracing::info!(
                 "GPU backend ({ep}): switching from quantized to fp16 model (INT8 ops lack GPU kernels)"
             );
@@ -309,6 +313,7 @@ impl LocalEmbeddingModelConfig {
     }
 
     fn apply_env_overrides(defaults: Self) -> Result<Self> {
+        let explicit_model_env = model_source_and_onnx_file_are_set();
         Ok(Self {
             source: defaults.source,
             onnx_file: env_override(LOCAL_EMBEDDING_ONNX_FILE_ENV)
@@ -316,6 +321,7 @@ impl LocalEmbeddingModelConfig {
             onnx_data_file: env_optional_override(
                 LOCAL_EMBEDDING_ONNX_DATA_FILE_ENV,
                 defaults.onnx_data_file.clone(),
+                explicit_model_env,
             ),
             tokenizer_file: env_override(LOCAL_EMBEDDING_TOKENIZER_FILE_ENV)
                 .unwrap_or_else(|| defaults.tokenizer_file.clone()),
@@ -383,12 +389,32 @@ pub(super) fn env_override(key: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-pub(super) fn env_optional_override(key: &str, default: Option<String>) -> Option<String> {
-    match std::env::var(key) {
-        Ok(value) if value.trim().is_empty() => None,
-        Ok(value) => Some(value.trim().to_string()),
-        Err(_) => default,
+fn env_optional_override(
+    key: &str,
+    default: Option<String>,
+    explicit_model_env: bool,
+) -> Option<String> {
+    let value = std::env::var(key).ok();
+    resolve_optional_env_value(value.as_deref(), default, explicit_model_env)
+}
+
+fn resolve_optional_env_value(
+    value: Option<&str>,
+    default: Option<String>,
+    explicit_model_env: bool,
+) -> Option<String> {
+    match value {
+        Some(value) if value.trim().is_empty() => None,
+        Some(value) => Some(value.trim().to_string()),
+        None if explicit_model_env => None,
+        None => default,
     }
+}
+
+fn model_source_and_onnx_file_are_set() -> bool {
+    (env_override(LOCAL_EMBEDDING_REPO_ENV).is_some()
+        || env_override(LOCAL_EMBEDDING_DIR_ENV).is_some())
+        && env_override(LOCAL_EMBEDDING_ONNX_FILE_ENV).is_some()
 }
 
 pub(super) fn parse_env_usize(key: &str, default: usize) -> Result<usize> {
@@ -443,6 +469,7 @@ pub fn normalize_huggingface_repo(value: &str) -> Result<String> {
 
     Ok(trimmed.to_string())
 }
+
 pub(crate) mod assets;
 pub(crate) mod cuda;
 pub(crate) mod ort;
@@ -486,4 +513,45 @@ pub fn vera_home_dir() -> Result<PathBuf> {
     }
 
     Ok(legacy)
+}
+
+#[cfg(test)]
+mod finding_tests {
+    use super::*;
+    use crate::config::OnnxExecutionProvider;
+
+    #[test]
+    fn gpu_adjustment_only_changes_the_default_jina_model() {
+        let mut custom_repo = LocalEmbeddingModelConfig::from_huggingface_repo("org/model");
+        custom_repo.adjust_for_gpu(OnnxExecutionProvider::Cuda);
+        assert_eq!(custom_repo.onnx_file, EMBEDDING_ONNX_FILE);
+        assert_eq!(
+            custom_repo.onnx_data_file.as_deref(),
+            Some(EMBEDDING_ONNX_DATA_FILE)
+        );
+
+        let mut jina = LocalEmbeddingModelConfig::jina();
+        jina.adjust_for_gpu(OnnxExecutionProvider::Cuda);
+        assert_eq!(jina.onnx_file, EMBEDDING_ONNX_GPU_FILE);
+        assert_eq!(
+            jina.onnx_data_file.as_deref(),
+            Some(EMBEDDING_ONNX_GPU_DATA_FILE)
+        );
+    }
+
+    #[test]
+    fn omitted_data_file_is_disabled_for_explicit_model_environment() {
+        assert_eq!(
+            resolve_optional_env_value(None, Some("default.data".to_string()), true),
+            None
+        );
+        assert_eq!(
+            resolve_optional_env_value(None, Some("default.data".to_string()), false).as_deref(),
+            Some("default.data")
+        );
+        assert_eq!(
+            resolve_optional_env_value(Some("custom.data"), None, true).as_deref(),
+            Some("custom.data")
+        );
+    }
 }

@@ -4,6 +4,7 @@
 use crate::config::OnnxExecutionProvider;
 use anyhow::{Context, Result};
 use reqwest::Client;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use tokio::fs;
 
@@ -135,6 +136,11 @@ pub(super) async fn try_wheel_download_ort(
     lib_dir: &std::path::Path,
 ) -> Result<()> {
     let pkg = pip_package_for_ep(ep).context("not a pip-based EP")?;
+    if !cfg!(target_arch = "x86_64") {
+        anyhow::bail!(
+            "direct PyPI wheel fallback for {pkg} is only supported on Linux x86_64; install it manually"
+        );
+    }
     let pypi_name = pkg.replace('-', "_");
 
     eprintln!("Trying direct wheel download from PyPI...");
@@ -699,14 +705,14 @@ pub fn ensure_provider_dependencies(
 pub fn inspect_shared_library_deps(
     runtime_path: &std::path::Path,
 ) -> Result<Option<SharedLibraryDependencyStatus>> {
-    inspect_shared_library_deps_impl(runtime_path)
+    inspect_shared_library_deps_impl(runtime_path, None)
 }
 
 pub fn inspect_provider_dependencies(
     ep: OnnxExecutionProvider,
     runtime_path: &std::path::Path,
 ) -> Result<Option<SharedLibraryDependencyStatus>> {
-    Ok(inspect_shared_library_deps(runtime_path)?
+    Ok(inspect_shared_library_deps_impl(runtime_path, Some(ep))?
         .map(|status| required_dependency_status(ep, status)))
 }
 
@@ -736,6 +742,7 @@ pub(super) fn required_dependency_status(
 #[cfg(target_os = "linux")]
 pub(super) fn inspect_shared_library_deps_impl(
     runtime_path: &std::path::Path,
+    _ep: Option<OnnxExecutionProvider>,
 ) -> Result<Option<SharedLibraryDependencyStatus>> {
     if !runtime_path.exists() {
         return Ok(None);
@@ -786,6 +793,7 @@ pub(super) fn inspect_shared_library_deps_impl(
 #[cfg(target_os = "macos")]
 pub(super) fn inspect_shared_library_deps_impl(
     runtime_path: &std::path::Path,
+    _ep: Option<OnnxExecutionProvider>,
 ) -> Result<Option<SharedLibraryDependencyStatus>> {
     if !runtime_path.exists() {
         return Ok(None);
@@ -830,6 +838,7 @@ pub(super) fn inspect_shared_library_deps_impl(
 #[cfg(target_os = "windows")]
 pub(super) fn inspect_shared_library_deps_impl(
     runtime_path: &std::path::Path,
+    ep: Option<OnnxExecutionProvider>,
 ) -> Result<Option<SharedLibraryDependencyStatus>> {
     if !runtime_path.exists() {
         return Ok(None);
@@ -838,7 +847,7 @@ pub(super) fn inspect_shared_library_deps_impl(
     let inspected_files = collect_runtime_libraries(runtime_path, ".dll");
 
     // Use dumpbin if available (Visual Studio), otherwise fall back to a
-    // known-list check for CUDA provider DLLs alongside onnxruntime.dll.
+    // known-list check for provider DLLs alongside onnxruntime.dll.
     let mut missing_details = Vec::new();
     let mut missing_libraries = Vec::new();
 
@@ -869,13 +878,20 @@ pub(super) fn inspect_shared_library_deps_impl(
             }
         }
     } else {
-        // No dumpbin: check that expected CUDA provider DLLs exist alongside the runtime.
+        // No dumpbin: check that the selected provider DLLs exist alongside the runtime.
         if let Some(dir) = runtime_path.parent() {
-            let expected_cuda_libs = [
-                "onnxruntime_providers_shared.dll",
-                "onnxruntime_providers_cuda.dll",
-            ];
-            for lib in &expected_cuda_libs {
+            let expected_provider_libs = if matches!(ep, Some(OnnxExecutionProvider::DirectMl)) {
+                [
+                    "onnxruntime_providers_shared.dll",
+                    "onnxruntime_providers_dml.dll",
+                ]
+            } else {
+                [
+                    "onnxruntime_providers_shared.dll",
+                    "onnxruntime_providers_cuda.dll",
+                ]
+            };
+            for lib in &expected_provider_libs {
                 if !dir.join(lib).exists() {
                     missing_details.push(format!("onnxruntime.dll: {lib}"));
                     missing_libraries.push(lib.to_string());
@@ -911,6 +927,7 @@ pub(super) fn which_dll(name: &str) -> Option<std::path::PathBuf> {
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 pub(super) fn inspect_shared_library_deps_impl(
     _: &std::path::Path,
+    _ep: Option<OnnxExecutionProvider>,
 ) -> Result<Option<SharedLibraryDependencyStatus>> {
     Ok(None)
 }
@@ -1228,12 +1245,35 @@ pub(super) fn write_lib_file(
     reader: &mut impl std::io::Read,
     dest: &std::path::Path,
 ) -> Result<()> {
-    let mut out = std::fs::File::create(dest)?;
-    std::io::copy(reader, &mut out)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(dest, std::fs::Permissions::from_mode(0o755))?;
+    let attempt = MODEL_DOWNLOAD_ATTEMPT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let temp_path = dest.with_extension(format!("part.{}.{}", std::process::id(), attempt));
+
+    let result: Result<()> = (|| {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        let mut out = options.open(&temp_path)?;
+        std::io::copy(reader, &mut out)?;
+        out.flush()?;
+        out.sync_all()?;
+        drop(out);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&temp_path, std::fs::Permissions::from_mode(0o755))?;
+        }
+
+        #[cfg(windows)]
+        if dest.exists() {
+            std::fs::remove_file(dest)?;
+        }
+        std::fs::rename(&temp_path, dest)?;
+        Ok(())
+    })();
+
+    if let Err(error) = result {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(error);
     }
     Ok(())
 }
@@ -1395,5 +1435,44 @@ pub fn wrap_ort_error(e: impl std::fmt::Display) -> String {
         format!(
             "Failed to initialize ONNX session: {err_msg}\nRun `vera doctor --probe` for details."
         )
+    }
+}
+
+#[cfg(test)]
+mod finding_tests {
+    use super::*;
+    use std::io::{self, Read};
+
+    struct FailingReader {
+        yielded_data: bool,
+    }
+
+    impl Read for FailingReader {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            if self.yielded_data {
+                return Err(io::Error::other("synthetic extraction failure"));
+            }
+            self.yielded_data = true;
+            buffer[..4].copy_from_slice(b"part");
+            Ok(4)
+        }
+    }
+
+    #[test]
+    fn failed_library_write_leaves_destination_unchanged() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let destination = temp_dir.path().join("libonnxruntime.so");
+        std::fs::write(&destination, b"existing").unwrap();
+
+        let result = write_lib_file(
+            &mut FailingReader {
+                yielded_data: false,
+            },
+            &destination,
+        );
+
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&destination).unwrap(), b"existing");
+        assert_eq!(std::fs::read_dir(temp_dir.path()).unwrap().count(), 1);
     }
 }
