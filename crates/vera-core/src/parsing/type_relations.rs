@@ -96,6 +96,21 @@ fn extract_chunk_relations(chunk: &Chunk) -> Vec<RawTypeRelation> {
             ruby_relations(chunk, &header, &owner)
         }
         Language::CSharp | Language::Kotlin | Language::Swift | Language::Cpp | Language::Dart => {
+            // A colon only denotes inheritance on type declarations. On
+            // functions/methods it introduces a return type, and on C++
+            // constructors a member initializer list.
+            if !matches!(
+                chunk.symbol_type,
+                Some(
+                    SymbolType::Class
+                        | SymbolType::Struct
+                        | SymbolType::Enum
+                        | SymbolType::Interface
+                        | SymbolType::Trait
+                )
+            ) {
+                return Vec::new();
+            }
             let Some(owner) = relation_owner(chunk) else {
                 return Vec::new();
             };
@@ -118,7 +133,10 @@ fn relation_owner(chunk: &Chunk) -> Option<String> {
     if name.starts_with("impl ") {
         return None;
     }
-    simple_name(name)
+    // Split chunks carry a " (part N)" suffix on the symbol name; strip it
+    // so the owner resolves to the original symbol.
+    let base = name.split(" (part ").next().unwrap_or(name);
+    simple_name(base)
 }
 
 fn relation_header(chunk: &Chunk) -> String {
@@ -153,7 +171,14 @@ fn normalize_header(value: &str) -> String {
 }
 
 fn rust_relations(chunk: &Chunk, header: &str) -> Vec<RawTypeRelation> {
-    if let Some(body) = header.strip_prefix("trait ") {
+    // Tolerate visibility/modifiers before `trait` (e.g. `pub trait`,
+    // `pub unsafe trait`) by matching the keyword at a word boundary.
+    let trait_body = header.strip_prefix("trait ").or_else(|| {
+        header
+            .find(" trait ")
+            .map(|idx| &header[idx + " trait ".len()..])
+    });
+    if let Some(body) = trait_body {
         let Some(owner) = relation_owner(chunk) else {
             return Vec::new();
         };
@@ -753,5 +778,93 @@ mod tests {
         );
         // Must NOT produce a self-referential Foo->Foo relation
         assert!(relations.iter().all(|r| r.target != "Foo"));
+    }
+
+    #[test]
+    fn kotlin_function_return_type_is_not_a_relation() {
+        let chunk = Chunk {
+            id: "test:0".to_string(),
+            file_path: "Api.kt".to_string(),
+            line_start: 1,
+            line_end: 3,
+            content: "fun load(): String {\n    return \"x\"\n}\n".to_string(),
+            language: Language::Kotlin,
+            symbol_type: Some(SymbolType::Function),
+            symbol_name: Some("load".to_string()),
+        };
+
+        assert!(extract_type_relations(&[chunk]).is_empty());
+    }
+
+    #[test]
+    fn kotlin_class_colon_relations_still_work() {
+        let chunk = class_chunk(Language::Kotlin, "Foo", "class Foo : Bar, Baz {\n}\n");
+
+        let relations = extract_type_relations(&[chunk]);
+        assert_eq!(relations.len(), 2);
+        assert!(
+            relations
+                .iter()
+                .any(|r| r.target == "Bar" && r.kind == TypeRelationKind::Extends)
+        );
+        assert!(
+            relations
+                .iter()
+                .any(|r| r.target == "Baz" && r.kind == TypeRelationKind::Conforms)
+        );
+    }
+
+    #[test]
+    fn cpp_constructor_initializer_is_not_a_relation() {
+        let chunk = Chunk {
+            id: "test:0".to_string(),
+            file_path: "foo.cpp".to_string(),
+            line_start: 1,
+            line_end: 1,
+            content: "Foo() : member_(1) {}\n".to_string(),
+            language: Language::Cpp,
+            symbol_type: Some(SymbolType::Method),
+            symbol_name: Some("Foo".to_string()),
+        };
+
+        assert!(extract_type_relations(&[chunk]).is_empty());
+    }
+
+    #[test]
+    fn rust_pub_trait_extends_relation() {
+        let chunk = Chunk {
+            id: "test:0".to_string(),
+            file_path: "lib.rs".to_string(),
+            line_start: 1,
+            line_end: 3,
+            content: "pub trait Child: Parent + Send {\n    fn child(&self);\n}\n".to_string(),
+            language: Language::Rust,
+            symbol_type: Some(SymbolType::Trait),
+            symbol_name: Some("Child".to_string()),
+        };
+
+        let relations = extract_type_relations(&[chunk]);
+        assert_eq!(relations.len(), 2);
+        assert!(
+            relations
+                .iter()
+                .all(|r| r.owner == "Child" && r.kind == TypeRelationKind::Extends)
+        );
+        assert!(relations.iter().any(|r| r.target == "Parent"));
+        assert!(relations.iter().any(|r| r.target == "Send"));
+    }
+
+    #[test]
+    fn split_chunk_part_suffix_resolves_owner() {
+        let chunk = class_chunk(
+            Language::CSharp,
+            "HugeClass (part 1)",
+            "public class HugeClass : Base {\n}\n",
+        );
+
+        let relations = extract_type_relations(&[chunk]);
+        assert_eq!(relations.len(), 1);
+        assert_eq!(relations[0].owner, "HugeClass");
+        assert_eq!(relations[0].target, "Base");
     }
 }

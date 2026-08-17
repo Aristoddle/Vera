@@ -14,8 +14,15 @@ use super::languages::tree_sitter_grammar;
 fn body_node_kinds(lang: Language) -> &'static [&'static str] {
     match lang {
         // Tier 1A: core languages
-        Language::Rust => &["block", "field_declaration_list", "enum_variant_list"],
-        Language::TypeScript | Language::JavaScript => &["statement_block", "class_body"],
+        Language::Rust => &[
+            "block",
+            "field_declaration_list",
+            "enum_variant_list",
+            "declaration_list",
+        ],
+        Language::TypeScript | Language::JavaScript => {
+            &["statement_block", "class_body", "interface_body"]
+        }
         Language::Python => &["block"],
         Language::Go => &["block", "field_declaration_list"],
         Language::Java => &["block", "class_body", "interface_body", "enum_body"],
@@ -149,6 +156,20 @@ pub fn extract_signature(content: &str, lang: Language) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn typescript_interface_signature() {
+        let code = "export interface Repo extends Base {\n    get(id: string): Item;\n}\n";
+        let sig = extract_signature(code, Language::TypeScript);
+        assert_eq!(sig, "export interface Repo extends Base { ... }");
+    }
+
+    #[test]
+    fn rust_pub_trait_signature() {
+        let code = "pub trait Child: Parent + Send {\n    fn child(&self);\n}\n";
+        let sig = extract_signature(code, Language::Rust);
+        assert_eq!(sig, "pub trait Child: Parent + Send { ... }");
+    }
 
     #[test]
     fn rust_function_signature() {

@@ -228,6 +228,29 @@ class Server {
 }
 
 #[test]
+fn typescript_interface_and_abstract_methods() {
+    let source = r#"interface Store {
+    get(key: string): string | undefined;
+    set(key: string, value: string): void;
+}
+
+abstract class Base {
+    abstract render(): void;
+}
+"#;
+    let chunks =
+        parse_and_chunk(source, "store.ts", Language::TypeScript, &default_config()).unwrap();
+
+    for name in ["get", "set", "render"] {
+        let chunk = chunks
+            .iter()
+            .find(|c| c.symbol_name == Some(name.to_string()));
+        assert!(chunk.is_some(), "missing method chunk: {name}");
+        assert_eq!(chunk.unwrap().symbol_type, Some(SymbolType::Method));
+    }
+}
+
+#[test]
 fn typescript_enum_and_type_alias() {
     let source = r#"enum Direction {
     Up,

@@ -503,7 +503,12 @@ fn classify_typescript(kind: &str) -> Option<SymbolType> {
         "interface_declaration" => Some(SymbolType::Interface),
         "type_alias_declaration" => Some(SymbolType::TypeAlias),
         "enum_declaration" => Some(SymbolType::Enum),
-        "method_definition" => Some(SymbolType::Method),
+        // `method_signature` covers TS interface methods and abstract class
+        // members (`abstract_method_signature`): body-less declarations that
+        // still name a callable member.
+        "method_definition" | "method_signature" | "abstract_method_signature" => {
+            Some(SymbolType::Method)
+        }
         "lexical_declaration" | "variable_declaration" => Some(SymbolType::Variable),
         "export_statement" => None, // recurse into children
         _ => None,
