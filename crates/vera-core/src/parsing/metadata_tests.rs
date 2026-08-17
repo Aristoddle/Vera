@@ -9,13 +9,9 @@
 //!
 //! These tests fulfil VAL-IDX-004 requirements (10+ metadata samples validated).
 
-use crate::config::IndexingConfig;
 use crate::parsing::parse_and_chunk;
+use crate::parsing::test_support::{default_config, find_chunk, parse};
 use crate::types::{Language, SymbolType};
-
-fn default_config() -> IndexingConfig {
-    IndexingConfig::default()
-}
 
 /// Helper: verify that a chunk's content matches the source at the declared line range.
 ///
@@ -79,19 +75,6 @@ fn assert_chunk_metadata(
         "line_end must be >= line_start"
     );
     assert!(!chunk.id.is_empty(), "chunk id must not be empty");
-}
-
-/// Parse `source` with the default config, panicking on failure.
-fn parse(source: &str, path: &str, lang: Language) -> Vec<crate::types::Chunk> {
-    parse_and_chunk(source, path, lang, &default_config()).unwrap()
-}
-
-/// Find the chunk named `name`, panicking with a clear message if absent.
-fn find_chunk<'a>(chunks: &'a [crate::types::Chunk], name: &str) -> &'a crate::types::Chunk {
-    chunks
-        .iter()
-        .find(|c| c.symbol_name.as_deref() == Some(name))
-        .unwrap_or_else(|| panic!("should find chunk named '{name}'"))
 }
 
 // =========================================================

@@ -4,12 +4,9 @@
 //! Tier 0 fallback, large symbol splitting, and edge cases.
 
 use crate::config::IndexingConfig;
+use crate::parsing::test_support::{default_config, parse};
 use crate::parsing::{parse_and_chunk, parse_file_with_diagnostics};
 use crate::types::{Language, SymbolType};
-
-fn default_config() -> IndexingConfig {
-    IndexingConfig::default()
-}
 
 // =========================================================
 // Rust tests
@@ -24,7 +21,7 @@ fn rust_functions_produce_chunks() {
 fn world() -> i32 {
     42
 }"#;
-    let chunks = parse_and_chunk(source, "main.rs", Language::Rust, &default_config()).unwrap();
+    let chunks = parse(source, "main.rs", Language::Rust);
     let funcs: Vec<_> = chunks
         .iter()
         .filter(|c| c.symbol_type == Some(SymbolType::Function))
@@ -46,7 +43,7 @@ impl Point {
         Self { x, y }
     }
 }"#;
-    let chunks = parse_and_chunk(source, "point.rs", Language::Rust, &default_config()).unwrap();
+    let chunks = parse(source, "point.rs", Language::Rust);
     assert!(chunks.len() >= 2, "expected struct + method(s)");
 
     let struc = chunks
@@ -78,7 +75,7 @@ fn rust_enum_and_trait() {
 trait Paintable {
     fn paint(&self, color: Color);
 }"#;
-    let chunks = parse_and_chunk(source, "paint.rs", Language::Rust, &default_config()).unwrap();
+    let chunks = parse(source, "paint.rs", Language::Rust);
     let enm = chunks
         .iter()
         .find(|c| c.symbol_type == Some(SymbolType::Enum));
@@ -92,7 +89,7 @@ trait Paintable {
 #[test]
 fn rust_type_alias() {
     let source = "type Result<T> = std::result::Result<T, MyError>;\n";
-    let chunks = parse_and_chunk(source, "lib.rs", Language::Rust, &default_config()).unwrap();
+    let chunks = parse(source, "lib.rs", Language::Rust);
     let ta = chunks
         .iter()
         .find(|c| c.symbol_type == Some(SymbolType::TypeAlias));
@@ -115,8 +112,7 @@ class UserService:
     def get_user(self, user_id):
         return self.db.get(user_id)
 "#;
-    let chunks =
-        parse_and_chunk(source, "service.py", Language::Python, &default_config()).unwrap();
+    let chunks = parse(source, "service.py", Language::Python);
     // Now: function + __init__ method + get_user method (+ possible gap chunks)
     assert!(chunks.len() >= 3, "expected function + 2 class methods");
 
@@ -154,8 +150,7 @@ fn python_decorated_function() {
 def expensive_compute(n):
     return sum(range(n))
 "#;
-    let chunks =
-        parse_and_chunk(source, "compute.py", Language::Python, &default_config()).unwrap();
+    let chunks = parse(source, "compute.py", Language::Python);
     let func = chunks
         .iter()
         .find(|c| c.symbol_type == Some(SymbolType::Function));
@@ -189,8 +184,7 @@ class Server {
     }
 }
 "#;
-    let chunks =
-        parse_and_chunk(source, "server.ts", Language::TypeScript, &default_config()).unwrap();
+    let chunks = parse(source, "server.ts", Language::TypeScript);
     assert!(
         chunks.len() >= 5,
         "expected function + interface + class + methods"
@@ -238,8 +232,7 @@ abstract class Base {
     abstract render(): void;
 }
 "#;
-    let chunks =
-        parse_and_chunk(source, "store.ts", Language::TypeScript, &default_config()).unwrap();
+    let chunks = parse(source, "store.ts", Language::TypeScript);
 
     for name in ["get", "set", "render"] {
         let chunk = chunks
@@ -261,8 +254,7 @@ fn typescript_enum_and_type_alias() {
 
 type Point = { x: number; y: number };
 "#;
-    let chunks =
-        parse_and_chunk(source, "types.ts", Language::TypeScript, &default_config()).unwrap();
+    let chunks = parse(source, "types.ts", Language::TypeScript);
 
     let enm = chunks
         .iter()
@@ -298,7 +290,7 @@ func (p *Point) Distance() float64 {
     return p.X*p.X + p.Y*p.Y
 }
 "#;
-    let chunks = parse_and_chunk(source, "main.go", Language::Go, &default_config()).unwrap();
+    let chunks = parse(source, "main.go", Language::Go);
     assert!(
         chunks.len() >= 3,
         "expected func + struct + method, got {}",
@@ -333,7 +325,7 @@ type Shape interface {
     Perimeter() float64
 }
 "#;
-    let chunks = parse_and_chunk(source, "shapes.go", Language::Go, &default_config()).unwrap();
+    let chunks = parse(source, "shapes.go", Language::Go);
     let iface = chunks
         .iter()
         .find(|c| c.symbol_type == Some(SymbolType::Interface));
@@ -357,8 +349,7 @@ fn java_class_with_methods() {
     }
 }
 "#;
-    let chunks =
-        parse_and_chunk(source, "Calculator.java", Language::Java, &default_config()).unwrap();
+    let chunks = parse(source, "Calculator.java", Language::Java);
     assert!(!chunks.is_empty());
 
     let cls = chunks
@@ -378,8 +369,7 @@ enum Color {
     RED, GREEN, BLUE;
 }
 "#;
-    let chunks =
-        parse_and_chunk(source, "Drawable.java", Language::Java, &default_config()).unwrap();
+    let chunks = parse(source, "Drawable.java", Language::Java);
 
     let iface = chunks
         .iter()
@@ -415,7 +405,7 @@ int main() {
     return 0;
 }
 "#;
-    let chunks = parse_and_chunk(source, "main.c", Language::C, &default_config()).unwrap();
+    let chunks = parse(source, "main.c", Language::C);
     assert!(chunks.len() >= 2, "expected struct + functions");
 
     let func = chunks
@@ -443,7 +433,7 @@ namespace geometry {
     }
 }
 "#;
-    let chunks = parse_and_chunk(source, "shape.cpp", Language::Cpp, &default_config()).unwrap();
+    let chunks = parse(source, "shape.cpp", Language::Cpp);
     assert!(
         !chunks.is_empty(),
         "expected at least class or namespace chunks"
@@ -467,7 +457,7 @@ namespace geometry {
 #[test]
 fn unknown_language_uses_tier0() {
     let source = "some content\nmore content\nthird line\n";
-    let chunks = parse_and_chunk(source, "data.xyz", Language::Unknown, &default_config()).unwrap();
+    let chunks = parse(source, "data.xyz", Language::Unknown);
     assert!(!chunks.is_empty(), "tier0 should produce chunks");
     assert_eq!(chunks[0].language, Language::Unknown);
     assert_eq!(chunks[0].symbol_type, Some(SymbolType::Block));
@@ -495,7 +485,7 @@ fn haskell_indexing_uses_tier0_fallback() {
 #[test]
 fn toml_uses_whole_file_chunking() {
     let source = "[package]\nname = \"vera\"\nversion = \"0.1.0\"\n";
-    let chunks = parse_and_chunk(source, "Cargo.toml", Language::Toml, &default_config()).unwrap();
+    let chunks = parse(source, "Cargo.toml", Language::Toml);
     assert_eq!(chunks.len(), 1);
     assert_eq!(chunks[0].language, Language::Toml);
     assert_eq!(chunks[0].symbol_name.as_deref(), Some("Cargo.toml"));
@@ -564,7 +554,7 @@ Usage
 Dispatch messages.
 "#;
 
-    let chunks = parse_and_chunk(source, "guide.rst", Language::Rst, &default_config()).unwrap();
+    let chunks = parse(source, "guide.rst", Language::Rst);
 
     let names: Vec<String> = chunks
         .iter()
@@ -640,7 +630,7 @@ fn chunk_metadata_matches_source() {
     let source = r#"fn greet(name: &str) -> String {
     format!("Hello, {}!", name)
 }"#;
-    let chunks = parse_and_chunk(source, "lib.rs", Language::Rust, &default_config()).unwrap();
+    let chunks = parse(source, "lib.rs", Language::Rust);
     assert_eq!(chunks.len(), 1);
 
     let chunk = &chunks[0];
@@ -669,8 +659,7 @@ class Calculator {
     }
 }
 "#;
-    let chunks =
-        parse_and_chunk(source, "calc.js", Language::JavaScript, &default_config()).unwrap();
+    let chunks = parse(source, "calc.js", Language::JavaScript);
     assert!(chunks.len() >= 2, "expected function + class");
 
     let func = chunks
@@ -704,7 +693,7 @@ fn whitespace_only_source_no_chunks() {
 #[test]
 fn comment_only_file_falls_back() {
     let source = "// This is a comment\n// Another comment\n";
-    let chunks = parse_and_chunk(source, "comments.rs", Language::Rust, &default_config()).unwrap();
+    let chunks = parse(source, "comments.rs", Language::Rust);
     // Should produce Tier 0 fallback chunks since no symbols found
     assert!(
         !chunks.is_empty(),
