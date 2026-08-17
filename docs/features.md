@@ -210,7 +210,7 @@ Default markdown codeblock format cuts ~35-40% tokens vs JSON. On a 20-query ben
 
 ### Response Truncation
 
-Large chunks are automatically truncated at 8K characters with a `[...truncated]` marker to prevent blowing up LLM context windows. Short results pass through unchanged.
+Output is progressively truncated to fit a total character budget (`retrieval.max_output_chars`, default 12,000) so results do not blow up LLM context windows. Lower-ranked results are truncated first, at a line boundary, with a `[...truncated]` marker. Short results pass through unchanged.
 
 ### Multiple Output Formats
 
