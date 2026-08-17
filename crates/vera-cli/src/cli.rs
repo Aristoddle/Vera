@@ -53,13 +53,6 @@ pub struct Cli {
 #[derive(Subcommand)]
 pub enum Commands {
     /// Start the MCP (Model Context Protocol) server.
-    ///
-    /// Runs a JSON-RPC 2.0 server over stdio for tool integration.
-    /// The server exposes tools: search_code, get_stats, get_overview, regex_search, and explain_path.
-    /// search_code auto-indexes and starts a file watcher on first use.
-    ///
-    /// Examples:
-    ///   vera mcp
     #[command(long_about = "Start the MCP (Model Context Protocol) server.\n\n\
                       Runs a JSON-RPC 2.0 server over stdio so editors, assistants, and \
                       other tools can use Vera's indexing and search capabilities.\n\n\
@@ -76,16 +69,6 @@ pub enum Commands {
     Mcp,
 
     /// Start the Vera HTTP API server for remote embedding and reranking.
-    ///
-    /// Loads the configured embedding model and reranker once, then exposes
-    /// OpenAI-compatible /v1/embeddings and /v1/rerank endpoints so that any
-    /// standard vera client can connect via `vera setup --api`.
-    ///
-    /// Examples:
-    ///   vera serve --onnx-jina-cuda         # GPU host (NVIDIA)
-    ///   vera serve --onnx-jina-cpu          # CPU host
-    ///   vera serve --host 0.0.0.0 --port 8080
-    ///   vera serve --api-key some-api-key
     #[command(long_about = "Start the Vera HTTP API server.\n\n\
                       Loads the embedding model and reranker ONCE at startup (using the \
                       selected backend), then exposes them via HTTP so any unmodified \
@@ -137,10 +120,6 @@ pub enum Commands {
     },
 
     /// Install or manage the Vera skill for supported coding agents.
-    ///
-    /// This is the preferred agent integration path. It writes the canonical
-    /// `skills/vera` bundle into well-known skill directories for supported
-    /// clients, so agents can use the Vera CLI directly without MCP.
     #[command(
         long_about = "Install or manage the Vera skill for supported coding agents.\n\n\
                       This is the preferred agent integration path. Vera installs a \
@@ -178,8 +157,6 @@ pub enum Commands {
     },
 
     /// Remove Vera: binary, models, config, agent skills, and PATH shim.
-    ///
-    /// Per-project indexes (.vera/) are not removed.
     #[command(
         long_about = "Remove Vera: binary cache, models, ONNX Runtime libs, config, \n\
                       credentials, agent skill files, and the PATH shim.\n\n\
@@ -191,9 +168,6 @@ pub enum Commands {
     Uninstall,
 
     /// Interactive first-time setup wizard.
-    ///
-    /// Walks through backend selection, agent skill installation, and
-    /// optional project indexing in one guided flow.
     #[command(long_about = "Interactive first-time setup wizard.\n\n\
                       Walks through three steps:\n  \
                       1. Backend selection (Potion CPU, ONNX runtime + GPU, or API mode)\n  \
@@ -227,9 +201,6 @@ pub enum Commands {
     },
 
     /// Select and manage the model backend.
-    ///
-    /// Use this to switch between GPU providers, change embedding models,
-    /// or reconfigure API mode without running the full setup wizard.
     #[command(long_about = "Select and manage the model backend.\n\n\
                       This is the focused backend configuration command. It handles \
                       runtime selection, model downloads, and API credential persistence \
@@ -257,9 +228,6 @@ pub enum Commands {
     },
 
     /// Inspect the current Vera setup for common configuration issues.
-    ///
-    /// Checks the persisted config, effective mode, local runtime or API env,
-    /// and whether the current repository has an index.
     #[command(
         long_about = "Inspect the current Vera setup for common configuration issues.\n\n\
                       Checks the persisted config, effective mode, local runtime or \
@@ -278,9 +246,6 @@ pub enum Commands {
     },
 
     /// Repair the configured Vera backend.
-    ///
-    /// Re-fetches missing local runtime/model assets for the selected local
-    /// backend, or re-persists API configuration from the current environment.
     #[command(long_about = "Repair the configured Vera backend.\n\n\
                       For local backends, this re-fetches missing runtime and \
                       model assets for the selected backend. For API mode, it re-saves \
@@ -321,15 +286,6 @@ pub enum Commands {
     },
 
     /// Index a codebase for search.
-    ///
-    /// Discovers source files, parses them with tree-sitter, creates
-    /// searchable chunks, generates embeddings, and stores everything
-    /// in a local `.vera/` index directory.
-    ///
-    /// Examples:
-    ///   vera index .
-    ///   vera index /path/to/repo
-    ///   vera index . --json
     #[command(long_about = "Index a codebase for search.\n\n\
                       Discovers source files (respecting .gitignore), parses them with \
                       tree-sitter for 60+ languages, creates searchable chunks at symbol \
@@ -364,10 +320,6 @@ pub enum Commands {
     },
 
     /// Run agent-oriented structural search intents.
-    ///
-    /// Uses the existing index to answer common code-navigation questions
-    /// without regex authoring or raw tree-sitter syntax. Use `vera references`
-    /// for exact caller/callee questions.
     #[command(long_about = "Run agent-oriented structural search intents.\n\n\
                       Uses the existing index to answer common code-navigation \n\
                       questions without regex authoring or raw tree-sitter queries.\n\n\
@@ -402,16 +354,6 @@ pub enum Commands {
     },
 
     /// Search the indexed codebase.
-    ///
-    /// Performs hybrid search combining BM25 keyword matching and vector
-    /// similarity, fused with Reciprocal Rank Fusion (RRF). Optional
-    /// cross-encoder reranking for improved precision.
-    ///
-    /// Examples:
-    ///   vera search "authentication logic"
-    ///   vera search "parse_config" --lang rust
-    ///   vera search "OAuth token refresh" "JWT expiry handling" "auth middleware"
-    ///   vera search "config" --intent "find where database connection strings are loaded"
     #[command(long_about = "Search the indexed codebase.\n\n\
                       Performs hybrid search combining BM25 keyword matching and vector \
                       similarity via Reciprocal Rank Fusion (RRF). Optional cross-encoder \
@@ -473,14 +415,6 @@ pub enum Commands {
     },
 
     /// Incrementally update the index for changed files.
-    ///
-    /// Detects files that have been added, modified, or deleted since
-    /// the last index/update, and only re-processes changed files.
-    /// Much faster than a full re-index.
-    ///
-    /// Examples:
-    ///   vera update .
-    ///   vera update /path/to/repo --json
     #[command(long_about = "Incrementally update the index for changed files.\n\n\
                       Uses content hashing to detect files that have been added, modified, \
                       or deleted since the last index/update. Only changed files are \
@@ -515,13 +449,6 @@ pub enum Commands {
     },
 
     /// Show architecture overview of the indexed project.
-    ///
-    /// Returns a high-level summary: languages, directories, entry points,
-    /// symbol types, and complexity hotspots. Useful for onboarding.
-    ///
-    /// Examples:
-    ///   vera overview
-    ///   vera overview --json
     #[command(long_about = "Show architecture overview of the indexed project.\n\n\
                       Returns a high-level summary of the codebase: languages with file \n\
                       and chunk counts, top-level directories, symbol type breakdown, \n\
@@ -587,14 +514,6 @@ pub enum Commands {
     },
 
     /// Regex pattern search over indexed files.
-    ///
-    /// Searches file contents using a regex pattern, returning matches
-    /// with surrounding context. Only searches files in the index.
-    ///
-    /// Examples:
-    ///   vera grep "fn\s+main"
-    ///   vera grep "TODO|FIXME" -i
-    ///   vera grep "impl.*Display" --context 5
     #[command(long_about = "Regex pattern search over indexed files.\n\n\
                       Searches file contents using a regex pattern, returning matches \
                       with surrounding context lines. Only searches files that are in \
@@ -645,13 +564,6 @@ pub enum Commands {
     DeadCode,
 
     /// Show index statistics.
-    ///
-    /// Displays file count, chunk count, index size on disk,
-    /// and language breakdown for the current index.
-    ///
-    /// Examples:
-    ///   vera stats
-    ///   vera stats --json
     #[command(long_about = "Show index statistics.\n\n\
                       Displays file count, chunk count, index size on disk, and a breakdown \
                       of chunks by programming language for the current index.\n\n\
@@ -662,17 +574,6 @@ pub enum Commands {
     Stats,
 
     /// Watch a project directory and auto-update the index on file changes.
-    ///
-    /// Starts a background file watcher that triggers incremental index updates
-    /// when source files change. Useful for long coding sessions where you want
-    /// the index to stay fresh without manual `vera update` calls.
-    ///
-    /// Requires an existing index (run `vera index <path>` first).
-    /// Blocks until interrupted with Ctrl-C.
-    ///
-    /// Examples:
-    ///   vera watch .
-    ///   vera watch /path/to/repo
     #[command(
         long_about = "Watch a project directory and auto-update the index on file changes.\n\n\
                       Starts a background file watcher that triggers incremental index updates \n\
@@ -691,14 +592,6 @@ pub enum Commands {
     },
 
     /// Show or set configuration values.
-    ///
-    /// Without arguments, shows the current configuration. Use subcommands
-    /// to get or set individual values.
-    ///
-    /// Examples:
-    ///   vera config
-    ///   vera config get retrieval.default_limit
-    ///   vera config set retrieval.default_limit 20
     #[command(long_about = "Show or set configuration values.\n\n\
                       Without arguments or with `show`, displays the full current \
                       configuration as a table (or JSON with --json).\n\n\
