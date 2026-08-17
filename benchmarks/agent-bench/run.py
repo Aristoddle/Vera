@@ -72,11 +72,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--effort", default="medium", help="droid reasoning effort level"
     )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Re-run cells that already completed successfully (default: skip them)",
+    )
     return parser.parse_args()
 
 
 def fail(message: str) -> NoReturn:
     raise SystemExit(f"agent-bench: error: {message}")
+
+
+def lane_slug(model: str, effort: str) -> str:
+    """Filesystem-safe tag for a model/effort lane (model IDs may contain '/')."""
+    return re.sub(r"[^A-Za-z0-9._-]+", "-", f"{model}-{effort}")
 
 
 def load_questions(limit: int | None) -> list[dict[str, Any]]:
@@ -296,14 +306,23 @@ def write_prompts(run_dir: Path, questions: list[dict[str, Any]]) -> None:
 
 
 def run_question(
-    run_dir: Path, arm: str, question: dict[str, Any], model: str, effort: str
+    run_dir: Path, arm: str, question: dict[str, Any], model: str, effort: str, force: bool
 ) -> None:
     arm_dir = run_dir / arm
     repo_dir = arm_dir / "repo"
     prompt = arm_dir / "prompts" / f"q{question['number']:02d}.md"
-    suffix = f"q{question['number']:02d}.{model}-{effort}.jsonl"
+    slug = lane_slug(model, effort)
+    suffix = f"q{question['number']:02d}.{slug}.jsonl"
     output_path = arm_dir / suffix
-    stderr_path = arm_dir / f"q{question['number']:02d}.{model}-{effort}.stderr.log"
+    stderr_path = arm_dir / f"q{question['number']:02d}.{slug}.stderr.log"
+    meta_path = arm_dir / f"q{question['number']:02d}.{slug}.run.json"
+    if not force and output_path.is_file() and meta_path.is_file():
+        try:
+            if json.loads(meta_path.read_text(encoding="utf-8")).get("returncode") == 0:
+                print(f"  {arm} q{question['number']:02d}: skipped (already done)")
+                return
+        except json.JSONDecodeError:
+            pass
     shim_dir = run_dir / "control" / "bin" if arm == "control" else None
     env = environment_for(arm, shim_dir=shim_dir)
     start = time.monotonic()
@@ -336,7 +355,7 @@ def run_question(
             check=False,
         )
     wall_s = time.monotonic() - start
-    (arm_dir / f"q{question['number']:02d}.{model}-{effort}.run.json").write_text(
+    meta_path.write_text(
         json.dumps({"returncode": result.returncode, "wall_s": wall_s}, indent=2) + "\n",
         encoding="utf-8",
     )
@@ -345,7 +364,7 @@ def run_question(
 
 
 def run_agents(
-    run_dir: Path, questions: list[dict[str, Any]], model: str, effort: str
+    run_dir: Path, questions: list[dict[str, Any]], model: str, effort: str, force: bool
 ) -> None:
     for arm in ARMS:
         if not (run_dir / arm / "repo").is_dir():
@@ -358,7 +377,7 @@ def run_agents(
     print(f"Running {len(questions)} questions in {run_dir} with {model} ({effort})")
     for question, arm_order in zip(questions, arms_by_question):
         for arm in arm_order:
-            run_question(run_dir, arm, question, model, effort)
+            run_question(run_dir, arm, question, model, effort, force)
 
 
 def json_objects(path: Path) -> Iterable[dict[str, Any]]:
@@ -482,20 +501,29 @@ def analyze_run(
         "questions": {},
         "summary": {},
     }
+    slug = lane_slug(model, effort)
     for question in questions:
         number = question["number"]
         result["questions"][f"q{number:02d}"] = {}
         for arm in ARMS:
             arm_dir = run_dir / arm
-            result["questions"][f"q{number:02d}"][arm] = parse_jsonl(
-                arm_dir / f"q{number:02d}.{model}-{effort}.jsonl",
-                arm_dir / f"q{number:02d}.{model}-{effort}.run.json",
+            parsed = parse_jsonl(
+                arm_dir / f"q{number:02d}.{slug}.jsonl",
+                arm_dir / f"q{number:02d}.{slug}.run.json",
             )
+            # A nonzero droid exit means the cell is not a valid measurement;
+            # mark it so aggregates and judging exclude it.
+            if parsed.get("returncode") not in (None, 0):
+                parsed["failed"] = True
+            result["questions"][f"q{number:02d}"][arm] = parsed
 
     for arm in ARMS:
         rows = [result["questions"][f"q{q['number']:02d}"][arm] for q in questions]
+        failed = sum(1 for row in rows if row.get("failed"))
+        rows = [row for row in rows if not row.get("failed")]
         result["summary"][arm] = {
             "questions": len(rows),
+            "failed": failed,
             "tool_calls": sum((Counter(row["tool_calls"]) for row in rows), Counter()),
             "tokens_in": sum(row["tokens_in"] for row in rows),
             "tokens_out": sum(row["tokens_out"] for row in rows),
@@ -504,7 +532,7 @@ def analyze_run(
             "wall_s_total": sum(row["wall_s"] or 0.0 for row in rows),
             "duration_ms_total": sum(row["duration_ms"] or 0.0 for row in rows),
         }
-    result_path = run_dir / f"results.{model}-{effort}.json"
+    result_path = run_dir / f"results.{slug}.json"
     result_path.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
     print_comparison(result)
     print(f"Wrote {result_path}")
@@ -513,12 +541,12 @@ def analyze_run(
 
 def print_comparison(result: dict[str, Any]) -> None:
     print("\nArm comparison")
-    print("arm         questions  tool calls  tokens in  tokens out  wall s  duration ms")
+    print("arm         questions  failed  tool calls  tokens in  tokens out  wall s  duration ms")
     for arm in ARMS:
         summary = result["summary"][arm]
         tool_count = sum(summary["tool_calls"].values())
         print(
-            f"{arm:<11} {summary['questions']:>9}  {tool_count:>10}  "
+            f"{arm:<11} {summary['questions']:>9}  {summary['failed']:>6}  {tool_count:>10}  "
             f"{summary['tokens_in']:>9}  {summary['tokens_out']:>10}  "
             f"{summary['wall_s_total']:>6.1f}  {summary['duration_ms_total']:>12.0f}"
         )
@@ -531,13 +559,13 @@ def main() -> None:
         analyze_run(args.analyze.resolve(), questions, args.model, args.effort)
         return
     if args.run is not None:
-        run_agents(args.run.resolve(), questions, args.model, args.effort)
+        run_agents(args.run.resolve(), questions, args.model, args.effort, args.force)
         analyze_run(args.run.resolve(), questions, args.model, args.effort)
         return
     run_dir = setup_run(questions)
     if args.setup_only:
         return
-    run_agents(run_dir, questions, args.model, args.effort)
+    run_agents(run_dir, questions, args.model, args.effort, args.force)
     analyze_run(run_dir, questions, args.model, args.effort)
 
 

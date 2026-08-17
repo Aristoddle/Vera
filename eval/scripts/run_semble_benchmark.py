@@ -44,6 +44,19 @@ def is_match(result_path, gt):
     return result_path == gt_path or result_path.endswith("/" + gt_path) or gt_path.endswith("/" + result_path)
 
 
+def percentile(sorted_values, p):
+    """Linear interpolation between nearest ranks, matching eval/src/metrics.rs."""
+    if not sorted_values:
+        return 0.0
+    if len(sorted_values) == 1:
+        return sorted_values[0]
+    rank = p / 100.0 * (len(sorted_values) - 1)
+    lower = int(rank)
+    upper = min(lower + 1, len(sorted_values) - 1)
+    frac = rank - lower
+    return sorted_values[lower] * (1 - frac) + sorted_values[upper] * frac
+
+
 def recall_at_k(results, ground_truth, k):
     if not ground_truth:
         return 0.0
@@ -157,8 +170,8 @@ def main():
     print(f"nDCG: {avg('ndcg'):.4f}")
 
     latencies = sorted(m["latency_ms"] for m in all_metrics)
-    print(f"Latency p50: {latencies[n//2]:.1f}ms")
-    print(f"Latency p95: {latencies[int(n*0.95)]:.1f}ms")
+    print(f"Latency p50: {percentile(latencies, 50):.1f}ms")
+    print(f"Latency p95: {percentile(latencies, 95):.1f}ms")
     print(f"Index time: {total_index_time:.1f}s")
 
     print()
@@ -179,8 +192,8 @@ def main():
             "recall_at_10": avg("recall_at_10"),
             "mrr": avg("mrr"),
             "ndcg": avg("ndcg"),
-            "latency_p50_ms": latencies[n//2],
-            "latency_p95_ms": latencies[int(n*0.95)],
+            "latency_p50_ms": percentile(latencies, 50),
+            "latency_p95_ms": percentile(latencies, 95),
             "index_time_secs": total_index_time,
         },
         "per_category": {

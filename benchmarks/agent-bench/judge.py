@@ -29,8 +29,13 @@ def judge(question_text, key_text, answer, out_file):
         capture_output=True, text=True, timeout=1800,
     )
     out_file.write_text(proc.stdout + "\n=== STDERR ===\n" + proc.stderr)
-    m = re.search(r"SCORE:\s*(\d+)", proc.stdout)
-    return int(m.group(1)) if m else None
+    if proc.returncode != 0:
+        raise SystemExit(f"judge: agy exited {proc.returncode}; see {out_file}")
+    m = re.search(r"(?m)^SCORE:\s*(\d+)\s*$", proc.stdout)
+    score = int(m.group(1)) if m else -1
+    if not 0 <= score <= 10:
+        raise SystemExit(f"judge: no valid SCORE (0-10) in response; see {out_file}")
+    return score
 
 def main():
     run_dir = Path(sys.argv[1])
@@ -49,6 +54,8 @@ def main():
         entry = results["questions"].get(f"q{qn:02d}", {}).get(arm)
         if not entry or not entry.get("answer"):
             print(f"skip {arm} q{qn}: no answer"); continue
+        if entry.get("failed"):
+            print(f"skip {arm} q{qn}: failed run"); continue
         out_file = judge_dir / f"{arm}-q{qn:02d}.txt"
         score = judge(qtext[qn], keys[qn], entry["answer"], out_file)
         entry["score"] = score

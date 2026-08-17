@@ -121,6 +121,13 @@ def main():
             per_category.setdefault(task["category"], []).append(m)
 
     n = len(all_metrics)
+    if n == 0:
+        print(
+            "No results: every repository was skipped; run eval/setup-corpus.sh first",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
     def avg(key): return sum(m[key] for m in all_metrics) / n
 
     print(f"\n=== Semble on Vera's Eval Set ({n} tasks) ===")

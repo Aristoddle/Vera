@@ -76,13 +76,9 @@ impl ToolAdapter for VeraBm25Adapter {
             RESULT_LIMIT,
         )) {
             Ok((results, _)) => results.into_iter().map(into_retrieval_result).collect(),
-            Err(err) => {
-                eprintln!(
-                    "warning: vera-bm25 search failed for {}: {err}",
-                    repo_path.display()
-                );
-                Vec::new()
-            }
+            // Abort rather than return empty results: a failed search would
+            // otherwise be scored as a legitimate zero and skew aggregates.
+            Err(err) => panic!("vera-bm25 search failed for {}: {err}", repo_path.display()),
         }
     }
 
@@ -98,13 +94,7 @@ impl ToolAdapter for VeraBm25Adapter {
 
         match indexed {
             Ok(summary) => (summary.elapsed_secs, dir_size(&index_dir(repo_path))),
-            Err(err) => {
-                eprintln!(
-                    "warning: vera-bm25 index failed for {}: {err}",
-                    repo_path.display()
-                );
-                (0.0, 0)
-            }
+            Err(err) => panic!("vera-bm25 index failed for {}: {err}", repo_path.display()),
         }
     }
 }
@@ -236,13 +226,9 @@ impl ToolAdapter for VeraFullAdapter {
             RESULT_LIMIT,
         )) {
             Ok((results, _)) => results.into_iter().map(into_retrieval_result).collect(),
-            Err(err) => {
-                eprintln!(
-                    "warning: vera-full search failed for {}: {err}",
-                    repo_path.display()
-                );
-                Vec::new()
-            }
+            // Abort rather than return empty results: a failed search would
+            // otherwise be scored as a legitimate zero and skew aggregates.
+            Err(err) => panic!("vera-full search failed for {}: {err}", repo_path.display()),
         }
     }
 
@@ -250,18 +236,10 @@ impl ToolAdapter for VeraFullAdapter {
         let repo_path = Path::new(repo_path);
 
         let Some(provider) = self.search_context.embedding_provider() else {
-            eprintln!(
-                "warning: embedding provider unavailable for {}",
-                self.backend
-            );
-            return (0.0, 0);
+            panic!("embedding provider unavailable for {}", self.backend);
         };
         let Some(model_name) = self.search_context.model_name() else {
-            eprintln!(
-                "warning: embedding model name unavailable for {}",
-                self.backend
-            );
-            return (0.0, 0);
+            panic!("embedding model name unavailable for {}", self.backend);
         };
 
         let indexed = self.runtime.block_on(index_repository(
@@ -273,13 +251,7 @@ impl ToolAdapter for VeraFullAdapter {
 
         match indexed {
             Ok(summary) => (summary.elapsed_secs, dir_size(&index_dir(repo_path))),
-            Err(err) => {
-                eprintln!(
-                    "warning: vera-full index failed for {}: {err}",
-                    repo_path.display()
-                );
-                (0.0, 0)
-            }
+            Err(err) => panic!("vera-full index failed for {}: {err}", repo_path.display()),
         }
     }
 }
