@@ -76,7 +76,7 @@ impl LocalReranker {
     pub fn probe_session(ep: OnnxExecutionProvider) -> Result<()> {
         let ort_path = crate::local_models::ort_library_path_for_ep(ep)?;
         crate::local_models::ensure_ort_runtime(Some(&ort_path))?;
-        let (onnx_path, _) = default_asset_paths(ep)?;
+        let (onnx_path, _) = default_asset_paths()?;
         let _ = build_session(ep, onnx_path)?;
         Ok(())
     }
@@ -84,7 +84,7 @@ impl LocalReranker {
     pub fn probe_inference(ep: OnnxExecutionProvider) -> Result<()> {
         let ort_path = crate::local_models::ort_library_path_for_ep(ep)?;
         crate::local_models::ensure_ort_runtime(Some(&ort_path))?;
-        let (onnx_path, tokenizer_path) = default_asset_paths(ep)?;
+        let (onnx_path, tokenizer_path) = default_asset_paths()?;
         let mut session = build_session(ep, onnx_path)?;
         let tokenizer = load_tokenizer(tokenizer_path)?;
         run_probe_inference(&mut session, &tokenizer)
@@ -216,17 +216,14 @@ impl LocalReranker {
 }
 
 async fn load_reranker_components(ep: OnnxExecutionProvider) -> Result<(Session, Tokenizer)> {
-    let onnx_path = ensure_model_file(
-        RERANKER_REPO,
-        crate::local_models::reranker_onnx_file_for_ep(ep),
-    )
-    .await
-    .with_context(|| {
-        format!(
-            "Failed to download ONNX model: {}",
-            crate::local_models::reranker_onnx_file_for_ep(ep)
-        )
-    })?;
+    let onnx_path = ensure_model_file(RERANKER_REPO, crate::local_models::RERANKER_ONNX_FILE)
+        .await
+        .with_context(|| {
+            format!(
+                "Failed to download ONNX model: {}",
+                crate::local_models::RERANKER_ONNX_FILE
+            )
+        })?;
 
     let tokenizer_path = ensure_model_file(RERANKER_REPO, TOKENIZER_FILE)
         .await
@@ -238,14 +235,12 @@ async fn load_reranker_components(ep: OnnxExecutionProvider) -> Result<(Session,
     Ok((session, tokenizer))
 }
 
-fn default_asset_paths(
-    ep: OnnxExecutionProvider,
-) -> Result<(std::path::PathBuf, std::path::PathBuf)> {
+fn default_asset_paths() -> Result<(std::path::PathBuf, std::path::PathBuf)> {
     let model_dir = crate::local_models::vera_home_dir()?
         .join("models")
         .join(RERANKER_REPO);
     Ok((
-        model_dir.join(crate::local_models::reranker_onnx_file_for_ep(ep)),
+        model_dir.join(crate::local_models::RERANKER_ONNX_FILE),
         model_dir.join(TOKENIZER_FILE),
     ))
 }

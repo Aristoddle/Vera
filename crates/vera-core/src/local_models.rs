@@ -46,9 +46,6 @@ pub const LOCAL_EMBEDDING_QUERY_PREFIX_ENV: &str = "VERA_LOCAL_EMBEDDING_QUERY_P
 pub const LEGACY_EMBEDDING_QUERY_PREFIX_ENV: &str = "VERA_EMBEDDING_QUERY_PREFIX";
 
 const RERANKER_REPO: &str = "jinaai/jina-reranker-v2-base-multilingual";
-const RERANKER_ONNX_FILE: &str = "onnx/model_quantized.onnx";
-const RERANKER_TOKENIZER_FILE: &str = "tokenizer.json";
-
 /// No prebuilt reranker ONNX export runs on the CoreML GPU: the quantized
 /// export contains DynamicQuantizeLinear/MatMulInteger ops the CoreML EP cannot
 /// execute, and the fp16 export stores every tensor as float16 which the CoreML
@@ -56,9 +53,8 @@ const RERANKER_TOKENIZER_FILE: &str = "tokenizer.json";
 /// to CPU). Since CoreML cannot accelerate the reranker either way, all backends
 /// use the quantized INT8 export — the fastest CPU path. `vera doctor` surfaces
 /// the CoreML CPU fallback so the all-green probe does not mislead users.
-pub fn reranker_onnx_file_for_ep(_ep: OnnxExecutionProvider) -> &'static str {
-    RERANKER_ONNX_FILE
-}
+pub const RERANKER_ONNX_FILE: &str = "onnx/model_quantized.onnx";
+const RERANKER_TOKENIZER_FILE: &str = "tokenizer.json";
 
 /// ONNX Runtime version to auto-download. Using 1.24.4 for CUDA 13 support.
 /// The `ort` crate (rc.11) uses `load-dynamic` so any ABI-compatible ORT works.
@@ -2508,12 +2504,8 @@ pub async fn prepare_local_models_for_ep(
     }
     paths.push(embedding_paths.tokenizer_path);
     paths.push(
-        ensure_model_file_with_kind(
-            RERANKER_REPO,
-            reranker_onnx_file_for_ep(ep),
-            LocalModelAssetKind::Onnx,
-        )
-        .await?,
+        ensure_model_file_with_kind(RERANKER_REPO, RERANKER_ONNX_FILE, LocalModelAssetKind::Onnx)
+            .await?,
     );
     paths.push(
         ensure_model_file_with_kind(
@@ -2538,7 +2530,7 @@ pub fn inspect_local_model_files_for_ep(
     let reranker_onnx = vera_home
         .join("models")
         .join(RERANKER_REPO)
-        .join(reranker_onnx_file_for_ep(ep));
+        .join(RERANKER_ONNX_FILE);
     let reranker_tokenizer = vera_home
         .join("models")
         .join(RERANKER_REPO)
@@ -3089,21 +3081,6 @@ mod tests {
         assert!(!status.exists);
         assert_eq!(status.state, LocalModelAssetState::Missing);
         assert_eq!(status.detail.as_deref(), Some("file not found"));
-    }
-
-    #[test]
-    fn reranker_onnx_file_selects_expected_model_per_backend() {
-        // Every backend uses the quantized export: no prebuilt reranker ONNX
-        // runs on the CoreML GPU, and quantized INT8 is the fastest CPU path.
-        let cases = [
-            (OnnxExecutionProvider::Cpu, RERANKER_ONNX_FILE),
-            (OnnxExecutionProvider::Cuda, RERANKER_ONNX_FILE),
-            (OnnxExecutionProvider::CoreMl, RERANKER_ONNX_FILE),
-        ];
-
-        for (ep, expected) in cases {
-            assert_eq!(reranker_onnx_file_for_ep(ep), expected);
-        }
     }
 
     #[test]

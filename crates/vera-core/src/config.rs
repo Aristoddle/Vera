@@ -40,11 +40,17 @@ pub struct IndexingConfig {
     pub max_chunk_bytes: usize,
 }
 
-fn default_max_chunk_bytes() -> usize {
-    std::env::var("VERA_MAX_CHUNK_BYTES")
+/// Read a `usize` config override from an environment variable, falling
+/// back to `default` when unset or unparseable.
+fn env_usize(key: &str, default: usize) -> usize {
+    std::env::var(key)
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(24_576)
+        .unwrap_or(default)
+}
+
+fn default_max_chunk_bytes() -> usize {
+    env_usize("VERA_MAX_CHUNK_BYTES", 24_576)
 }
 
 impl Default for IndexingConfig {
@@ -97,10 +103,7 @@ fn default_max_output_chars() -> usize {
 }
 
 fn default_max_rerank_batch() -> usize {
-    std::env::var("VERA_MAX_RERANK_BATCH")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(20)
+    env_usize("VERA_MAX_RERANK_BATCH", 20)
 }
 
 impl Default for RetrievalConfig {
@@ -181,11 +184,7 @@ impl Default for EmbeddingConfig {
 }
 
 fn default_max_in_flight_inputs() -> usize {
-    std::env::var("VERA_MAX_IN_FLIGHT_INPUTS")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .map(|value| value.max(1))
-        .unwrap_or(16)
+    env_usize("VERA_MAX_IN_FLIGHT_INPUTS", 16).max(1)
 }
 
 impl EmbeddingConfig {
@@ -455,14 +454,6 @@ fn detect_apple_silicon_mem_info() -> GpuInfo {
     }
 }
 
-/// Detect available GPU VRAM in MB for the given execution provider.
-///
-/// For CUDA/ROCm, runs `nvidia-smi` or `rocm-smi`. Returns `None` if
-/// detection fails (command not found, parse error, etc.).
-pub fn detect_gpu_vram_mb(ep: OnnxExecutionProvider) -> Option<u64> {
-    detect_gpu_info(ep).vram_free_mb
-}
-
 fn detect_nvidia_gpu_info() -> GpuInfo {
     // Single nvidia-smi call that returns free VRAM, device name, total VRAM, and driver.
     let output = std::process::Command::new("nvidia-smi")
@@ -580,19 +571,14 @@ pub fn resolve_backend(backend: Option<InferenceBackend>) -> InferenceBackend {
     InferenceBackend::Api
 }
 
-/// Check whether two model names refer to the same model.
+/// Check whether two model names refer to the same model, using configured
+/// alias groups plus aliases supplied by `VERA_EMBEDDING_MODEL_ALIASES`.
 ///
 /// Model names may differ only by an org/repo prefix (e.g.
 /// `"jinaai/jina-embeddings-v5-text-nano-retrieval"` vs
-/// `"jina-embeddings-v5-text-nano-retrieval"`). This function
-/// normalises both names by stripping everything up to and including
-/// the last `/` and then comparing case-insensitively.
-pub fn model_names_match(a: &str, b: &str) -> bool {
-    model_names_match_with_aliases(a, b, &[])
-}
-
-/// Check whether two model names match using configured alias groups plus
-/// aliases supplied by `VERA_EMBEDDING_MODEL_ALIASES`.
+/// `"jina-embeddings-v5-text-nano-retrieval"`). Both names are normalised by
+/// stripping everything up to and including the last `/` and then compared
+/// case-insensitively.
 pub fn model_names_match_with_aliases(a: &str, b: &str, aliases: &[Vec<String>]) -> bool {
     let a = normalize_model_name(a);
     let b = normalize_model_name(b);
@@ -827,6 +813,11 @@ mod tests {
         );
 
         remove_env("VERA_LOCAL");
+    }
+
+    /// Shorthand for matching without configured alias groups.
+    fn model_names_match(a: &str, b: &str) -> bool {
+        model_names_match_with_aliases(a, b, &[])
     }
 
     #[test]

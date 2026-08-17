@@ -521,6 +521,7 @@ impl LruCache {
         );
     }
 
+    #[cfg(test)]
     fn len(&self) -> usize {
         self.entries.len()
     }
@@ -554,6 +555,7 @@ impl<P: EmbeddingProvider> CachedEmbeddingProvider<P> {
     }
 
     /// Return the number of currently cached entries.
+    #[cfg(test)]
     pub fn cache_size(&self) -> usize {
         self.cache.lock().unwrap().len()
     }

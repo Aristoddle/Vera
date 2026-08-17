@@ -4,12 +4,9 @@
 //! Vectors are stored alongside the metadata DB in the same SQLite file.
 
 use anyhow::{Context, Result};
-use rusqlite::{Connection, ffi::sqlite3_auto_extension, params};
+use rusqlite::{Connection, OptionalExtension, ffi::sqlite3_auto_extension, params};
 use sqlite_vec::sqlite3_vec_init;
 use zerocopy::IntoBytes;
-
-/// Configurable vector dimensionality (default 4096 for Qwen3-Embedding-8B).
-const DEFAULT_VECTOR_DIM: usize = 4096;
 
 /// sqlite-vec backed vector store for embedding search.
 pub struct VectorStore {
@@ -46,11 +43,6 @@ impl VectorStore {
         let store = Self { conn, dim };
         store.init_schema()?;
         Ok(store)
-    }
-
-    /// Open with default dimensionality (4096 for Qwen3).
-    pub fn open_default(db_path: &std::path::Path) -> Result<Self> {
-        Self::open(db_path, DEFAULT_VECTOR_DIM)
     }
 
     /// Initialize the vector table schema.
@@ -344,21 +336,6 @@ fn register_sqlite_vec() {
             sqlite3_auto_extension(Some(func));
         }
     });
-}
-
-/// Extension trait to make `optional()` work with rusqlite.
-trait OptionalExt<T> {
-    fn optional(self) -> std::result::Result<Option<T>, rusqlite::Error>;
-}
-
-impl<T> OptionalExt<T> for std::result::Result<T, rusqlite::Error> {
-    fn optional(self) -> std::result::Result<Option<T>, rusqlite::Error> {
-        match self {
-            Ok(val) => Ok(Some(val)),
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(e),
-        }
-    }
 }
 
 #[cfg(test)]

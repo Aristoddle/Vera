@@ -4,7 +4,7 @@
 //! in a SQLite database. Uses WAL mode for concurrent read performance.
 
 use anyhow::{Context, Result};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::parsing::type_relations::{RawTypeRelation, TypeRelationKind};
 use crate::types::{Chunk, Language, SymbolType};
@@ -1112,21 +1112,6 @@ fn parse_symbol_type(s: &str) -> SymbolType {
         "variable" => SymbolType::Variable,
         "module" => SymbolType::Module,
         _ => SymbolType::Block,
-    }
-}
-
-/// Extension trait to make `optional()` work with rusqlite.
-trait OptionalExt<T> {
-    fn optional(self) -> std::result::Result<Option<T>, rusqlite::Error>;
-}
-
-impl<T> OptionalExt<T> for std::result::Result<T, rusqlite::Error> {
-    fn optional(self) -> std::result::Result<Option<T>, rusqlite::Error> {
-        match self {
-            Ok(val) => Ok(Some(val)),
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(e),
-        }
     }
 }
 
