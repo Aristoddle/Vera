@@ -19,7 +19,8 @@ use crate::retrieval::hybrid::{
 };
 use crate::retrieval::query_classifier::{QueryType, classify_query, params_for_query_type};
 use crate::retrieval::query_utils::{
-    looks_like_compound_identifier, looks_like_filename, path_depth, trim_query_token,
+    content_declares_public_symbol, content_starts_with_impl, looks_like_compound_identifier,
+    looks_like_filename, path_depth, result_key, trim_query_token,
 };
 use crate::retrieval::ranking::{
     RankingStage, apply_query_ranking_with_filters, is_path_weighted_query,
@@ -39,6 +40,20 @@ pub struct SearchTimings {
     pub reranking: Option<Duration>,
     pub augmentation: Option<Duration>,
     pub total: Option<Duration>,
+}
+
+impl From<crate::retrieval::hybrid::HybridTimings> for SearchTimings {
+    fn from(t: crate::retrieval::hybrid::HybridTimings) -> Self {
+        SearchTimings {
+            embedding: t.embedding,
+            bm25: t.bm25,
+            vector: t.vector,
+            fusion: t.fusion,
+            reranking: t.reranking,
+            augmentation: None,
+            total: None,
+        }
+    }
 }
 
 /// Reusable search dependencies for a process or command invocation.
@@ -255,14 +270,7 @@ impl SearchContext {
             .await?
         };
 
-        let mut timings = SearchTimings {
-            embedding: hybrid_timings.embedding,
-            bm25: hybrid_timings.bm25,
-            vector: hybrid_timings.vector,
-            fusion: hybrid_timings.fusion,
-            reranking: hybrid_timings.reranking,
-            ..Default::default()
-        };
+        let mut timings = SearchTimings::from(hybrid_timings);
 
         let aug_start = Instant::now();
         let results =
@@ -542,7 +550,7 @@ fn collect_exact_match_candidates(
                         path_depth: path_depth(&chunk.file_path),
                         line_start: chunk.line_start,
                     },
-                    result: chunk_to_result(chunk),
+                    result: chunk.into_search_result(0.0),
                 });
             }
         }
@@ -580,7 +588,7 @@ fn collect_exact_match_candidates(
             };
             candidates.push(ExactMatchCandidate {
                 order,
-                result: chunk_to_result(chunk),
+                result: chunk.into_search_result(0.0),
             });
         }
     }
@@ -599,7 +607,7 @@ fn collect_exact_match_candidates(
                     path_depth: path_depth(&chunk.file_path),
                     line_start: chunk.line_start,
                 },
-                result: chunk_to_result(chunk),
+                result: chunk.into_search_result(0.0),
             });
         }
     }
@@ -650,19 +658,7 @@ fn collect_stem_matched_definitions(
 
         let chunks = store.get_chunks_by_file(file_path)?;
         for chunk in chunks {
-            let is_definition = matches!(
-                chunk.symbol_type,
-                Some(
-                    SymbolType::Class
-                        | SymbolType::Struct
-                        | SymbolType::Trait
-                        | SymbolType::Interface
-                        | SymbolType::Enum
-                        | SymbolType::Function
-                        | SymbolType::Module
-                )
-            );
-            if is_definition {
+            if is_definition_chunk(&chunk) {
                 results.push(chunk);
             }
         }
@@ -732,19 +728,7 @@ fn collect_concept_matched_files(
         for chunk in chunks {
             // Only inject definition chunks to avoid flooding results with
             // every line of a concept-matched file.
-            let is_definition = matches!(
-                chunk.symbol_type,
-                Some(
-                    SymbolType::Class
-                        | SymbolType::Struct
-                        | SymbolType::Trait
-                        | SymbolType::Interface
-                        | SymbolType::Enum
-                        | SymbolType::Function
-                        | SymbolType::Module
-                )
-            );
-            if is_definition {
+            if is_definition_chunk(&chunk) {
                 results.push(chunk);
             }
         }
@@ -885,27 +869,28 @@ fn chunk_looks_like_impl(chunk: &Chunk) -> bool {
         .symbol_name
         .as_deref()
         .is_some_and(|name| name.to_ascii_lowercase().contains("impl"))
-        || chunk
-            .content
-            .lines()
-            .find(|line| !line.trim().is_empty())
-            .is_some_and(|line| line.trim_start().starts_with("impl "))
+        || content_starts_with_impl(&chunk.content)
 }
 
 fn chunk_is_public_symbol(chunk: &Chunk) -> bool {
-    chunk.content.lines().find_map(|line| {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            return None;
-        }
+    content_declares_public_symbol(&chunk.content)
+}
+
+/// Definition-type symbols eligible for exact-match injection. Intentionally
+/// excludes `Method` (unlike ranking's definition predicate).
+fn is_definition_chunk(chunk: &Chunk) -> bool {
+    matches!(
+        chunk.symbol_type,
         Some(
-            trimmed.starts_with("pub ")
-                || trimmed.starts_with("export ")
-                || trimmed.starts_with("public ")
-                || trimmed.starts_with("class ")
-                || trimmed.starts_with("interface "),
+            SymbolType::Class
+                | SymbolType::Struct
+                | SymbolType::Trait
+                | SymbolType::Interface
+                | SymbolType::Enum
+                | SymbolType::Function
+                | SymbolType::Module
         )
-    }) == Some(true)
+    )
 }
 
 fn uppercase_identifier_query(identifier: &str) -> bool {
@@ -913,26 +898,6 @@ fn uppercase_identifier_query(identifier: &str) -> bool {
         .chars()
         .next()
         .is_some_and(|ch| ch.is_ascii_uppercase())
-}
-
-fn result_key(result: &SearchResult) -> String {
-    format!(
-        "{}:{}:{}",
-        result.file_path, result.line_start, result.line_end
-    )
-}
-
-fn chunk_to_result(chunk: crate::types::Chunk) -> SearchResult {
-    SearchResult {
-        file_path: chunk.file_path,
-        line_start: chunk.line_start,
-        line_end: chunk.line_end,
-        content: chunk.content,
-        language: chunk.language,
-        score: 0.0,
-        symbol_name: chunk.symbol_name,
-        symbol_type: chunk.symbol_type,
-    }
 }
 
 #[cfg(test)]

@@ -23,7 +23,7 @@ use crate::types::SearchResult;
 // ── Error types ──────────────────────────────────────────────────────
 
 /// Errors specific to the reranking pipeline.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum RerankerError {
     /// Authentication failure (invalid or missing API key).
     #[error("reranker API authentication failed: {message}")]
@@ -618,25 +618,7 @@ pub(crate) mod test_helpers {
             documents: &[String],
         ) -> Result<Vec<RerankScore>, RerankerError> {
             if let Some(ref err) = self.fail_with {
-                return Err(match err {
-                    RerankerError::AuthError { message } => RerankerError::AuthError {
-                        message: message.clone(),
-                    },
-                    RerankerError::ConnectionError { message } => RerankerError::ConnectionError {
-                        message: message.clone(),
-                    },
-                    RerankerError::ApiError { status, message } => RerankerError::ApiError {
-                        status: *status,
-                        message: message.clone(),
-                    },
-                    RerankerError::RateLimitError { message } => RerankerError::RateLimitError {
-                        message: message.clone(),
-                    },
-                    RerankerError::ResponseError { message } => RerankerError::ResponseError {
-                        message: message.clone(),
-                    },
-                    RerankerError::Cancelled => RerankerError::Cancelled,
-                });
+                return Err(err.clone());
             }
 
             // Deterministic scoring: reverse order of input (last doc scores highest).

@@ -8,14 +8,13 @@ use anyhow::{Result, bail};
 use regex::{Captures, Regex};
 use tree_sitter::Parser;
 
-use crate::corpus::{ContentClass, classify_content, classify_path};
+use crate::corpus::{ContentClass, classify_content};
 use crate::parsing::languages;
 use crate::retrieval::apply_filters;
 use crate::retrieval::file_scan::{
-    allows_class, bounded_byte_snippet, file_scan_priority, language_for_path,
-    smallest_symbol_chunk_for_line, symbol_for_line,
+    allows_class, bounded_byte_snippet, language_for_path, smallest_symbol_chunk_for_line,
+    sort_files_by_scan_priority, symbol_for_line,
 };
-use crate::retrieval::query_utils::path_depth;
 use crate::storage::metadata::MetadataStore;
 use crate::types::{Chunk, Language, SearchFilters, SearchResult, SearchScope};
 
@@ -123,16 +122,7 @@ fn search_definitions(
 
     let results = chunks
         .into_iter()
-        .map(|chunk| SearchResult {
-            file_path: chunk.file_path,
-            line_start: chunk.line_start,
-            line_end: chunk.line_end,
-            content: chunk.content,
-            language: chunk.language,
-            score: 1.0,
-            symbol_name: chunk.symbol_name,
-            symbol_type: chunk.symbol_type,
-        })
+        .map(|chunk| chunk.into_search_result(1.0))
         .collect();
 
     Ok(apply_filters(results, filters, limit))
@@ -258,19 +248,7 @@ where
     F: FnMut(&str, Language, &str, &[Chunk]) -> Result<Vec<StructuralMatch>>,
 {
     let mut files = store.indexed_files()?;
-    files.sort_by(|left, right| {
-        let left_language = language_for_path(left);
-        let right_language = language_for_path(right);
-        let left_key = (
-            file_scan_priority(classify_path(left, left_language), filters),
-            path_depth(left),
-        );
-        let right_key = (
-            file_scan_priority(classify_path(right, right_language), filters),
-            path_depth(right),
-        );
-        left_key.cmp(&right_key).then_with(|| left.cmp(right))
-    });
+    sort_files_by_scan_priority(&mut files, filters);
 
     let mut results = Vec::new();
     let mut seen = HashSet::new();

@@ -24,3 +24,62 @@ pub(crate) fn looks_like_filename(token: &str) -> bool {
         "dockerfile" | "makefile" | "cmakelists.txt" | "nginx.conf"
     ) || token.contains('.')
 }
+
+/// Check whether the first non-empty content line declares a public symbol
+/// (pub/export/public/class/interface).
+pub(crate) fn content_declares_public_symbol(content: &str) -> bool {
+    content.lines().find_map(|line| {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        Some(
+            trimmed.starts_with("pub ")
+                || trimmed.starts_with("export ")
+                || trimmed.starts_with("public ")
+                || trimmed.starts_with("class ")
+                || trimmed.starts_with("interface "),
+        )
+    }) == Some(true)
+}
+
+/// Check whether the first non-empty content line starts an impl block.
+pub(crate) fn content_starts_with_impl(content: &str) -> bool {
+    content
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .is_some_and(|line| line.trim_start().starts_with("impl "))
+}
+
+/// Generate a unique key for a search result to detect overlaps.
+///
+/// Uses file_path + line_start + line_end as a composite key, since
+/// SearchResult doesn't carry the chunk ID but these fields uniquely
+/// identify a chunk within the index.
+pub(crate) fn result_key(result: &crate::types::SearchResult) -> String {
+    format!(
+        "{}:{}:{}",
+        result.file_path, result.line_start, result.line_end
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{Language, SearchResult};
+
+    #[test]
+    fn result_key_format() {
+        let r = SearchResult {
+            file_path: "src/main.rs".to_string(),
+            line_start: 10,
+            line_end: 20,
+            content: String::new(),
+            score: 1.0,
+            symbol_name: None,
+            symbol_type: None,
+            language: Language::Rust,
+        };
+        assert_eq!(result_key(&r), "src/main.rs:10:20");
+    }
+}

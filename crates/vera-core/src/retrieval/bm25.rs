@@ -130,16 +130,7 @@ fn search_bm25_with_stores_inner(
             continue;
         };
 
-        let result = SearchResult {
-            file_path: chunk.file_path,
-            line_start: chunk.line_start,
-            line_end: chunk.line_end,
-            content: chunk.content,
-            language: chunk.language,
-            score: f64::from(bm25_result.score),
-            symbol_name: chunk.symbol_name,
-            symbol_type: chunk.symbol_type,
-        };
+        let result = chunk.into_search_result(f64::from(bm25_result.score));
 
         if filters.is_some_and(|filters| !filters.matches(&result)) {
             continue;

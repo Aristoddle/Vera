@@ -19,6 +19,7 @@ use crate::embedding::EmbeddingProvider;
 use crate::retrieval::bm25::search_bm25_with_stores_and_filters;
 use crate::retrieval::graph_augmentation::augment_pool;
 use crate::retrieval::query_classifier::{QueryType, classify_query, params_for_query_type};
+use crate::retrieval::query_utils::result_key;
 use crate::retrieval::ranking::is_path_weighted_query;
 use crate::retrieval::reranker::{Reranker, rerank_results};
 use crate::retrieval::vector::{VectorSearchError, search_vector_with_stores};
@@ -428,18 +429,6 @@ pub fn fuse_rrf_multi_weighted(
             result
         })
         .collect()
-}
-
-/// Generate a unique key for a search result to detect overlaps.
-///
-/// Uses file_path + line_start + line_end as a composite key, since
-/// SearchResult doesn't carry the chunk ID but these fields uniquely
-/// identify a chunk within the index.
-fn result_key(result: &SearchResult) -> String {
-    format!(
-        "{}:{}:{}",
-        result.file_path, result.line_start, result.line_end
-    )
 }
 
 #[cfg(test)]

@@ -96,16 +96,7 @@ pub async fn search_vector_with_stores(
         // Convert distance to similarity score: higher is better.
         let score = distance_to_similarity(vr.distance);
 
-        results.push(SearchResult {
-            file_path: chunk.file_path,
-            line_start: chunk.line_start,
-            line_end: chunk.line_end,
-            content: chunk.content,
-            language: chunk.language,
-            score,
-            symbol_name: chunk.symbol_name,
-            symbol_type: chunk.symbol_type,
-        });
+        results.push(chunk.into_search_result(score));
 
         if results.len() >= limit {
             break;

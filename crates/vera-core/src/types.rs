@@ -286,6 +286,22 @@ pub struct Chunk {
     pub symbol_name: Option<String>,
 }
 
+impl Chunk {
+    /// Convert the chunk into a search result with the given relevance score.
+    pub(crate) fn into_search_result(self, score: f64) -> SearchResult {
+        SearchResult {
+            file_path: self.file_path,
+            line_start: self.line_start,
+            line_end: self.line_end,
+            content: self.content,
+            language: self.language,
+            score,
+            symbol_name: self.symbol_name,
+            symbol_type: self.symbol_type,
+        }
+    }
+}
+
 /// Programming language of a source file or chunk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]

@@ -10,6 +10,7 @@ use anyhow::Result;
 use crate::config::VeraConfig;
 use crate::types::{SearchFilters, SearchResult};
 
+use super::query_utils::result_key;
 use super::search_service::{SearchContext, SearchTimings};
 
 /// Run an iterative (multi-hop) search.
@@ -88,29 +89,4 @@ pub async fn execute_iterative_search_with_context(
 
     merged.truncate(result_limit);
     Ok((merged, timings))
-}
-
-fn result_key(r: &SearchResult) -> String {
-    format!("{}:{}:{}", r.file_path, r.line_start, r.line_end)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::types::Language;
-
-    #[test]
-    fn result_key_format() {
-        let r = SearchResult {
-            file_path: "src/main.rs".to_string(),
-            line_start: 10,
-            line_end: 20,
-            content: String::new(),
-            score: 1.0,
-            symbol_name: None,
-            symbol_type: None,
-            language: Language::Rust,
-        };
-        assert_eq!(result_key(&r), "src/main.rs:10:20");
-    }
 }

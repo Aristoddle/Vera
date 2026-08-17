@@ -10,11 +10,11 @@ use std::path::Path;
 use anyhow::Result;
 use regex::RegexBuilder;
 
-use crate::corpus::{ContentClass, classify_content, classify_path};
+use crate::corpus::{ContentClass, classify_content};
 use crate::retrieval::file_scan::{
-    allows_class, bounded_byte_snippet, file_scan_priority, language_for_path, symbol_for_line,
+    allows_class, bounded_byte_snippet, language_for_path, sort_files_by_scan_priority,
+    symbol_for_line,
 };
-use crate::retrieval::query_utils::path_depth;
 use crate::retrieval::ranking::{RankingStage, apply_query_ranking_with_filters};
 use crate::storage::metadata::MetadataStore;
 use crate::types::{Chunk, SearchFilters, SearchResult, SymbolType};
@@ -40,19 +40,7 @@ pub fn search_regex(
     let metadata_path = index_dir.join("metadata.db");
     let store = MetadataStore::open(&metadata_path)?;
     let mut files = store.indexed_files()?;
-    files.sort_by(|left, right| {
-        let left_key = {
-            let language = language_for_path(left);
-            let class = classify_path(left, language);
-            (file_scan_priority(class, filters), path_depth(left))
-        };
-        let right_key = {
-            let language = language_for_path(right);
-            let class = classify_path(right, language);
-            (file_scan_priority(class, filters), path_depth(right))
-        };
-        left_key.cmp(&right_key).then_with(|| left.cmp(right))
-    });
+    sort_files_by_scan_priority(&mut files, filters);
 
     // Resolve the project root (index_dir is .vera/, parent is project root).
     let project_root = index_dir

@@ -1,7 +1,9 @@
 use std::path::Path;
 
-use crate::corpus::ContentClass;
+use crate::corpus::{ContentClass, classify_path};
 use crate::types::{Chunk, Language, SearchFilters, SymbolType};
+
+use super::query_utils::path_depth;
 
 pub(crate) fn language_for_path(file_path: &str) -> Language {
     let path = Path::new(file_path);
@@ -55,6 +57,22 @@ pub(crate) fn file_scan_priority(class: ContentClass, filters: &SearchFilters) -
             ContentClass::Generated => 8,
         },
     }
+}
+
+/// Sort files so high-priority classes (per active scope filters) and
+/// shallower paths are scanned first; ties break by path for determinism.
+pub(crate) fn sort_files_by_scan_priority(files: &mut [String], filters: &SearchFilters) {
+    files.sort_by(|left, right| {
+        let left_key = (
+            file_scan_priority(classify_path(left, language_for_path(left)), filters),
+            path_depth(left),
+        );
+        let right_key = (
+            file_scan_priority(classify_path(right, language_for_path(right)), filters),
+            path_depth(right),
+        );
+        left_key.cmp(&right_key).then_with(|| left.cmp(right))
+    });
 }
 
 pub(crate) fn smallest_symbol_chunk_for_line(chunks: &[Chunk], line: u32) -> Option<&Chunk> {

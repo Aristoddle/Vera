@@ -9,7 +9,8 @@ use crate::chunk_text::file_name;
 use crate::corpus::{ContentClass, classify_content, classify_path, content_class_label};
 use crate::retrieval::query_classifier::{QueryType, classify_query};
 use crate::retrieval::query_utils::{
-    looks_like_compound_identifier, looks_like_filename, path_depth, trim_query_token,
+    content_declares_public_symbol, content_starts_with_impl, looks_like_compound_identifier,
+    looks_like_filename, path_depth, trim_query_token,
 };
 use crate::types::{Language, SearchFilters, SearchResult, SymbolType};
 use std::collections::HashMap;
@@ -914,27 +915,11 @@ fn parent_dir_stems(path: &str) -> Vec<String> {
 }
 
 fn is_public_symbol(result: &SearchResult) -> bool {
-    result.content.lines().find_map(|line| {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            return None;
-        }
-        Some(
-            trimmed.starts_with("pub ")
-                || trimmed.starts_with("export ")
-                || trimmed.starts_with("public ")
-                || trimmed.starts_with("class ")
-                || trimmed.starts_with("interface "),
-        )
-    }) == Some(true)
+    content_declares_public_symbol(&result.content)
 }
 
 fn looks_like_impl_block(result: &SearchResult) -> bool {
-    result
-        .content
-        .lines()
-        .find(|line| !line.trim().is_empty())
-        .is_some_and(|line| line.trim_start().starts_with("impl "))
+    content_starts_with_impl(&result.content)
 }
 
 fn shares_keyword_stem(left: &str, right: &str) -> bool {
