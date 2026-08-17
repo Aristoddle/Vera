@@ -89,78 +89,55 @@ pub enum AgentClient {
 }
 
 impl AgentClient {
+    /// All concrete (non-All) clients with display names, in display order.
+    const META: &[(AgentClient, &str)] = &[
+        (AgentClient::Agents, "Universal (.agents/skills/)"),
+        (AgentClient::Amp, "Amp (Sourcegraph)"),
+        (AgentClient::Antigravity, "Antigravity"),
+        (AgentClient::Augment, "Augment Code"),
+        (AgentClient::Claude, "Claude Code (Anthropic)"),
+        (AgentClient::Cline, "Cline"),
+        (AgentClient::Codebuff, "Codebuff"),
+        (AgentClient::Codebuddy, "CodeBuddy"),
+        (AgentClient::Codex, "Codex (OpenAI)"),
+        (AgentClient::Copilot, "Copilot (GitHub)"),
+        (AgentClient::Cortex, "Cortex Code (Snowflake)"),
+        (AgentClient::Crush, "Crush"),
+        (AgentClient::Cursor, "Cursor"),
+        (AgentClient::Droid, "Droid (Factory)"),
+        (AgentClient::Gemini, "Gemini CLI (Google)"),
+        (AgentClient::Goose, "Goose (Block)"),
+        (AgentClient::Iflow, "iFlow"),
+        (AgentClient::Junie, "Junie (JetBrains)"),
+        (AgentClient::Kilo, "Kilo Code"),
+        (AgentClient::Kiro, "Kiro"),
+        (AgentClient::Kimi, "Kimi (Moonshot)"),
+        (AgentClient::Vibe, "Vibe (Mistral)"),
+        (AgentClient::Mux, "Mux"),
+        (AgentClient::Opencode, "OpenCode"),
+        (AgentClient::Openhands, "OpenHands"),
+        (AgentClient::Pi, "Pi"),
+        (AgentClient::Qwen, "Qwen Code"),
+        (AgentClient::Roo, "Roo Code"),
+        (AgentClient::Trae, "Trae"),
+        (AgentClient::Windsurf, "Windsurf"),
+        (AgentClient::Zed, "Zed"),
+    ];
+
     /// All concrete (non-All) client variants, in display order.
-    fn all_concrete() -> &'static [AgentClient] {
-        &[
-            AgentClient::Agents,
-            AgentClient::Amp,
-            AgentClient::Antigravity,
-            AgentClient::Augment,
-            AgentClient::Claude,
-            AgentClient::Cline,
-            AgentClient::Codebuff,
-            AgentClient::Codebuddy,
-            AgentClient::Codex,
-            AgentClient::Copilot,
-            AgentClient::Cortex,
-            AgentClient::Crush,
-            AgentClient::Cursor,
-            AgentClient::Droid,
-            AgentClient::Gemini,
-            AgentClient::Goose,
-            AgentClient::Iflow,
-            AgentClient::Junie,
-            AgentClient::Kilo,
-            AgentClient::Kiro,
-            AgentClient::Kimi,
-            AgentClient::Vibe,
-            AgentClient::Mux,
-            AgentClient::Opencode,
-            AgentClient::Openhands,
-            AgentClient::Pi,
-            AgentClient::Qwen,
-            AgentClient::Roo,
-            AgentClient::Trae,
-            AgentClient::Windsurf,
-            AgentClient::Zed,
-        ]
+    fn all_concrete() -> impl Iterator<Item = AgentClient> + 'static {
+        Self::META.iter().map(|(client, _)| *client)
     }
 
     fn display_name(&self) -> &'static str {
-        match self {
-            AgentClient::All => "All",
-            AgentClient::Agents => "Universal (.agents/skills/)",
-            AgentClient::Amp => "Amp (Sourcegraph)",
-            AgentClient::Antigravity => "Antigravity",
-            AgentClient::Augment => "Augment Code",
-            AgentClient::Claude => "Claude Code (Anthropic)",
-            AgentClient::Cline => "Cline",
-            AgentClient::Codebuff => "Codebuff",
-            AgentClient::Codebuddy => "CodeBuddy",
-            AgentClient::Codex => "Codex (OpenAI)",
-            AgentClient::Copilot => "Copilot (GitHub)",
-            AgentClient::Cortex => "Cortex Code (Snowflake)",
-            AgentClient::Crush => "Crush",
-            AgentClient::Cursor => "Cursor",
-            AgentClient::Droid => "Droid (Factory)",
-            AgentClient::Gemini => "Gemini CLI (Google)",
-            AgentClient::Goose => "Goose (Block)",
-            AgentClient::Iflow => "iFlow",
-            AgentClient::Junie => "Junie (JetBrains)",
-            AgentClient::Kilo => "Kilo Code",
-            AgentClient::Kiro => "Kiro",
-            AgentClient::Kimi => "Kimi (Moonshot)",
-            AgentClient::Vibe => "Vibe (Mistral)",
-            AgentClient::Mux => "Mux",
-            AgentClient::Opencode => "OpenCode",
-            AgentClient::Openhands => "OpenHands",
-            AgentClient::Pi => "Pi",
-            AgentClient::Qwen => "Qwen Code",
-            AgentClient::Roo => "Roo Code",
-            AgentClient::Trae => "Trae",
-            AgentClient::Windsurf => "Windsurf",
-            AgentClient::Zed => "Zed",
+        if *self == AgentClient::All {
+            return "All";
         }
+        Self::META
+            .iter()
+            .find(|(client, _)| client == self)
+            .map(|(_, name)| *name)
+            .unwrap_or("All")
     }
 }
 
@@ -327,7 +304,7 @@ fn install_interactive() -> anyhow::Result<()> {
     let cwd = std::env::current_dir().context("failed to resolve current directory")?;
     let home = state::user_home_dir()?;
     let statuses = collect_client_install_statuses(scope, &cwd, &home)?;
-    let all_clients = AgentClient::all_concrete();
+    let all_clients: Vec<AgentClient> = AgentClient::all_concrete().collect();
     let installed_clients: Vec<AgentClient> = statuses
         .iter()
         .filter(|status| status.is_installed())
@@ -512,10 +489,10 @@ fn remove(
 fn remove_interactive() -> anyhow::Result<()> {
     let cwd = std::env::current_dir().context("failed to resolve current directory")?;
     let home = state::user_home_dir()?;
-    let all_clients = AgentClient::all_concrete();
+    let all_clients: Vec<AgentClient> = AgentClient::all_concrete().collect();
 
     let mut installed: Vec<(AgentClient, AgentScope, PathBuf)> = Vec::new();
-    for &client in all_clients {
+    for &client in &all_clients {
         for scope in [AgentScope::Global, AgentScope::Project] {
             let path = skill_path_for(client, scope, &cwd, &home)?;
             if path.join("SKILL.md").exists() {
@@ -735,7 +712,7 @@ fn resolve_locations(client: AgentClient, scope: AgentScope) -> anyhow::Result<V
 
 fn selected_clients_for(client: AgentClient) -> Vec<AgentClient> {
     match client {
-        AgentClient::All => AgentClient::all_concrete().to_vec(),
+        AgentClient::All => AgentClient::all_concrete().collect(),
         single => vec![single],
     }
 }
@@ -744,7 +721,7 @@ pub(crate) fn all_skill_paths(cwd: Option<&Path>, home: &Path) -> anyhow::Result
     let mut paths = BTreeSet::new();
     let cwd_for_globals = cwd.unwrap_or(home);
 
-    for &client in AgentClient::all_concrete() {
+    for client in AgentClient::all_concrete() {
         paths.insert(skill_path_for(
             client,
             AgentScope::Global,
@@ -772,8 +749,6 @@ fn collect_client_install_statuses(
     };
 
     AgentClient::all_concrete()
-        .iter()
-        .copied()
         .map(|client| {
             let scopes = scopes
                 .iter()
@@ -825,7 +800,7 @@ fn resolve_locations_with_roots(
     home: &Path,
 ) -> anyhow::Result<Vec<SkillLocation>> {
     let clients = match client {
-        AgentClient::All => AgentClient::all_concrete().to_vec(),
+        AgentClient::All => AgentClient::all_concrete().collect(),
         single => vec![single],
     };
     let scopes = match scope {
@@ -1403,7 +1378,7 @@ mod tests {
     fn all_concrete_clients_have_paths() {
         let cwd = Path::new("/tmp/project");
         let home = Path::new("/tmp/home");
-        for &client in AgentClient::all_concrete() {
+        for client in AgentClient::all_concrete() {
             skill_path_for(client, AgentScope::Global, cwd, home)
                 .unwrap_or_else(|_| panic!("no global path for {:?}", client));
             skill_path_for(client, AgentScope::Project, cwd, home)
