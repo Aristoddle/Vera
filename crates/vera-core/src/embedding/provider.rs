@@ -48,6 +48,15 @@ pub enum EmbeddingError {
     Cancelled,
 }
 
+/// Wrap an internal failure as an `ApiError` with status 500 (local pipeline
+/// errors surface through the same variant as remote API errors).
+pub(crate) fn api_err(error: impl std::fmt::Display) -> EmbeddingError {
+    EmbeddingError::ApiError {
+        status: 500,
+        message: error.to_string(),
+    }
+}
+
 // ── Provider trait ───────────────────────────────────────────────────
 
 /// Trait abstracting an embedding provider.

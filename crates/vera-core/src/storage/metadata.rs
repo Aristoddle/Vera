@@ -306,11 +306,7 @@ impl MetadataStore {
             .query_map(params![file_path], |row| Ok(row_to_chunk(row)))
             .context("failed to query chunks by file")?;
 
-        let mut chunks = Vec::new();
-        for row in rows {
-            chunks.push(row.context("failed to read chunk row")??);
-        }
-        Ok(chunks)
+        collect_rows(rows)?.into_iter().collect()
     }
 
     /// Get all chunks whose symbol name matches exactly (case-insensitive).
@@ -330,11 +326,7 @@ impl MetadataStore {
             .query_map(params![symbol_name], |row| Ok(row_to_chunk(row)))
             .context("failed to query chunks by symbol name")?;
 
-        let mut chunks = Vec::new();
-        for row in rows {
-            chunks.push(row.context("failed to read symbol chunk row")??);
-        }
-        Ok(chunks)
+        collect_rows(rows)?.into_iter().collect()
     }
 
     /// Get all chunks whose symbol name matches exactly (case-sensitive).
@@ -357,11 +349,7 @@ impl MetadataStore {
             .query_map(params![symbol_name], |row| Ok(row_to_chunk(row)))
             .context("failed to query chunks by symbol name (case-sensitive)")?;
 
-        let mut chunks = Vec::new();
-        for row in rows {
-            chunks.push(row.context("failed to read case-sensitive symbol chunk row")??);
-        }
-        Ok(chunks)
+        collect_rows(rows)?.into_iter().collect()
     }
 
     /// Get chunks whose symbol names contain the given term (case-insensitive).
@@ -389,11 +377,7 @@ impl MetadataStore {
             })
             .context("failed to query chunks by symbol name substring")?;
 
-        let mut chunks = Vec::new();
-        for row in rows {
-            chunks.push(row.context("failed to read substring symbol chunk row")??);
-        }
-        Ok(chunks)
+        collect_rows(rows)?.into_iter().collect()
     }
 
     /// Count total chunks in the store.
@@ -546,11 +530,7 @@ impl MetadataStore {
         let rows = stmt
             .query_map([], |row| row.get(0))
             .context("failed to query tracked files")?;
-        let mut files = Vec::new();
-        for row in rows {
-            files.push(row.context("failed to read tracked file")?);
-        }
-        Ok(files)
+        collect_rows(rows)
     }
 
     /// Get all persisted file states.
@@ -583,11 +563,7 @@ impl MetadataStore {
             })
             .context("failed to query file states")?;
 
-        let mut states = Vec::new();
-        for row in rows {
-            states.push(row.context("failed to read file state")?);
-        }
-        Ok(states)
+        collect_rows(rows)
     }
 
     // ── Reference (call graph) operations ──────────────────────────
@@ -694,11 +670,7 @@ impl MetadataStore {
                 })
             })
             .context("failed to query callers")?;
-        let mut results = Vec::new();
-        for row in rows {
-            results.push(row.context("failed to read caller row")?);
-        }
-        Ok(results)
+        collect_rows(rows)
     }
 
     /// Find explicit type relations that point at a given target symbol.
@@ -729,11 +701,7 @@ impl MetadataStore {
                 })
             })
             .context("failed to query type relations")?;
-        let mut results = Vec::new();
-        for row in rows {
-            results.push(row.context("failed to read type relation row")?);
-        }
-        Ok(results)
+        collect_rows(rows)
     }
 
     /// Find all symbols called by a given symbol name.
@@ -755,11 +723,7 @@ impl MetadataStore {
                 })
             })
             .context("failed to query callees")?;
-        let mut results = Vec::new();
-        for row in rows {
-            results.push(row.context("failed to read callee row")?);
-        }
-        Ok(results)
+        collect_rows(rows)
     }
 
     /// Find defined symbols that have zero callers (potential dead code).
@@ -792,11 +756,7 @@ impl MetadataStore {
                 })
             })
             .context("failed to query dead symbols")?;
-        let mut results = Vec::new();
-        for row in rows {
-            results.push(row.context("failed to read dead symbol row")?);
-        }
-        Ok(results)
+        collect_rows(rows)
     }
 
     /// Get distinct file paths in the index.
@@ -808,11 +768,7 @@ impl MetadataStore {
         let rows = stmt
             .query_map([], |row| row.get(0))
             .context("failed to query indexed files")?;
-        let mut files = Vec::new();
-        for row in rows {
-            files.push(row.context("failed to read file path")?);
-        }
-        Ok(files)
+        collect_rows(rows)
     }
 
     /// Count distinct files in the index.
@@ -840,12 +796,10 @@ impl MetadataStore {
                 Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
             })
             .context("failed to query language stats")?;
-        let mut stats = Vec::new();
-        for row in rows {
-            let (lang, count) = row.context("failed to read language stat")?;
-            stats.push((lang, count as u64));
-        }
-        Ok(stats)
+        Ok(collect_rows(rows)?
+            .into_iter()
+            .map(|(lang, count): (String, i64)| (lang, count as u64))
+            .collect())
     }
 
     /// Get language breakdown by file count (language -> file count).
@@ -862,12 +816,10 @@ impl MetadataStore {
                 Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
             })
             .context("failed to query language file counts")?;
-        let mut stats = Vec::new();
-        for row in rows {
-            let (lang, count) = row.context("failed to read language file count")?;
-            stats.push((lang, count as u64));
-        }
-        Ok(stats)
+        Ok(collect_rows(rows)?
+            .into_iter()
+            .map(|(lang, count): (String, i64)| (lang, count as u64))
+            .collect())
     }
 
     /// Collect persisted index health metrics from file-level states.
@@ -933,10 +885,7 @@ impl MetadataStore {
             })
             .context("failed to execute index health query")?;
 
-        let mut by_language = Vec::new();
-        for row in rows {
-            by_language.push(row.context("failed to read index health row")?);
-        }
+        let by_language = collect_rows(rows)?;
 
         Ok(IndexHealth {
             files_indexed: files_indexed as u64,
@@ -970,12 +919,10 @@ impl MetadataStore {
                 Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
             })
             .context("failed to query top directories")?;
-        let mut dirs = Vec::new();
-        for row in rows {
-            let (dir, count) = row.context("failed to read directory stat")?;
-            dirs.push((dir, count as u64));
-        }
-        Ok(dirs)
+        Ok(collect_rows(rows)?
+            .into_iter()
+            .map(|(dir, count): (String, i64)| (dir, count as u64))
+            .collect())
     }
 
     /// Get total lines of code across all chunks.
@@ -1006,12 +953,10 @@ impl MetadataStore {
                 Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
             })
             .context("failed to query symbol type stats")?;
-        let mut stats = Vec::new();
-        for row in rows {
-            let (sym_type, count) = row.context("failed to read symbol type stat")?;
-            stats.push((sym_type, count as u64));
-        }
-        Ok(stats)
+        Ok(collect_rows(rows)?
+            .into_iter()
+            .map(|(sym_type, count): (String, i64)| (sym_type, count as u64))
+            .collect())
     }
 
     /// Get files with the most chunks (hotspots).
@@ -1028,12 +973,10 @@ impl MetadataStore {
                 Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
             })
             .context("failed to query hotspot files")?;
-        let mut files = Vec::new();
-        for row in rows {
-            let (path, count) = row.context("failed to read hotspot file")?;
-            files.push((path, count as u64));
-        }
-        Ok(files)
+        Ok(collect_rows(rows)?
+            .into_iter()
+            .map(|(path, count): (String, i64)| (path, count as u64))
+            .collect())
     }
 
     /// Find likely entry point files (main.*, index.*, app.*, etc.).
@@ -1057,11 +1000,7 @@ impl MetadataStore {
         let rows = stmt
             .query_map([], |row| row.get::<_, String>(0))
             .context("failed to query entry points")?;
-        let mut files = Vec::new();
-        for row in rows {
-            files.push(row.context("failed to read entry point")?);
-        }
-        Ok(files)
+        collect_rows(rows)
     }
 }
 
@@ -1113,6 +1052,15 @@ fn parse_symbol_type(s: &str) -> SymbolType {
         "module" => SymbolType::Module,
         _ => SymbolType::Block,
     }
+}
+
+/// Collect fallible mapped rows into a Vec, attaching a read-failure context.
+fn collect_rows<T>(
+    rows: impl IntoIterator<Item = std::result::Result<T, rusqlite::Error>>,
+) -> Result<Vec<T>> {
+    rows.into_iter()
+        .map(|row| row.context("failed to read row"))
+        .collect()
 }
 
 #[cfg(test)]

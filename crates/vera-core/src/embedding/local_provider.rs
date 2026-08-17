@@ -1,5 +1,5 @@
 use crate::config::OnnxExecutionProvider;
-use crate::embedding::provider::{EmbeddingError, EmbeddingProvider};
+use crate::embedding::provider::{EmbeddingError, EmbeddingProvider, api_err};
 use crate::local_models::{LocalEmbeddingModelConfig, LocalEmbeddingPooling};
 use anyhow::{Context, Result};
 use ort::session::{Session, builder::GraphOptimizationLevel};
@@ -271,11 +271,7 @@ impl LocalEmbeddingProvider {
         ep: OnnxExecutionProvider,
         gpu_mem_limit_mb: u64,
     ) -> Result<Self, EmbeddingError> {
-        let base_config =
-            LocalEmbeddingModelConfig::from_env().map_err(|e| EmbeddingError::ApiError {
-                status: 500,
-                message: e.to_string(),
-            })?;
+        let base_config = LocalEmbeddingModelConfig::from_env().map_err(api_err)?;
         let mut config = base_config.clone();
         config.adjust_for_gpu(ep);
         let mut batch_scaler = if ep == OnnxExecutionProvider::Cpu {
@@ -305,22 +301,9 @@ impl LocalEmbeddingProvider {
         };
         let ort_path = crate::local_models::ensure_ort_library_for_ep(ep)
             .await
-            .map_err(|e| EmbeddingError::ApiError {
-                status: 500,
-                message: e.to_string(),
-            })?;
-        crate::local_models::ensure_ort_runtime(Some(&ort_path)).map_err(|e| {
-            EmbeddingError::ApiError {
-                status: 500,
-                message: e.to_string(),
-            }
-        })?;
-        crate::local_models::ensure_provider_dependencies(ep, &ort_path).map_err(|e| {
-            EmbeddingError::ApiError {
-                status: 500,
-                message: e.to_string(),
-            }
-        })?;
+            .map_err(api_err)?;
+        crate::local_models::ensure_ort_runtime(Some(&ort_path)).map_err(api_err)?;
+        crate::local_models::ensure_provider_dependencies(ep, &ort_path).map_err(api_err)?;
         let components = load_embedding_components(ep, &config, gpu_mem_limit_mb).await;
         let (session, tokenizer) = match components {
             Ok(components) => components,
@@ -334,23 +317,19 @@ impl LocalEmbeddingProvider {
                 batch_scaler = None;
                 load_embedding_components(OnnxExecutionProvider::Cpu, &config, 0)
                     .await
-                    .map_err(|fallback_error| EmbeddingError::ApiError {
-                        status: 500,
-                        message: format!(
+                    .map_err(|fallback_error| {
+                        api_err(format!(
                             "{}\nHint: run `vera repair --onnx-jina-{ep}`.\nCPU fallback also failed: {}\nHint: run `vera repair --onnx-jina-cpu`.",
                             crate::local_models::wrap_ort_error(error),
                             crate::local_models::wrap_ort_error(fallback_error),
-                        ),
+                        ))
                     })?
             }
             Err(error) => {
-                return Err(EmbeddingError::ApiError {
-                    status: 500,
-                    message: format!(
-                        "{}\nHint: run `vera repair --onnx-jina-{ep}`.",
-                        crate::local_models::wrap_ort_error(error)
-                    ),
-                });
+                return Err(api_err(format!(
+                    "{}\nHint: run `vera repair --onnx-jina-{ep}`.",
+                    crate::local_models::wrap_ort_error(error)
+                )));
             }
         };
 
@@ -391,55 +370,12 @@ impl LocalEmbeddingProvider {
         run_probe_inference(&mut session, &tokenizer)
     }
 
-    #[allow(clippy::needless_range_loop)]
-    fn do_embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
-        let encodings = self.tokenize_texts(texts)?;
-        if encodings.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        if self.batch_scaler.is_none() {
-            return self.do_embed_once(&encodings);
-        }
-
-        let mut results = Vec::with_capacity(encodings.len());
-        let mut start = 0;
-        while start < encodings.len() {
-            let remaining = &encodings[start..];
-            let seq_len = batch_max_len(remaining);
-            let planned_batch_len = self
-                .batch_scaler
-                .as_ref()
-                .unwrap()
-                .recommend_batch_len(remaining.len(), seq_len)
-                .min(remaining.len())
-                .max(1);
-            let end = start + planned_batch_len;
-            tracing::debug!(
-                requested_batch_size = remaining.len(),
-                planned_batch_size = planned_batch_len,
-                seq_len,
-                "planning local ONNX embedding sub-batch"
-            );
-            let mut batch = self.embed_with_adaptive_batching(&encodings[start..end])?;
-            results.append(&mut batch);
-            start = end;
-        }
-
-        Ok(results)
-    }
-
     fn do_embed_cancellable(
         &self,
         texts: &[String],
         cancel: &CancellationToken,
     ) -> Result<Vec<Vec<f32>>, EmbeddingError> {
-        let encodings = self
-            .tokenize_texts(texts)
-            .map_err(|e| EmbeddingError::ApiError {
-                status: 500,
-                message: e.to_string(),
-            })?;
+        let encodings = self.tokenize_texts(texts).map_err(api_err)?;
 
         if encodings.is_empty() {
             return Ok(Vec::new());
@@ -449,12 +385,7 @@ impl LocalEmbeddingProvider {
             if cancel.is_cancelled() {
                 return Err(EmbeddingError::Cancelled);
             }
-            return self
-                .do_embed_once(&encodings)
-                .map_err(|e| EmbeddingError::ApiError {
-                    status: 500,
-                    message: e.to_string(),
-                });
+            return self.do_embed_once(&encodings).map_err(api_err);
         }
 
         let mut results = Vec::with_capacity(encodings.len());
@@ -481,10 +412,7 @@ impl LocalEmbeddingProvider {
             );
             let batch = self
                 .embed_with_adaptive_batching(&encodings[start..end])
-                .map_err(|e| EmbeddingError::ApiError {
-                    status: 500,
-                    message: e.to_string(),
-                })?;
+                .map_err(api_err)?;
             results.extend(batch);
             start = end;
         }
@@ -966,18 +894,10 @@ impl EmbeddingProvider for LocalEmbeddingProvider {
         let texts = texts.to_vec();
 
         task::spawn_blocking(move || {
-            provider
-                .do_embed(&texts)
-                .map_err(|e| EmbeddingError::ApiError {
-                    status: 500,
-                    message: e.to_string(),
-                })
+            provider.do_embed_cancellable(&texts, &CancellationToken::new())
         })
         .await
-        .map_err(|e| EmbeddingError::ApiError {
-            status: 500,
-            message: e.to_string(),
-        })?
+        .map_err(api_err)?
     }
 
     async fn embed_batch_cancellable(
@@ -994,10 +914,7 @@ impl EmbeddingProvider for LocalEmbeddingProvider {
 
         task::spawn_blocking(move || provider.do_embed_cancellable(&texts, &cancel))
             .await
-            .map_err(|e| EmbeddingError::ApiError {
-                status: 500,
-                message: e.to_string(),
-            })?
+            .map_err(api_err)?
     }
 }
 
