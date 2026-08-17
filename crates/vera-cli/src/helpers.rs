@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use clap::Args;
-use serde::Serialize;
+use vera_core::presentation::{CompactResult, truncate_to_budget};
 
 /// Wait for the process interrupt used to cancel long-running CLI operations.
 pub async fn wait_for_interrupt() {
@@ -294,50 +294,6 @@ pub fn resolve_backend_flags(flags: &LocalBackendFlags) -> vera_core::config::In
     vera_core::config::resolve_backend(explicit)
 }
 
-/// Compact JSON representation that drops low-signal fields (`score`, `language`)
-/// and omits null optional fields. This is the default for AI agent consumption.
-#[derive(Serialize)]
-struct CompactResult<'a> {
-    file_path: &'a str,
-    line_start: u32,
-    line_end: u32,
-    content: &'a str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    symbol_name: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    symbol_type: Option<&'a vera_core::types::SymbolType>,
-}
-
-impl<'a> CompactResult<'a> {
-    fn from_search_result(r: &'a vera_core::types::SearchResult) -> Self {
-        Self {
-            file_path: &r.file_path,
-            line_start: r.line_start,
-            line_end: r.line_end,
-            content: &r.content,
-            symbol_name: r.symbol_name.as_deref(),
-            symbol_type: r.symbol_type.as_ref(),
-        }
-    }
-}
-
-/// Truncate `content` to fit within `allowed` bytes, breaking at a line boundary.
-fn truncate_to_budget(content: &str, allowed: usize) -> std::borrow::Cow<'_, str> {
-    if content.len() <= allowed {
-        return std::borrow::Cow::Borrowed(content);
-    }
-    let end = content
-        .char_indices()
-        .take_while(|(i, _)| *i < allowed)
-        .last()
-        .map(|(i, c)| i + c.len_utf8())
-        .unwrap_or(0);
-    let break_at = content[..end].rfind('\n').unwrap_or(end);
-    let mut truncated = content[..break_at].to_string();
-    truncated.push_str("\n[...truncated]");
-    std::borrow::Cow::Owned(truncated)
-}
-
 /// Output search results with a total character budget.
 ///
 /// Priority: `--json` compact JSON > `--raw` verbose > default markdown codeblocks.
@@ -380,7 +336,7 @@ pub fn output_results(
             .map(|(i, r)| {
                 let mut cr = CompactResult::from_search_result(r);
                 if compact {
-                    cr.content = &compacted[i];
+                    cr.content = std::borrow::Cow::Borrowed(compacted[i].as_str());
                 }
                 cr
             })

@@ -11,8 +11,8 @@
 
 use std::sync::{Arc, Mutex, OnceLock};
 
-use serde::Serialize;
 use serde_json::Value;
+use vera_core::presentation::{CompactResult, truncate_to_budget};
 
 use crate::protocol::{ToolCallResult, ToolDefinition};
 use crate::watcher::WatchHandle;
@@ -29,37 +29,6 @@ struct CachedSearchContext {
 
 /// Default total output budget for MCP responses (chars).
 const MCP_OUTPUT_BUDGET: usize = 20_000;
-
-/// Compact result representation for MCP tool responses.
-/// Drops `score` and `language` (inferrable from extension), omits null fields.
-#[derive(Serialize)]
-struct CompactResult<'a> {
-    file_path: &'a str,
-    line_start: u32,
-    line_end: u32,
-    content: std::borrow::Cow<'a, str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    symbol_name: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    symbol_type: Option<&'a vera_core::types::SymbolType>,
-}
-
-/// Truncate `content` to fit within `allowed` bytes, breaking at a line boundary.
-fn truncate_to_budget(content: &str, allowed: usize) -> std::borrow::Cow<'_, str> {
-    if content.len() <= allowed {
-        return std::borrow::Cow::Borrowed(content);
-    }
-    let end = content
-        .char_indices()
-        .take_while(|(i, _)| *i < allowed)
-        .last()
-        .map(|(i, c)| i + c.len_utf8())
-        .unwrap_or(0);
-    let break_at = content[..end].rfind('\n').unwrap_or(end);
-    let mut truncated = content[..break_at].to_string();
-    truncated.push_str("\n[...truncated]");
-    std::borrow::Cow::Owned(truncated)
-}
 
 /// Serialize search results as compact JSON, applying a total character budget.
 /// When `signatures_only` is true, function/class bodies are stripped before output.
@@ -1243,21 +1212,6 @@ mod tests {
         assert!(properties.contains_key("changed"));
         assert!(properties.contains_key("since"));
         assert!(properties.contains_key("base"));
-    }
-
-    #[test]
-    fn truncate_to_budget_short_passthrough() {
-        let short = "hello world";
-        let result = truncate_to_budget(short, 1000);
-        assert_eq!(result.as_ref(), short);
-    }
-
-    #[test]
-    fn truncate_to_budget_long_truncates() {
-        let long = "a".repeat(500);
-        let result = truncate_to_budget(&long, 100);
-        assert!(result.len() < long.len());
-        assert!(result.ends_with("[...truncated]"));
     }
 
     #[test]
