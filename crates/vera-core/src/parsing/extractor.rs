@@ -905,7 +905,7 @@ fn collect_symbols(
 
     // Handle Clojure S-expressions: (defn name ...), (ns name), (defmacro name ...), (def name ...)
     if lang == Language::Clojure && kind == "list_lit" {
-        if let Some(sym) = extract_clojure_define(&node, source) {
+        if let Some(sym) = extract_lisp_define(&node, source, CLOJURE_DEFINE_KINDS) {
             symbols.push(sym);
             return;
         }
@@ -919,7 +919,7 @@ fn collect_symbols(
         }
     }
     if lang == Language::CommonLisp && kind == "list_lit" {
-        if let Some(sym) = extract_commonlisp_list(&node, source) {
+        if let Some(sym) = extract_lisp_define(&node, source, COMMONLISP_DEFINE_KINDS) {
             symbols.push(sym);
             return;
         }
@@ -1218,10 +1218,36 @@ fn extract_racket_define(node: &tree_sitter::Node<'_>, source: &[u8]) -> Option<
     Some(RawSymbol::at(node, name, sym_type))
 }
 
-/// Extract a symbol from a Clojure `list_lit` node for defn/defmacro/ns/def forms.
+/// Keyword-to-symbol-type table for Clojure `list_lit` define forms.
+const CLOJURE_DEFINE_KINDS: &[(&[&str], SymbolType)] = &[
+    (&["defn", "defmacro", "defn-"], SymbolType::Function),
+    (&["ns"], SymbolType::Module),
+    (&["def", "defonce"], SymbolType::Variable),
+];
+
+/// Keyword-to-symbol-type table for Common Lisp `list_lit` define forms.
+const COMMONLISP_DEFINE_KINDS: &[(&[&str], SymbolType)] = &[
+    (&["defclass"], SymbolType::Class),
+    (
+        &["defvar", "defparameter", "defconstant"],
+        SymbolType::Variable,
+    ),
+    (&["defpackage"], SymbolType::Module),
+    (
+        &["defmacro", "defgeneric", "defmethod"],
+        SymbolType::Function,
+    ),
+];
+
+/// Extract a symbol from a Lisp `list_lit` define form.
 ///
-/// Clojure AST: `list_lit` → first `sym_lit` child text is the keyword → second `sym_lit` is the name.
-fn extract_clojure_define(node: &tree_sitter::Node<'_>, source: &[u8]) -> Option<RawSymbol> {
+/// AST: `list_lit` → first `sym_lit` child text is the keyword → second
+/// `sym_lit` is the name.
+fn extract_lisp_define(
+    node: &tree_sitter::Node<'_>,
+    source: &[u8],
+    keyword_types: &[(&[&str], SymbolType)],
+) -> Option<RawSymbol> {
     let mut cursor = node.walk();
     let sym_lits: Vec<_> = node
         .children(&mut cursor)
@@ -1233,12 +1259,9 @@ fn extract_clojure_define(node: &tree_sitter::Node<'_>, source: &[u8]) -> Option
     }
 
     let keyword = sym_lits[0].utf8_text(source).ok()?;
-    let sym_type = match keyword {
-        "defn" | "defmacro" | "defn-" => SymbolType::Function,
-        "ns" => SymbolType::Module,
-        "def" | "defonce" => SymbolType::Variable,
-        _ => return None,
-    };
+    let sym_type = keyword_types
+        .iter()
+        .find_map(|(keywords, ty)| keywords.contains(&keyword).then_some(*ty))?;
 
     let name = sym_lits[1].utf8_text(source).ok().map(|s| s.to_string());
 
@@ -1262,34 +1285,6 @@ fn extract_commonlisp_defun(node: &tree_sitter::Node<'_>, source: &[u8]) -> Opti
         });
 
     Some(RawSymbol::at(node, name, SymbolType::Function))
-}
-
-/// Extract a symbol from a Common Lisp `list_lit` node for defclass/defvar/defparameter etc.
-///
-/// CL AST for non-defun forms: `list_lit` → first `sym_lit` is keyword → second `sym_lit` is name.
-fn extract_commonlisp_list(node: &tree_sitter::Node<'_>, source: &[u8]) -> Option<RawSymbol> {
-    let mut cursor = node.walk();
-    let sym_lits: Vec<_> = node
-        .children(&mut cursor)
-        .filter(|c| c.kind() == "sym_lit")
-        .collect();
-
-    if sym_lits.len() < 2 {
-        return None;
-    }
-
-    let keyword = sym_lits[0].utf8_text(source).ok()?;
-    let sym_type = match keyword {
-        "defclass" => SymbolType::Class,
-        "defvar" | "defparameter" | "defconstant" => SymbolType::Variable,
-        "defpackage" => SymbolType::Module,
-        "defmacro" | "defgeneric" | "defmethod" => SymbolType::Function,
-        _ => return None,
-    };
-
-    let name = sym_lits[1].utf8_text(source).ok().map(|s| s.to_string());
-
-    Some(RawSymbol::at(node, name, sym_type))
 }
 
 fn extract_elixir_name(node: &tree_sitter::Node<'_>, source: &[u8]) -> Option<String> {
