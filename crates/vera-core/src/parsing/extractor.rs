@@ -23,6 +23,20 @@ pub struct RawSymbol {
     pub end_row: usize,
 }
 
+impl RawSymbol {
+    /// Build a symbol spanning the given node.
+    fn at(node: &tree_sitter::Node<'_>, name: Option<String>, symbol_type: SymbolType) -> Self {
+        Self {
+            name,
+            symbol_type,
+            start_byte: node.start_byte(),
+            end_byte: node.end_byte(),
+            start_row: node.start_position().row,
+            end_row: node.end_position().row,
+        }
+    }
+}
+
 /// Maps a tree-sitter node kind to a [`SymbolType`] for the given language.
 ///
 /// Returns `None` if the node kind is not a top-level symbol we extract.
@@ -608,6 +622,30 @@ const DART_KINDS: &[(&[&str], SymbolType)] = &[
     ),
 ];
 
+/// Node kinds whose text is a usable symbol name in the extract_name fallback.
+const PRIMARY_NAME_KINDS: &[&str] = &[
+    "identifier",
+    "type_identifier",
+    "property_identifier",
+    "simple_identifier",
+    "word",
+    "constant",
+];
+
+/// Superset of PRIMARY_NAME_KINDS accepted by name_from_node (adds
+/// field_identifier plus the generic `name`/`variable` wrapper kinds).
+const NAME_KINDS: &[&str] = &[
+    "identifier",
+    "type_identifier",
+    "property_identifier",
+    "field_identifier",
+    "simple_identifier",
+    "word",
+    "constant",
+    "name",
+    "variable",
+];
+
 /// Extract the name of a symbol from a tree-sitter node.
 ///
 /// Looks for the first `name` or `identifier`-type child node.
@@ -675,14 +713,7 @@ pub fn extract_name(node: &tree_sitter::Node<'_>, source: &[u8]) -> Option<Strin
     // Fallback: look for first identifier child
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        let kind = child.kind();
-        if kind == "identifier"
-            || kind == "type_identifier"
-            || kind == "property_identifier"
-            || kind == "simple_identifier"
-            || kind == "word"
-            || kind == "constant"
-        {
+        if PRIMARY_NAME_KINDS.contains(&child.kind()) {
             return Some(child.utf8_text(source).ok()?.to_string());
         }
     }
@@ -716,16 +747,7 @@ fn extract_impl_name(node: &tree_sitter::Node<'_>, source: &[u8]) -> Option<Stri
 fn name_from_node(node: &tree_sitter::Node<'_>, source: &[u8]) -> Option<String> {
     let kind = node.kind();
     // Direct identifier nodes
-    if kind == "identifier"
-        || kind == "type_identifier"
-        || kind == "property_identifier"
-        || kind == "field_identifier"
-        || kind == "simple_identifier"
-        || kind == "word"
-        || kind == "constant"
-        || kind == "name"
-        || kind == "variable"
-    {
+    if NAME_KINDS.contains(&kind) {
         return Some(node.utf8_text(source).ok()?.to_string());
     }
     // Pointer declarators, reference declarators, etc. (C/C++)
@@ -836,14 +858,7 @@ fn collect_symbols(
             if child.kind() == "type_spec" {
                 let sym_type = refine_go_type_spec(&child, source);
                 let name = extract_name(&child, source);
-                symbols.push(RawSymbol {
-                    name,
-                    symbol_type: sym_type,
-                    start_byte: child.start_byte(),
-                    end_byte: child.end_byte(),
-                    start_row: child.start_position().row,
-                    end_row: child.end_position().row,
-                });
+                symbols.push(RawSymbol::at(&child, name, sym_type));
             }
         }
         return;
@@ -854,14 +869,7 @@ fn collect_symbols(
         if let Some(rhs) = node.child_by_field_name("rhs") {
             if rhs.kind() == "function_definition" {
                 let name = extract_name(&node, source);
-                symbols.push(RawSymbol {
-                    name,
-                    symbol_type: SymbolType::Function,
-                    start_byte: node.start_byte(),
-                    end_byte: node.end_byte(),
-                    start_row: node.start_position().row,
-                    end_row: node.end_position().row,
-                });
+                symbols.push(RawSymbol::at(&node, name, SymbolType::Function));
                 return;
             }
         }
@@ -873,14 +881,7 @@ fn collect_symbols(
         for child in node.children(&mut cursor) {
             if child.kind() == "struct_declaration" {
                 let name = extract_name(&node, source);
-                symbols.push(RawSymbol {
-                    name,
-                    symbol_type: SymbolType::Struct,
-                    start_byte: node.start_byte(),
-                    end_byte: node.end_byte(),
-                    start_row: node.start_position().row,
-                    end_row: node.end_position().row,
-                });
+                symbols.push(RawSymbol::at(&node, name, SymbolType::Struct));
                 return;
             }
         }
@@ -935,14 +936,7 @@ fn collect_symbols(
                 };
                 if let Some(st) = sym_type {
                     let name = extract_elixir_name(&node, source);
-                    symbols.push(RawSymbol {
-                        name,
-                        symbol_type: st,
-                        start_byte: node.start_byte(),
-                        end_byte: node.end_byte(),
-                        start_row: node.start_position().row,
-                        end_row: node.end_position().row,
-                    });
+                    symbols.push(RawSymbol::at(&node, name, st));
                     if text == "defmodule" {
                         if let Some(do_block) = get_elixir_do_block(&node) {
                             let mut cursor = do_block.walk();
@@ -1010,26 +1004,12 @@ fn collect_symbols(
                 || kind == "category_implementation")
         {
             let name = extract_name(&node, source);
-            symbols.push(RawSymbol {
-                name,
-                symbol_type: sym_type,
-                start_byte: node.start_byte(),
-                end_byte: node.end_byte(),
-                start_row: node.start_position().row,
-                end_row: node.end_position().row,
-            });
+            symbols.push(RawSymbol::at(&node, name, sym_type));
             let mut cursor = node.walk();
             for child in node.children(&mut cursor) {
                 if let Some(child_sym) = classify_node(lang, child.kind()) {
                     let child_name = extract_name(&child, source);
-                    symbols.push(RawSymbol {
-                        name: child_name,
-                        symbol_type: child_sym,
-                        start_byte: child.start_byte(),
-                        end_byte: child.end_byte(),
-                        start_row: child.start_position().row,
-                        end_row: child.end_position().row,
-                    });
+                    symbols.push(RawSymbol::at(&child, child_name, child_sym));
                 }
                 // Also check inside implementation_definition
                 if child.kind() == "implementation_definition" {
@@ -1037,14 +1017,7 @@ fn collect_symbols(
                     for inner_child in child.children(&mut inner) {
                         if let Some(inner_sym) = classify_node(lang, inner_child.kind()) {
                             let inner_name = extract_name(&inner_child, source);
-                            symbols.push(RawSymbol {
-                                name: inner_name,
-                                symbol_type: inner_sym,
-                                start_byte: inner_child.start_byte(),
-                                end_byte: inner_child.end_byte(),
-                                start_row: inner_child.start_position().row,
-                                end_row: inner_child.end_position().row,
-                            });
+                            symbols.push(RawSymbol::at(&inner_child, inner_name, inner_sym));
                         }
                     }
                 }
@@ -1057,14 +1030,7 @@ fn collect_symbols(
             && (kind == "namespace_declaration" || kind == "file_scoped_namespace_declaration")
         {
             let name = extract_name(&node, source);
-            symbols.push(RawSymbol {
-                name,
-                symbol_type: sym_type,
-                start_byte: node.start_byte(),
-                end_byte: node.end_byte(),
-                start_row: node.start_position().row,
-                end_row: node.end_position().row,
-            });
+            symbols.push(RawSymbol::at(&node, name, sym_type));
             let mut cursor = node.walk();
             collect_symbols_cursor(&mut cursor, source, lang, symbols, depth + 1);
             return;
@@ -1090,14 +1056,7 @@ fn collect_symbols(
         // For Protobuf services, extract rpc methods:
         if lang == Language::Protobuf && (kind == "service" || kind == "service_definition") {
             let name = extract_name(&node, source);
-            symbols.push(RawSymbol {
-                name,
-                symbol_type: sym_type,
-                start_byte: node.start_byte(),
-                end_byte: node.end_byte(),
-                start_row: node.start_position().row,
-                end_row: node.end_position().row,
-            });
+            symbols.push(RawSymbol::at(&node, name, sym_type));
 
             let mut cursor = node.walk();
             for child in node.children(&mut cursor) {
@@ -1217,14 +1176,7 @@ fn extract_scheme_define(node: &tree_sitter::Node<'_>, source: &[u8]) -> Option<
         None
     };
 
-    Some(RawSymbol {
-        name,
-        symbol_type: sym_type,
-        start_byte: node.start_byte(),
-        end_byte: node.end_byte(),
-        start_row: node.start_position().row,
-        end_row: node.end_position().row,
-    })
+    Some(RawSymbol::at(node, name, sym_type))
 }
 
 /// Extract a symbol from a Racket `list` node for define/module/struct forms.
@@ -1263,14 +1215,7 @@ fn extract_racket_define(node: &tree_sitter::Node<'_>, source: &[u8]) -> Option<
         None
     };
 
-    Some(RawSymbol {
-        name,
-        symbol_type: sym_type,
-        start_byte: node.start_byte(),
-        end_byte: node.end_byte(),
-        start_row: node.start_position().row,
-        end_row: node.end_position().row,
-    })
+    Some(RawSymbol::at(node, name, sym_type))
 }
 
 /// Extract a symbol from a Clojure `list_lit` node for defn/defmacro/ns/def forms.
@@ -1297,14 +1242,7 @@ fn extract_clojure_define(node: &tree_sitter::Node<'_>, source: &[u8]) -> Option
 
     let name = sym_lits[1].utf8_text(source).ok().map(|s| s.to_string());
 
-    Some(RawSymbol {
-        name,
-        symbol_type: sym_type,
-        start_byte: node.start_byte(),
-        end_byte: node.end_byte(),
-        start_row: node.start_position().row,
-        end_row: node.end_position().row,
-    })
+    Some(RawSymbol::at(node, name, sym_type))
 }
 
 /// Extract a symbol from a Common Lisp `defun` node.
@@ -1323,14 +1261,7 @@ fn extract_commonlisp_defun(node: &tree_sitter::Node<'_>, source: &[u8]) -> Opti
                 .and_then(|s| s.utf8_text(source).ok().map(|t| t.to_string()))
         });
 
-    Some(RawSymbol {
-        name,
-        symbol_type: SymbolType::Function,
-        start_byte: node.start_byte(),
-        end_byte: node.end_byte(),
-        start_row: node.start_position().row,
-        end_row: node.end_position().row,
-    })
+    Some(RawSymbol::at(node, name, SymbolType::Function))
 }
 
 /// Extract a symbol from a Common Lisp `list_lit` node for defclass/defvar/defparameter etc.
@@ -1358,14 +1289,7 @@ fn extract_commonlisp_list(node: &tree_sitter::Node<'_>, source: &[u8]) -> Optio
 
     let name = sym_lits[1].utf8_text(source).ok().map(|s| s.to_string());
 
-    Some(RawSymbol {
-        name,
-        symbol_type: sym_type,
-        start_byte: node.start_byte(),
-        end_byte: node.end_byte(),
-        start_row: node.start_position().row,
-        end_row: node.end_position().row,
-    })
+    Some(RawSymbol::at(node, name, sym_type))
 }
 
 fn extract_elixir_name(node: &tree_sitter::Node<'_>, source: &[u8]) -> Option<String> {
@@ -1433,14 +1357,7 @@ fn extract_impl_methods(
     symbols: &mut Vec<RawSymbol>,
 ) {
     let name = extract_name(&impl_node, source);
-    symbols.push(RawSymbol {
-        name,
-        symbol_type: SymbolType::Block,
-        start_byte: impl_node.start_byte(),
-        end_byte: impl_node.end_byte(),
-        start_row: impl_node.start_position().row,
-        end_row: impl_node.end_position().row,
-    });
+    symbols.push(RawSymbol::at(&impl_node, name, SymbolType::Block));
 
     let mut cursor = impl_node.walk();
 
@@ -1450,24 +1367,10 @@ fn extract_impl_methods(
             for item in child.children(&mut inner_cursor) {
                 if item.kind() == "function_item" {
                     let name = extract_name(&item, source);
-                    symbols.push(RawSymbol {
-                        name,
-                        symbol_type: SymbolType::Method,
-                        start_byte: item.start_byte(),
-                        end_byte: item.end_byte(),
-                        start_row: item.start_position().row,
-                        end_row: item.end_position().row,
-                    });
+                    symbols.push(RawSymbol::at(&item, name, SymbolType::Method));
                 } else if let Some(sym_type) = classify_node(lang, item.kind()) {
                     let name = extract_name(&item, source);
-                    symbols.push(RawSymbol {
-                        name,
-                        symbol_type: sym_type,
-                        start_byte: item.start_byte(),
-                        end_byte: item.end_byte(),
-                        start_row: item.start_position().row,
-                        end_row: item.end_position().row,
-                    });
+                    symbols.push(RawSymbol::at(&item, name, sym_type));
                 }
             }
         }
@@ -1486,14 +1389,7 @@ fn extract_python_class_methods(
     symbols: &mut Vec<RawSymbol>,
 ) {
     let name = extract_name(&class_node, source);
-    symbols.push(RawSymbol {
-        name,
-        symbol_type: SymbolType::Class,
-        start_byte: class_node.start_byte(),
-        end_byte: class_node.end_byte(),
-        start_row: class_node.start_position().row,
-        end_row: class_node.end_position().row,
-    });
+    symbols.push(RawSymbol::at(&class_node, name, SymbolType::Class));
 
     // The class body is a `block` child.
     let mut cursor = class_node.walk();
@@ -1504,14 +1400,7 @@ fn extract_python_class_methods(
                 // Direct function_definition in class body = method.
                 if item.kind() == "function_definition" {
                     let name = extract_name(&item, source);
-                    symbols.push(RawSymbol {
-                        name,
-                        symbol_type: SymbolType::Method,
-                        start_byte: item.start_byte(),
-                        end_byte: item.end_byte(),
-                        start_row: item.start_position().row,
-                        end_row: item.end_position().row,
-                    });
+                    symbols.push(RawSymbol::at(&item, name, SymbolType::Method));
                 }
                 // Decorated methods: decorated_definition > function_definition
                 else if item.kind() == "decorated_definition" {
@@ -1546,14 +1435,7 @@ fn extract_general_class_methods(
 ) {
     // ALWAYS push the class/wrapper itself
     let name = extract_name(&class_node, source);
-    symbols.push(RawSymbol {
-        name,
-        symbol_type: class_sym_type,
-        start_byte: class_node.start_byte(),
-        end_byte: class_node.end_byte(),
-        start_row: class_node.start_position().row,
-        end_row: class_node.end_position().row,
-    });
+    symbols.push(RawSymbol::at(&class_node, name, class_sym_type));
 
     let mut cursor = class_node.walk();
 
@@ -1619,14 +1501,7 @@ fn extract_general_class_methods(
                     for java_child in item.children(&mut java_cursor) {
                         if let Some(sym_type) = classify_node(lang, java_child.kind()) {
                             let name = extract_name(&java_child, source);
-                            symbols.push(RawSymbol {
-                                name,
-                                symbol_type: sym_type,
-                                start_byte: java_child.start_byte(),
-                                end_byte: java_child.end_byte(),
-                                start_row: java_child.start_position().row,
-                                end_row: java_child.end_position().row,
-                            });
+                            symbols.push(RawSymbol::at(&java_child, name, sym_type));
                             continue;
                         }
 
@@ -1634,14 +1509,7 @@ fn extract_general_class_methods(
                         for java_inner in java_child.children(&mut java_inner_cursor) {
                             if let Some(sym_type) = classify_node(lang, java_inner.kind()) {
                                 let name = extract_name(&java_inner, source);
-                                symbols.push(RawSymbol {
-                                    name,
-                                    symbol_type: sym_type,
-                                    start_byte: java_inner.start_byte(),
-                                    end_byte: java_inner.end_byte(),
-                                    start_row: java_inner.start_position().row,
-                                    end_row: java_inner.end_position().row,
-                                });
+                                symbols.push(RawSymbol::at(&java_inner, name, sym_type));
                             }
                         }
                     }
