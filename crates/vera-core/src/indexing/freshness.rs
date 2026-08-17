@@ -73,8 +73,7 @@ pub(crate) fn record_index_snapshot(
 /// Compare the current repo contents against the index metadata.
 ///
 /// New and deleted files are detected via discovery vs tracked files. Modified
-/// files are verified with the stored content hashes, using the saved refresh
-/// timestamp to avoid re-hashing unchanged candidates when available.
+/// files are verified with the stored content hashes for every tracked file.
 pub fn detect_staleness(
     repo_path: &Path,
     fallback_config: &IndexingConfig,
@@ -87,7 +86,6 @@ pub fn detect_staleness(
         MetadataStore::open(&metadata_path).context("failed to open metadata store")?;
 
     let indexing_config = load_indexing_config(&metadata_store, fallback_config);
-    let refreshed_at_ms = load_refreshed_at_millis(&metadata_store);
     let discovery = discovery::discover_files(&repo_root, &indexing_config)
         .context("failed to discover files for freshness scan")?;
 
@@ -115,10 +113,6 @@ pub fn detect_staleness(
     for (rel_path, absolute_path) in current_files
         .iter()
         .filter(|(path, _)| tracked_files.contains(path.as_str()))
-        .filter(|(_, absolute_path)| {
-            refreshed_at_ms
-                .is_none_or(|refresh_time| file_may_be_newer(absolute_path, refresh_time))
-        })
     {
         let content = match crate::discovery::read_source_lossy(absolute_path) {
             Ok(content) => content,
@@ -168,32 +162,6 @@ fn load_indexing_config(
     }
 }
 
-fn load_refreshed_at_millis(metadata_store: &MetadataStore) -> Option<u64> {
-    match metadata_store.get_index_meta(INDEX_REFRESHED_AT_KEY) {
-        Ok(Some(raw)) => match raw.parse::<u64>() {
-            Ok(value) => Some(value),
-            Err(err) => {
-                warn!(value = %raw, error = %err, "failed to parse saved refresh timestamp");
-                None
-            }
-        },
-        Ok(None) => None,
-        Err(err) => {
-            warn!(error = %err, "failed to read saved refresh timestamp");
-            None
-        }
-    }
-}
-
-fn file_may_be_newer(path: &Path, refreshed_at_ms: u64) -> bool {
-    std::fs::metadata(path)
-        .and_then(|metadata| metadata.modified())
-        .ok()
-        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
-        .map(|duration| duration.as_millis() as u64 > refreshed_at_ms)
-        .unwrap_or(true)
-}
-
 fn current_time_millis() -> Result<u64> {
     Ok(SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -241,6 +209,25 @@ mod tests {
                 files_deleted: 1,
             }
         );
+    }
+
+    #[test]
+    fn freshness_scan_checks_tracked_files_even_when_snapshot_is_newer() {
+        let dir = tempdir().unwrap();
+        write_file(dir.path(), "src/lib.rs", "pub fn current() {}\n");
+
+        let index_dir = dir.path().join(".vera");
+        std::fs::create_dir_all(&index_dir).unwrap();
+        let metadata = MetadataStore::open(&index_dir.join("metadata.db")).unwrap();
+        metadata
+            .set_file_hash("src/lib.rs", &content_hash("pub fn previous() {}\n"))
+            .unwrap();
+        metadata
+            .set_index_meta(INDEX_REFRESHED_AT_KEY, &u64::MAX.to_string())
+            .unwrap();
+
+        let freshness = detect_staleness(dir.path(), &IndexingConfig::default()).unwrap();
+        assert_eq!(freshness.files_modified, 1);
     }
 
     #[test]

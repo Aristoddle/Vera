@@ -497,16 +497,7 @@ where
             // Replace old chunk data for modified files only after embedding
             // succeeded, so a failure leaves the previous index entries intact.
             if !modified.is_empty() {
-                let vector_path = idx_dir.join("vectors.db");
-                let vector_store = VectorStore::open(&vector_path, stored_dim)
-                    .context("failed to open vector store for modification")?;
-                let bm25_dir = idx_dir.join("bm25");
-                let bm25_index = Bm25Index::open(&bm25_dir)
-                    .context("failed to open BM25 index for modification")?;
-
-                for (file_path, _, _) in &modified {
-                    remove_file_chunk_data(&metadata_store, &vector_store, &bm25_index, file_path)?;
-                }
+                remove_modified_chunk_data(&metadata_store, &idx_dir, stored_dim, &modified)?;
             }
 
             // Store metadata.
@@ -536,6 +527,9 @@ where
                 .insert_chunks(&all_chunks)
                 .context("failed to insert updated BM25 documents")?;
         } else {
+            if !modified.is_empty() {
+                remove_modified_chunk_data(&metadata_store, &idx_dir, stored_dim, &modified)?;
+            }
             on_progress(UpdateProgress::EmbeddingDone { count: 0 });
         }
 
@@ -712,6 +706,26 @@ fn remove_file_chunk_data(
     Ok(())
 }
 
+fn remove_modified_chunk_data(
+    metadata_store: &MetadataStore,
+    idx_dir: &Path,
+    stored_dim: usize,
+    modified: &[(String, String, String)],
+) -> Result<()> {
+    let vector_path = idx_dir.join("vectors.db");
+    let vector_store = VectorStore::open(&vector_path, stored_dim)
+        .context("failed to open vector store for modification")?;
+    let bm25_dir = idx_dir.join("bm25");
+    let bm25_index =
+        Bm25Index::open(&bm25_dir).context("failed to open BM25 index for modification")?;
+
+    for (file_path, _, _) in modified {
+        remove_file_chunk_data(metadata_store, &vector_store, &bm25_index, file_path)?;
+    }
+
+    Ok(())
+}
+
 /// Remove all data for a file from the index stores.
 fn remove_file_from_index(
     metadata_store: &MetadataStore,
@@ -736,3 +750,67 @@ fn remove_file_from_index(
 #[cfg(test)]
 #[path = "update_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod regression_tests {
+    use crate::config::VeraConfig;
+    use crate::embedding::test_helpers::MockProvider;
+    use crate::indexing::{
+        UpdateOptions, detect_staleness, index_dir, index_repository, update_repository,
+        update_repository_with_options_and_progress,
+    };
+    use crate::storage::bm25::Bm25Index;
+    use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn update_removes_old_chunks_when_modified_file_has_no_chunks() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("main.rs"), "fn old_name() {}\n").unwrap();
+        let provider = MockProvider::new(8);
+        let config = VeraConfig::default();
+
+        index_repository(dir.path(), &provider, &config, "mock-model")
+            .await
+            .unwrap();
+        let idx = index_dir(&dir.path().canonicalize().unwrap());
+        let bm25 = Bm25Index::open(&idx.join("bm25")).unwrap();
+        assert!(!bm25.search("old_name", 10).unwrap().is_empty());
+
+        std::fs::write(dir.path().join("main.rs"), "\n \n").unwrap();
+        update_repository(dir.path(), &provider, &config, "mock-model")
+            .await
+            .unwrap();
+
+        assert!(bm25.search("old_name", 10).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn update_keeps_deferred_modified_files_stale() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "fn a() {}\n").unwrap();
+        std::fs::write(dir.path().join("b.rs"), "fn b() {}\n").unwrap();
+        let provider = MockProvider::new(8);
+        let config = VeraConfig::default();
+
+        index_repository(dir.path(), &provider, &config, "mock-model")
+            .await
+            .unwrap();
+        std::fs::write(dir.path().join("a.rs"), "fn updated_a() {}\n").unwrap();
+        std::fs::write(dir.path().join("b.rs"), "fn updated_b() {}\n").unwrap();
+
+        let summary = update_repository_with_options_and_progress(
+            dir.path(),
+            &provider,
+            &config,
+            "mock-model",
+            &UpdateOptions { max_files: Some(1) },
+            |_| {},
+        )
+        .await
+        .unwrap();
+        assert_eq!(summary.files_deferred, 1);
+
+        let freshness = detect_staleness(dir.path(), &config.indexing).unwrap();
+        assert_eq!(freshness.files_modified, 1);
+    }
+}

@@ -82,6 +82,7 @@ pub enum PathReason {
     Indexed,
     Missing,
     Directory,
+    NonRegularFile,
     OutsideRoot,
     DefaultExclude,
     CliExclude,
@@ -103,6 +104,7 @@ impl std::fmt::Display for PathReason {
             Self::Indexed => "indexed",
             Self::Missing => "missing",
             Self::Directory => "directory",
+            Self::NonRegularFile => "non_regular_file",
             Self::OutsideRoot => "outside_root",
             Self::DefaultExclude => "default_exclude",
             Self::CliExclude => "cli_exclude",
@@ -399,6 +401,20 @@ pub fn explain_path(root: &Path, path: &Path, config: &IndexingConfig) -> Result
             pattern: None,
             details: Some("directories are not indexed directly".to_string()),
         });
+    }
+
+    if !candidate.is_file() {
+        return Ok(path_excluded(
+            display_input,
+            absolute_display,
+            relative_path,
+            IgnoreMatchExplanation {
+                reason: PathReason::NonRegularFile,
+                source: Some("discovery".to_string()),
+                pattern: None,
+                details: Some("only regular files are indexed".to_string()),
+            },
+        ));
     }
 
     if let Some(explanation) = explain_override_match(&root, relative, config)? {
@@ -1505,5 +1521,18 @@ mod tests {
         assert_eq!(explanation.reason, PathReason::OutsideRoot);
 
         fs::remove_file(outside).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explain_path_rejects_non_regular_files() {
+        let dir = TempDir::new().unwrap();
+        let device = dir.path().join("null-device");
+        std::os::unix::fs::symlink("/dev/null", &device).unwrap();
+
+        let explanation =
+            explain_path(dir.path(), Path::new("null-device"), &default_config()).unwrap();
+        assert_eq!(explanation.decision, PathDecision::Excluded);
+        assert_eq!(explanation.reason, PathReason::NonRegularFile);
     }
 }
