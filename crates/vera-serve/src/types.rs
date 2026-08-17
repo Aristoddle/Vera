@@ -78,6 +78,13 @@ pub struct RerankResponse {
 pub struct RerankResult {
     pub index: usize,
     pub relevance_score: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub document: Option<RerankDocument>,
+}
+
+#[derive(Serialize)]
+pub struct RerankDocument {
+    pub text: String,
 }
 
 // ── Shared ────────────────────────────────────────────────────────────────────

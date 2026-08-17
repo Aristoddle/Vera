@@ -121,7 +121,14 @@ pub async fn run_server(
                 tokio::time::sleep(check_interval).await;
                 let mut guard = cache.lock().await;
                 if let Some(ref cached) = *guard {
-                    if cached.last_used.elapsed() >= timeout {
+                    // Skip eviction while a request still holds a provider Arc;
+                    // evicting now would force a second model load in parallel.
+                    let in_use = Arc::strong_count(&cached.embedding) > 1
+                        || cached
+                            .reranker
+                            .as_ref()
+                            .is_some_and(|r| Arc::strong_count(r) > 1);
+                    if cached.last_used.elapsed() >= timeout && !in_use {
                         *guard = None;
                         eprintln!("vera serve: model unloaded (idle timeout reached)");
                     }

@@ -18,7 +18,7 @@ use crate::{
     AppState, CachedProviders,
     types::{
         ApiError, EmbeddingObject, EmbeddingsRequest, EmbeddingsResponse, EmbeddingsUsage,
-        HealthResponse, RerankRequest, RerankResponse, RerankResult,
+        HealthResponse, RerankDocument, RerankRequest, RerankResponse, RerankResult,
     },
 };
 
@@ -232,11 +232,20 @@ pub async fn rerank(
             if let Some(n) = top_n {
                 scores.truncate(n);
             }
+            let return_documents = req.return_documents.unwrap_or(false);
             let results = scores
                 .into_iter()
                 .map(|s| RerankResult {
                     index: s.index,
                     relevance_score: s.relevance_score,
+                    document: if return_documents {
+                        req.documents
+                            .get(s.index)
+                            .cloned()
+                            .map(|text| RerankDocument { text })
+                    } else {
+                        None
+                    },
                 })
                 .collect();
             Json(RerankResponse { results }).into_response()
