@@ -157,7 +157,8 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                         "description": "Filter by programming language (e.g., rust, python)"
                     },
                     "path": {
-                        "type": "string",
+                        "type": ["string", "array"],
+                        "items": {"type": "string"},
                         "description": "Filter by file path glob, as a string or an array of strings. Repeated patterns use OR semantics (e.g., src/**/*.rs)"
                     },
                     "symbol_type": {
@@ -194,7 +195,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                         "description": "Return only function/class signatures (omit bodies). Use for broad exploration; fits more results in fewer tokens."
                     }
                 },
-                "required": ["query"]
+                "anyOf": [{"required": ["query"]}, {"required": ["queries"]}]
             }),
         },
         ToolDefinition {
@@ -326,7 +327,8 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                         "description": "Filter by programming language (e.g., rust, python)"
                     },
                     "path": {
-                        "type": "string",
+                        "type": ["string", "array"],
+                        "items": {"type": "string"},
                         "description": "Filter by file path glob, as a string or an array of strings. Repeated patterns use OR semantics (e.g., src/**/*.rs)"
                     },
                     "symbol_type": {
