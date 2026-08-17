@@ -234,7 +234,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                 "properties": {
                     "path": project_path_prop(),
                 }
-            }), "regex search"),
+            }), "overview"),
         },
         ToolDefinition {
             name: "regex_search".to_string(),
@@ -270,7 +270,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                     }
                 },
                 "required": ["pattern"]
-            }), "search"),
+            }), "regex search"),
         },
         ToolDefinition {
             name: "structural_search".to_string(),
@@ -316,7 +316,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                     }
                 },
                 "required": ["kind"]
-            }), "references"),
+            }), "search"),
         },
         ToolDefinition {
             name: "find_references".to_string(),
@@ -1036,6 +1036,27 @@ mod tests {
         assert!(overview_props.contains_key("changed"));
         assert!(overview_props.contains_key("since"));
         assert!(overview_props.contains_key("base"));
+    }
+
+    #[test]
+    fn git_scope_descriptions_name_the_right_operation() {
+        let tools = tool_definitions();
+        for (tool_name, noun) in [
+            ("search_code", "search"),
+            ("get_overview", "overview"),
+            ("regex_search", "regex search"),
+            ("structural_search", "search"),
+            ("find_references", "references"),
+        ] {
+            let tool = tools.iter().find(|tool| tool.name == tool_name).unwrap();
+            let description = tool.input_schema["properties"]["changed"]["description"]
+                .as_str()
+                .unwrap();
+            assert!(
+                description.starts_with(&format!("Restrict {noun} to")),
+                "{tool_name} changed description should name '{noun}': {description}"
+            );
+        }
     }
 
     #[test]
