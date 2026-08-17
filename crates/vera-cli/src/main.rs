@@ -320,16 +320,21 @@ mod tests {
     use super::*;
     use clap::CommandFactory;
 
+    /// Parse argv and return the subcommand, panicking on parse failure.
+    fn parse(argv: &[&str]) -> Commands {
+        Cli::parse_from(argv).command
+    }
+
     #[test]
     fn cli_parses_index_command() {
-        let cli = Cli::parse_from(["vera", "index", "/tmp/repo"]);
-        assert!(matches!(cli.command, Commands::Index { path, .. } if path == "/tmp/repo"));
+        assert!(
+            matches!(parse(&["vera", "index", "/tmp/repo"]), Commands::Index { path, .. } if path == "/tmp/repo")
+        );
     }
 
     #[test]
     fn cli_parses_agent_install_command() {
-        let cli = Cli::parse_from(["vera", "agent", "install", "--client", "codex"]);
-        match cli.command {
+        match parse(&["vera", "agent", "install", "--client", "codex"]) {
             Commands::Agent {
                 command,
                 client,
@@ -346,8 +351,7 @@ mod tests {
 
     #[test]
     fn cli_parses_setup_command() {
-        let cli = Cli::parse_from(["vera", "setup", "--local", "--index", "."]);
-        match cli.command {
+        match parse(&["vera", "setup", "--local", "--index", "."]) {
             Commands::Setup {
                 backend,
                 embedding,
@@ -366,8 +370,7 @@ mod tests {
 
     #[test]
     fn cli_parses_onnx_jina_cpu_flag() {
-        let cli = Cli::parse_from(["vera", "index", ".", "--onnx-jina-cpu"]);
-        match cli.command {
+        match parse(&["vera", "index", ".", "--onnx-jina-cpu"]) {
             Commands::Index { backend, .. } => {
                 assert!(backend.onnx_jina_cpu);
                 assert!(!backend.local);
@@ -378,8 +381,7 @@ mod tests {
 
     #[test]
     fn cli_parses_potion_code_flag() {
-        let cli = Cli::parse_from(["vera", "setup", "--potion-code", "--yes"]);
-        match cli.command {
+        match parse(&["vera", "setup", "--potion-code", "--yes"]) {
             Commands::Setup { backend, .. } => {
                 assert!(backend.potion_code);
                 assert_eq!(
@@ -393,8 +395,7 @@ mod tests {
 
     #[test]
     fn cli_parses_potion_cpu_alias() {
-        let cli = Cli::parse_from(["vera", "repair", "--potion-cpu"]);
-        match cli.command {
+        match parse(&["vera", "repair", "--potion-cpu"]) {
             Commands::Repair { backend, .. } => assert!(backend.potion_code),
             _ => panic!("expected Repair command"),
         }
@@ -402,8 +403,7 @@ mod tests {
 
     #[test]
     fn cli_parses_onnx_jina_cuda_flag() {
-        let cli = Cli::parse_from(["vera", "search", "test", "--onnx-jina-cuda"]);
-        match cli.command {
+        match parse(&["vera", "search", "test", "--onnx-jina-cuda"]) {
             Commands::Search { backend, .. } => {
                 assert!(backend.onnx_jina_cuda);
             }
@@ -426,20 +426,23 @@ mod tests {
 
     #[test]
     fn cli_parses_doctor_command() {
-        let cli = Cli::parse_from(["vera", "doctor"]);
-        assert!(matches!(cli.command, Commands::Doctor { probe: false }));
+        assert!(matches!(
+            parse(&["vera", "doctor"]),
+            Commands::Doctor { probe: false }
+        ));
     }
 
     #[test]
     fn cli_parses_doctor_probe_command() {
-        let cli = Cli::parse_from(["vera", "doctor", "--probe"]);
-        assert!(matches!(cli.command, Commands::Doctor { probe: true }));
+        assert!(matches!(
+            parse(&["vera", "doctor", "--probe"]),
+            Commands::Doctor { probe: true }
+        ));
     }
 
     #[test]
     fn cli_parses_repair_command() {
-        let cli = Cli::parse_from(["vera", "repair", "--onnx-jina-cuda"]);
-        match cli.command {
+        match parse(&["vera", "repair", "--onnx-jina-cuda"]) {
             Commands::Repair { backend, .. } => assert!(backend.onnx_jina_cuda),
             _ => panic!("expected Repair command"),
         }
@@ -447,8 +450,7 @@ mod tests {
 
     #[test]
     fn cli_parses_setup_code_rank_embed_flag() {
-        let cli = Cli::parse_from(["vera", "setup", "--code-rank-embed", "--onnx-jina-cuda"]);
-        match cli.command {
+        match parse(&["vera", "setup", "--code-rank-embed", "--onnx-jina-cuda"]) {
             Commands::Setup {
                 backend, embedding, ..
             } => {
@@ -461,21 +463,23 @@ mod tests {
 
     #[test]
     fn cli_parses_upgrade_command() {
-        let cli = Cli::parse_from(["vera", "upgrade", "--apply"]);
-        assert!(matches!(cli.command, Commands::Upgrade { apply: true }));
+        assert!(matches!(
+            parse(&["vera", "upgrade", "--apply"]),
+            Commands::Upgrade { apply: true }
+        ));
     }
 
     #[test]
     fn cli_parses_search_command() {
-        let cli = Cli::parse_from(["vera", "search", "find auth"]);
+        let command = parse(&["vera", "search", "find auth"]);
         assert!(
-            matches!(cli.command, Commands::Search { queries, .. } if queries == vec!["find auth".to_string()])
+            matches!(command, Commands::Search { queries, .. } if queries == vec!["find auth".to_string()])
         );
     }
 
     #[test]
     fn cli_parses_search_with_filters() {
-        let cli = Cli::parse_from([
+        match parse(&[
             "vera",
             "search",
             "find auth",
@@ -483,8 +487,7 @@ mod tests {
             "rust",
             "--limit",
             "5",
-        ]);
-        match cli.command {
+        ]) {
             Commands::Search {
                 queries,
                 filters,
@@ -501,8 +504,7 @@ mod tests {
 
     #[test]
     fn cli_parses_search_with_type_filter() {
-        let cli = Cli::parse_from(["vera", "search", "find auth", "--type", "function"]);
-        match cli.command {
+        match parse(&["vera", "search", "find auth", "--type", "function"]) {
             Commands::Search {
                 queries, filters, ..
             } => {
@@ -515,7 +517,7 @@ mod tests {
 
     #[test]
     fn cli_parses_search_with_path_filter() {
-        let cli = Cli::parse_from([
+        match parse(&[
             "vera",
             "search",
             "config",
@@ -523,8 +525,7 @@ mod tests {
             "src/**/*.rs",
             "--path",
             "tests/**/*.rs",
-        ]);
-        match cli.command {
+        ]) {
             Commands::Search {
                 queries, filters, ..
             } => {
@@ -540,7 +541,7 @@ mod tests {
 
     #[test]
     fn cli_parses_search_with_all_filters() {
-        let cli = Cli::parse_from([
+        match parse(&[
             "vera",
             "search",
             "handle request",
@@ -552,8 +553,7 @@ mod tests {
             "function",
             "--limit",
             "3",
-        ]);
-        match cli.command {
+        ]) {
             Commands::Search {
                 queries,
                 filters,
@@ -572,7 +572,7 @@ mod tests {
 
     #[test]
     fn cli_parses_search_with_multiple_queries_and_intent() {
-        let cli = Cli::parse_from([
+        match parse(&[
             "vera",
             "search",
             "OAuth token refresh",
@@ -580,8 +580,7 @@ mod tests {
             "auth middleware",
             "--intent",
             "find where tokens are refreshed and validated",
-        ]);
-        match cli.command {
+        ]) {
             Commands::Search {
                 queries, intent, ..
             } => {
@@ -632,15 +631,14 @@ mod tests {
 
     #[test]
     fn cli_parses_search_scope_flags() {
-        let cli = Cli::parse_from([
+        match parse(&[
             "vera",
             "search",
             "mod loader",
             "--scope",
             "runtime",
             "--include-generated",
-        ]);
-        match cli.command {
+        ]) {
             Commands::Search { filters, .. } => {
                 assert_eq!(filters.scope, Some("runtime".to_string()));
                 assert!(filters.include_generated);
@@ -651,15 +649,16 @@ mod tests {
 
     #[test]
     fn cli_parses_update_command() {
-        let cli = Cli::parse_from(["vera", "update", "/tmp/repo"]);
-        assert!(matches!(cli.command, Commands::Update { path, .. } if path == "/tmp/repo"));
+        assert!(
+            matches!(parse(&["vera", "update", "/tmp/repo"]), Commands::Update { path, .. } if path == "/tmp/repo")
+        );
     }
 
     #[test]
     fn cli_parses_update_no_progress_flag() {
-        let cli = Cli::parse_from(["vera", "update", "/tmp/repo", "--no-progress"]);
+        let command = parse(&["vera", "update", "/tmp/repo", "--no-progress"]);
         assert!(matches!(
-            cli.command,
+            command,
             Commands::Update {
                 no_progress: true,
                 ..
@@ -669,9 +668,9 @@ mod tests {
 
     #[test]
     fn cli_parses_update_max_files_flag() {
-        let cli = Cli::parse_from(["vera", "update", "/tmp/repo", "--max-files", "250"]);
+        let command = parse(&["vera", "update", "/tmp/repo", "--max-files", "250"]);
         assert!(matches!(
-            cli.command,
+            command,
             Commands::Update {
                 max_files: Some(max_files),
                 ..
@@ -686,15 +685,14 @@ mod tests {
 
     #[test]
     fn cli_parses_grep_scope_flags() {
-        let cli = Cli::parse_from([
+        match parse(&[
             "vera",
             "grep",
             "keybind",
             "--scope",
             "docs",
             "--include-generated",
-        ]);
-        match cli.command {
+        ]) {
             Commands::Grep { filters, .. } => {
                 assert_eq!(filters.scope, Some("docs".to_string()));
                 assert!(filters.include_generated);
@@ -705,14 +703,13 @@ mod tests {
 
     #[test]
     fn cli_parses_grep_with_path_filter() {
-        let cli = Cli::parse_from([
+        match parse(&[
             "vera",
             "grep",
             "queryClient|invalidateQueries",
             "--path",
             "frontend/src/**",
-        ]);
-        match cli.command {
+        ]) {
             Commands::Grep {
                 pattern, filters, ..
             } => {
@@ -725,7 +722,7 @@ mod tests {
 
     #[test]
     fn cli_parses_grep_with_all_filters() {
-        let cli = Cli::parse_from([
+        match parse(&[
             "vera",
             "grep",
             "Authorization",
@@ -737,8 +734,7 @@ mod tests {
             "function",
             "--scope",
             "source",
-        ]);
-        match cli.command {
+        ]) {
             Commands::Grep {
                 pattern, filters, ..
             } => {
@@ -782,8 +778,7 @@ mod tests {
 
     #[test]
     fn cli_parses_structural_definitions_command() {
-        let cli = Cli::parse_from(["vera", "structural", "definitions", "parse_config"]);
-        match cli.command {
+        match parse(&["vera", "structural", "definitions", "parse_config"]) {
             Commands::Structural { intent, query, .. } => {
                 assert!(matches!(
                     intent,
@@ -797,7 +792,7 @@ mod tests {
 
     #[test]
     fn cli_parses_structural_filters_and_git_scope() {
-        let cli = Cli::parse_from([
+        match parse(&[
             "vera",
             "structural",
             "env",
@@ -810,8 +805,7 @@ mod tests {
             "function",
             "--changed",
             "--compact",
-        ]);
-        match cli.command {
+        ]) {
             Commands::Structural {
                 intent,
                 query,
@@ -837,7 +831,7 @@ mod tests {
 
     #[test]
     fn cli_parses_references_limit_git_scope_and_compact() {
-        let cli = Cli::parse_from([
+        match parse(&[
             "vera",
             "references",
             "parse_config",
@@ -845,8 +839,7 @@ mod tests {
             "7",
             "--changed",
             "--compact",
-        ]);
-        match cli.command {
+        ]) {
             Commands::References {
                 symbol,
                 limit,
@@ -865,14 +858,14 @@ mod tests {
 
     #[test]
     fn cli_parses_watch_command() {
-        let cli = Cli::parse_from(["vera", "watch", "/tmp/repo"]);
-        assert!(matches!(cli.command, Commands::Watch { path } if path == "/tmp/repo"));
+        assert!(
+            matches!(parse(&["vera", "watch", "/tmp/repo"]), Commands::Watch { path } if path == "/tmp/repo")
+        );
     }
 
     #[test]
     fn cli_parses_stats_command() {
-        let cli = Cli::parse_from(["vera", "stats"]);
-        assert!(matches!(cli.command, Commands::Stats));
+        assert!(matches!(parse(&["vera", "stats"]), Commands::Stats));
     }
 
     #[test]
@@ -891,14 +884,12 @@ mod tests {
 
     #[test]
     fn cli_parses_config_command() {
-        let cli = Cli::parse_from(["vera", "config"]);
-        assert!(matches!(cli.command, Commands::Config { args } if args.is_empty()));
+        assert!(matches!(parse(&["vera", "config"]), Commands::Config { args } if args.is_empty()));
     }
 
     #[test]
     fn cli_parses_config_show() {
-        let cli = Cli::parse_from(["vera", "config", "show"]);
-        match cli.command {
+        match parse(&["vera", "config", "show"]) {
             Commands::Config { args } => {
                 assert_eq!(args, vec!["show".to_string()]);
             }
@@ -908,8 +899,7 @@ mod tests {
 
     #[test]
     fn cli_parses_config_get() {
-        let cli = Cli::parse_from(["vera", "config", "get", "retrieval.default_limit"]);
-        match cli.command {
+        match parse(&["vera", "config", "get", "retrieval.default_limit"]) {
             Commands::Config { args } => {
                 assert_eq!(
                     args,
@@ -922,8 +912,7 @@ mod tests {
 
     #[test]
     fn cli_parses_config_set() {
-        let cli = Cli::parse_from(["vera", "config", "set", "retrieval.default_limit", "20"]);
-        match cli.command {
+        match parse(&["vera", "config", "set", "retrieval.default_limit", "20"]) {
             Commands::Config { args } => {
                 assert_eq!(
                     args,
