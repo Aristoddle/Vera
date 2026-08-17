@@ -1422,7 +1422,7 @@ mod tests {
         assert_eq!(
             paths
                 .iter()
-                .filter(|path| { **path == PathBuf::from("/tmp/project/.agents/skills/vera") })
+                .filter(|path| path.as_os_str() == "/tmp/project/.agents/skills/vera")
                 .count(),
             1
         );
