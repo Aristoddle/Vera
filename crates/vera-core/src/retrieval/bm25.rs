@@ -267,19 +267,7 @@ mod tests {
         metadata_store.insert_chunks(&chunks).unwrap();
 
         let bm25_index = Bm25Index::open_in_memory().unwrap();
-        let lang_strings: Vec<String> = chunks.iter().map(|c| c.language.to_string()).collect();
-        let bm25_docs: Vec<Bm25Document<'_>> = chunks
-            .iter()
-            .zip(lang_strings.iter())
-            .map(|(c, lang)| Bm25Document {
-                chunk_id: &c.id,
-                file_path: &c.file_path,
-                content: &c.content,
-                symbol_name: c.symbol_name.as_deref(),
-                language: lang,
-            })
-            .collect();
-        bm25_index.insert_batch(&bm25_docs).unwrap();
+        bm25_index.insert_chunks(&chunks).unwrap();
 
         (bm25_index, metadata_store)
     }

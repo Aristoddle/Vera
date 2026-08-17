@@ -272,15 +272,8 @@ mod tests {
 
         // Generate embeddings and store vectors.
         let vector_store = VectorStore::open_in_memory(dim).unwrap();
-        let embeddings = crate::embedding::embed_chunks(&provider, &chunks, chunks.len(), 0)
-            .await
-            .unwrap();
-
-        let batch: Vec<(&str, &[f32])> = embeddings
-            .iter()
-            .map(|(id, vec)| (id.as_str(), vec.as_slice()))
-            .collect();
-        vector_store.insert_batch(&batch).unwrap();
+        crate::embedding::test_helpers::embed_and_insert_vectors(&vector_store, &provider, &chunks)
+            .await;
 
         (vector_store, metadata_store)
     }

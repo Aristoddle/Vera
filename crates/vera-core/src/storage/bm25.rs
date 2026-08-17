@@ -139,6 +139,23 @@ impl Bm25Index {
         Ok(())
     }
 
+    /// Insert all chunks as BM25 documents in one batch.
+    pub fn insert_chunks(&self, chunks: &[crate::types::Chunk]) -> Result<()> {
+        let lang_strings: Vec<String> = chunks.iter().map(|c| c.language.to_string()).collect();
+        let docs: Vec<Bm25Document<'_>> = chunks
+            .iter()
+            .zip(lang_strings.iter())
+            .map(|(c, lang)| Bm25Document {
+                chunk_id: &c.id,
+                file_path: &c.file_path,
+                content: &c.content,
+                symbol_name: c.symbol_name.as_deref(),
+                language: lang,
+            })
+            .collect();
+        self.insert_batch(&docs)
+    }
+
     /// Search the index with a text query.
     ///
     /// Searches across content and symbol_name fields.

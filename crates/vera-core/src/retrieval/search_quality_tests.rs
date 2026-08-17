@@ -7,7 +7,6 @@
 //! symbols, content, and cross-file relationships.
 
 use crate::config::VeraConfig;
-use crate::embedding::embed_chunks;
 use crate::embedding::test_helpers::MockProvider;
 use crate::indexing::index_repository;
 use crate::parsing;
@@ -15,7 +14,7 @@ use crate::retrieval::apply_filters;
 use crate::retrieval::bm25::search_bm25_with_stores;
 use crate::retrieval::hybrid::fuse_rrf;
 use crate::retrieval::vector::search_vector_with_stores;
-use crate::storage::bm25::{Bm25Document, Bm25Index};
+use crate::storage::bm25::Bm25Index;
 use crate::storage::metadata::MetadataStore;
 use crate::storage::vector::VectorStore;
 use crate::types::{Chunk, Language, SearchFilters, SearchResult, SymbolType};
@@ -315,29 +314,11 @@ async fn setup_indexed_corpus() -> (
     metadata_store.insert_chunks(&all_chunks).unwrap();
 
     let vector_store = VectorStore::open_in_memory(dim).unwrap();
-    let embeddings = embed_chunks(&provider, &all_chunks, all_chunks.len(), 0)
-        .await
-        .unwrap();
-    let batch: Vec<(&str, &[f32])> = embeddings
-        .iter()
-        .map(|(id, vec)| (id.as_str(), vec.as_slice()))
-        .collect();
-    vector_store.insert_batch(&batch).unwrap();
+    crate::embedding::test_helpers::embed_and_insert_vectors(&vector_store, &provider, &all_chunks)
+        .await;
 
     let bm25_index = Bm25Index::open_in_memory().unwrap();
-    let lang_strings: Vec<String> = all_chunks.iter().map(|c| c.language.to_string()).collect();
-    let bm25_docs: Vec<Bm25Document<'_>> = all_chunks
-        .iter()
-        .zip(lang_strings.iter())
-        .map(|(c, lang)| Bm25Document {
-            chunk_id: &c.id,
-            file_path: &c.file_path,
-            content: &c.content,
-            symbol_name: c.symbol_name.as_deref(),
-            language: lang,
-        })
-        .collect();
-    bm25_index.insert_batch(&bm25_docs).unwrap();
+    bm25_index.insert_chunks(&all_chunks).unwrap();
 
     (
         bm25_index,

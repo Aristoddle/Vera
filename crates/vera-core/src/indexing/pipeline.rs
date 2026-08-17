@@ -20,7 +20,7 @@ use crate::indexing::update::content_hash;
 use crate::parsing;
 use crate::parsing::references::RawReference;
 use crate::parsing::type_relations::RawTypeRelation;
-use crate::storage::bm25::{Bm25Document, Bm25Index};
+use crate::storage::bm25::Bm25Index;
 use crate::storage::metadata::{FileIndexState, FileIndexStatus, MetadataStore};
 use crate::storage::vector::VectorStore;
 use crate::types::{Chunk, Language};
@@ -660,24 +660,11 @@ fn store_index(
     }
     let bm25_index = Bm25Index::open(&bm25_dir).context("failed to open BM25 index")?;
 
-    // Pre-compute language strings so BM25 documents can borrow them.
-    let lang_strings: Vec<String> = chunks.iter().map(|c| c.language.to_string()).collect();
-    let bm25_docs: Vec<Bm25Document<'_>> = chunks
-        .iter()
-        .zip(lang_strings.iter())
-        .map(|(c, lang)| Bm25Document {
-            chunk_id: &c.id,
-            file_path: &c.file_path,
-            content: &c.content,
-            symbol_name: c.symbol_name.as_deref(),
-            language: lang,
-        })
-        .collect();
     bm25_index
-        .insert_batch(&bm25_docs)
+        .insert_chunks(chunks)
         .context("failed to insert BM25 documents")?;
 
-    debug!(docs = bm25_docs.len(), "BM25 index built");
+    debug!(docs = chunks.len(), "BM25 index built");
 
     Ok(())
 }

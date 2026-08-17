@@ -23,7 +23,7 @@ use crate::config::VeraConfig;
 use crate::discovery;
 use crate::embedding::{EmbeddingProvider, embed_chunks_concurrent_with_progress};
 use crate::parsing;
-use crate::storage::bm25::{Bm25Document, Bm25Index};
+use crate::storage::bm25::Bm25Index;
 use crate::storage::metadata::{FileIndexState, FileIndexStatus, MetadataStore};
 use crate::storage::vector::VectorStore;
 use crate::types::Language;
@@ -610,21 +610,8 @@ where
             let bm25_index =
                 Bm25Index::open(&bm25_dir).context("failed to open BM25 index for insertion")?;
 
-            let lang_strings: Vec<String> =
-                all_chunks.iter().map(|c| c.language.to_string()).collect();
-            let bm25_docs: Vec<Bm25Document<'_>> = all_chunks
-                .iter()
-                .zip(lang_strings.iter())
-                .map(|(c, lang)| Bm25Document {
-                    chunk_id: &c.id,
-                    file_path: &c.file_path,
-                    content: &c.content,
-                    symbol_name: c.symbol_name.as_deref(),
-                    language: lang,
-                })
-                .collect();
             bm25_index
-                .insert_batch(&bm25_docs)
+                .insert_chunks(&all_chunks)
                 .context("failed to insert updated BM25 documents")?;
         } else {
             on_progress(UpdateProgress::EmbeddingDone { count: 0 });

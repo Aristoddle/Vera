@@ -767,10 +767,9 @@ mod tests {
     /// Returns (index_dir_path, stored_dim) for use in integration tests.
     async fn setup_test_index(tmp: &std::path::Path) -> (std::path::PathBuf, usize) {
         use crate::config::VeraConfig;
-        use crate::embedding::embed_chunks;
         use crate::embedding::test_helpers::MockProvider;
         use crate::parsing;
-        use crate::storage::bm25::{Bm25Document, Bm25Index};
+        use crate::storage::bm25::Bm25Index;
         use crate::storage::metadata::MetadataStore;
         use crate::storage::vector::VectorStore;
 
@@ -819,31 +818,17 @@ mod tests {
         // Vector store.
         let vector_path = index_dir.join("vectors.db");
         let vector_store = VectorStore::open(&vector_path, dim).unwrap();
-        let embeddings = embed_chunks(&provider, &all_chunks, all_chunks.len(), 0)
-            .await
-            .unwrap();
-        let batch: Vec<(&str, &[f32])> = embeddings
-            .iter()
-            .map(|(id, vec)| (id.as_str(), vec.as_slice()))
-            .collect();
-        vector_store.insert_batch(&batch).unwrap();
+        crate::embedding::test_helpers::embed_and_insert_vectors(
+            &vector_store,
+            &provider,
+            &all_chunks,
+        )
+        .await;
 
         // BM25 index.
         let bm25_dir = index_dir.join("bm25");
         let bm25 = Bm25Index::open(&bm25_dir).unwrap();
-        let lang_strings: Vec<String> = all_chunks.iter().map(|c| c.language.to_string()).collect();
-        let bm25_docs: Vec<Bm25Document<'_>> = all_chunks
-            .iter()
-            .zip(lang_strings.iter())
-            .map(|(c, lang)| Bm25Document {
-                chunk_id: &c.id,
-                file_path: &c.file_path,
-                content: &c.content,
-                symbol_name: c.symbol_name.as_deref(),
-                language: lang,
-            })
-            .collect();
-        bm25.insert_batch(&bm25_docs).unwrap();
+        bm25.insert_chunks(&all_chunks).unwrap();
 
         (index_dir, dim)
     }
