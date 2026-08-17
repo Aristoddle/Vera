@@ -25,6 +25,8 @@ pub(crate) struct SetupReport {
 }
 
 /// `backend`: Some(local backend) for local, None + api=true for API, None + api=false defaults to auto-detect.
+/// `allow_wizard`: bare interactive invocations run the full wizard only for
+/// `vera setup`; `vera backend` always stays in the backend-only flow.
 pub fn run(
     backend: Option<InferenceBackend>,
     api: bool,
@@ -32,11 +34,12 @@ pub fn run(
     json_output: bool,
     yes: bool,
     embedding_flags: LocalEmbeddingModelFlags,
+    allow_wizard: bool,
 ) -> anyhow::Result<()> {
     // If no flags at all and interactive, run the full wizard.
     let is_bare_interactive =
         !api && backend.is_none() && !json_output && !yes && !embedding_flags.any_set();
-    if is_bare_interactive && index_path.is_none() {
+    if allow_wizard && is_bare_interactive && index_path.is_none() {
         return run_wizard();
     }
 

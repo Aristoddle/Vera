@@ -964,18 +964,13 @@ fn sync(json_output: bool) -> anyhow::Result<()> {
         updated.push(location.path.clone());
     }
 
-    let refreshed_snippets = if stale_locations
-        .iter()
-        .any(|location| location.scope == AgentScope::Project)
-    {
-        project_cwd
-            .as_deref()
-            .map(|cwd| refresh_existing_vera_snippets(&find_agent_configs(cwd)))
-            .transpose()?
-            .unwrap_or_default()
-    } else {
-        Vec::new()
-    };
+    // Refresh managed markdown snippets whenever a project directory is
+    // available, regardless of which skill installs were stale.
+    let refreshed_snippets = project_cwd
+        .as_deref()
+        .map(|cwd| refresh_existing_vera_snippets(&find_agent_configs(cwd)))
+        .transpose()?
+        .unwrap_or_default();
 
     if json_output {
         let reports: Vec<_> = updated
@@ -1173,9 +1168,16 @@ fn refresh_vera_snippet(existing: &str, file_name: &str) -> Option<String> {
 
 fn refresh_vera_snippet_in_markdown(existing: &str) -> Option<String> {
     let start = markdown_section_start(existing, AGENTS_MD_SNIPPET_HEADING)?;
-    let next_section_offset = existing[start + AGENTS_MD_SNIPPET_HEADING.len()..].find("\n## ");
-    let end = next_section_offset
-        .map(|offset| start + AGENTS_MD_SNIPPET_HEADING.len() + offset + 1)
+    // The managed section ends at the next heading of equal or higher level
+    // (`## ` or `# `). Deeper headings (`### ` and below) stay in the section.
+    let body_start = start + AGENTS_MD_SNIPPET_HEADING.len();
+    let end = existing[body_start..]
+        .match_indices('\n')
+        .map(|(idx, _)| body_start + idx + 1)
+        .find(|&line_start| {
+            let line = &existing[line_start..];
+            line.starts_with("# ") || line.starts_with("## ")
+        })
         .unwrap_or(existing.len());
     let section = &existing[start..end];
     if !section.contains(AGENTS_MD_SNIPPET_INTRO) {
@@ -1473,6 +1475,19 @@ mod tests {
             )
         );
         assert!(updated.contains("## Build\n\nRun tests.\n"));
+    }
+
+    #[test]
+    fn refresh_vera_snippet_in_markdown_preserves_following_top_level_section() {
+        let existing = format!(
+            "{}\n\n# Guidelines\n\nRun tests first.\n",
+            AGENTS_MD_SNIPPET.trim_end()
+        );
+
+        let updated = refresh_vera_snippet_in_markdown(&existing).unwrap();
+
+        assert!(updated.contains(AGENTS_MD_SNIPPET.trim_end()));
+        assert!(updated.contains("# Guidelines\n\nRun tests first.\n"));
     }
 
     #[test]

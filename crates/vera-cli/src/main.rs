@@ -830,6 +830,7 @@ fn main() {
                 cli.json,
                 yes,
                 embedding,
+                true,
             )
         }
         Commands::Backend {
@@ -846,6 +847,7 @@ fn main() {
                 cli.json,
                 yes,
                 embedding,
+                false,
             )
         }
         Commands::Uninstall => {
