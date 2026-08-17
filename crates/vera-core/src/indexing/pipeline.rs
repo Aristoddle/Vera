@@ -12,14 +12,16 @@ use anyhow::{Context, Result, bail};
 use rayon::prelude::*;
 use tracing::{debug, info, warn};
 
+use crate::CancellationToken;
 use crate::config::VeraConfig;
 use crate::discovery::{self, DiscoveryResult};
 use crate::embedding::{EmbeddingProvider, embed_chunks_concurrent_with_progress};
 use crate::indexing::update::content_hash;
 use crate::parsing;
 use crate::parsing::references::RawReference;
-use crate::storage::bm25::{Bm25Document, Bm25Index};
-use crate::storage::metadata::MetadataStore;
+use crate::parsing::type_relations::RawTypeRelation;
+use crate::storage::bm25::Bm25Index;
+use crate::storage::metadata::{FileIndexState, FileIndexStatus, MetadataStore};
 use crate::storage::vector::VectorStore;
 use crate::types::{Chunk, Language};
 
@@ -42,6 +44,10 @@ pub struct IndexSummary {
     pub large_skipped_paths: Vec<(String, u64)>,
     /// Number of files skipped due to permission or read errors.
     pub error_skipped: usize,
+    /// Number of successfully indexed files whose parse trees contained errors.
+    pub files_with_tree_sitter_errors: usize,
+    /// Number of successfully indexed files that fell back to Tier 0 chunking.
+    pub files_using_tier0_fallback: usize,
     /// Files that had parse errors (path + error message).
     pub parse_errors: Vec<FileError>,
     /// Wall-clock elapsed time in seconds.
@@ -71,9 +77,6 @@ pub enum IndexProgress {
     /// Index artifacts written to disk.
     StorageDone,
 }
-
-/// No-op progress callback (used when caller doesn't need progress).
-pub(crate) fn no_progress(_: IndexProgress) {}
 
 // ── Index directory layout ───────────────────────────────────────────
 
@@ -116,10 +119,36 @@ pub async fn index_repository<P: EmbeddingProvider>(
     config: &VeraConfig,
     model_name: &str,
 ) -> Result<IndexSummary> {
-    index_repository_with_progress(repo_path, provider, config, model_name, no_progress).await
+    index_repository_with_cancellation(
+        repo_path,
+        provider,
+        config,
+        model_name,
+        &CancellationToken::new(),
+    )
+    .await
 }
 
-/// Index a repository with progress reporting via a callback.
+/// Index a repository while cooperatively observing cancellation.
+pub async fn index_repository_with_cancellation<P: EmbeddingProvider>(
+    repo_path: &Path,
+    provider: &P,
+    config: &VeraConfig,
+    model_name: &str,
+    cancellation: &CancellationToken,
+) -> Result<IndexSummary> {
+    index_repository_with_progress_and_cancellation(
+        repo_path,
+        provider,
+        config,
+        model_name,
+        |_| {},
+        cancellation,
+    )
+    .await
+}
+
+/// Index a repository and report progress to the supplied callback.
 pub async fn index_repository_with_progress<P, F>(
     repo_path: &Path,
     provider: &P,
@@ -131,7 +160,32 @@ where
     P: EmbeddingProvider,
     F: Fn(IndexProgress) + Send + Sync,
 {
+    index_repository_with_progress_and_cancellation(
+        repo_path,
+        provider,
+        config,
+        model_name,
+        on_progress,
+        &CancellationToken::new(),
+    )
+    .await
+}
+
+/// Index a repository with progress reporting and cooperative cancellation.
+pub async fn index_repository_with_progress_and_cancellation<P, F>(
+    repo_path: &Path,
+    provider: &P,
+    config: &VeraConfig,
+    model_name: &str,
+    on_progress: F,
+    cancellation: &CancellationToken,
+) -> Result<IndexSummary>
+where
+    P: EmbeddingProvider,
+    F: Fn(IndexProgress) + Send + Sync,
+{
     let start = Instant::now();
+    cancellation.check()?;
 
     // ── 1. Validate path ─────────────────────────────────────────
     if !repo_path.exists() {
@@ -149,7 +203,8 @@ where
 
     // ── 2. Discover files ────────────────────────────────────────
     let discovery =
-        discovery::discover_files(&repo_root, &config.indexing).context("file discovery failed")?;
+        discovery::discover_files_with_cancellation(&repo_root, &config.indexing, cancellation)
+            .context("file discovery failed")?;
 
     if discovery.files.is_empty() {
         return Ok(IndexSummary {
@@ -160,6 +215,8 @@ where
             large_skipped: discovery.large_skipped,
             large_skipped_paths: discovery.large_skipped_paths.clone(),
             error_skipped: discovery.error_skipped,
+            files_with_tree_sitter_errors: 0,
+            files_using_tier0_fallback: 0,
             parse_errors: Vec::new(),
             elapsed_secs: start.elapsed().as_secs_f64(),
         });
@@ -177,8 +234,8 @@ where
     });
 
     // ── 3. Parse and chunk each file (parallelized with rayon) ──
-    let (all_chunks, parse_errors, file_hashes, all_refs) =
-        parse_discovered_files_parallel(&discovery, &repo_root, config);
+    let (all_chunks, parse_errors, file_hashes, all_refs, all_type_relations, file_states) =
+        parse_discovered_files_parallel(&discovery, &repo_root, config, cancellation)?;
 
     info!(
         chunks = all_chunks.len(),
@@ -198,14 +255,28 @@ where
             large_skipped: discovery.large_skipped,
             large_skipped_paths: discovery.large_skipped_paths.clone(),
             error_skipped: discovery.error_skipped,
+            files_with_tree_sitter_errors: count_tree_sitter_error_files(&file_states),
+            files_using_tier0_fallback: count_tier0_fallback_files(&file_states),
             parse_errors,
             elapsed_secs: start.elapsed().as_secs_f64(),
         });
     }
 
     // ── 4. Generate embeddings (concurrent batches) ──────────────
-    let batch_size = config.embedding.batch_size;
-    let max_concurrent_requests = config.embedding.max_concurrent_requests;
+    cancellation.check()?;
+    let (batch_size, max_concurrent_requests) = config.embedding.bounded_parallelism();
+    if batch_size != config.embedding.batch_size
+        || max_concurrent_requests != config.embedding.max_concurrent_requests
+    {
+        info!(
+            configured_batch_size = config.embedding.batch_size,
+            configured_concurrency = config.embedding.max_concurrent_requests,
+            max_in_flight_inputs = config.embedding.max_in_flight_inputs,
+            batch_size,
+            max_concurrent_requests,
+            "clamped embedding parallelism to the in-flight input bound"
+        );
+    }
 
     let progress_cb = |done: usize, total: usize| {
         on_progress(IndexProgress::EmbeddingProgress { done, total });
@@ -220,6 +291,7 @@ where
     )
     .await
     .context("embedding generation failed")?;
+    cancellation.check()?;
 
     // Truncate vectors if max_stored_dim is configured.
     let stored_dim = super::truncate_embeddings(&mut embeddings, config.embedding.max_stored_dim);
@@ -240,7 +312,12 @@ where
         &embeddings,
         &file_hashes,
         &all_refs,
-        model_name,
+        &all_type_relations,
+        IndexBuildMetadata {
+            file_states: &file_states,
+            indexing_config: &config.indexing,
+            model_name,
+        },
     )
     .context("failed to write index artifacts")?;
 
@@ -257,6 +334,8 @@ where
         large_skipped: discovery.large_skipped,
         large_skipped_paths: discovery.large_skipped_paths,
         error_skipped: discovery.error_skipped,
+        files_with_tree_sitter_errors: count_tree_sitter_error_files(&file_states),
+        files_using_tier0_fallback: count_tier0_fallback_files(&file_states),
         parse_errors,
         elapsed_secs: start.elapsed().as_secs_f64(),
     })
@@ -275,130 +354,227 @@ fn parse_discovered_files_parallel(
     discovery: &DiscoveryResult,
     repo_root: &Path,
     config: &VeraConfig,
-) -> (
+    cancellation: &CancellationToken,
+) -> Result<(
     Vec<Chunk>,
     Vec<FileError>,
     Vec<(String, String)>,
     Vec<(String, Vec<RawReference>)>,
-) {
+    Vec<(String, Vec<RawTypeRelation>)>,
+    Vec<FileIndexState>,
+)> {
     let config = Arc::new(config.clone());
     let repo_root = Arc::new(repo_root.to_path_buf());
 
-    // Process files in parallel: returns Ok((chunks, rel_path, hash, refs)) or Err.
-    #[allow(clippy::type_complexity)]
-    let results: Vec<Result<(Vec<Chunk>, String, String, Vec<RawReference>), FileError>> =
-        discovery
-            .files
-            .par_iter()
-            .map(|file| {
-                let source = std::fs::read_to_string(&file.absolute_path).map_err(|err| {
+    struct ParsedFileResult {
+        chunks: Vec<Chunk>,
+        parse_error: Option<FileError>,
+        file_hash: Option<(String, String)>,
+        refs: Option<(String, Vec<RawReference>)>,
+        type_relations: Option<(String, Vec<RawTypeRelation>)>,
+        file_state: Option<FileIndexState>,
+    }
+
+    let results: Vec<ParsedFileResult> = discovery
+        .files
+        .par_iter()
+        .map(|file| {
+            if cancellation.is_cancelled() {
+                return ParsedFileResult {
+                    chunks: Vec::new(),
+                    parse_error: None,
+                    file_hash: None,
+                    refs: None,
+                    type_relations: None,
+                    file_state: None,
+                };
+            }
+
+            let source = match crate::discovery::read_source_lossy(&file.absolute_path) {
+                Ok(source) => source,
+                Err(err) => {
                     warn!(
                         file = %file.relative_path,
                         error = %err,
                         "failed to read file for parsing"
                     );
-                    FileError {
-                        file_path: file.relative_path.clone(),
-                        error: err.to_string(),
-                    }
-                })?;
-
-                let language = file
-                    .absolute_path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .and_then(Language::from_filename)
-                    .unwrap_or_else(|| {
-                        let ext = file
-                            .absolute_path
-                            .extension()
-                            .and_then(|e| e.to_str())
-                            .unwrap_or("");
-                        Language::from_extension(ext)
-                    });
-
-                // RST files need preprocessing before chunking, but refs
-                // come from the raw source, so they can't share a single parse.
-                let parse_result = if language == Language::Rst {
-                    let refs = parsing::parse_and_extract_references(&source, language);
-                    let normalized_source = match parsing::sphinx::preprocess_rst(
-                        &source,
-                        &file.absolute_path,
-                        repo_root.as_path(),
-                    ) {
-                        Ok(preprocessed) => Some(preprocessed),
-                        Err(err) => {
-                            warn!(
-                                file = %file.relative_path,
-                                error = %err,
-                                "failed to preprocess rst; falling back to raw source"
-                            );
-                            None
-                        }
+                    return ParsedFileResult {
+                        chunks: Vec::new(),
+                        parse_error: Some(FileError {
+                            file_path: file.relative_path.clone(),
+                            error: err.to_string(),
+                        }),
+                        file_hash: None,
+                        refs: None,
+                        type_relations: None,
+                        file_state: None,
                     };
-                    let src = normalized_source.as_deref().unwrap_or(&source);
-                    let hash = content_hash(src);
-                    parsing::parse_and_chunk(src, &file.relative_path, language, &config.indexing)
-                        .map(|chunks| (chunks, refs, hash))
-                } else {
-                    let hash = content_hash(&source);
-                    parsing::parse_file(&source, &file.relative_path, language, &config.indexing)
-                        .map(|(chunks, refs)| (chunks, refs, hash))
-                };
+                }
+            };
 
-                parse_result
-                    .inspect(|(chunks, refs, _)| {
-                        debug!(
-                            file = %file.relative_path,
-                            chunks = chunks.len(),
-                            refs = refs.len(),
-                            "parsed file"
-                        );
-                    })
-                    .map(|(chunks, refs, hash)| (chunks, file.relative_path.clone(), hash, refs))
-                    .map_err(|err| {
+            let language = file
+                .absolute_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .and_then(Language::from_filename)
+                .unwrap_or_else(|| {
+                    let ext = file
+                        .absolute_path
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .unwrap_or("");
+                    Language::from_extension(ext)
+                });
+
+            // RST files need preprocessing before chunking, but refs
+            // come from the raw source, so they can't share a single parse.
+            let parsed = if language == Language::Rst {
+                let refs = parsing::parse_and_extract_references(&source, language);
+                let normalized_source = match parsing::sphinx::preprocess_rst(
+                    &source,
+                    &file.absolute_path,
+                    repo_root.as_path(),
+                ) {
+                    Ok(preprocessed) => Some(preprocessed),
+                    Err(err) => {
                         warn!(
                             file = %file.relative_path,
                             error = %err,
-                            "parse error"
+                            "failed to preprocess rst; falling back to raw source"
                         );
-                        FileError {
+                        None
+                    }
+                };
+                let src = normalized_source.as_deref().unwrap_or(&source);
+                let hash = content_hash(src);
+                parsing::parse_file_with_diagnostics(
+                    src,
+                    &file.relative_path,
+                    language,
+                    &config.indexing,
+                )
+                .map(|(chunks, _ignored_refs, diagnostics)| (chunks, refs, hash, diagnostics))
+            } else {
+                let hash = content_hash(&source);
+                parsing::parse_file_with_diagnostics(
+                    &source,
+                    &file.relative_path,
+                    language,
+                    &config.indexing,
+                )
+                .map(|(chunks, refs, diagnostics)| (chunks, refs, hash, diagnostics))
+            };
+
+            match parsed {
+                Ok((chunks, refs, hash, diagnostics)) => {
+                    let chunk_count = chunks.len() as u64;
+                    let type_relations = parsing::type_relations::extract_type_relations(&chunks);
+                    debug!(
+                        file = %file.relative_path,
+                        chunks = chunk_count,
+                        refs = refs.len(),
+                        type_relations = type_relations.len(),
+                        "parsed file"
+                    );
+                    ParsedFileResult {
+                        chunks,
+                        parse_error: None,
+                        file_hash: Some((file.relative_path.clone(), hash)),
+                        refs: (!refs.is_empty()).then_some((file.relative_path.clone(), refs)),
+                        type_relations: (!type_relations.is_empty())
+                            .then_some((file.relative_path.clone(), type_relations)),
+                        file_state: Some(FileIndexState {
+                            file_path: file.relative_path.clone(),
+                            language: language.to_string(),
+                            status: FileIndexStatus::Indexed,
+                            tree_has_error: diagnostics.tree_has_error,
+                            tier0_fallback: diagnostics.used_tier0_fallback,
+                            chunk_count,
+                        }),
+                    }
+                }
+                Err(err) => {
+                    warn!(
+                        file = %file.relative_path,
+                        error = %err,
+                        "parse error"
+                    );
+                    ParsedFileResult {
+                        chunks: Vec::new(),
+                        parse_error: Some(FileError {
                             file_path: file.relative_path.clone(),
                             error: err.to_string(),
-                        }
-                    })
-            })
-            .collect();
+                        }),
+                        file_hash: Some((file.relative_path.clone(), content_hash(&source))),
+                        refs: None,
+                        type_relations: None,
+                        file_state: Some(FileIndexState {
+                            file_path: file.relative_path.clone(),
+                            language: language.to_string(),
+                            status: FileIndexStatus::ParseError,
+                            tree_has_error: false,
+                            tier0_fallback: false,
+                            chunk_count: 0,
+                        }),
+                    }
+                }
+            }
+        })
+        .collect();
+
+    cancellation.check()?;
 
     // Flatten results into chunks, errors, file hashes, and references.
     let mut all_chunks = Vec::new();
     let mut parse_errors = Vec::new();
     let mut file_hashes = Vec::new();
     let mut all_refs = Vec::new();
+    let mut all_type_relations = Vec::new();
+    let mut file_states = Vec::new();
     for result in results {
-        match result {
-            Ok((chunks, rel_path, hash, refs)) => {
-                all_chunks.extend(chunks);
-                if !refs.is_empty() {
-                    all_refs.push((rel_path.clone(), refs));
-                }
-                file_hashes.push((rel_path, hash));
-            }
-            Err(error) => parse_errors.push(error),
+        all_chunks.extend(result.chunks);
+        if let Some(error) = result.parse_error {
+            parse_errors.push(error);
+        }
+        if let Some(file_hash) = result.file_hash {
+            file_hashes.push(file_hash);
+        }
+        if let Some(file_refs) = result.refs {
+            all_refs.push(file_refs);
+        }
+        if let Some(type_relations) = result.type_relations {
+            all_type_relations.push(type_relations);
+        }
+        if let Some(file_state) = result.file_state {
+            file_states.push(file_state);
         }
     }
 
-    (all_chunks, parse_errors, file_hashes, all_refs)
+    Ok((
+        all_chunks,
+        parse_errors,
+        file_hashes,
+        all_refs,
+        all_type_relations,
+        file_states,
+    ))
 }
 
 /// Write chunks, embeddings, BM25 index, file hashes, and references to disk.
+struct IndexBuildMetadata<'a> {
+    file_states: &'a [FileIndexState],
+    indexing_config: &'a crate::config::IndexingConfig,
+    model_name: &'a str,
+}
+
 fn store_index(
     idx_dir: &Path,
     chunks: &[Chunk],
     embeddings: &[(String, Vec<f32>)],
     file_hashes: &[(String, String)],
     file_refs: &[(String, Vec<RawReference>)],
-    model_name: &str,
+    file_type_relations: &[(String, Vec<RawTypeRelation>)],
+    metadata: IndexBuildMetadata<'_>,
 ) -> Result<()> {
     // Ensure index directory exists.
     std::fs::create_dir_all(idx_dir)
@@ -426,6 +602,10 @@ fn store_index(
             .context("failed to store file hash")?;
     }
 
+    metadata_store
+        .insert_file_states(metadata.file_states)
+        .context("failed to store file index states")?;
+
     // Store call-site references for call graph analysis.
     for (file_path, refs) in file_refs {
         metadata_store
@@ -433,17 +613,29 @@ fn store_index(
             .context("failed to store references")?;
     }
 
+    for (file_path, relations) in file_type_relations {
+        metadata_store
+            .insert_type_relations(file_path, relations)
+            .context("failed to store type relations")?;
+    }
+
     metadata_store
-        .set_index_meta("model_name", model_name)
+        .set_index_meta("model_name", metadata.model_name)
         .context("failed to store model_name")?;
     metadata_store
         .set_index_meta("embedding_dim", &dim.to_string())
         .context("failed to store embedding_dim")?;
+    super::freshness::record_index_snapshot(&metadata_store, metadata.indexing_config)
+        .context("failed to store index freshness metadata")?;
 
     debug!(chunks = chunks.len(), "metadata stored");
 
     // ── Vector store ─────────────────────────────────────────────
     let vector_path = idx_dir.join(VECTOR_DB);
+    if vector_path.exists() {
+        std::fs::remove_file(&vector_path)
+            .with_context(|| format!("failed to reset vector db: {}", vector_path.display()))?;
+    }
     let vector_store =
         VectorStore::open(&vector_path, dim).context("failed to open vector store")?;
     vector_store
@@ -462,29 +654,33 @@ fn store_index(
 
     // ── BM25 index ───────────────────────────────────────────────
     let bm25_dir = idx_dir.join(BM25_SUBDIR);
+    if bm25_dir.exists() {
+        std::fs::remove_dir_all(&bm25_dir)
+            .with_context(|| format!("failed to reset BM25 dir: {}", bm25_dir.display()))?;
+    }
     let bm25_index = Bm25Index::open(&bm25_dir).context("failed to open BM25 index")?;
-    bm25_index.clear().context("failed to clear BM25 index")?;
 
-    // Pre-compute language strings so BM25 documents can borrow them.
-    let lang_strings: Vec<String> = chunks.iter().map(|c| c.language.to_string()).collect();
-    let bm25_docs: Vec<Bm25Document<'_>> = chunks
-        .iter()
-        .zip(lang_strings.iter())
-        .map(|(c, lang)| Bm25Document {
-            chunk_id: &c.id,
-            file_path: &c.file_path,
-            content: &c.content,
-            symbol_name: c.symbol_name.as_deref(),
-            language: lang,
-        })
-        .collect();
     bm25_index
-        .insert_batch(&bm25_docs)
+        .insert_chunks(chunks)
         .context("failed to insert BM25 documents")?;
 
-    debug!(docs = bm25_docs.len(), "BM25 index built");
+    debug!(docs = chunks.len(), "BM25 index built");
 
     Ok(())
+}
+
+fn count_tree_sitter_error_files(file_states: &[FileIndexState]) -> usize {
+    file_states
+        .iter()
+        .filter(|state| state.status == FileIndexStatus::Indexed && state.tree_has_error)
+        .count()
+}
+
+fn count_tier0_fallback_files(file_states: &[FileIndexState]) -> usize {
+    file_states
+        .iter()
+        .filter(|state| state.status == FileIndexStatus::Indexed && state.tier0_fallback)
+        .count()
 }
 
 #[cfg(test)]

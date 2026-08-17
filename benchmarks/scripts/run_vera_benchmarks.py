@@ -7,7 +7,6 @@ Modes:
   - hybrid          : BM25 + vector via RRF fusion + reranking (default)
   - hybrid-norerank : BM25 + vector via RRF fusion, no reranking
   - bm25-only       : BM25 keyword search only (no embedding API)
-  - vector-only     : Vector similarity search only (embedding API)
 
 Usage:
     python3 benchmarks/scripts/run_vera_benchmarks.py [--mode MODE] [--runs N]
@@ -17,6 +16,22 @@ Requires:
     - Corpus repos cloned (bash eval/setup-corpus.sh)
     - secrets.env for API credentials (embedding + reranker)
 """
+
+from bench_common import (
+    TASKS_DIR,
+    binary_version,
+    compute_task_metrics,
+    git_sha,
+    is_match,
+    load_secrets,
+    load_tasks,
+    matched_relevances,
+    mrr,
+    ndcg_at_k,
+    percentile,
+    precision_at_k,
+    recall_at_k,
+)
 
 import argparse
 import json
@@ -30,62 +45,14 @@ from typing import Any
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 VERA_BIN = REPO_ROOT / "target" / "release" / "vera"
 CORPUS_DIR = REPO_ROOT / ".bench" / "repos"
-TASKS_DIR = REPO_ROOT / "eval" / "tasks"
 RESULTS_DIR = REPO_ROOT / "benchmarks" / "results" / "vera-retrieval"
 BASELINES_FILE = (
     REPO_ROOT / "benchmarks" / "results" / "competitor-baselines" / "all_baselines.json"
 )
 
 
-def load_secrets() -> dict[str, str]:
-    """Load API credentials from secrets.env."""
-    secrets_path = REPO_ROOT / "secrets.env"
-    env = {}
-    if secrets_path.exists():
-        with open(secrets_path) as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                if "=" in line:
-                    key, _, value = line.partition("=")
-                    # Strip quotes
-                    value = value.strip().strip("'\"")
-                    env[key.strip()] = value
-    return env
 
 
-def load_tasks() -> list[dict]:
-    """Load all benchmark tasks from eval/tasks/*.json."""
-    tasks = []
-    for task_file in sorted(TASKS_DIR.glob("*.json")):
-        with open(task_file) as f:
-            file_tasks = json.load(f)
-            tasks.extend(file_tasks)
-    return tasks
-
-
-def get_vera_version() -> str:
-    """Get Vera binary version."""
-    result = subprocess.run(
-        [str(VERA_BIN), "--version"],
-        capture_output=True,
-        text=True,
-        timeout=10,
-    )
-    return result.stdout.strip()
-
-
-def get_git_sha() -> str:
-    """Get current git commit SHA."""
-    result = subprocess.run(
-        ["git", "rev-parse", "HEAD"],
-        capture_output=True,
-        text=True,
-        cwd=REPO_ROOT,
-        timeout=10,
-    )
-    return result.stdout.strip()
 
 
 def index_repo(repo_name: str, env: dict[str, str]) -> tuple[float, int]:
@@ -148,7 +115,6 @@ def run_search(
       - hybrid          : full pipeline (BM25 + vector + reranking)
       - hybrid-norerank : BM25 + vector, no reranking
       - bm25-only       : BM25 only (unset embedding env vars)
-      - vector-only     : handled by calling vector search directly
     """
     repo_path = CORPUS_DIR / repo_name
     full_env = {**os.environ, **env}
@@ -169,19 +135,6 @@ def run_search(
             "RERANKER_MODEL_API_KEY",
         ]:
             full_env.pop(key, None)
-    elif mode == "vector-only":
-        # We'll handle vector-only by searching with the hybrid pipeline
-        # but the BM25 results will naturally merge via RRF.
-        # A true vector-only mode would require passing a flag.
-        # For now, we run hybrid without reranking and note this in the report.
-        # Actually, let's use a different approach: we need to modify the pipeline.
-        # Since we can't easily do vector-only via CLI, we'll run hybrid-norerank
-        # and note this is a hybrid baseline. For a true vector-only comparison,
-        # we use the M1 vector-only baseline from the competitor baselines.
-        # UPDATE: Let's create a proper vector-only by disabling BM25 contribution.
-        # Since the CLI doesn't support a --mode flag, we'll note this limitation.
-        pass
-
     cmd = [
         str(VERA_BIN),
         "--json",
@@ -223,113 +176,12 @@ def run_search(
 # ── Metric computation ────────────────────────────────────────────────
 
 
-def is_match(result: dict, gt: dict) -> bool:
-    """Check if a retrieval result matches a ground truth entry (file + line overlap)."""
-    return (
-        result.get("file_path") == gt["file_path"]
-        and result.get("line_start", 0) <= gt["line_end"]
-        and result.get("line_end", 0) >= gt["line_start"]
-    )
 
 
-def recall_at_k(results: list[dict], ground_truth: list[dict], k: int) -> float:
-    """Compute Recall@k."""
-    if not ground_truth:
-        return 0.0
-    top_k = results[:k]
-    found = sum(1 for gt in ground_truth if any(is_match(r, gt) for r in top_k))
-    return found / len(ground_truth)
 
 
-def mrr(results: list[dict], ground_truth: list[dict]) -> float:
-    """Compute Mean Reciprocal Rank."""
-    for i, result in enumerate(results):
-        if any(is_match(result, gt) for gt in ground_truth):
-            return 1.0 / (i + 1)
-    return 0.0
 
 
-def precision_at_k(results: list[dict], ground_truth: list[dict], k: int) -> float:
-    """Compute Precision@k."""
-    top_k = results[:k]
-    if not top_k:
-        return 0.0
-    relevant = sum(
-        1 for r in top_k if any(is_match(r, gt) for gt in ground_truth)
-    )
-    return relevant / len(top_k)
-
-
-def matched_relevances(results: list[dict], ground_truth: list[dict], k: int) -> list[int]:
-    """Assign each ranked result to at most one unmatched ground-truth entry."""
-    top_k = results[:k]
-    used = [False] * len(ground_truth)
-    relevances = []
-
-    for result in top_k:
-        best_idx = None
-        best_rel = 0
-        for idx, gt in enumerate(ground_truth):
-            if used[idx] or not is_match(result, gt):
-                continue
-            rel = gt.get("relevance", 1)
-            if rel > best_rel:
-                best_idx = idx
-                best_rel = rel
-
-        if best_idx is not None:
-            used[best_idx] = True
-            relevances.append(best_rel)
-        else:
-            relevances.append(0)
-
-    return relevances
-
-
-def ndcg_at_k(results: list[dict], ground_truth: list[dict], k: int) -> float:
-    """Compute nDCG@k."""
-    import math
-
-    dcg = 0.0
-    for i, relevance in enumerate(matched_relevances(results, ground_truth, k)):
-        dcg += relevance / math.log2(i + 2.0)
-
-    # Ideal DCG
-    ideal_rels = sorted(
-        [gt.get("relevance", 1) for gt in ground_truth], reverse=True
-    )[:k]
-    ideal_dcg = sum(rel / math.log2(i + 2.0) for i, rel in enumerate(ideal_rels))
-
-    return dcg / ideal_dcg if ideal_dcg > 0 else 0.0
-
-
-def compute_task_metrics(
-    results: list[dict], ground_truth: list[dict]
-) -> dict[str, float]:
-    """Compute all retrieval metrics for a single task."""
-    return {
-        "recall_at_1": recall_at_k(results, ground_truth, 1),
-        "recall_at_5": recall_at_k(results, ground_truth, 5),
-        "recall_at_10": recall_at_k(results, ground_truth, 10),
-        "mrr": mrr(results, ground_truth),
-        "ndcg": ndcg_at_k(results, ground_truth, 10),
-        "precision_at_3": precision_at_k(results, ground_truth, 3),
-    }
-
-
-def percentile(values: list[float], p: float) -> float:
-    """Compute the p-th percentile of a sorted list."""
-    if not values:
-        return 0.0
-    sorted_vals = sorted(values)
-    n = len(sorted_vals)
-    if n == 1:
-        return sorted_vals[0]
-    rank = p / 100.0 * (n - 1)
-    lower = int(rank)
-    upper = min(lower + 1, n - 1)
-    frac = rank - lower
-    return sorted_vals[lower] * (1 - frac) + sorted_vals[upper] * frac
 
 
 # ── Main benchmark runner ────────────────────────────────────────────
@@ -641,35 +493,26 @@ def verify_assertions(vera_results: dict[str, dict]) -> list[tuple[str, bool, st
         f"hybrid={h_mrr:.4f}, bm25-only={b_mrr:.4f}",
     ))
 
-    # 2. Hybrid MRR@10 > vector-only MRR@10
-    # Use M1 baseline vector-only if we don't have vera vector-only
-    if "vector-only" in vera_results:
-        v_mrr = vera_results["vector-only"]["aggregate"]["retrieval"].get("mrr", 0)
-        checks.append((
-            "Hybrid MRR@10 > vector-only MRR@10",
-            h_mrr > v_mrr,
-            f"hybrid={h_mrr:.4f}, vector-only={v_mrr:.4f}",
-        ))
-    else:
-        # Fall back to M1 baseline
-        baselines = load_baselines()
-        if baselines and "vector-only" in baselines:
-            v_mrr = baselines["vector-only"]["aggregate"]["retrieval"].get("mrr", 0)
-        elif baselines:
-            # Try other keys
-            for key, data in baselines.items():
-                if "vector" in key.lower():
-                    v_mrr = data["aggregate"]["retrieval"].get("mrr", 0)
-                    break
-            else:
-                v_mrr = 0.2814  # Hardcoded from baseline report
+    # 2. Hybrid MRR@10 > vector-only MRR@10 (M1 baseline; the CLI has no
+    # vector-only mode, so Vera-side vector-only numbers cannot be produced)
+    baselines = load_baselines()
+    if baselines and "vector-only" in baselines:
+        v_mrr = baselines["vector-only"]["aggregate"]["retrieval"].get("mrr", 0)
+    elif baselines:
+        # Try other keys
+        for key, data in baselines.items():
+            if "vector" in key.lower():
+                v_mrr = data["aggregate"]["retrieval"].get("mrr", 0)
+                break
         else:
-            v_mrr = 0.2814
-        checks.append((
-            "Hybrid MRR@10 > vector-only MRR@10 (M1 baseline)",
-            h_mrr > v_mrr,
-            f"hybrid={h_mrr:.4f}, vector-only-baseline={v_mrr:.4f}",
-        ))
+            v_mrr = 0.2814  # Hardcoded from baseline report
+    else:
+        v_mrr = 0.2814
+    checks.append((
+        "Hybrid MRR@10 > vector-only MRR@10 (M1 baseline)",
+        h_mrr > v_mrr,
+        f"hybrid={h_mrr:.4f}, vector-only-baseline={v_mrr:.4f}",
+    ))
 
     # 3. Reranked Precision@3 > unreranked Precision@3
     h_p3 = hybrid.get("precision_at_3", 0)
@@ -717,7 +560,7 @@ def main():
         "--modes",
         nargs="+",
         default=["hybrid", "hybrid-norerank", "bm25-only"],
-        choices=["hybrid", "hybrid-norerank", "bm25-only", "vector-only"],
+        choices=["hybrid", "hybrid-norerank", "bm25-only"],
         help="Retrieval modes to benchmark",
     )
     parser.add_argument(
@@ -746,8 +589,8 @@ def main():
     tasks = load_tasks()
     repos = sorted(set(t["repo"] for t in tasks))
 
-    print(f"Vera version: {get_vera_version()}")
-    print(f"Git SHA: {get_git_sha()}")
+    print(f"Vera version: {binary_version(VERA_BIN)}")
+    print(f"Git SHA: {git_sha()}")
     print(f"Tasks: {len(tasks)}")
     print(f"Repos: {', '.join(repos)}")
     print(f"Modes: {', '.join(args.modes)}")
@@ -800,8 +643,8 @@ def main():
 
     # Save combined results with metadata
     combined = {
-        "vera_version": get_vera_version(),
-        "git_sha": get_git_sha(),
+        "vera_version": binary_version(VERA_BIN),
+        "git_sha": git_sha(),
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "modes": vera_results,
         "index_stats": index_stats,

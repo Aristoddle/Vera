@@ -66,69 +66,76 @@ pub fn run(json_output: bool, probe: bool) -> anyhow::Result<()> {
         detail: backend.to_string(),
     });
 
-    if local_mode {
-        let ep = backend
-            .execution_provider()
-            .expect("local backend must include an execution provider");
-        let embedding_model = vera_core::local_models::LocalEmbeddingModelConfig::from_env()?;
-        checks.push(DoctorCheck {
-            name: "local-embedding-model",
-            status: CheckStatus::Ok,
-            detail: embedding_model.display_name(),
-        });
-        let runtime_path = vera_core::local_models::ort_library_path_for_ep(ep)?;
-        let runtime_check = vera_core::local_models::ensure_ort_runtime(Some(&runtime_path));
-        let runtime_detail = match &runtime_check {
-            Ok(()) => runtime_path.display().to_string(),
-            Err(err) => format!("{} ({})", runtime_path.display(), one_line_error(err)),
-        };
-        checks.push(DoctorCheck {
-            name: "onnx-runtime",
-            status: if runtime_check.is_ok() {
-                CheckStatus::Ok
-            } else {
-                CheckStatus::Fail
-            },
-            detail: runtime_detail,
-        });
+    match backend {
+        vera_core::config::InferenceBackend::OnnxJina(ep) => {
+            let embedding_model = vera_core::local_models::LocalEmbeddingModelConfig::from_env()?;
+            checks.push(DoctorCheck {
+                name: "local-embedding-model",
+                status: CheckStatus::Ok,
+                detail: embedding_model.display_name(),
+            });
+            let runtime_path = vera_core::local_models::ort_library_path_for_ep(ep)?;
+            let runtime_check = vera_core::local_models::ensure_ort_runtime(Some(&runtime_path));
+            let runtime_detail = match &runtime_check {
+                Ok(()) => runtime_path.display().to_string(),
+                Err(err) => format!("{} ({})", runtime_path.display(), one_line_error(err)),
+            };
+            checks.push(DoctorCheck {
+                name: "onnx-runtime",
+                status: if runtime_check.is_ok() {
+                    CheckStatus::Ok
+                } else {
+                    CheckStatus::Fail
+                },
+                detail: runtime_detail,
+            });
 
-        let model_assets =
-            vera_core::local_models::inspect_local_model_files_for_ep(ep, &embedding_model)?;
-        let present = model_assets.iter().filter(|asset| asset.exists).count();
-        checks.push(DoctorCheck {
-            name: "local-models",
-            status: if present == model_assets.len() {
-                CheckStatus::Ok
-            } else {
-                CheckStatus::Warn
-            },
-            detail: format!("{present}/{} local assets present", model_assets.len()),
-        });
-        if probe {
-            checks.extend(probe_local_backend(ep, &runtime_path, &model_assets)?);
+            let model_assets =
+                vera_core::local_models::inspect_local_model_files_for_ep(ep, &embedding_model)?;
+            let repair_hint = format!("run `vera repair --onnx-jina-{ep}`");
+            checks.push(local_model_assets_check(&model_assets, &repair_hint));
+            if probe {
+                checks.extend(probe_local_backend(ep, &runtime_path, &model_assets)?);
+            }
         }
-    } else {
-        checks.push(check_env_group(
-            "embedding-api",
-            &[
-                "EMBEDDING_MODEL_BASE_URL",
-                "EMBEDDING_MODEL_ID",
-                "EMBEDDING_MODEL_API_KEY",
-            ],
-        ));
-        checks.push(check_env_group(
-            "reranker-api",
-            &[
-                "RERANKER_MODEL_BASE_URL",
-                "RERANKER_MODEL_ID",
-                "RERANKER_MODEL_API_KEY",
-            ],
-        ));
-        if probe {
-            checks.push(skipped_check(
-                "probe",
-                "probe is only available for local ONNX backends",
+        vera_core::config::InferenceBackend::PotionCode => {
+            checks.push(DoctorCheck {
+                name: "local-embedding-model",
+                status: CheckStatus::Ok,
+                detail: vera_core::local_models::potion_code_model_name().to_string(),
+            });
+            let model_assets = vera_core::local_models::inspect_potion_code_model_files()?;
+            checks.push(local_model_assets_check(
+                &model_assets,
+                "run `vera repair --potion-code`",
             ));
+            if probe {
+                checks.extend(probe_potion_backend(&model_assets));
+            }
+        }
+        vera_core::config::InferenceBackend::Api => {
+            checks.push(check_env_group(
+                "embedding-api",
+                &[
+                    "EMBEDDING_MODEL_BASE_URL",
+                    "EMBEDDING_MODEL_ID",
+                    "EMBEDDING_MODEL_API_KEY",
+                ],
+            ));
+            checks.push(check_env_group(
+                "reranker-api",
+                &[
+                    "RERANKER_MODEL_BASE_URL",
+                    "RERANKER_MODEL_ID",
+                    "RERANKER_MODEL_API_KEY",
+                ],
+            ));
+            if probe {
+                checks.push(skipped_check(
+                    "probe",
+                    "probe is only available for local backends",
+                ));
+            }
         }
     }
 
@@ -218,6 +225,76 @@ fn saved_backend_check(config: &state::StoredConfig) -> DoctorCheck {
     }
 }
 
+fn local_model_assets_check(
+    model_assets: &[vera_core::local_models::LocalModelAssetStatus],
+    repair_hint: &str,
+) -> DoctorCheck {
+    let valid = model_assets.iter().filter(|asset| asset.is_valid()).count();
+    let missing = model_assets
+        .iter()
+        .filter(|asset| asset.is_missing())
+        .map(|asset| asset.name)
+        .collect::<Vec<_>>();
+    let invalid = model_assets
+        .iter()
+        .filter(|asset| asset.is_invalid())
+        .map(|asset| {
+            asset.detail.as_deref().map_or_else(
+                || asset.name.to_string(),
+                |detail| format!("{} ({detail})", asset.name),
+            )
+        })
+        .collect::<Vec<_>>();
+    let status = if invalid.is_empty() && missing.is_empty() {
+        CheckStatus::Ok
+    } else if invalid.is_empty() {
+        CheckStatus::Warn
+    } else {
+        CheckStatus::Fail
+    };
+    let detail = if !invalid.is_empty() {
+        format!(
+            "{valid}/{} local assets valid; invalid: {}; {repair_hint}",
+            model_assets.len(),
+            invalid.join(", ")
+        )
+    } else if !missing.is_empty() {
+        format!(
+            "{valid}/{} local assets valid; missing: {}; {repair_hint}",
+            model_assets.len(),
+            missing.join(", ")
+        )
+    } else {
+        format!("{valid}/{} local assets valid", model_assets.len())
+    };
+    DoctorCheck {
+        name: "local-models",
+        status,
+        detail,
+    }
+}
+
+fn probe_potion_backend(
+    model_assets: &[vera_core::local_models::LocalModelAssetStatus],
+) -> Vec<DoctorCheck> {
+    let missing = missing_assets(
+        model_assets,
+        &["potion-tokenizer", "potion-model", "potion-config"],
+    );
+    if !missing.is_empty() {
+        return vec![skipped_check(
+            "probe-potion-code",
+            format!("skipped because assets are missing: {}", missing.join(", ")),
+        )];
+    }
+
+    vec![result_check(
+        "probe-potion-code",
+        "potion-code returned a finite embedding".to_string(),
+        vera_core::embedding::Model2VecProvider::probe_inference(),
+    )]
+}
+
 fn probe_local_backend(
     ep: vera_core::config::OnnxExecutionProvider,
     runtime_path: &std::path::Path,
@@ -250,13 +327,31 @@ fn probe_local_backend(
     let provider_ok = matches!(provider_stage.status, CheckStatus::Ok);
     checks.push(provider_stage);
 
-    let embedding_session_stage = if ort_ok && provider_ok {
+    let dependencies_stage = if ep == vera_core::config::OnnxExecutionProvider::Cpu {
+        skipped_check(
+            "probe-dependencies",
+            "skipped for the CPU backend because provider-specific shared-library checks are not needed",
+        )
+    } else if ort_ok {
+        dependency_probe_check(ep, runtime_path)
+    } else {
+        skipped_check(
+            "probe-dependencies",
+            "skipped because ONNX Runtime could not be initialized",
+        )
+    };
+    let dependencies_ok = !matches!(dependencies_stage.status, CheckStatus::Fail);
+    checks.push(dependencies_stage);
+
+    let embedding_session_stage = if ort_ok && provider_ok && dependencies_ok {
         let missing = missing_assets(model_assets, &["embedding-onnx", "embedding-onnx-data"]);
         if missing.is_empty() {
             result_check(
                 "probe-embedding-session",
                 "embedding session created".to_string(),
-                vera_core::embedding::local_provider::LocalEmbeddingProvider::probe_session(ep),
+                wrap_onnx_session_probe(
+                    vera_core::embedding::local_provider::LocalEmbeddingProvider::probe_session(ep),
+                ),
             )
         } else {
             skipped_check(
@@ -267,18 +362,20 @@ fn probe_local_backend(
     } else {
         skipped_check(
             "probe-embedding-session",
-            "skipped because provider registration failed",
+            "skipped because provider registration or dependencies failed",
         )
     };
     checks.push(embedding_session_stage);
 
-    let reranker_session_stage = if ort_ok && provider_ok {
+    let reranker_session_stage = if ort_ok && provider_ok && dependencies_ok {
         let missing = missing_assets(model_assets, &["reranker-onnx"]);
         if missing.is_empty() {
             result_check(
                 "probe-reranker-session",
                 "reranker session created".to_string(),
-                vera_core::retrieval::local_reranker::LocalReranker::probe_session(ep),
+                wrap_onnx_session_probe(
+                    vera_core::retrieval::local_reranker::LocalReranker::probe_session(ep),
+                ),
             )
         } else {
             skipped_check(
@@ -289,12 +386,12 @@ fn probe_local_backend(
     } else {
         skipped_check(
             "probe-reranker-session",
-            "skipped because provider registration failed",
+            "skipped because provider registration or dependencies failed",
         )
     };
     checks.push(reranker_session_stage);
 
-    let tiny_inference_stage = if ort_ok && provider_ok {
+    let tiny_inference_stage = if ort_ok && provider_ok && dependencies_ok {
         let missing = missing_assets(
             model_assets,
             &[
@@ -327,7 +424,7 @@ fn probe_local_backend(
     } else {
         skipped_check(
             "probe-tiny-inference",
-            "skipped because provider registration failed",
+            "skipped because provider registration or dependencies failed",
         )
     };
     let tiny_inference_ok = matches!(tiny_inference_stage.status, CheckStatus::Ok);
@@ -348,14 +445,19 @@ fn probe_local_backend(
         });
     }
 
-    checks.push(if ep == vera_core::config::OnnxExecutionProvider::Cpu {
-        skipped_check(
-            "probe-dependencies",
-            "skipped for the CPU backend because provider-specific shared-library checks are not needed",
-        )
-    } else {
-        dependency_probe_check(runtime_path)
-    });
+    // No prebuilt reranker ONNX export runs on the CoreML GPU (the quantized
+    // export has ops the CoreML EP cannot execute, the fp16 export has an
+    // unsupported input dtype), so ORT silently falls back to CPU for the
+    // reranker even though the embedding model is GPU-accelerated. The probes
+    // above cannot detect this, so surface it deterministically here.
+    if ep == vera_core::config::OnnxExecutionProvider::CoreMl {
+        checks.push(DoctorCheck {
+            name: "probe-reranker-coreml-cpu",
+            status: CheckStatus::Warn,
+            detail: "the reranker runs on CPU under CoreML (no CoreML-compatible reranker ONNX export exists); only the embedding model is GPU-accelerated. Reranking will be slower than embedding. If reranking latency is unacceptable, disable it with `vera config set retrieval.reranking_enabled false`".to_string(),
+        });
+    }
+
     Ok(checks)
 }
 
@@ -369,7 +471,7 @@ fn missing_assets(
             model_assets
                 .iter()
                 .find(|asset| asset.name == *required_name)
-                .filter(|asset| !asset.exists)
+                .filter(|asset| !asset.is_valid())
                 .map(|asset| asset.name)
         })
         .collect()
@@ -402,7 +504,10 @@ fn skipped_check(name: &'static str, detail: impl Into<String>) -> DoctorCheck {
     }
 }
 
-fn dependency_probe_check(runtime_path: &std::path::Path) -> DoctorCheck {
+fn dependency_probe_check(
+    ep: vera_core::config::OnnxExecutionProvider,
+    runtime_path: &std::path::Path,
+) -> DoctorCheck {
     if !runtime_path.exists() {
         return skipped_check(
             "probe-dependencies",
@@ -410,7 +515,7 @@ fn dependency_probe_check(runtime_path: &std::path::Path) -> DoctorCheck {
         );
     }
 
-    match vera_core::local_models::inspect_shared_library_deps(runtime_path) {
+    match vera_core::local_models::inspect_provider_dependencies(ep, runtime_path) {
         Ok(Some(status)) => {
             if status.missing_details.is_empty() {
                 DoctorCheck {
@@ -439,6 +544,10 @@ fn dependency_probe_check(runtime_path: &std::path::Path) -> DoctorCheck {
             detail: one_line_error(&err),
         },
     }
+}
+
+fn wrap_onnx_session_probe(result: anyhow::Result<()>) -> anyhow::Result<()> {
+    result.map_err(|err| anyhow::anyhow!(vera_core::local_models::wrap_ort_error(err)))
 }
 
 fn version_check(status: &update_check::BinaryVersionStatus) -> DoctorCheck {

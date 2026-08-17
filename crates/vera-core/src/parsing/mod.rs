@@ -18,12 +18,22 @@ pub mod languages;
 pub mod references;
 pub mod signatures;
 pub mod sphinx;
+pub mod type_relations;
 
 use anyhow::{Context, Result};
 use tree_sitter::Parser;
 
 use crate::config::IndexingConfig;
 use crate::types::{Chunk, Language};
+
+/// Parsing diagnostics captured alongside chunk extraction.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ParseDiagnostics {
+    /// Whether the tree-sitter parse tree contained error nodes.
+    pub tree_has_error: bool,
+    /// Whether Vera had to fall back to Tier 0 line chunking.
+    pub used_tier0_fallback: bool,
+}
 
 /// Parse a source file and produce both chunks and call-site references in a
 /// single pass, avoiding redundant tree-sitter parsing and symbol extraction.
@@ -41,19 +51,33 @@ pub fn parse_file(
     language: Language,
     config: &IndexingConfig,
 ) -> Result<(Vec<Chunk>, Vec<references::RawReference>)> {
+    let (chunks, refs, _diagnostics) =
+        parse_file_with_diagnostics(source, file_path, language, config)?;
+    Ok((chunks, refs))
+}
+
+/// Parse a source file and return both code chunks and parser diagnostics.
+pub fn parse_file_with_diagnostics(
+    source: &str,
+    file_path: &str,
+    language: Language,
+    config: &IndexingConfig,
+) -> Result<(Vec<Chunk>, Vec<references::RawReference>, ParseDiagnostics)> {
     // Special-case formats that don't use standard symbol extraction.
     if language == Language::Markdown {
         let chunks = chunker::markdown_section_chunks(source, file_path);
         return Ok((
             chunker::split_oversized_chunks(chunks, config.max_chunk_bytes),
             Vec::new(),
+            ParseDiagnostics::default(),
         ));
     }
     if language == Language::Rst {
-        let chunks = parse_rst_section_chunks(source, file_path)?;
+        let (chunks, diagnostics) = parse_rst_section_chunks(source, file_path)?;
         return Ok((
             chunker::split_oversized_chunks(chunks, config.max_chunk_bytes),
             Vec::new(),
+            diagnostics,
         ));
     }
     if language.prefers_file_chunking() {
@@ -61,6 +85,18 @@ pub fn parse_file(
         return Ok((
             chunker::split_oversized_chunks(chunks, config.max_chunk_bytes),
             Vec::new(),
+            ParseDiagnostics::default(),
+        ));
+    }
+    if uses_indexing_tier0_fallback(language) {
+        let chunks = chunker::tier0_line_chunks(source, file_path, language);
+        return Ok((
+            chunker::split_oversized_chunks(chunks, config.max_chunk_bytes),
+            Vec::new(),
+            ParseDiagnostics {
+                used_tier0_fallback: true,
+                ..ParseDiagnostics::default()
+            },
         ));
     }
 
@@ -71,6 +107,10 @@ pub fn parse_file(
             return Ok((
                 chunker::split_oversized_chunks(chunks, config.max_chunk_bytes),
                 Vec::new(),
+                ParseDiagnostics {
+                    used_tier0_fallback: true,
+                    ..ParseDiagnostics::default()
+                },
             ));
         }
     };
@@ -83,6 +123,7 @@ pub fn parse_file(
     let tree = parser
         .parse(source, None)
         .context("tree-sitter parsing returned None")?;
+    let tree_has_error = tree.root_node().has_error();
 
     // Single symbol extraction pass reused for both chunking and references.
     let symbols = extractor::extract_symbols(&tree, source.as_bytes(), language);
@@ -90,7 +131,8 @@ pub fn parse_file(
         references::extract_references_with_symbols(&tree, source.as_bytes(), language, &symbols);
     let chunks = chunker::chunks_from_symbols(&symbols, source, file_path, language, config);
 
-    let chunks = if chunks.is_empty() && !source.trim().is_empty() {
+    let used_tier0_fallback = chunks.is_empty() && !source.trim().is_empty();
+    let chunks = if used_tier0_fallback {
         chunker::tier0_line_chunks(source, file_path, language)
     } else {
         chunks
@@ -99,7 +141,15 @@ pub fn parse_file(
     Ok((
         chunker::split_oversized_chunks(chunks, config.max_chunk_bytes),
         refs,
+        ParseDiagnostics {
+            tree_has_error,
+            used_tier0_fallback,
+        },
     ))
+}
+
+fn uses_indexing_tier0_fallback(language: Language) -> bool {
+    matches!(language, Language::Haskell)
 }
 
 /// Parse a source file and produce chunks (without references).
@@ -111,11 +161,15 @@ pub fn parse_and_chunk(
     language: Language,
     config: &IndexingConfig,
 ) -> Result<Vec<Chunk>> {
-    let (chunks, _refs) = parse_file(source, file_path, language, config)?;
+    let (chunks, _refs, _diagnostics) =
+        parse_file_with_diagnostics(source, file_path, language, config)?;
     Ok(chunks)
 }
 
-fn parse_rst_section_chunks(source: &str, file_path: &str) -> Result<Vec<Chunk>> {
+fn parse_rst_section_chunks(
+    source: &str,
+    file_path: &str,
+) -> Result<(Vec<Chunk>, ParseDiagnostics)> {
     let grammar = languages::tree_sitter_grammar(Language::Rst)
         .context("missing tree-sitter grammar for reStructuredText")?;
 
@@ -127,13 +181,26 @@ fn parse_rst_section_chunks(source: &str, file_path: &str) -> Result<Vec<Chunk>>
     let tree = parser
         .parse(source, None)
         .context("tree-sitter parsing returned None")?;
+    let tree_has_error = tree.root_node().has_error();
 
     let headings = extractor::extract_rst_section_titles(&tree, source.as_bytes());
     if headings.is_empty() {
-        return Ok(chunker::tier0_line_chunks(source, file_path, Language::Rst));
+        return Ok((
+            chunker::tier0_line_chunks(source, file_path, Language::Rst),
+            ParseDiagnostics {
+                tree_has_error,
+                used_tier0_fallback: true,
+            },
+        ));
     }
 
-    Ok(chunker::rst_section_chunks(source, file_path, &headings))
+    Ok((
+        chunker::rst_section_chunks(source, file_path, &headings),
+        ParseDiagnostics {
+            tree_has_error,
+            used_tier0_fallback: false,
+        },
+    ))
 }
 
 /// Parse a source file and extract call-site references only.
@@ -158,6 +225,9 @@ pub fn parse_and_extract_references(
     };
     references::extract_references(&tree, source.as_bytes(), language)
 }
+
+#[cfg(test)]
+pub(crate) mod test_support;
 
 #[cfg(test)]
 mod tests;

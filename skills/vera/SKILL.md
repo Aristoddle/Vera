@@ -1,6 +1,6 @@
 ---
 name: vera
-description: Semantic code search, regex pattern search, and symbol lookup across a local repository. Returns ranked markdown codeblocks with file path, line range, content, and optional symbol info. Use `vera search` for conceptual/behavioral queries (how a feature works, where logic lives, exploring unfamiliar code). Use `vera grep` for exact strings, regex patterns, imports, and TODOs. Use `vera references` to trace callers/callees. Use rg only for bulk find-and-replace or files outside the index.
+description: Semantic code search, exact regex search, structural intent search, and symbol reference lookup across a local repository. Returns ranked markdown codeblocks with file path, line range, content, and optional symbol info. Use `vera search` for conceptual/behavioral queries, `vera grep` for exact text, `vera structural` for common structural tasks, `vera references` for callers/callees, and `vera explain-path` to debug indexing decisions. Use rg only for bulk find-and-replace or files outside the index.
 ---
 
 # Vera
@@ -10,34 +10,47 @@ Semantic code search CLI. Combines BM25 keyword matching with vector similarity 
 ## Workflow
 
 1. Ensure Vera is installed and on `PATH` (add `.vera/` to `.gitignore` on first use). If missing: `references/install.md`.
-2. Configure exclusions: Vera respects `.gitignore` by default (no setup needed). If you need custom exclusions, create a `.veraignore` file (gitignore syntax). Important: `.veraignore` **replaces** `.gitignore` rules entirely. To keep gitignore rules and add your own on top, start `.veraignore` with `#include .gitignore`, then add only your extra patterns (do not repeat entries already in `.gitignore`). Use `--exclude` for one-off exclusions, `--no-ignore` to disable all ignore parsing, or `--verbose` during indexing to see which files are skipped.
-3. Index the repo: `vera index .` (first time) or `vera update .` (after edits). Use `vera index . --verbose` to debug exclusion rules.
+2. Configure exclusions: Vera respects `.gitignore` by default (no setup needed). If you need custom exclusions, create a `.veraignore` file (gitignore syntax). Important: `.veraignore` **replaces** `.gitignore` rules entirely. To keep gitignore rules and add your own on top, start `.veraignore` with `#include .gitignore`, then add only your extra patterns (do not repeat entries already in `.gitignore`). Use `--exclude` for one-off exclusions, `--no-ignore` to disable all ignore parsing, and `vera explain-path path/to/file` to debug why a file is or is not indexed.
+3. Index the repo: `vera index .` (first time) or `vera update .` (after edits; pass `--max-files <N>` to bound processed files per run and report deferred files, or `--no-progress` to disable interactive progress). Use `vera stats --json` to inspect index health (parse failures, tree-sitter error nodes, Tier 0 fallback).
 4. For long sessions, start the watcher: `vera watch .` (background process, Ctrl-C to stop, 2s debounce). This auto-updates the index on file changes and replaces manual `vera update .` calls.
-5. Get oriented: `vera overview` returns a project summary: language breakdown, directory structure, entry points, complexity hotspots, and detected conventions (frameworks, patterns, config files). Use this for onboarding before searching.
+5. Get oriented: `vera overview` returns a project summary: language breakdown, directory structure, entry points, complexity hotspots, and detected conventions (frameworks, patterns, config files). Add `--changed`, `--since <rev>`, or `--base <rev>` when the task is limited to modified files or a PR diff.
 6. Use `vera references <symbol>` to find callers; add `--callees` to see what it calls. `vera dead-code` lists functions with no callers.
 7. Search:
    ```sh
-    vera search "authentication middleware"
-    vera search "parse_config" --type function --limit 5
-    vera search "database connection" --lang rust --path "src/**"
-    vera search "OAuth token refresh" "JWT expiry handling" "auth middleware"
-    vera search "config" --intent "find where database connection strings are loaded"
-    vera search "keybind handling" --scope docs
+     vera search "authentication middleware"
+     vera search "parse_config" --type function --limit 5
+     vera search "database connection" --lang rust --path "src/**" --path "tests/**"
+     vera search "token validation" --changed          # only modified, staged, and untracked files
+     vera search "config loading" --base origin/main   # only files changed since merge-base
+     vera search "OAuth token refresh" "JWT expiry handling" "auth middleware"
+     vera search "config" --intent "find where database connection strings are loaded"
+     vera search "keybind handling" --scope docs
     vera search "mod loader" --scope runtime --include-generated
     vera search "config loading" --deep    # RAG-fusion query expansion (falls back to iterative symbol-following)
     vera search "auth" --compact            # signatures only: broad exploration in fewer tokens
    ```
 8. Regex search (exact patterns, imports, TODOs). `vera grep` only searches indexed files, so `.veraignore` and exclusion rules apply:
    ```sh
-    vera grep "fn\s+main"
-    vera grep "TODO|FIXME" -i              # case-insensitive
-    vera grep "queryClient|invalidateQueries" --path "frontend/src/**"
-    vera grep "Authorization" --lang rust --type function
-    vera grep "keybind" --scope docs        # scoped to docs
-    vera grep "use std::collections" --context 0  # no surrounding lines
-    vera grep "handler" --compact           # signatures only
+     vera grep "fn\s+main"
+     vera grep "TODO|FIXME" -i              # case-insensitive
+     vera grep "queryClient|invalidateQueries" --path "frontend/src/**"
+     vera grep "Authorization" --lang rust --type function
+     vera grep "TODO" --changed             # only modified files
+     vera grep "keybind" --scope docs        # scoped to docs
+     vera grep "use std::collections" --context 0  # no surrounding lines
+     vera grep "handler" --compact           # signatures only
    ```
-9. Use the first results (they are ranked by relevance). Output is markdown codeblocks by default.
+9. Structural search for common agent tasks:
+   ```sh
+    vera structural definitions parse_config
+    vera structural env DATABASE_URL
+    vera structural routes --path "src/**"
+    vera structural sql
+    vera structural impls Loader
+    vera references parse_config --changed
+   ```
+   Use `vera structural impls <symbol>` for explicit inheritance or conformance declarations only. It does not infer implicit interface satisfaction.
+10. Use the first results (they are ranked by relevance). Output is markdown codeblocks by default.
 
 ## Example Output
 
@@ -51,7 +64,7 @@ pub async fn search_hybrid(...) -> Result<Vec<SearchResult>> { ... }
 ```
 ````
 
-The info string contains `file_path:line_start-line_end` and optional `symbol_type:symbol_name`. Use `--json` for compact single-line JSON (programmatic consumption). `--raw` and `--timing` work with `vera search` and `vera grep`, and can appear before or after the subcommand.
+The info string contains `file_path:line_start-line_end` and optional `symbol_type:symbol_name`. Use `--json` for compact single-line JSON (programmatic consumption). `--raw` works with `vera search`, `vera grep`, and `vera references`; `--timing` works with `vera search` and `vera grep`. Both can appear before or after the subcommand.
 
 ## Choosing the Right Tool
 
@@ -59,9 +72,12 @@ The info string contains `file_path:line_start-line_end` and optional `symbol_ty
 |------|------|
 | Concepts, behavior, "how does X work" | `vera search` |
 | Exact strings, regex, imports, TODOs within indexed files | `vera grep` |
+| Definitions, env reads, routes, SQL, explicit implementation lookups | `vera structural` |
+| Exact callers or callees | `vera references` |
+| Explain why a file is or is not indexed | `vera explain-path` |
 | Bulk find-and-replace, file names, files outside index | `rg` |
 
-`vera search` understands synonyms and related concepts. `vera grep` matches literal patterns.
+`vera search` understands synonyms and related concepts. `vera grep` matches literal patterns. `vera structural` is the high-signal structural layer for agents, and `vera references` is the exact call-graph tool.
 
 ## Search Scopes
 
@@ -88,13 +104,15 @@ Vera favors source files by default. Use `--scope docs` for prose and ADRs, `--s
 - Use 2-3 varied queries to capture different aspects (e.g., "OAuth token refresh", "JWT expiry handling", "auth middleware"). You can pass them in one call: `vera search "OAuth token refresh" "JWT expiry handling" "auth middleware"`.
 - Add `--intent` when the query is ambiguous but your higher-level goal is clear (e.g., `vera search "config" --intent "find where database connection strings are loaded from environment variables"`).
 - For known symbol names, search the exact name: `vera search "parse_config"`.
-- Start broad, then narrow with `--lang`, `--path`, `--type`, `--limit`.
+- Start broad, then narrow with `--lang`, `--path`, `--type`, `--limit`. Repeat `--path` to OR multiple path patterns.
+- When reviewing a PR or a narrow worktree change, add `--changed`, `--since <rev>`, or `--base <rev>` before broadening the query.
 - After code changes mid-session, run `vera update .` before searching again (or use `vera watch .` to auto-update).
 
 ## Failure Recovery
 
 - `no index found` → `vera index .`
 - stale results after edits → `vera update .`
+- indexing surprise / missing file → `vera explain-path path/to/file`
 - local model/ONNX fails → `vera doctor --probe`, then `references/troubleshooting.md`
 - missing local assets → `vera repair`
 - switch GPU/model backend → `vera backend`

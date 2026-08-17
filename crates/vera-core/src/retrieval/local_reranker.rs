@@ -6,6 +6,7 @@ use ort::session::{Session, builder::GraphOptimizationLevel};
 use std::sync::{Arc, Mutex};
 use tokenizers::Tokenizer;
 use tokio::task;
+use tokio_util::sync::CancellationToken;
 
 const RERANKER_REPO: &str = "jinaai/jina-reranker-v2-base-multilingual";
 const TOKENIZER_FILE: &str = "tokenizer.json";
@@ -38,44 +39,33 @@ impl LocalReranker {
             }
         })?;
 
-        let onnx_path = ensure_model_file(
-            RERANKER_REPO,
-            crate::local_models::reranker_onnx_file_for_ep(ep),
-        )
-        .await
-        .map_err(|e| RerankerError::ApiError {
-            status: 500,
-            message: format!("Failed to download ONNX model: {}", e),
-        })?;
-
-        let tokenizer_path = ensure_model_file(RERANKER_REPO, TOKENIZER_FILE)
-            .await
-            .map_err(|e| RerankerError::ApiError {
-                status: 500,
-                message: format!("Failed to download tokenizer: {}", e),
-            })?;
-
-        let tokenizer = task::spawn_blocking(move || load_tokenizer(tokenizer_path))
-            .await
-            .map_err(|e| RerankerError::ApiError {
-                status: 500,
-                message: e.to_string(),
-            })?
-            .map_err(|e| RerankerError::ApiError {
-                status: 500,
-                message: e.to_string(),
-            })?;
-
-        let session = task::spawn_blocking(move || build_session(ep, onnx_path))
-            .await
-            .map_err(|e| RerankerError::ApiError {
-                status: 500,
-                message: e.to_string(),
-            })?
-            .map_err(|e| RerankerError::ApiError {
-                status: 500,
-                message: crate::local_models::wrap_ort_error(e),
-            })?;
+        let components = load_reranker_components(ep).await;
+        let (session, tokenizer) = match components {
+            Ok(components) => components,
+            Err(error) if ep != OnnxExecutionProvider::Cpu => {
+                tracing::warn!(
+                    backend = %ep,
+                    error = %error,
+                    "selected ONNX execution provider failed; retrying reranker session on CPU"
+                );
+                load_reranker_components(OnnxExecutionProvider::Cpu)
+                    .await
+                    .map_err(|fallback_error| RerankerError::ApiError {
+                        status: 500,
+                        message: format!(
+                            "{}\nCPU fallback also failed: {}",
+                            crate::local_models::wrap_ort_error(error),
+                            crate::local_models::wrap_ort_error(fallback_error)
+                        ),
+                    })?
+            }
+            Err(error) => {
+                return Err(RerankerError::ApiError {
+                    status: 500,
+                    message: crate::local_models::wrap_ort_error(error),
+                });
+            }
+        };
 
         Ok(Self {
             session: Arc::new(Mutex::new(session)),
@@ -86,7 +76,7 @@ impl LocalReranker {
     pub fn probe_session(ep: OnnxExecutionProvider) -> Result<()> {
         let ort_path = crate::local_models::ort_library_path_for_ep(ep)?;
         crate::local_models::ensure_ort_runtime(Some(&ort_path))?;
-        let (onnx_path, _) = default_asset_paths(ep)?;
+        let (onnx_path, _) = default_asset_paths()?;
         let _ = build_session(ep, onnx_path)?;
         Ok(())
     }
@@ -94,7 +84,7 @@ impl LocalReranker {
     pub fn probe_inference(ep: OnnxExecutionProvider) -> Result<()> {
         let ort_path = crate::local_models::ort_library_path_for_ep(ep)?;
         crate::local_models::ensure_ort_runtime(Some(&ort_path))?;
-        let (onnx_path, tokenizer_path) = default_asset_paths(ep)?;
+        let (onnx_path, tokenizer_path) = default_asset_paths()?;
         let mut session = build_session(ep, onnx_path)?;
         let tokenizer = load_tokenizer(tokenizer_path)?;
         run_probe_inference(&mut session, &tokenizer)
@@ -192,16 +182,28 @@ impl LocalReranker {
         Ok(results)
     }
 
-    fn do_rerank(&self, query: &str, documents: &[String]) -> Result<Vec<RerankScore>> {
+    fn do_rerank_cancellable(
+        &self,
+        query: &str,
+        documents: &[String],
+        cancel: &CancellationToken,
+    ) -> Result<Vec<RerankScore>, RerankerError> {
         if documents.is_empty() {
             return Ok(Vec::new());
         }
 
         let mut combined = Vec::with_capacity(documents.len());
         for (batch_index, batch) in documents.chunks(MAX_RERANK_BATCH_SIZE).enumerate() {
-            let mut scores =
-                self.do_rerank_batch(query, batch, batch_index * MAX_RERANK_BATCH_SIZE)?;
-            combined.append(&mut scores);
+            if cancel.is_cancelled() {
+                return Err(RerankerError::Cancelled);
+            }
+            let scores = self
+                .do_rerank_batch(query, batch, batch_index * MAX_RERANK_BATCH_SIZE)
+                .map_err(|e| RerankerError::ApiError {
+                    status: 500,
+                    message: e.to_string(),
+                })?;
+            combined.extend(scores);
         }
 
         combined.sort_by(|a, b| {
@@ -213,14 +215,32 @@ impl LocalReranker {
     }
 }
 
-fn default_asset_paths(
-    ep: OnnxExecutionProvider,
-) -> Result<(std::path::PathBuf, std::path::PathBuf)> {
+async fn load_reranker_components(ep: OnnxExecutionProvider) -> Result<(Session, Tokenizer)> {
+    let onnx_path = ensure_model_file(RERANKER_REPO, crate::local_models::RERANKER_ONNX_FILE)
+        .await
+        .with_context(|| {
+            format!(
+                "Failed to download ONNX model: {}",
+                crate::local_models::RERANKER_ONNX_FILE
+            )
+        })?;
+
+    let tokenizer_path = ensure_model_file(RERANKER_REPO, TOKENIZER_FILE)
+        .await
+        .context("Failed to download tokenizer")?;
+
+    let tokenizer = task::spawn_blocking(move || load_tokenizer(tokenizer_path)).await??;
+    let session = task::spawn_blocking(move || build_session(ep, onnx_path)).await??;
+
+    Ok((session, tokenizer))
+}
+
+fn default_asset_paths() -> Result<(std::path::PathBuf, std::path::PathBuf)> {
     let model_dir = crate::local_models::vera_home_dir()?
         .join("models")
         .join(RERANKER_REPO);
     Ok((
-        model_dir.join(crate::local_models::reranker_onnx_file_for_ep(ep)),
+        model_dir.join(crate::local_models::RERANKER_ONNX_FILE),
         model_dir.join(TOKENIZER_FILE),
     ))
 }
@@ -298,18 +318,32 @@ impl Reranker for LocalReranker {
         let documents = documents.to_vec();
 
         task::spawn_blocking(move || {
-            provider
-                .do_rerank(&query, &documents)
-                .map_err(|e| RerankerError::ApiError {
-                    status: 500,
-                    message: e.to_string(),
-                })
+            provider.do_rerank_cancellable(&query, &documents, &CancellationToken::new())
         })
         .await
         .map_err(|e| RerankerError::ApiError {
             status: 500,
             message: e.to_string(),
         })?
+    }
+
+    async fn rerank_cancellable(
+        &self,
+        query: &str,
+        documents: &[String],
+        cancel: &CancellationToken,
+    ) -> Result<Vec<RerankScore>, RerankerError> {
+        let provider = self.clone();
+        let query = query.to_string();
+        let documents = documents.to_vec();
+        let cancel = cancel.clone();
+
+        task::spawn_blocking(move || provider.do_rerank_cancellable(&query, &documents, &cancel))
+            .await
+            .map_err(|e| RerankerError::ApiError {
+                status: 500,
+                message: e.to_string(),
+            })?
     }
 }
 

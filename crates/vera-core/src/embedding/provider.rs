@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 use crate::chunk_text;
@@ -25,6 +26,11 @@ pub enum EmbeddingError {
     #[error("embedding API connection failed: {message}")]
     ConnectionError { message: String },
 
+    /// The request exceeded its client-side timeout. Retrying could duplicate
+    /// work when an upstream proxy continues processing after disconnect.
+    #[error("embedding API request timed out: {message}")]
+    TimeoutError { message: String },
+
     /// The API returned a non-auth, non-connection error.
     #[error("embedding API error (status {status}): {message}")]
     ApiError { status: u16, message: String },
@@ -36,6 +42,19 @@ pub enum EmbeddingError {
     /// Unexpected response format.
     #[error("unexpected embedding API response: {message}")]
     ResponseError { message: String },
+
+    /// Request was cancelled because the client disconnected.
+    #[error("embedding cancelled")]
+    Cancelled,
+}
+
+/// Wrap an internal failure as an `ApiError` with status 500 (local pipeline
+/// errors surface through the same variant as remote API errors).
+pub(crate) fn api_err(error: impl std::fmt::Display) -> EmbeddingError {
+    EmbeddingError::ApiError {
+        status: 500,
+        message: error.to_string(),
+    }
 }
 
 // ── Provider trait ───────────────────────────────────────────────────
@@ -64,6 +83,21 @@ pub trait EmbeddingProvider: Send + Sync {
     /// `None` means Vera should use the configured batch size as-is.
     fn max_batch_size(&self) -> Option<usize> {
         None
+    }
+
+    /// Like `embed_batch`, but aborts between sub-batches if `cancel` is fired.
+    ///
+    /// The default implementation ignores the token and delegates to `embed_batch`.
+    /// Providers that run blocking inference in sub-batch loops should override this
+    /// to check `cancel.is_cancelled()` between iterations so client disconnects
+    /// stop GPU work without waiting for the entire request to finish.
+    async fn embed_batch_cancellable(
+        &self,
+        texts: &[String],
+        cancel: &CancellationToken,
+    ) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+        let _ = cancel;
+        self.embed_batch(texts).await
     }
 }
 
@@ -251,20 +285,19 @@ impl OpenAiProvider {
             input: texts,
         };
 
-        // Rate limit errors get extra retries beyond the normal max.
-        let max_total_retries = self.config.max_retries + 4;
         let mut last_err = None;
-        for attempt in 0..=max_total_retries {
-            if attempt > 0 {
+        let mut retries = 0;
+        loop {
+            if retries > 0 {
                 let is_rate_limit = matches!(last_err, Some(EmbeddingError::RateLimitError { .. }));
                 let delay = if is_rate_limit {
                     // Rate limit: wait 2-4s with exponential backoff.
-                    Duration::from_secs(2 + u64::from(attempt.min(2)))
+                    Duration::from_secs(2 + u64::from(retries.min(2)))
                 } else {
-                    Duration::from_millis(500 * 2u64.pow(attempt.min(5) - 1))
+                    Duration::from_millis(500 * 2u64.pow(retries.min(5) - 1))
                 };
                 debug!(
-                    attempt,
+                    attempt = retries + 1,
                     delay_ms = delay.as_millis(),
                     rate_limited = is_rate_limit,
                     "retrying embedding API"
@@ -275,27 +308,28 @@ impl OpenAiProvider {
             match self.send_request(&url, &body).await {
                 Ok(vectors) => return Ok(vectors),
                 Err(e) => {
-                    // Don't retry auth or context-size errors; they won't
-                    // resolve with the same request. Context-size errors are
-                    // handled by embed_batch_resilient which truncates the text.
-                    if matches!(e, EmbeddingError::AuthError { .. }) || is_context_size_error(&e) {
+                    // A timed-out request may still be running behind a proxy,
+                    // so replaying it can create an abandoned-work queue.
+                    // Context-size errors are handled by embed_batch_resilient.
+                    if !is_retryable_error(&e) {
                         return Err(e);
                     }
+
+                    let retry_limit = retry_limit_for_error(&e, self.config.max_retries);
                     warn!(
-                        attempt = attempt + 1,
-                        max = max_total_retries + 1,
+                        attempt = retries + 1,
+                        max = retry_limit + 1,
                         error = %e,
                         "embedding API call failed"
                     );
+                    if retries >= retry_limit {
+                        return Err(e);
+                    }
                     last_err = Some(e);
+                    retries += 1;
                 }
             }
         }
-
-        Err(last_err.unwrap_or_else(|| EmbeddingError::ApiError {
-            status: 0,
-            message: "all retries exhausted".to_string(),
-        }))
     }
 
     /// Send a single HTTP request and parse the response.
@@ -313,7 +347,11 @@ impl OpenAiProvider {
             .send()
             .await
             .map_err(|e| {
-                if e.is_connect() || e.is_timeout() {
+                if e.is_timeout() {
+                    EmbeddingError::TimeoutError {
+                        message: format!("request to embedding API timed out: {e}"),
+                    }
+                } else if e.is_connect() {
                     EmbeddingError::ConnectionError {
                         message: format!("failed to connect to embedding API: {e}"),
                     }
@@ -327,21 +365,23 @@ impl OpenAiProvider {
         let status = response.status().as_u16();
 
         if status == 401 || status == 403 {
-            let text = response.text().await.unwrap_or_default();
+            let text = read_response_text(response, "failed to read authentication error response")
+                .await?;
             return Err(EmbeddingError::AuthError {
                 message: sanitize_error_message(&text),
             });
         }
 
         if status == 429 {
-            let text = response.text().await.unwrap_or_default();
+            let text = read_response_text(response, "failed to read rate limit response").await?;
             return Err(EmbeddingError::RateLimitError {
                 message: sanitize_error_message(&text),
             });
         }
 
         if !response.status().is_success() {
-            let text = response.text().await.unwrap_or_default();
+            let text =
+                read_response_text(response, "failed to read embedding error response").await?;
             // Some providers return 400 with "Unable to process" for transient
             // overload conditions. Treat these as rate limits so they get retried.
             if status == 400 && text.contains("Unable to process") {
@@ -355,13 +395,10 @@ impl OpenAiProvider {
             });
         }
 
-        let resp: EmbeddingResponse =
-            response
-                .json()
-                .await
-                .map_err(|e| EmbeddingError::ResponseError {
-                    message: format!("failed to parse embedding response: {e}"),
-                })?;
+        let resp: EmbeddingResponse = response
+            .json()
+            .await
+            .map_err(|error| response_read_error(error, "failed to parse embedding response"))?;
 
         // Sort by index to ensure correct ordering.
         let mut data = resp.data;
@@ -381,6 +418,28 @@ impl OpenAiProvider {
 
         Ok(vectors)
     }
+}
+
+fn response_read_error(error: reqwest::Error, context: &str) -> EmbeddingError {
+    if error.is_timeout() {
+        EmbeddingError::TimeoutError {
+            message: format!("{context}: {error}"),
+        }
+    } else {
+        EmbeddingError::ResponseError {
+            message: format!("{context}: {error}"),
+        }
+    }
+}
+
+async fn read_response_text(
+    response: reqwest::Response,
+    context: &str,
+) -> Result<String, EmbeddingError> {
+    response
+        .text()
+        .await
+        .map_err(|error| response_read_error(error, context))
 }
 
 impl EmbeddingProvider for OpenAiProvider {
@@ -421,6 +480,10 @@ impl EmbeddingProvider for OpenAiProvider {
 pub struct CachedEmbeddingProvider<P> {
     inner: P,
     cache: Mutex<LruCache>,
+    /// Namespace prefix for cache keys (typically the model id or provider URL).
+    /// Prevents cross-model cache poisoning when the same query text is embedded
+    /// by different models producing incompatible vectors.
+    namespace: String,
 }
 
 /// Simple bounded cache with insertion-order eviction.
@@ -467,6 +530,7 @@ impl LruCache {
         );
     }
 
+    #[cfg(test)]
     fn len(&self) -> usize {
         self.entries.len()
     }
@@ -477,16 +541,43 @@ impl<P: EmbeddingProvider> CachedEmbeddingProvider<P> {
     ///
     /// `max_entries` controls the maximum number of cached embeddings.
     /// A reasonable default for interactive use is 256–1024.
+    ///
+    /// `namespace` is a stable identifier for the embedding model (e.g.,
+    /// model name, provider URL, or config key). It prefixes every cache key
+    /// so that switching models invalidates the cache instead of silently
+    /// returning vectors from the wrong model.
     pub fn new(inner: P, max_entries: usize) -> Self {
         Self {
             inner,
             cache: Mutex::new(LruCache::new(max_entries)),
+            namespace: String::new(),
+        }
+    }
+
+    /// Create a cached provider with an explicit namespace for cache key isolation.
+    pub fn with_namespace(inner: P, max_entries: usize, namespace: impl Into<String>) -> Self {
+        Self {
+            inner,
+            cache: Mutex::new(LruCache::new(max_entries)),
+            namespace: namespace.into(),
         }
     }
 
     /// Return the number of currently cached entries.
+    #[cfg(test)]
     pub fn cache_size(&self) -> usize {
         self.cache.lock().unwrap().len()
+    }
+
+    /// Build a cache key that includes the namespace (model identity) so that
+    /// switching embedding models invalidates the cache rather than silently
+    /// returning vectors from a different model.
+    fn make_cache_key(&self, query: &str) -> String {
+        if self.namespace.is_empty() {
+            query.to_string()
+        } else {
+            format!("{}\0{}", self.namespace, query)
+        }
     }
 }
 
@@ -498,8 +589,8 @@ impl<P: EmbeddingProvider> EmbeddingProvider for CachedEmbeddingProvider<P> {
 
         // For single-text batches (query embedding), check cache first.
         if texts.len() == 1 {
-            let key = &texts[0];
-            if let Some(cached) = self.cache.lock().unwrap().get(key) {
+            let key = self.make_cache_key(&texts[0]);
+            if let Some(cached) = self.cache.lock().unwrap().get(&key) {
                 debug!("embedding cache hit for query");
                 return Ok(vec![cached.clone()]);
             }
@@ -510,7 +601,40 @@ impl<P: EmbeddingProvider> EmbeddingProvider for CachedEmbeddingProvider<P> {
 
         // Cache single-text results (query embeddings).
         if texts.len() == 1 && vectors.len() == 1 {
-            let key = texts[0].clone();
+            let key = self.make_cache_key(&texts[0]);
+            let vector = vectors[0].clone();
+            self.cache.lock().unwrap().insert(key, vector);
+            debug!("embedding cached for query");
+        }
+
+        Ok(vectors)
+    }
+
+    async fn embed_batch_cancellable(
+        &self,
+        texts: &[String],
+        cancel: &CancellationToken,
+    ) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Query cache hits do not perform provider work, so they can return
+        // immediately even when cancellation has already fired.
+        if texts.len() == 1 {
+            let key = self.make_cache_key(&texts[0]);
+            if let Some(cached) = self.cache.lock().unwrap().get(&key) {
+                debug!("embedding cache hit for query");
+                return Ok(vec![cached.clone()]);
+            }
+        }
+
+        // Preserve cancellation on cache misses so wrapped local providers
+        // can stop between their own inference sub-batches.
+        let vectors = self.inner.embed_batch_cancellable(texts, cancel).await?;
+
+        if texts.len() == 1 && vectors.len() == 1 {
+            let key = self.make_cache_key(&texts[0]);
             let vector = vectors[0].clone();
             self.cache.lock().unwrap().insert(key, vector);
             debug!("embedding cached for query");
@@ -574,6 +698,21 @@ fn effective_batch_size<P: EmbeddingProvider>(provider: &P, configured_batch_siz
     }
 }
 
+fn retry_limit_for_error(error: &EmbeddingError, configured_retries: u32) -> u32 {
+    if matches!(error, EmbeddingError::RateLimitError { .. }) {
+        configured_retries.saturating_add(4)
+    } else {
+        configured_retries
+    }
+}
+
+fn is_retryable_error(error: &EmbeddingError) -> bool {
+    !matches!(
+        error,
+        EmbeddingError::AuthError { .. } | EmbeddingError::TimeoutError { .. }
+    ) && !is_context_size_error(error)
+}
+
 #[derive(Clone)]
 struct EmbeddingBatchItem {
     original_index: usize,
@@ -585,9 +724,11 @@ fn embedding_error_message(error: &EmbeddingError) -> &str {
     match error {
         EmbeddingError::AuthError { message }
         | EmbeddingError::ConnectionError { message }
+        | EmbeddingError::TimeoutError { message }
         | EmbeddingError::ApiError { message, .. }
         | EmbeddingError::RateLimitError { message }
         | EmbeddingError::ResponseError { message } => message,
+        EmbeddingError::Cancelled => "embedding cancelled",
     }
 }
 
@@ -604,6 +745,7 @@ fn context_size_info(error: &EmbeddingError) -> Option<ContextSizeInfo> {
         && !lower.contains("\"n_ctx\"")
         && !lower.contains("too large to process")
         && !lower.contains("max allowed tokens per submitted batch")
+        && !lower.contains("maximum input length")
     {
         return None;
     }
@@ -615,6 +757,7 @@ fn context_size_info(error: &EmbeddingError) -> Option<ContextSizeInfo> {
     static N_PROMPT_RE: OnceLock<Regex> = OnceLock::new();
     static MAX_BATCH_TOKENS_RE: OnceLock<Regex> = OnceLock::new();
     static BATCH_TOKENS_RE: OnceLock<Regex> = OnceLock::new();
+    static MAX_INPUT_LENGTH_RE: OnceLock<Regex> = OnceLock::new();
     let n_ctx_re = N_CTX_RE.get_or_init(|| Regex::new(r#""n_ctx"\s*:\s*(\d+)"#).unwrap());
     let max_context_re =
         MAX_CONTEXT_RE.get_or_init(|| Regex::new(r"max context size \((\d+)").unwrap());
@@ -627,6 +770,9 @@ fn context_size_info(error: &EmbeddingError) -> Option<ContextSizeInfo> {
         .get_or_init(|| Regex::new(r"max allowed tokens per submitted batch is (\d+)").unwrap());
     let batch_tokens_re =
         BATCH_TOKENS_RE.get_or_init(|| Regex::new(r"your batch has (\d+) tokens?").unwrap());
+    // OpenAI: `Invalid 'input[3]': maximum input length is 8192 tokens.`
+    let max_input_length_re =
+        MAX_INPUT_LENGTH_RE.get_or_init(|| Regex::new(r"maximum input length is (\d+)").unwrap());
 
     let max_tokens = n_ctx_re
         .captures(&lower)
@@ -635,6 +781,11 @@ fn context_size_info(error: &EmbeddingError) -> Option<ContextSizeInfo> {
         .or_else(|| batch_size_re.captures(&lower).and_then(|caps| caps.get(1)))
         .or_else(|| {
             max_batch_tokens_re
+                .captures(&lower)
+                .and_then(|caps| caps.get(1))
+        })
+        .or_else(|| {
+            max_input_length_re
                 .captures(&lower)
                 .and_then(|caps| caps.get(1))
         })
@@ -733,7 +884,7 @@ async fn embed_batch_resilient<P: EmbeddingProvider>(
                 completed.extend(
                     batch
                         .into_iter()
-                        .zip(vectors.into_iter())
+                        .zip(vectors)
                         .map(|(item, vector)| (item.original_index, item.chunk_id, vector)),
                 );
             }
@@ -781,52 +932,6 @@ async fn embed_batch_resilient<P: EmbeddingProvider>(
     Ok(completed)
 }
 
-/// Embed all chunks using the given provider, respecting batch size.
-///
-/// Returns a vector of `(chunk_id, embedding)` pairs in the same order
-/// as the input chunks. All vectors have the same dimensionality.
-pub async fn embed_chunks<P: EmbeddingProvider>(
-    provider: &P,
-    chunks: &[Chunk],
-    batch_size: usize,
-    max_chunk_bytes: usize,
-) -> Result<Vec<(String, Vec<f32>)>, EmbeddingError> {
-    if chunks.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let batch_size = effective_batch_size(provider, batch_size);
-    let total = chunks.len();
-    let mut results: Vec<(String, Vec<f32>)> = Vec::with_capacity(total);
-
-    for (batch_idx, batch) in chunks.chunks(batch_size).enumerate() {
-        debug!(
-            batch = batch_idx + 1,
-            total_batches = total.div_ceil(batch_size),
-            batch_size = batch.len(),
-            "embedding batch"
-        );
-
-        let items: Vec<EmbeddingBatchItem> = batch
-            .iter()
-            .enumerate()
-            .map(|(index, chunk)| EmbeddingBatchItem {
-                original_index: index,
-                chunk_id: chunk.id.clone(),
-                text: chunk_to_embedding_text(chunk, max_chunk_bytes),
-            })
-            .collect();
-
-        let vectors = embed_batch_resilient(provider, items).await?;
-
-        for (_, chunk_id, vector) in vectors {
-            results.push((chunk_id, vector));
-        }
-    }
-
-    Ok(results)
-}
-
 /// Embed all chunks using the given provider with concurrent batch processing.
 ///
 /// Splits chunks into batches and sends up to `max_concurrent` batches
@@ -842,79 +947,15 @@ pub async fn embed_chunks_concurrent<P: EmbeddingProvider>(
     max_concurrent: usize,
     max_chunk_bytes: usize,
 ) -> Result<Vec<(String, Vec<f32>)>, EmbeddingError> {
-    if chunks.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let batch_size = effective_batch_size(provider, batch_size);
-    let max_concurrent = max_concurrent.max(1);
-    let total = chunks.len();
-    let total_batches = total.div_ceil(batch_size);
-
-    debug!(
-        total_chunks = total,
-        batch_size, total_batches, max_concurrent, "starting concurrent embedding"
-    );
-
-    // Sort chunks by text length so each batch has similar-length texts,
-    // minimizing wasted padding in the ONNX input tensors. This can cut
-    // local CPU inference time by 50%+ on codebases with mixed chunk sizes.
-    let mut indexed_chunks: Vec<(usize, &Chunk)> = chunks.iter().enumerate().collect();
-    indexed_chunks.sort_by_key(|(_, c)| c.content.len());
-
-    // Prepare all batch inputs upfront (in length-sorted order).
-    // (original_index, chunk_id) pairs + embedding texts per batch.
-    let batch_inputs: Vec<Vec<EmbeddingBatchItem>> = indexed_chunks
-        .chunks(batch_size)
-        .map(|batch| {
-            batch
-                .iter()
-                .map(|(orig_idx, chunk)| EmbeddingBatchItem {
-                    original_index: *orig_idx,
-                    chunk_id: chunk.id.clone(),
-                    text: chunk_to_embedding_text(chunk, max_chunk_bytes),
-                })
-                .collect()
-        })
-        .collect();
-
-    // (orig_index, chunk_id, embedding) — we track orig_index to restore order.
-    let mut all_results: Vec<(usize, String, Vec<f32>)> = Vec::with_capacity(total);
-
-    // Process in groups of max_concurrent to overlap API calls while
-    // keeping lifetime management simple (no task spawning needed).
-    for group_start in (0..batch_inputs.len()).step_by(max_concurrent) {
-        let group_end = (group_start + max_concurrent).min(batch_inputs.len());
-        let group = &batch_inputs[group_start..group_end];
-
-        let futures: Vec<_> = group
-            .iter()
-            .enumerate()
-            .map(|(i, items)| {
-                let batch_idx = group_start + i;
-                async move {
-                    debug!(batch = batch_idx + 1, total_batches, "embedding batch");
-                    embed_batch_resilient(provider, items.clone()).await
-                }
-            })
-            .collect();
-
-        // Run all futures in this group concurrently.
-        let results = futures::future::join_all(futures).await;
-        for result in results {
-            all_results.extend(result?);
-        }
-    }
-
-    // Restore original chunk order (undoing the length sort).
-    all_results.sort_by_key(|(orig_idx, _, _)| *orig_idx);
-
-    let results: Vec<(String, Vec<f32>)> = all_results
-        .into_iter()
-        .map(|(_, id, vec)| (id, vec))
-        .collect();
-
-    Ok(results)
+    embed_chunks_concurrent_with_progress(
+        provider,
+        chunks,
+        batch_size,
+        max_concurrent,
+        max_chunk_bytes,
+        |_, _| {},
+    )
+    .await
 }
 
 /// Like `embed_chunks_concurrent` but calls `on_progress(done, total)` after each batch.
@@ -1103,6 +1144,9 @@ pub(crate) mod test_helpers {
                             message: message.clone(),
                         }
                     }
+                    EmbeddingError::TimeoutError { message } => EmbeddingError::TimeoutError {
+                        message: message.clone(),
+                    },
                     EmbeddingError::ApiError { status, message } => EmbeddingError::ApiError {
                         status: *status,
                         message: message.clone(),
@@ -1113,6 +1157,7 @@ pub(crate) mod test_helpers {
                     EmbeddingError::ResponseError { message } => EmbeddingError::ResponseError {
                         message: message.clone(),
                     },
+                    EmbeddingError::Cancelled => EmbeddingError::Cancelled,
                 });
             }
 
@@ -1144,6 +1189,34 @@ pub(crate) mod test_helpers {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    struct CancellationAwareProvider;
+
+    impl EmbeddingProvider for CancellationAwareProvider {
+        async fn embed_batch(&self, _texts: &[String]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+            Err(EmbeddingError::ResponseError {
+                message: "non-cancellable path used".to_string(),
+            })
+        }
+
+        async fn embed_batch_cancellable(
+            &self,
+            _texts: &[String],
+            cancel: &CancellationToken,
+        ) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+            if cancel.is_cancelled() {
+                return Err(EmbeddingError::Cancelled);
+            }
+            Ok(vec![vec![1.0]])
+        }
+
+        fn expected_dim(&self) -> Option<usize> {
+            Some(1)
+        }
+    }
 
     #[test]
     fn prepare_query_text_with_prefix() {
@@ -1161,6 +1234,20 @@ mod tests {
         let config = EmbeddingProviderConfig::new("http://x".into(), "m".into(), "k".into());
         let provider = OpenAiProvider::new(config).unwrap();
         assert_eq!(provider.prepare_query_text("find foo"), "find foo");
+    }
+
+    #[tokio::test]
+    async fn cached_provider_forwards_cancellation_on_cache_miss() {
+        let cached = CachedEmbeddingProvider::new(CancellationAwareProvider, 8);
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        let result = cached
+            .embed_batch_cancellable(&["uncached query".to_string()], &cancel)
+            .await;
+
+        assert!(matches!(result, Err(EmbeddingError::Cancelled)));
+        assert_eq!(cached.cache_size(), 0);
     }
 
     #[test]
@@ -1263,5 +1350,95 @@ mod tests {
         assert_eq!(info.max_tokens, 120000);
         assert_eq!(info.input_tokens, Some(124417));
         assert!(is_context_size_error(&err));
+    }
+
+    #[test]
+    fn context_size_info_parses_openai_max_input_length_error() {
+        // OpenAI reports only the limit, not the input token count. See issue #21.
+        let err = EmbeddingError::ApiError {
+            status: 400,
+            message: "{\"error\":{\"message\":\"Invalid 'input[3]': maximum input length is 8192 tokens.\",\"type\":\"invalid_request_error\",\"param\":null,\"code\":null}}".to_string(),
+        };
+        let info = context_size_info(&err).expect("should recognize openai max input length error");
+        assert_eq!(info.max_tokens, 8192);
+        assert_eq!(info.input_tokens, None);
+        assert!(is_context_size_error(&err));
+    }
+
+    #[test]
+    fn rate_limits_receive_only_the_documented_extra_retries() {
+        let error = EmbeddingError::RateLimitError {
+            message: "busy".into(),
+        };
+        assert_eq!(retry_limit_for_error(&error, 3), 7);
+    }
+
+    #[test]
+    fn ordinary_failures_do_not_receive_rate_limit_retries() {
+        let error = EmbeddingError::ConnectionError {
+            message: "refused".into(),
+        };
+        assert_eq!(retry_limit_for_error(&error, 3), 3);
+    }
+
+    #[test]
+    fn timeouts_are_not_retried() {
+        let timeout = EmbeddingError::TimeoutError {
+            message: "upstream may still be working".into(),
+        };
+        let connection = EmbeddingError::ConnectionError {
+            message: "connection refused".into(),
+        };
+
+        assert!(!is_retryable_error(&timeout));
+        assert!(is_retryable_error(&connection));
+    }
+
+    #[tokio::test]
+    async fn delayed_rate_limit_body_is_a_non_retryable_timeout() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let server_request_count = request_count.clone();
+
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                server_request_count.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let mut request = [0_u8; 2048];
+                    let _ = stream.read(&mut request).await;
+                    stream
+                        .write_all(
+                            b"HTTP/1.1 429 Too Many Requests\r\nContent-Length: 4\r\nConnection: close\r\n\r\n",
+                        )
+                        .await
+                        .unwrap();
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    let _ = stream.write_all(b"slow").await;
+                });
+            }
+        });
+
+        let config = EmbeddingProviderConfig::new(
+            format!("http://{address}"),
+            "test-model".into(),
+            "test-key".into(),
+        )
+        .with_timeout(Duration::from_millis(50))
+        .with_max_retries(3);
+        let provider = OpenAiProvider::new(config).unwrap();
+
+        let error = tokio::time::timeout(
+            Duration::from_secs(1),
+            provider.embed_batch(&["input".to_string()]),
+        )
+        .await
+        .expect("a body timeout must not enter rate-limit backoff")
+        .unwrap_err();
+
+        assert!(matches!(error, EmbeddingError::TimeoutError { .. }));
+        assert_eq!(request_count.load(Ordering::SeqCst), 1);
+        server.abort();
     }
 }

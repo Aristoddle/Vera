@@ -1,6 +1,6 @@
 # Installation Guide
 
-Complete setup instructions for Vera. For the short version, see the [Quick Start](../README.md#quick-start) in the README.
+For the short path, use the [Quick Start](../README.md#quick-start) in the README.
 
 ## Install the Binary
 
@@ -23,6 +23,7 @@ Download from [GitHub Releases](https://github.com/lemon07r/Vera/releases) for L
 **Build from source** (Rust 1.85+):
 ```bash
 git clone https://github.com/lemon07r/Vera.git && cd Vera
+bash scripts/bootstrap-vendored-grammars.sh   # downloads the four grammars that are not tracked in git
 cargo build --release
 cp target/release/vera ~/.local/bin/
 vera setup
@@ -40,9 +41,9 @@ CPU, CUDA, ROCm, and OpenVINO images available. See [docker.md](docker.md).
 
 ## Set Up a Backend
 
-Vera's index and search always run locally. The "backend" only controls where embedding and reranking models run. There are two modes:
+Vera's index and search always run locally. The "backend" only controls where embedding and reranking models run.
 
-### API Mode (recommended)
+### API Mode
 
 Models run on a remote server. No downloads, no GPU required, works on any hardware. You just need an API key from any OpenAI-compatible provider.
 
@@ -58,42 +59,58 @@ Many providers offer free tiers or generous trial credits. Any OpenAI-compatible
 |----------|-----------|-------|
 | [Jina AI](https://jina.ai/) | Yes (1M tokens free) | Vera's default local models are Jina, so the API versions work well too |
 | [OpenAI](https://platform.openai.com/) | Trial credits | `text-embedding-3-small` or `text-embedding-3-large` |
-| [Voyage AI](https://www.voyageai.com/) | Free tier available | Code-optimized models |
+| [Voyage AI](https://www.voyageai.com/) | Free tier available | Code-optimized models (`voyage-code-3`, `rerank-2`) |
 | [Cohere](https://cohere.com/) | Trial key | `embed-english-v3.0` |
 
-You can also set the environment variables directly instead of using the wizard:
+For non-interactive setup, set the environment variables directly and add `--yes`:
 
 ```bash
 export EMBEDDING_MODEL_BASE_URL=https://api.jina.ai/v1
 export EMBEDDING_MODEL_ID=jina-embeddings-v3
 export EMBEDDING_MODEL_API_KEY=your-key
 
-# Optional: reranker for better precision
+# Optional: reranker for better precision (Jina or Voyage AI)
 export RERANKER_MODEL_BASE_URL=https://api.jina.ai/v1
 export RERANKER_MODEL_ID=jina-reranker-v2-base-multilingual
 export RERANKER_MODEL_API_KEY=your-key
 
-vera setup --api
+# Or for Voyage AI:
+# export RERANKER_MODEL_BASE_URL=https://api.voyageai.com/v1
+# export RERANKER_MODEL_ID=rerank-2
+# export RERANKER_MODEL_API_KEY=your-key
+
+vera setup --api --yes
 ```
+
+Vera automatically handles Voyage AI's rerank wire format when `RERANKER_MODEL_BASE_URL` points to `https://api.voyageai.com/v1`.
 
 Only model calls leave your machine. Indexing, storage, and search remain local.
 
-### Local Mode
+### CPU Local Mode
 
-Models run on your machine using ONNX Runtime. Vera downloads two small models (~100 MB total) and auto-detects your GPU. No API key needed, fully offline after setup.
+Potion Code runs on CPU with static embeddings. It does not need ONNX Runtime or a GPU.
+
+```bash
+vera setup --potion-code
+```
+
+Use this for CPU-only machines when you want local model calls. The interactive `vera setup` wizard selects Potion Code when it does not detect a supported GPU.
+
+### GPU Local Mode
+
+Models run on your machine using ONNX Runtime. Vera downloads the Jina embedding model and the local reranker, then uses your GPU provider. No API key needed, fully offline after setup.
 
 **Pick the right command for your hardware:**
 
 | You have | Command | What happens |
 |----------|---------|-------------|
 | Not sure | `vera setup` | Interactive wizard auto-detects your hardware |
+| CPU only | `vera setup --potion-code` | Uses Potion Code static embeddings |
 | Apple Silicon (M1/M2/M3/M4) | `vera setup --onnx-jina-coreml` | Uses CoreML GPU acceleration |
 | NVIDIA GPU | `vera setup --onnx-jina-cuda` | Uses CUDA. Fastest local option |
 | AMD GPU (Linux) | `vera setup --onnx-jina-rocm` | Uses ROCm |
 | Intel GPU (Linux) | `vera setup --onnx-jina-openvino` | Uses OpenVINO |
 | DirectX 12 GPU (Windows) | `vera setup --onnx-jina-directml` | Uses DirectML |
-
-> **Note:** Local mode on CPU (without a GPU) works but is slow for initial indexing. If you don't have a GPU, API mode is the better choice. After the first index, `vera update .` only re-embeds changed files, so incremental updates are fast even on CPU.
 
 For custom ONNX models, GPU-specific tuning, and inference speed comparisons, see [models.md](models.md).
 
@@ -101,7 +118,7 @@ For custom ONNX models, GPU-specific tuning, and inference speed comparisons, se
 
 ```bash
 vera doctor          # checks config, models, and connectivity
-vera doctor --probe  # deeper ONNX runtime diagnostics
+vera doctor --probe  # deeper local backend diagnostics
 ```
 
 ## Index and Search
@@ -133,14 +150,20 @@ This is optional but recommended if you use AI coding agents. The interactive fl
 Use Vera before opening many files or running broad text search when you need to find where logic lives or how a feature works.
 
 - `vera search "query"` for semantic code search. Describe behavior: "JWT validation", not "auth". If one phrasing misses, try 2-3 varied queries or add `--intent "goal"`.
+- `vera search ... --changed`, `--since <rev>`, or `--base <rev>` when the task is limited to modified files or a PR diff
 - `vera grep "pattern"` for exact text or regex in indexed files
-- `vera references <symbol>` for callers and callees
-- `vera overview` for a project summary (languages, entry points, hotspots)
-- `vera search --deep "query"` for query decomposition + parallel search with weighted fusion
+- `vera structural definitions <symbol>`, `vera structural env <NAME>`, `vera structural routes`, or `vera structural impls <symbol>` for common structural tasks and explicit type relationships
+- `vera explain-path path/to/file` to explain why a file is or is not indexed
+- `vera references <symbol>` for callers and `vera references <symbol> --callees` for callees
+- `vera overview` for a project summary (languages, entry points, hotspots). Add `--changed`, `--since <rev>`, or `--base <rev>` to scope it to modified files.
+- `vera stats --json` for index health, including tree-sitter error, parse-failure, and Tier 0 fallback counts
+- `vera search --deep "query"` for RAG-fusion query expansion + merged ranking
 - Narrow `vera search` or `vera grep` with `--lang`, `--path`, `--type`, or `--scope docs`
 - `vera watch .` to auto-update the index, or `vera update .` after edits (`vera index .` if `.vera/` is missing)
 - For detailed usage, query patterns, and troubleshooting, read the Vera skill file installed by `vera agent install`
 ```
+
+`vera structural impls <symbol>` only finds explicit declarations such as `implements`, `extends`, `with`, `:`, or `impl Trait for Type`. It does not infer implicit interface satisfaction.
 
 </details>
 
@@ -184,7 +207,7 @@ vera uninstall   # removes config dir, skill files, PATH shim
 ## Troubleshooting
 
 - Run `vera doctor` to diagnose issues.
-- Run `vera doctor --probe` for deeper ONNX diagnostics.
+- Run `vera doctor --probe` for deeper local backend diagnostics.
 - Wrong backend? Run `vera setup` again with a different flag.
-- Slow indexing on CPU? Switch to `--api` mode or use a GPU backend.
+- Slow Jina indexing on CPU? Switch to `--potion-code`, `--api`, or a GPU backend.
 - See [troubleshooting.md](troubleshooting.md) for more.

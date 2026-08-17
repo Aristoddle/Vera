@@ -4,7 +4,7 @@
 
 ```sh
 npx -y @vera-ai/cli install   # or: bunx @vera-ai/cli install / uvx vera-ai install
-vera setup                      # downloads local ONNX models + runtime
+vera setup                      # interactive backend wizard
 vera index .
 vera search "your query"
 ```
@@ -28,13 +28,19 @@ GPU flags download the matching ONNX Runtime build automatically.
 Point Vera at any OpenAI-compatible embedding endpoint:
 
 ```sh
-export EMBEDDING_MODEL_BASE_URL=https://your-embedding-api/v1
-export EMBEDDING_MODEL_ID=your-model
-export EMBEDDING_MODEL_API_KEY=your-key
 vera setup --api
 ```
 
-Optional reranker: set `RERANKER_MODEL_BASE_URL`, `RERANKER_MODEL_ID`, `RERANKER_MODEL_API_KEY` before running `vera setup --api`.
+For non-interactive setup, export the endpoint values first and add `--yes`:
+
+```sh
+export EMBEDDING_MODEL_BASE_URL=https://your-embedding-api/v1
+export EMBEDDING_MODEL_ID=your-model
+export EMBEDDING_MODEL_API_KEY=your-key
+vera setup --api --yes
+```
+
+Optional reranker: enter it during interactive setup, or set `RERANKER_MODEL_BASE_URL`, `RERANKER_MODEL_ID`, and `RERANKER_MODEL_API_KEY` before running `vera setup --api --yes`.
 
 ## Skill Management
 
@@ -57,8 +63,8 @@ The `agents` client writes to the cross-agent `.agents/skills/` directory, which
 
 ```sh
 vera upgrade              # show update plan
-vera upgrade --apply      # execute upgrade (auto-syncs stale agent skill installs)
-vera agent sync           # manually sync skill files to match current binary version
+vera upgrade --apply      # execute the binary upgrade
+vera agent sync           # sync skill files and refresh managed project snippets
 ```
 
 ## Uninstalling

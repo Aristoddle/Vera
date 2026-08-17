@@ -122,11 +122,6 @@ impl CompletionClient {
         Ok(Self { client, config })
     }
 
-    /// Generate alternative code-search queries for RAG fusion.
-    pub fn expand_query(&self, query: &str) -> Result<Vec<String>> {
-        self.expand_query_with_context(query, &[])
-    }
-
     /// Generate alternative queries with optional codebase context from a BM25
     /// pre-filter. When `context_hints` is non-empty the LLM sees real symbol
     /// names and file paths from the index, producing more targeted rewrites.

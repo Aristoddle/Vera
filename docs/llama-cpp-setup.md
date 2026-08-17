@@ -60,6 +60,8 @@ llama-server \
 
 ### Option A: Environment Variables
 
+Run commands directly from this shell, or persist the config with `vera setup --api --yes` after exporting the variables.
+
 ```bash
 # Embedding (required)
 export EMBEDDING_MODEL_BASE_URL="http://localhost:8059/v1"
@@ -80,6 +82,9 @@ export VERA_COMPLETION_TIMEOUT_SECS="120"
 
 # Skip update checks in offline environments
 export VERA_NO_UPDATE_CHECK="1"
+
+# Optional: persist the embedding and reranker endpoints in Vera config
+vera setup --api --yes
 ```
 
 ### Option B: Interactive Setup
@@ -107,7 +112,7 @@ vera config set indexing.max_chunk_bytes 1800
 
 # Limit reranker batch size and document length
 export VERA_MAX_RERANK_BATCH=8
-export RERANKER_MAX_DOCUMENT_CHARS=1200
+export VERA_MAX_RERANK_DOC_CHARS=1200
 
 # Increase completion budget for reasoning models
 export VERA_COMPLETION_MAX_TOKENS=16384
@@ -141,7 +146,7 @@ Make sure the environment variables from step 4 are available to the MCP process
 ## Troubleshooting
 
 - **Embedding errors**: verify the server is running and the model ID matches the GGUF filename
-- **Reranker context errors**: lower `RERANKER_MAX_DOCUMENT_CHARS` or `VERA_MAX_RERANK_BATCH`
+- **Reranker context errors**: lower `VERA_MAX_RERANK_DOC_CHARS` or `VERA_MAX_RERANK_BATCH`
 - **`--deep` behaves like normal search**: completion env vars are not set; Vera falls back to iterative symbol-following search
 - **`--deep` fails with query expansion errors**: ensure the completion model returns JSON; increase `VERA_COMPLETION_MAX_TOKENS` for reasoning models
 - **Slow indexing**: reduce `indexing.max_chunk_bytes` or add exclusions to `.veraignore`

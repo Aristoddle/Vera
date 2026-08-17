@@ -1,15 +1,98 @@
 //! Shared helper functions for CLI command implementations.
 
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
 use clap::Args;
-use serde::Serialize;
+use vera_core::presentation::{CompactResult, truncate_to_budget};
+
+/// Wait for the process interrupt used to cancel long-running CLI operations.
+pub async fn wait_for_interrupt() {
+    let _ = tokio::signal::ctrl_c().await;
+}
+
+/// Run an operation until it completes or an interrupt signal wins.
+///
+/// Dropping the operation future propagates cancellation through in-flight
+/// client requests instead of leaving the CLI runtime alive until they finish.
+pub async fn cancel_on_signal<T, Operation, Signal>(
+    operation: Operation,
+    signal: Signal,
+    operation_name: &str,
+) -> anyhow::Result<T>
+where
+    Operation: std::future::Future<Output = anyhow::Result<T>>,
+    Signal: std::future::Future<Output = ()>,
+{
+    tokio::select! {
+        result = operation => result,
+        _ = signal => anyhow::bail!("{operation_name} cancelled"),
+    }
+}
 
 /// Load the effective runtime configuration.
 pub fn load_runtime_config() -> anyhow::Result<vera_core::config::VeraConfig> {
     crate::state::load_runtime_config()
 }
 
+pub fn warn_if_index_stale(repo_path: &Path, indexing_config: &vera_core::config::IndexingConfig) {
+    match vera_core::indexing::detect_staleness(repo_path, indexing_config) {
+        Ok(freshness) if freshness.is_stale() => {
+            let stderr = std::io::stderr();
+            let mut err = stderr.lock();
+            let _ = writeln!(
+                err,
+                "warning: index may be stale: {}. Search and grep only cover indexed files. Run `vera update .` or `vera watch .`.",
+                freshness.summary()
+            );
+        }
+        Ok(_) => {}
+        Err(err) => {
+            tracing::debug!(error = %err, "failed to check index freshness");
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Args)]
+pub struct SearchFilterArgs {
+    /// Filter by programming language (case-insensitive).
+    #[arg(long)]
+    pub lang: Option<String>,
+    /// Filter by file path glob pattern (e.g., "src/**/*.rs"). Repeatable;
+    /// patterns are combined with OR semantics.
+    #[arg(long)]
+    pub path: Vec<String>,
+    /// Filter by symbol type.
+    /// Note: function and method are treated as aliases.
+    #[arg(long, rename_all = "snake_case")]
+    pub r#type: Option<String>,
+    /// Restrict results to a coarse corpus scope.
+    #[arg(long, value_parser = ["source", "docs", "runtime", "all"])]
+    pub scope: Option<String>,
+    /// Include generated or minified files such as dist bundles.
+    #[arg(long)]
+    pub include_generated: bool,
+}
+
+impl SearchFilterArgs {
+    pub fn to_filters(&self) -> vera_core::types::SearchFilters {
+        vera_core::types::SearchFilters {
+            language: self.lang.clone(),
+            path_glob: self.path.clone(),
+            exact_paths: None,
+            symbol_type: self.r#type.clone(),
+            scope: self.scope.as_deref().and_then(|value| value.parse().ok()),
+            include_generated: Some(self.include_generated),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Args)]
 pub struct LocalBackendFlags {
+    /// Use Potion Code static embeddings on CPU.
+    #[arg(long = "potion-code", visible_alias = "potion-cpu", group = "backend")]
+    pub potion_code: bool,
     /// Use local ONNX models on CPU.
     #[arg(long = "onnx-jina-cpu", group = "backend")]
     pub onnx_jina_cpu: bool,
@@ -33,9 +116,75 @@ pub struct LocalBackendFlags {
     pub local: bool,
 }
 
+#[derive(Debug, Clone, Default, Args)]
+pub struct GitScopeFlags {
+    /// Limit results to modified, staged, and untracked files.
+    #[arg(long, group = "git_scope")]
+    pub changed: bool,
+    /// Limit results to files changed since the given revision.
+    #[arg(long, value_name = "REV", group = "git_scope")]
+    pub since: Option<String>,
+    /// Limit results to files changed since merge-base(HEAD, REV).
+    #[arg(long, value_name = "REV", group = "git_scope")]
+    pub base: Option<String>,
+}
+
+impl GitScopeFlags {
+    pub fn resolve(&self) -> Option<vera_core::git_scope::GitScope> {
+        if self.changed {
+            Some(vera_core::git_scope::GitScope::Changed)
+        } else if let Some(rev) = self.since.as_ref() {
+            Some(vera_core::git_scope::GitScope::Since(rev.clone()))
+        } else {
+            self.base
+                .as_ref()
+                .map(|rev| vera_core::git_scope::GitScope::Base(rev.clone()))
+        }
+    }
+}
+
+pub fn prepare_indexed_repo(
+    indexing_config: &vera_core::config::IndexingConfig,
+) -> anyhow::Result<(PathBuf, PathBuf)> {
+    let cwd = std::env::current_dir()
+        .map_err(|e| anyhow::anyhow!("failed to get current directory: {e}"))?;
+    let index_dir = vera_core::indexing::index_dir(&cwd);
+    if !index_dir.exists() {
+        anyhow::bail!(
+            "no index found in current directory.\n\
+             Hint: run `vera index <path>` first to create an index."
+        );
+    }
+    warn_if_index_stale(&cwd, indexing_config);
+    Ok((cwd, index_dir))
+}
+
+pub fn apply_git_scope(
+    cwd: &Path,
+    filters: &vera_core::types::SearchFilters,
+    git_scope: Option<&vera_core::git_scope::GitScope>,
+) -> anyhow::Result<vera_core::types::SearchFilters> {
+    let mut filters = filters.clone();
+    if let Some(scope) = git_scope {
+        filters.exact_paths = Some(Arc::new(vera_core::git_scope::resolve_scope(cwd, scope)?));
+    }
+    Ok(filters)
+}
+
+pub fn prepare_indexed_search(
+    indexing_config: &vera_core::config::IndexingConfig,
+    filters: &vera_core::types::SearchFilters,
+    git_scope: Option<&vera_core::git_scope::GitScope>,
+) -> anyhow::Result<(PathBuf, vera_core::types::SearchFilters)> {
+    let (cwd, index_dir) = prepare_indexed_repo(indexing_config)?;
+    let filters = apply_git_scope(&cwd, filters, git_scope)?;
+    Ok((index_dir, filters))
+}
+
 impl LocalBackendFlags {
     pub fn any_set(&self) -> bool {
-        self.onnx_jina_cpu
+        self.potion_code
+            || self.onnx_jina_cpu
             || self.onnx_jina_cuda
             || self.onnx_jina_rocm
             || self.onnx_jina_directml
@@ -125,7 +274,9 @@ impl LocalEmbeddingModelFlags {
 /// Resolve an `InferenceBackend` from the per-command boolean flags.
 pub fn resolve_backend_flags(flags: &LocalBackendFlags) -> vera_core::config::InferenceBackend {
     use vera_core::config::{InferenceBackend, OnnxExecutionProvider};
-    let explicit = if flags.onnx_jina_cpu || flags.local {
+    let explicit = if flags.potion_code {
+        Some(InferenceBackend::PotionCode)
+    } else if flags.onnx_jina_cpu || flags.local {
         Some(InferenceBackend::OnnxJina(OnnxExecutionProvider::Cpu))
     } else if flags.onnx_jina_cuda {
         Some(InferenceBackend::OnnxJina(OnnxExecutionProvider::Cuda))
@@ -141,50 +292,6 @@ pub fn resolve_backend_flags(flags: &LocalBackendFlags) -> vera_core::config::In
         None
     };
     vera_core::config::resolve_backend(explicit)
-}
-
-/// Compact JSON representation that drops low-signal fields (`score`, `language`)
-/// and omits null optional fields. This is the default for AI agent consumption.
-#[derive(Serialize)]
-struct CompactResult<'a> {
-    file_path: &'a str,
-    line_start: u32,
-    line_end: u32,
-    content: &'a str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    symbol_name: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    symbol_type: Option<&'a vera_core::types::SymbolType>,
-}
-
-impl<'a> CompactResult<'a> {
-    fn from_search_result(r: &'a vera_core::types::SearchResult) -> Self {
-        Self {
-            file_path: &r.file_path,
-            line_start: r.line_start,
-            line_end: r.line_end,
-            content: &r.content,
-            symbol_name: r.symbol_name.as_deref(),
-            symbol_type: r.symbol_type.as_ref(),
-        }
-    }
-}
-
-/// Truncate `content` to fit within `allowed` bytes, breaking at a line boundary.
-fn truncate_to_budget(content: &str, allowed: usize) -> std::borrow::Cow<'_, str> {
-    if content.len() <= allowed {
-        return std::borrow::Cow::Borrowed(content);
-    }
-    let end = content
-        .char_indices()
-        .take_while(|(i, _)| *i < allowed)
-        .last()
-        .map(|(i, c)| i + c.len_utf8())
-        .unwrap_or(0);
-    let break_at = content[..end].rfind('\n').unwrap_or(end);
-    let mut truncated = content[..break_at].to_string();
-    truncated.push_str("\n[...truncated]");
-    std::borrow::Cow::Owned(truncated)
 }
 
 /// Output search results with a total character budget.
@@ -229,7 +336,7 @@ pub fn output_results(
             .map(|(i, r)| {
                 let mut cr = CompactResult::from_search_result(r);
                 if compact {
-                    cr.content = &compacted[i];
+                    cr.content = std::borrow::Cow::Borrowed(compacted[i].as_str());
                 }
                 cr
             })
@@ -328,6 +435,23 @@ pub fn print_human_summary(summary: &vera_core::indexing::IndexSummary, verbose:
     println!("  Embeddings generated: {}", summary.embeddings_generated);
     println!("  Elapsed time:        {:.2}s", summary.elapsed_secs);
 
+    if summary.files_with_tree_sitter_errors > 0 || summary.files_using_tier0_fallback > 0 {
+        println!();
+        println!("  Index health:");
+        if summary.files_with_tree_sitter_errors > 0 {
+            println!(
+                "    Tree-sitter errors: {}",
+                summary.files_with_tree_sitter_errors
+            );
+        }
+        if summary.files_using_tier0_fallback > 0 {
+            println!(
+                "    Tier 0 fallback:    {}",
+                summary.files_using_tier0_fallback
+            );
+        }
+    }
+
     // Report skipped files if any.
     let skipped_total = summary.binary_skipped + summary.large_skipped + summary.error_skipped;
     if skipped_total > 0 {
@@ -366,5 +490,67 @@ pub fn print_human_summary(summary: &vera_core::indexing::IndexSummary, verbose:
     if summary.files_parsed == 0 && summary.chunks_created == 0 {
         println!();
         println!("  No source files found to index.");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[test]
+    fn index_freshness_summary_formats_nonzero_counts() {
+        let freshness = vera_core::indexing::IndexFreshness {
+            files_added: 2,
+            files_modified: 1,
+            files_deleted: 3,
+        };
+        assert_eq!(freshness.summary(), "2 added, 1 modified, 3 deleted");
+    }
+
+    struct DropMarker(Arc<AtomicBool>);
+
+    impl Drop for DropMarker {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn operation_result_wins_before_cancellation() {
+        let result = cancel_on_signal(
+            async { Ok::<_, anyhow::Error>(42) },
+            std::future::pending(),
+            "test operation",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result, 42);
+    }
+
+    #[tokio::test]
+    async fn cancellation_drops_in_flight_operation() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let dropped_for_operation = dropped.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+
+        let operation = async move {
+            let _marker = DropMarker(dropped_for_operation);
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+            Ok::<_, anyhow::Error>(())
+        };
+        let signal = async move {
+            let _ = started_rx.await;
+        };
+
+        let error = cancel_on_signal(operation, signal, "test operation")
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("test operation cancelled"));
+        assert!(dropped.load(Ordering::SeqCst));
     }
 }

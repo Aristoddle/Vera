@@ -15,25 +15,32 @@ npm install -g @vera-ai/cli
 ## Quick Start
 
 ```bash
-vera setup --api
+vera setup --potion-code
 vera index .
 vera search "authentication logic"
 ```
 
-`vera setup` with no flags runs an interactive wizard. `vera agent install` manages skill files for your coding agents and can update `AGENTS.md` / `CLAUDE.md` style project instructions.
+`vera setup` with no flags runs an interactive wizard. `vera setup --api` prompts for an OpenAI-compatible endpoint and key; use `--yes` with `EMBEDDING_MODEL_*` variables for non-interactive setup. `vera agent install` manages skill files for your coding agents and can update `AGENTS.md` / `CLAUDE.md` style project instructions.
 
 ## Common Tasks
 
 | Task | Command |
 |------|---------|
 | Use the interactive setup wizard | `vera setup` |
-| Use API mode (recommended) | `vera setup --api` |
+| Use CPU-only local mode | `vera setup --potion-code` |
+| Configure API mode | `vera setup --api` |
 | Use a local NVIDIA backend | `vera setup --onnx-jina-cuda` |
 | Search semantically | `vera search "authentication middleware"` |
+| Search only changed files | `vera search "authentication middleware" --changed` |
+| Common structural tasks | `vera structural routes` / `vera structural env DATABASE_URL` / `vera structural impls Loader` |
+| Find callers or callees | `vera references foo` / `vera references foo --callees` |
+| Explain why a file is missing | `vera explain-path path/to/file` |
+| Inspect index health | `vera stats --json` |
 | Keep the index up to date | `vera update .` |
 | Watch for file changes | `vera watch .` |
+| Run local HTTP inference server | `vera serve` |
 | Diagnose setup issues | `vera doctor` |
-| Run the deeper ONNX probe | `vera doctor --probe` |
+| Run the deeper local probe | `vera doctor --probe` |
 | Repair missing local assets | `vera repair` |
 | Inspect binary upgrades | `vera upgrade` |
 | Install agent skills | `vera agent install` |
@@ -45,6 +52,7 @@ For the full backend matrix, model options, Docker setup, and troubleshooting, s
 - **61+ languages** via tree-sitter AST parsing
 - **Hybrid search**: BM25 keyword + vector similarity, fused with Reciprocal Rank Fusion
 - **Cross-encoder reranking** for precision
-- **Markdown codeblock output** by default with file paths, line ranges, and optional symbol info (use `--json` for compact JSON; `--raw` and `--timing` work with `vera search` and `vera grep`, before or after the subcommand)
+- **Git-aware scopes and index debugging**: `--changed` / `--since` / `--base`, `explain-path`, and index health in `vera stats`
+- **Markdown codeblock output** by default with file paths, line ranges, and optional symbol info (use `--json` for compact JSON; `--raw` works with `vera search`, `vera grep`, and `vera references`; `--timing` works with `vera search` and `vera grep`, before or after the subcommand)
 
-For full documentation, including custom local ONNX embedding models and manual install steps, see the [GitHub repo](https://github.com/lemon07r/Vera).
+For full documentation, including local model options and manual install steps, see the [GitHub repo](https://github.com/lemon07r/Vera).

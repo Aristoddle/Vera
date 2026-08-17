@@ -40,6 +40,7 @@ Common causes:
 - ONNX Runtime auto-download failed (check network, or set `ORT_DYLIB_PATH`)
 - local model assets have not been downloaded yet
 - GPU backend missing drivers (CUDA 12+ for `--onnx-jina-cuda`, ROCm for `--onnx-jina-rocm`, DirectX 12 for `--onnx-jina-directml`, macOS Apple Silicon for `--onnx-jina-coreml`)
+- non-CPU ONNX session loading failed after dependency checks passed; Vera retries runtime embedding and reranker setup on CPU and logs a warning
 
 Helpful commands:
 
@@ -57,19 +58,19 @@ On constrained GPUs, pass `--low-vram` to `vera index` to force conservative bat
 
 ## API Mode Fails
 
-Check:
+Re-run setup and enter the endpoint URL, model ID, and API key:
+
+```sh
+vera setup --api
+```
+
+For non-interactive setup, check these variables before running `vera setup --api --yes`:
 
 - `EMBEDDING_MODEL_BASE_URL`
 - `EMBEDDING_MODEL_ID`
 - `EMBEDDING_MODEL_API_KEY`
 
-Optional reranker values must either all be present or all be absent.
-
-Persist a working shell configuration with:
-
-```sh
-vera setup --api
-```
+Optional reranker values must either all be present or all be absent in non-interactive setup.
 
 ## Too Much Noise
 
@@ -98,7 +99,9 @@ Use `rg` for file names, counting matches, or files outside the Vera index.
 If unexpected files are indexed or missing from results:
 
 ```sh
-vera index . --verbose            # shows which files are skipped and why
+vera explain-path path/to/file
 ```
+
+Use `vera stats --json` if you need to inspect parse failures, tree-sitter error nodes, or Tier 0 fallback counts across the whole index.
 
 Check `.veraignore` syntax (gitignore format). Remember: `.veraignore` replaces `.gitignore` rules entirely unless you add `#include .gitignore` at the top to merge both. When using `#include .gitignore`, only add patterns that aren't already in `.gitignore`.

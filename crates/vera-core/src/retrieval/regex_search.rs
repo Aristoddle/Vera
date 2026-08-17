@@ -8,13 +8,16 @@
 use std::path::Path;
 
 use anyhow::Result;
-use regex::{Match, RegexBuilder};
+use regex::RegexBuilder;
 
-use crate::corpus::{ContentClass, classify_content, classify_path};
-use crate::retrieval::query_utils::path_depth;
+use crate::corpus::{ContentClass, classify_content};
+use crate::retrieval::file_scan::{
+    allows_class, bounded_byte_snippet, language_for_path, sort_files_by_scan_priority,
+    symbol_for_line,
+};
 use crate::retrieval::ranking::{RankingStage, apply_query_ranking_with_filters};
 use crate::storage::metadata::MetadataStore;
-use crate::types::{Chunk, Language, SearchFilters, SearchResult, SymbolType};
+use crate::types::{Chunk, SearchFilters, SearchResult, SymbolType};
 
 /// Search indexed files for a regex pattern.
 ///
@@ -37,19 +40,7 @@ pub fn search_regex(
     let metadata_path = index_dir.join("metadata.db");
     let store = MetadataStore::open(&metadata_path)?;
     let mut files = store.indexed_files()?;
-    files.sort_by(|left, right| {
-        let left_key = {
-            let language = language_for_path(left);
-            let class = classify_path(left, language);
-            (file_scan_priority(class, filters), path_depth(left))
-        };
-        let right_key = {
-            let language = language_for_path(right);
-            let class = classify_path(right, language);
-            (file_scan_priority(class, filters), path_depth(right))
-        };
-        left_key.cmp(&right_key).then_with(|| left.cmp(right))
-    });
+    sort_files_by_scan_priority(&mut files, filters);
 
     // Resolve the project root (index_dir is .vera/, parent is project root).
     let project_root = index_dir
@@ -82,7 +73,7 @@ pub fn search_regex(
         };
 
         let file_abs = project_root.join(file_rel);
-        let content = match std::fs::read_to_string(&file_abs) {
+        let content = match crate::discovery::read_source_lossy(&file_abs) {
             Ok(c) => c,
             Err(_) => continue,
         };
@@ -167,7 +158,8 @@ fn collect_minified_matches(
         if results.len() >= limit {
             break;
         }
-        let (snippet, line_start, line_end) = bounded_match_snippet(content, found, 220);
+        let (snippet, line_start, line_end) =
+            bounded_byte_snippet(content, found.start(), found.end(), 220);
         let (symbol_name, symbol_type) = symbol_for_line(file_chunks, line_start);
         let result = SearchResult {
             file_path: file_rel.to_string(),
@@ -192,119 +184,11 @@ fn regex_result_matches(filters: &SearchFilters, symbol_type: Option<SymbolType>
     filters.matches_symbol_type(symbol_type)
 }
 
-fn symbol_for_line(
-    chunks: Option<&[Chunk]>,
-    line: u32,
-) -> (Option<String>, Option<crate::types::SymbolType>) {
-    chunks
-        .and_then(|chunks| {
-            chunks
-                .iter()
-                .filter(|chunk| chunk.line_start <= line && line <= chunk.line_end)
-                .filter(|chunk| chunk.symbol_type.is_some() || chunk.symbol_name.is_some())
-                .min_by_key(|chunk| {
-                    (
-                        chunk.line_end.saturating_sub(chunk.line_start),
-                        chunk.line_start,
-                        chunk.line_end,
-                    )
-                })
-                .map(|chunk| (chunk.symbol_name.clone(), chunk.symbol_type))
-        })
-        .unwrap_or((None, None))
-}
-
-fn bounded_match_snippet(content: &str, found: Match<'_>, window: usize) -> (String, u32, u32) {
-    let start = clamp_char_boundary(content, found.start().saturating_sub(window));
-    let end = clamp_char_boundary(content, (found.end() + window).min(content.len()));
-    let mut snippet = content[start..end].to_string();
-
-    if start > 0 {
-        snippet.insert_str(0, "...");
-    }
-    if end < content.len() {
-        snippet.push_str("...");
-    }
-
-    let line_start = byte_to_line(content, found.start());
-    let line_end = byte_to_line(content, found.end());
-    (snippet, line_start, line_end.max(line_start))
-}
-
-fn clamp_char_boundary(content: &str, mut idx: usize) -> usize {
-    while idx > 0 && !content.is_char_boundary(idx) {
-        idx -= 1;
-    }
-    idx
-}
-
-fn byte_to_line(content: &str, byte_idx: usize) -> u32 {
-    content[..byte_idx.min(content.len())]
-        .bytes()
-        .filter(|byte| *byte == b'\n')
-        .count() as u32
-        + 1
-}
-
-fn allows_class(filters: &SearchFilters, class: ContentClass) -> bool {
-    match filters.scope {
-        Some(scope) => {
-            crate::corpus::matches_scope(class, scope, filters.include_generated.unwrap_or(true))
-        }
-        None => true,
-    }
-}
-
-fn file_scan_priority(class: ContentClass, filters: &SearchFilters) -> u8 {
-    match filters.scope {
-        Some(crate::types::SearchScope::Docs) => match class {
-            ContentClass::Docs => 0,
-            ContentClass::Archive => 1,
-            ContentClass::Config => 2,
-            ContentClass::Source | ContentClass::Unknown => 3,
-            ContentClass::Test | ContentClass::Example | ContentClass::Bench => 4,
-            ContentClass::Runtime => 5,
-            ContentClass::Generated => 6,
-        },
-        Some(crate::types::SearchScope::Runtime) => match class {
-            ContentClass::Runtime => 0,
-            ContentClass::Generated => 1,
-            ContentClass::Source | ContentClass::Config | ContentClass::Unknown => 2,
-            ContentClass::Test | ContentClass::Example | ContentClass::Bench => 3,
-            ContentClass::Docs | ContentClass::Archive => 4,
-        },
-        _ => match class {
-            ContentClass::Source => 0,
-            ContentClass::Config => 1,
-            ContentClass::Unknown => 2,
-            ContentClass::Test => 3,
-            ContentClass::Example | ContentClass::Bench => 4,
-            ContentClass::Docs => 5,
-            ContentClass::Archive => 6,
-            ContentClass::Runtime => 7,
-            ContentClass::Generated => 8,
-        },
-    }
-}
-
-fn language_for_path(file_path: &str) -> Language {
-    let path = Path::new(file_path);
-    path.file_name()
-        .and_then(|name| name.to_str())
-        .and_then(Language::from_filename)
-        .or_else(|| {
-            path.extension()
-                .and_then(|ext| ext.to_str())
-                .map(Language::from_extension)
-        })
-        .unwrap_or(Language::Unknown)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::storage::metadata::MetadataStore;
-    use crate::types::{Chunk, SymbolType};
+    use crate::types::{Chunk, Language, SymbolType};
 
     #[test]
     fn invalid_regex_returns_error() {
@@ -517,7 +401,7 @@ mod tests {
             0,
             &SearchFilters {
                 language: Some("python".to_string()),
-                path_glob: Some("tests/**".to_string()),
+                path_glob: vec!["tests/**".to_string()],
                 ..Default::default()
             },
         )

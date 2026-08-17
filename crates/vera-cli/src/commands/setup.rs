@@ -24,7 +24,9 @@ pub(crate) struct SetupReport {
     indexed_path: Option<String>,
 }
 
-/// `backend`: Some(OnnxJina(..)) for local, None + api=true for API, None + api=false defaults to local CPU.
+/// `backend`: Some(local backend) for local, None + api=true for API, None + api=false defaults to auto-detect.
+/// `allow_wizard`: bare interactive invocations run the full wizard only for
+/// `vera setup`; `vera backend` always stays in the backend-only flow.
 pub fn run(
     backend: Option<InferenceBackend>,
     api: bool,
@@ -32,11 +34,12 @@ pub fn run(
     json_output: bool,
     yes: bool,
     embedding_flags: LocalEmbeddingModelFlags,
+    allow_wizard: bool,
 ) -> anyhow::Result<()> {
     // If no flags at all and interactive, run the full wizard.
     let is_bare_interactive =
         !api && backend.is_none() && !json_output && !yes && !embedding_flags.any_set();
-    if is_bare_interactive && index_path.is_none() {
+    if allow_wizard && is_bare_interactive && index_path.is_none() {
         return run_wizard();
     }
 
@@ -48,21 +51,22 @@ pub fn run(
     } else if json_output || yes {
         let detected = detect_gpu();
         if !json_output {
-            eprintln!("Auto-detected backend: {detected}. Use a --onnx-jina-* flag to override.");
+            eprintln!("Auto-detected backend: {detected}. Use a backend flag to override.");
         }
         detected
     } else {
         prompt_backend()?
     };
-    if !effective_backend.is_local() && embedding_flags.any_set() {
+    if !effective_backend.is_onnx() && embedding_flags.any_set() {
         bail!("custom local embedding flags can only be used with local ONNX backends");
     }
     let local_embedding_model = effective_backend
-        .is_local()
+        .is_onnx()
         .then(|| resolve_local_embedding_model(&embedding_flags))
         .transpose()?;
 
     if !yes
+        && !json_output
         && !confirm(
             &effective_backend,
             local_embedding_model.as_ref(),
@@ -75,12 +79,17 @@ pub fn run(
         return Ok(());
     }
 
-    configure_backend(
+    let api_setup = should_prompt_api_config(effective_backend, json_output, yes)
+        .then(prompt_api_setup)
+        .transpose()?;
+
+    configure_backend_with_api_setup(
         effective_backend,
         local_embedding_model,
         index_path,
-        false,
+        json_output,
         "Vera setup complete.",
+        api_setup,
     )
 }
 
@@ -92,7 +101,7 @@ fn run_wizard() -> anyhow::Result<()> {
     cliclack::log::step("Step 1: Backend")?;
     let effective_backend = prompt_backend_select()?;
     let local_embedding_model = effective_backend
-        .is_local()
+        .is_onnx()
         .then(LocalEmbeddingModelConfig::default);
 
     if effective_backend == InferenceBackend::Api {
@@ -147,43 +156,84 @@ pub(crate) fn configure_backend(
     json_output: bool,
     success_header: &str,
 ) -> anyhow::Result<()> {
+    configure_backend_with_api_setup(
+        effective_backend,
+        local_embedding_model,
+        index_path,
+        json_output,
+        success_header,
+        None,
+    )
+}
+
+fn configure_backend_with_api_setup(
+    effective_backend: InferenceBackend,
+    local_embedding_model: Option<LocalEmbeddingModelConfig>,
+    index_path: Option<String>,
+    json_output: bool,
+    success_header: &str,
+    api_setup: Option<(ApiSetupInput, Option<ApiSetupInput>)>,
+) -> anyhow::Result<()> {
     let use_local = effective_backend.is_local();
     let mut models_prefetched = 0usize;
     let onnx_runtime_ready;
     let mut local_embedding_summary = None;
 
-    if let InferenceBackend::OnnxJina(ep) = effective_backend {
-        let local_embedding_model = local_embedding_model.unwrap_or_default();
-        let rt = tokio::runtime::Runtime::new()
-            .map_err(|e| anyhow::anyhow!("failed to create async runtime: {e}"))?;
-        let prefetched = rt.block_on(vera_core::local_models::prepare_local_models_for_ep(
-            ep,
-            &local_embedding_model,
-        ))?;
-        models_prefetched = prefetched.len();
-        // Use the downloaded library path (first prefetched file) for the readiness check.
-        onnx_runtime_ready = Some(
-            vera_core::local_models::ensure_ort_runtime(prefetched.first().map(|p| p.as_path()))
+    match effective_backend {
+        InferenceBackend::OnnxJina(ep) => {
+            let local_embedding_model = local_embedding_model.unwrap_or_default();
+            let rt = tokio::runtime::Runtime::new()
+                .map_err(|e| anyhow::anyhow!("failed to create async runtime: {e}"))?;
+            let prefetched = rt.block_on(vera_core::local_models::prepare_local_models_for_ep(
+                ep,
+                &local_embedding_model,
+            ))?;
+            models_prefetched = prefetched.len();
+            // Use the downloaded library path (first prefetched file) for the readiness check.
+            onnx_runtime_ready = Some(
+                vera_core::local_models::ensure_ort_runtime(
+                    prefetched.first().map(|p| p.as_path()),
+                )
                 .is_ok(),
-        );
-        state::save_backend(effective_backend)?;
-        state::save_local_embedding_model(&local_embedding_model)?;
-        state::apply_saved_env_force()?;
-        local_embedding_summary = Some(local_embedding_model.display_name());
-    } else {
-        let embedding = read_required_api_env(
-            "EMBEDDING_MODEL_BASE_URL",
-            "EMBEDDING_MODEL_ID",
-            "EMBEDDING_MODEL_API_KEY",
-        )?;
-        let reranker = read_optional_api_env(
-            "RERANKER_MODEL_BASE_URL",
-            "RERANKER_MODEL_ID",
-            "RERANKER_MODEL_API_KEY",
-        )?;
-        state::save_api_setup(&embedding, reranker.as_ref())?;
-        state::apply_saved_env_force()?;
-        onnx_runtime_ready = None;
+            );
+            state::save_backend(effective_backend)?;
+            state::save_local_embedding_model(&local_embedding_model)?;
+            state::clear_reranker_setup()?;
+            state::apply_saved_env_force()?;
+            local_embedding_summary = Some(local_embedding_model.display_name());
+        }
+        InferenceBackend::PotionCode => {
+            let rt = tokio::runtime::Runtime::new()
+                .map_err(|e| anyhow::anyhow!("failed to create async runtime: {e}"))?;
+            rt.block_on(vera_core::local_models::ensure_potion_code_assets())?;
+            models_prefetched = vera_core::local_models::inspect_potion_code_model_files()?.len();
+            onnx_runtime_ready = None;
+            state::save_backend(effective_backend)?;
+            state::clear_reranker_setup()?;
+            state::apply_saved_env_force()?;
+            local_embedding_summary =
+                Some(vera_core::local_models::potion_code_model_name().to_string());
+        }
+        InferenceBackend::Api => {
+            let (embedding, reranker) = match api_setup {
+                Some((embedding, reranker)) => (embedding, reranker),
+                None => (
+                    read_required_api_env(
+                        "EMBEDDING_MODEL_BASE_URL",
+                        "EMBEDDING_MODEL_ID",
+                        "EMBEDDING_MODEL_API_KEY",
+                    )?,
+                    read_optional_api_env(
+                        "RERANKER_MODEL_BASE_URL",
+                        "RERANKER_MODEL_ID",
+                        "RERANKER_MODEL_API_KEY",
+                    )?,
+                ),
+            };
+            state::save_api_setup(&embedding, reranker.as_ref())?;
+            state::apply_saved_env_force()?;
+            onnx_runtime_ready = None;
+        }
     }
 
     if state::load_saved_config()?.install_method.is_none() {
@@ -227,14 +277,12 @@ pub(crate) fn configure_backend(
                 println!("  Embedding model:      {model}");
             }
             println!("  Prefetched model files: {}", report.models_prefetched);
-            println!(
-                "  ONNX Runtime ready:   {}",
-                if report.onnx_runtime_ready == Some(true) {
-                    "yes"
-                } else {
-                    "no"
-                }
-            );
+            if let Some(ready) = report.onnx_runtime_ready {
+                println!(
+                    "  ONNX Runtime ready:   {}",
+                    if ready { "yes" } else { "no" }
+                );
+            }
         }
         if let Some(path) = report.indexed_path.as_deref() {
             println!("  Indexed path:         {path}");
@@ -250,8 +298,16 @@ pub(crate) fn configure_backend(
     Ok(())
 }
 
+fn should_prompt_api_config(
+    effective_backend: InferenceBackend,
+    json_output: bool,
+    yes: bool,
+) -> bool {
+    effective_backend == InferenceBackend::Api && !json_output && !yes
+}
+
 /// Probe the system for a usable GPU and return the best local backend.
-/// Falls back to CPU if nothing is detected.
+/// Falls back to Potion Code on CPU if nothing is detected.
 fn detect_gpu() -> InferenceBackend {
     // NVIDIA: check for nvidia-smi or vendor ID (0x10de) in sysfs
     let has_nvidia = std::process::Command::new("nvidia-smi")
@@ -310,7 +366,7 @@ fn detect_gpu() -> InferenceBackend {
         return InferenceBackend::OnnxJina(OnnxExecutionProvider::DirectMl);
     }
 
-    InferenceBackend::OnnxJina(OnnxExecutionProvider::Cpu)
+    InferenceBackend::PotionCode
 }
 
 /// Show an interactive backend selection menu. Auto-detect is the default.
@@ -329,7 +385,9 @@ fn prompt_backend_select() -> anyhow::Result<InferenceBackend> {
         InferenceBackend::OnnxJina(OnnxExecutionProvider::Rocm) => "AMD GPU detected",
         InferenceBackend::OnnxJina(OnnxExecutionProvider::OpenVino) => "Intel GPU detected",
         InferenceBackend::OnnxJina(OnnxExecutionProvider::DirectMl) => "DirectX 12 GPU assumed",
-        _ => "no GPU detected, will use CPU",
+        InferenceBackend::OnnxJina(OnnxExecutionProvider::Cpu) => "Jina ONNX CPU selected",
+        InferenceBackend::PotionCode => "no GPU detected, will use Potion CPU",
+        InferenceBackend::Api => "API mode",
     };
 
     let backend: InferenceBackend = cliclack::select("Select a backend")
@@ -342,6 +400,11 @@ fn prompt_backend_select() -> anyhow::Result<InferenceBackend> {
             InferenceBackend::Api,
             "API mode",
             "remote OpenAI-compatible endpoints",
+        )
+        .item(
+            InferenceBackend::PotionCode,
+            "Potion Code CPU",
+            "CPU-only machines",
         )
         .item(
             InferenceBackend::OnnxJina(OnnxExecutionProvider::Cuda),
@@ -370,8 +433,8 @@ fn prompt_backend_select() -> anyhow::Result<InferenceBackend> {
         )
         .item(
             InferenceBackend::OnnxJina(OnnxExecutionProvider::Cpu),
-            "CPU",
-            "slow, not recommended",
+            "Jina ONNX CPU",
+            "compatibility path",
         )
         .interact()?;
 
@@ -444,6 +507,27 @@ fn confirm(
 /// Interactive API configuration for the setup wizard.
 /// Offers common provider presets and prompts for credentials.
 fn configure_api_interactive() -> anyhow::Result<()> {
+    let (embedding, reranker) = prompt_api_setup()?;
+
+    state::save_backend(InferenceBackend::Api)?;
+    state::save_api_setup(&embedding, reranker.as_ref())?;
+    state::apply_saved_env_force()?;
+
+    if state::load_saved_config()?.install_method.is_none() {
+        if let Some(install_method) = crate::update_check::resolve_install_method().install_method {
+            state::save_install_method(Some(&install_method))?;
+        }
+    }
+
+    cliclack::log::success("API backend configured.")?;
+    cliclack::log::info(
+        "Your credentials are saved in Vera's config directory. You can remove any \
+         EMBEDDING_MODEL_* / RERANKER_MODEL_* env vars from your shell.",
+    )?;
+    Ok(())
+}
+
+fn prompt_api_setup() -> anyhow::Result<(ApiSetupInput, Option<ApiSetupInput>)> {
     #[derive(Clone)]
     struct ApiPreset {
         label: &'static str,
@@ -497,27 +581,18 @@ fn configure_api_interactive() -> anyhow::Result<()> {
     let preset = &presets[choice];
 
     // Embedding base URL
-    let embedding_base_url: String = if preset.embedding_base_url.is_empty() {
-        cliclack::input("Embedding API base URL")
-            .placeholder("https://api.openai.com/v1")
-            .interact()?
-    } else {
-        let url: String = cliclack::input("Embedding API base URL")
-            .default_input(preset.embedding_base_url)
-            .interact()?;
-        url
-    };
+    let embedding_base_url = prompt_required_input(
+        "Embedding API base URL",
+        (!preset.embedding_base_url.is_empty()).then_some(preset.embedding_base_url),
+        "https://api.openai.com/v1",
+    )?;
 
     // Embedding model
-    let embedding_model: String = if preset.embedding_model.is_empty() {
-        cliclack::input("Embedding model ID")
-            .placeholder("text-embedding-3-small")
-            .interact()?
-    } else {
-        cliclack::input("Embedding model ID")
-            .default_input(preset.embedding_model)
-            .interact()?
-    };
+    let embedding_model = prompt_required_input(
+        "Embedding model ID",
+        (!preset.embedding_model.is_empty()).then_some(preset.embedding_model),
+        "text-embedding-3-small",
+    )?;
 
     // Embedding API key
     let embedding_api_key: String = cliclack::password("Embedding API key")
@@ -540,25 +615,17 @@ fn configure_api_interactive() -> anyhow::Result<()> {
             .interact()?;
 
     let reranker = if setup_reranker {
-        let reranker_base_url: String = if preset.reranker_base_url.is_empty() {
-            cliclack::input("Reranker API base URL")
-                .placeholder("https://api.jina.ai/v1")
-                .interact()?
-        } else {
-            cliclack::input("Reranker API base URL")
-                .default_input(preset.reranker_base_url)
-                .interact()?
-        };
+        let reranker_base_url = prompt_required_input(
+            "Reranker API base URL",
+            (!preset.reranker_base_url.is_empty()).then_some(preset.reranker_base_url),
+            "https://api.jina.ai/v1",
+        )?;
 
-        let reranker_model: String = if preset.reranker_model.is_empty() {
-            cliclack::input("Reranker model ID")
-                .placeholder("jina-reranker-v2-base-multilingual")
-                .interact()?
-        } else {
-            cliclack::input("Reranker model ID")
-                .default_input(preset.reranker_model)
-                .interact()?
-        };
+        let reranker_model = prompt_required_input(
+            "Reranker model ID",
+            (!preset.reranker_model.is_empty()).then_some(preset.reranker_model),
+            "jina-reranker-v2-base-multilingual",
+        )?;
 
         let reranker_api_key: String =
             cliclack::password("Reranker API key (Enter to reuse embedding key)")
@@ -579,22 +646,24 @@ fn configure_api_interactive() -> anyhow::Result<()> {
         None
     };
 
-    state::save_backend(InferenceBackend::Api)?;
-    state::save_api_setup(&embedding, reranker.as_ref())?;
-    state::apply_saved_env_force()?;
+    Ok((embedding, reranker))
+}
 
-    if state::load_saved_config()?.install_method.is_none() {
-        if let Some(install_method) = crate::update_check::resolve_install_method().install_method {
-            state::save_install_method(Some(&install_method))?;
-        }
+fn prompt_required_input(
+    label: &str,
+    default: Option<&str>,
+    placeholder: &str,
+) -> anyhow::Result<String> {
+    let value: String = if let Some(default) = default {
+        cliclack::input(label).default_input(default).interact()?
+    } else {
+        cliclack::input(label).placeholder(placeholder).interact()?
+    };
+    let value = value.trim().to_string();
+    if value.is_empty() {
+        bail!("{} is required", label.to_ascii_lowercase());
     }
-
-    cliclack::log::success("API backend configured.")?;
-    cliclack::log::info(
-        "Your credentials are saved in Vera's config directory. You can remove any \
-         EMBEDDING_MODEL_* / RERANKER_MODEL_* env vars from your shell.",
-    )?;
-    Ok(())
+    Ok(value)
 }
 
 fn read_required_api_env(
@@ -631,5 +700,38 @@ fn read_optional_api_env(
         _ => bail!(
             "reranker config is incomplete. Set all of {base_key}, {model_key}, and {api_key_key}, or leave all three unset."
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn explicit_interactive_api_setup_prompts_for_config() {
+        assert!(should_prompt_api_config(
+            InferenceBackend::Api,
+            false,
+            false
+        ));
+    }
+
+    #[test]
+    fn noninteractive_api_setup_uses_environment_config() {
+        assert!(!should_prompt_api_config(
+            InferenceBackend::Api,
+            true,
+            false
+        ));
+        assert!(!should_prompt_api_config(
+            InferenceBackend::Api,
+            false,
+            true
+        ));
+        assert!(!should_prompt_api_config(
+            InferenceBackend::PotionCode,
+            false,
+            false
+        ));
     }
 }

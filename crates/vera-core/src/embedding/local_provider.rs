@@ -1,5 +1,5 @@
 use crate::config::OnnxExecutionProvider;
-use crate::embedding::provider::{EmbeddingError, EmbeddingProvider};
+use crate::embedding::provider::{EmbeddingError, EmbeddingProvider, api_err};
 use crate::local_models::{LocalEmbeddingModelConfig, LocalEmbeddingPooling};
 use anyhow::{Context, Result};
 use ort::session::{Session, builder::GraphOptimizationLevel};
@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokenizers::{Encoding, Tokenizer};
 use tokio::task;
+use tokio_util::sync::CancellationToken;
 
 const ADAPTIVE_BATCH_SCALER_STATE_VERSION: u32 = 1;
 
@@ -270,13 +271,10 @@ impl LocalEmbeddingProvider {
         ep: OnnxExecutionProvider,
         gpu_mem_limit_mb: u64,
     ) -> Result<Self, EmbeddingError> {
-        let mut config =
-            LocalEmbeddingModelConfig::from_env().map_err(|e| EmbeddingError::ApiError {
-                status: 500,
-                message: e.to_string(),
-            })?;
+        let base_config = LocalEmbeddingModelConfig::from_env().map_err(api_err)?;
+        let mut config = base_config.clone();
         config.adjust_for_gpu(ep);
-        let batch_scaler = if ep == OnnxExecutionProvider::Cpu {
+        let mut batch_scaler = if ep == OnnxExecutionProvider::Cpu {
             None
         } else {
             let persistence = match build_batch_scaler_persistence_target(ep, &config) {
@@ -293,7 +291,7 @@ impl LocalEmbeddingProvider {
                 .cached_asset_paths()
                 .ok()
                 .and_then(|p| fs::metadata(&p.onnx_path).ok())
-                .map(|m| m.len() / (1024 * 1024))
+                .map(|m| effective_model_size_for_adaptive_batching(ep, m.len() / (1024 * 1024)))
                 .unwrap_or(0);
             Some(Arc::new(PersistedAdaptiveBatchScaler::load_or_new(
                 config.max_length,
@@ -303,54 +301,37 @@ impl LocalEmbeddingProvider {
         };
         let ort_path = crate::local_models::ensure_ort_library_for_ep(ep)
             .await
-            .map_err(|e| EmbeddingError::ApiError {
-                status: 500,
-                message: e.to_string(),
-            })?;
-        crate::local_models::ensure_ort_runtime(Some(&ort_path)).map_err(|e| {
-            EmbeddingError::ApiError {
-                status: 500,
-                message: e.to_string(),
+            .map_err(api_err)?;
+        crate::local_models::ensure_ort_runtime(Some(&ort_path)).map_err(api_err)?;
+        crate::local_models::ensure_provider_dependencies(ep, &ort_path).map_err(api_err)?;
+        let components = load_embedding_components(ep, &config, gpu_mem_limit_mb).await;
+        let (session, tokenizer) = match components {
+            Ok(components) => components,
+            Err(error) if ep != OnnxExecutionProvider::Cpu => {
+                tracing::warn!(
+                    backend = %ep,
+                    error = %error,
+                    "selected ONNX execution provider failed; retrying embedding session on CPU"
+                );
+                config = base_config;
+                batch_scaler = None;
+                load_embedding_components(OnnxExecutionProvider::Cpu, &config, 0)
+                    .await
+                    .map_err(|fallback_error| {
+                        api_err(format!(
+                            "{}\nHint: run `vera repair --onnx-jina-{ep}`.\nCPU fallback also failed: {}\nHint: run `vera repair --onnx-jina-cpu`.",
+                            crate::local_models::wrap_ort_error(error),
+                            crate::local_models::wrap_ort_error(fallback_error),
+                        ))
+                    })?
             }
-        })?;
-        crate::local_models::ensure_provider_dependencies(ep, &ort_path).map_err(|e| {
-            EmbeddingError::ApiError {
-                status: 500,
-                message: e.to_string(),
+            Err(error) => {
+                return Err(api_err(format!(
+                    "{}\nHint: run `vera repair --onnx-jina-{ep}`.",
+                    crate::local_models::wrap_ort_error(error)
+                )));
             }
-        })?;
-        let asset_paths = crate::local_models::ensure_local_embedding_assets(&config)
-            .await
-            .map_err(|e| EmbeddingError::ApiError {
-                status: 500,
-                message: e.to_string(),
-            })?;
-        let onnx_path = asset_paths.onnx_path;
-        let tokenizer_path = asset_paths.tokenizer_path;
-
-        let tokenizer_max_length = config.max_length;
-        let tokenizer =
-            task::spawn_blocking(move || load_tokenizer(tokenizer_path, tokenizer_max_length))
-                .await
-                .map_err(|e| EmbeddingError::ApiError {
-                    status: 500,
-                    message: e.to_string(),
-                })?
-                .map_err(|e| EmbeddingError::ApiError {
-                    status: 500,
-                    message: e.to_string(),
-                })?;
-
-        let session = task::spawn_blocking(move || build_session(ep, onnx_path, gpu_mem_limit_mb))
-            .await
-            .map_err(|e| EmbeddingError::ApiError {
-                status: 500,
-                message: e.to_string(),
-            })?
-            .map_err(|e| EmbeddingError::ApiError {
-                status: 500,
-                message: crate::local_models::wrap_ort_error(e),
-            })?;
+        };
 
         Ok(Self {
             session: Arc::new(Mutex::new(session)),
@@ -389,20 +370,30 @@ impl LocalEmbeddingProvider {
         run_probe_inference(&mut session, &tokenizer)
     }
 
-    #[allow(clippy::needless_range_loop)]
-    fn do_embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
-        let encodings = self.tokenize_texts(texts)?;
+    fn do_embed_cancellable(
+        &self,
+        texts: &[String],
+        cancel: &CancellationToken,
+    ) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+        let encodings = self.tokenize_texts(texts).map_err(api_err)?;
+
         if encodings.is_empty() {
             return Ok(Vec::new());
         }
 
         if self.batch_scaler.is_none() {
-            return self.do_embed_once(&encodings);
+            if cancel.is_cancelled() {
+                return Err(EmbeddingError::Cancelled);
+            }
+            return self.do_embed_once(&encodings).map_err(api_err);
         }
 
         let mut results = Vec::with_capacity(encodings.len());
         let mut start = 0;
         while start < encodings.len() {
+            if cancel.is_cancelled() {
+                return Err(EmbeddingError::Cancelled);
+            }
             let remaining = &encodings[start..];
             let seq_len = batch_max_len(remaining);
             let planned_batch_len = self
@@ -419,8 +410,10 @@ impl LocalEmbeddingProvider {
                 seq_len,
                 "planning local ONNX embedding sub-batch"
             );
-            let mut batch = self.embed_with_adaptive_batching(&encodings[start..end])?;
-            results.append(&mut batch);
+            let batch = self
+                .embed_with_adaptive_batching(&encodings[start..end])
+                .map_err(api_err)?;
+            results.extend(batch);
             start = end;
         }
 
@@ -599,6 +592,25 @@ impl LocalEmbeddingProvider {
     }
 }
 
+async fn load_embedding_components(
+    ep: OnnxExecutionProvider,
+    config: &LocalEmbeddingModelConfig,
+    gpu_mem_limit_mb: u64,
+) -> Result<(Session, Tokenizer)> {
+    let asset_paths = crate::local_models::ensure_local_embedding_assets(config).await?;
+    let onnx_path = asset_paths.onnx_path;
+    let tokenizer_path = asset_paths.tokenizer_path;
+    let tokenizer_max_length = config.max_length;
+
+    let tokenizer =
+        task::spawn_blocking(move || load_tokenizer(tokenizer_path, tokenizer_max_length))
+            .await??;
+    let session =
+        task::spawn_blocking(move || build_session(ep, onnx_path, gpu_mem_limit_mb)).await??;
+
+    Ok((session, tokenizer))
+}
+
 fn build_batch_scaler_persistence_target(
     ep: OnnxExecutionProvider,
     config: &LocalEmbeddingModelConfig,
@@ -740,6 +752,20 @@ fn persisted_batch_margin(batch_len: usize) -> usize {
     batch_len.saturating_sub(margin).max(1)
 }
 
+// The model-size dampener protects discrete GPU backends from VRAM cold-start
+// overestimates. CoreML runs on unified memory, so file size is not a useful
+// proxy and can make Apple Silicon indexing start at batch 1 for long chunks.
+fn effective_model_size_for_adaptive_batching(
+    ep: OnnxExecutionProvider,
+    model_size_mb: u64,
+) -> u64 {
+    if ep == OnnxExecutionProvider::CoreMl {
+        0
+    } else {
+        model_size_mb
+    }
+}
+
 fn batch_max_len(encodings: &[Encoding]) -> usize {
     encodings
         .iter()
@@ -868,18 +894,27 @@ impl EmbeddingProvider for LocalEmbeddingProvider {
         let texts = texts.to_vec();
 
         task::spawn_blocking(move || {
-            provider
-                .do_embed(&texts)
-                .map_err(|e| EmbeddingError::ApiError {
-                    status: 500,
-                    message: e.to_string(),
-                })
+            provider.do_embed_cancellable(&texts, &CancellationToken::new())
         })
         .await
-        .map_err(|e| EmbeddingError::ApiError {
-            status: 500,
-            message: e.to_string(),
-        })?
+        .map_err(api_err)?
+    }
+
+    async fn embed_batch_cancellable(
+        &self,
+        texts: &[String],
+        cancel: &CancellationToken,
+    ) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+        let provider = self.clone();
+        let texts = texts.to_vec();
+        let cancel = cancel.clone();
+
+        task::spawn_blocking(move || provider.do_embed_cancellable(&texts, &cancel))
+            .await
+            .map_err(api_err)?
     }
 }
 
@@ -991,6 +1026,20 @@ mod tests {
         );
         // 400MB is 4x reference (100MB), so batch should be ~1/4 of 32 = 8.
         assert_eq!(large_batch, 8);
+    }
+
+    #[test]
+    fn coreml_adaptive_batching_ignores_model_size_cold_start_dampening() {
+        let cuda_size =
+            effective_model_size_for_adaptive_batching(OnnxExecutionProvider::Cuda, 400);
+        let coreml_size =
+            effective_model_size_for_adaptive_batching(OnnxExecutionProvider::CoreMl, 400);
+
+        let cuda = AdaptiveBatchScaler::new(512, cuda_size);
+        let coreml = AdaptiveBatchScaler::new(512, coreml_size);
+
+        assert_eq!(cuda.recommend_batch_len(16, 512), 1);
+        assert_eq!(coreml.recommend_batch_len(16, 512), 4);
     }
 
     #[test]

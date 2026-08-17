@@ -194,100 +194,113 @@ mod tests {
         parser.set_language(&grammar).expect("grammar should load");
     }
 
+    /// Every shipped grammar must parse a small representative sample
+    /// without error nodes.
     #[test]
-    fn html_grammar_creates_valid_parser() {
-        let grammar = tree_sitter_grammar(Language::Html).unwrap();
-        let mut parser = tree_sitter::Parser::new();
-        parser
-            .set_language(&grammar)
-            .expect("HTML grammar should load");
-        let tree = parser.parse("<div></div>", None).unwrap();
-        assert!(!tree.root_node().has_error());
-    }
-
-    #[test]
-    fn css_grammar_creates_valid_parser() {
-        let grammar = tree_sitter_grammar(Language::Css).unwrap();
-        let mut parser = tree_sitter::Parser::new();
-        parser
-            .set_language(&grammar)
-            .expect("CSS grammar should load");
-        let tree = parser.parse("body { color: red; }", None).unwrap();
-        assert!(!tree.root_node().has_error());
-    }
-
-    #[test]
-    fn scss_grammar_creates_valid_parser() {
-        let grammar = tree_sitter_grammar(Language::Scss).unwrap();
-        let mut parser = tree_sitter::Parser::new();
-        parser
-            .set_language(&grammar)
-            .expect("SCSS grammar should load");
-        let tree = parser
-            .parse("$color: red; body { color: $color; }", None)
-            .unwrap();
-        assert!(!tree.root_node().has_error());
-    }
-
-    #[test]
-    fn vue_grammar_creates_valid_parser() {
-        let grammar = tree_sitter_grammar(Language::Vue).unwrap();
-        let mut parser = tree_sitter::Parser::new();
-        parser
-            .set_language(&grammar)
-            .expect("Vue grammar should load");
-        let tree = parser
-            .parse("<template><div></div></template>", None)
-            .unwrap();
-        assert!(!tree.root_node().has_error());
-    }
-
-    #[test]
-    fn graphql_grammar_creates_valid_parser() {
-        let grammar = tree_sitter_grammar(Language::GraphQl).unwrap();
-        let mut parser = tree_sitter::Parser::new();
-        parser
-            .set_language(&grammar)
-            .expect("GraphQL grammar should load");
-        let tree = parser.parse("type Query { hello: String }", None).unwrap();
-        assert!(!tree.root_node().has_error());
-    }
-
-    #[test]
-    fn cmake_grammar_creates_valid_parser() {
-        let grammar = tree_sitter_grammar(Language::CMake).unwrap();
-        let mut parser = tree_sitter::Parser::new();
-        parser
-            .set_language(&grammar)
-            .expect("CMake grammar should load");
-        let tree = parser
-            .parse("cmake_minimum_required(VERSION 3.10)", None)
-            .unwrap();
-        assert!(!tree.root_node().has_error());
-    }
-
-    #[test]
-    fn dockerfile_grammar_creates_valid_parser() {
-        let grammar = tree_sitter_grammar(Language::Dockerfile).unwrap();
-        let mut parser = tree_sitter::Parser::new();
-        parser
-            .set_language(&grammar)
-            .expect("Dockerfile grammar should load");
-        let tree = parser.parse("FROM ubuntu:20.04\n", None).unwrap();
-        assert!(!tree.root_node().has_error());
-    }
-
-    #[test]
-    fn xml_grammar_creates_valid_parser() {
-        let grammar = tree_sitter_grammar(Language::Xml).unwrap();
-        let mut parser = tree_sitter::Parser::new();
-        parser
-            .set_language(&grammar)
-            .expect("XML grammar should load");
-        let tree = parser
-            .parse("<?xml version=\"1.0\"?><root><item/></root>", None)
-            .unwrap();
-        assert!(!tree.root_node().has_error());
+    fn grammars_parse_samples_without_errors() {
+        let cases: &[(Language, &str)] = &[
+            (Language::Html, "<div></div>"),
+            (Language::Css, "body { color: red; }"),
+            (Language::Scss, "$color: red; body { color: $color; }"),
+            (Language::Vue, "<template><div></div></template>"),
+            (Language::GraphQl, "type Query { hello: String }"),
+            (Language::CMake, "cmake_minimum_required(VERSION 3.10)"),
+            (Language::Dockerfile, "FROM ubuntu:20.04\n"),
+            (Language::Xml, "<?xml version=\"1.0\"?><root><item/></root>"),
+            (
+                Language::ObjectiveC,
+                "@interface Foo : NSObject\n- (void)bar;\n@end\n",
+            ),
+            (Language::Perl, "sub hello { print \"hello\\n\"; }\n"),
+            (
+                Language::Julia,
+                "function hello()\n println(\"hello\")\nend\n",
+            ),
+            (
+                Language::Nix,
+                "{ pkgs ? import <nixpkgs> {} }: pkgs.hello\n",
+            ),
+            (Language::OCaml, "let hello () = print_endline \"hello\"\n"),
+            (Language::Groovy, "def hello() { println 'hello' }\n"),
+            (Language::Clojure, "(defn hello [] (println \"hello\"))\n"),
+            (
+                Language::CommonLisp,
+                "(defun hello () (format t \"hello~%\"))\n",
+            ),
+            (Language::Erlang, "-module(hello).\nhello() -> ok.\n"),
+            (Language::FSharp, "let hello () = printfn \"hello\"\n"),
+            (
+                Language::Fortran,
+                "program hello\n print *, 'hello'\nend program hello\n",
+            ),
+            (
+                Language::PowerShell,
+                "function Hello { Write-Host 'hello' }\n",
+            ),
+            (Language::R, "hello <- function() { print(\"hello\") }\n"),
+            (Language::Matlab, "function y = square(x)\n y = x^2;\nend\n"),
+            (Language::DLang, "void main() { writeln(\"hello\"); }\n"),
+            (Language::Fish, "function hello\n echo hello\nend\n"),
+            (Language::Zsh, "function hello() {\n echo hello\n}\n"),
+            (
+                Language::Luau,
+                "local function hello()\n print(\"hello\")\nend\n",
+            ),
+            (Language::Scheme, "(define (hello) (display \"hello\"))\n"),
+            (
+                Language::Racket,
+                "#lang racket\n(define (hello) (displayln \"hello\"))\n",
+            ),
+            (
+                Language::Elm,
+                "module Main exposing (main)\n\nmain =\n text \"hello\"\n",
+            ),
+            (
+                Language::Glsl,
+                "void main() {\n gl_FragColor = vec4(1.0);\n}\n",
+            ),
+            (
+                Language::Hlsl,
+                "float4 main(float4 pos : SV_Position) : SV_Target {\n return float4(1, 0, 0, 1);\n}\n",
+            ),
+            (
+                Language::Svelte,
+                "<script>\n let count = 0;\n</script>\n<button>{count}</button>\n",
+            ),
+            (
+                Language::Astro,
+                "---\nconst title = \"Hello\";\n---\n<h1>{title}</h1>\n",
+            ),
+            (
+                Language::Makefile,
+                "all: build\n\nbuild:\n\tgcc -o main main.c\n",
+            ),
+            (Language::Ini, "[section]\nkey = value\n"),
+            (
+                Language::Nginx,
+                "server {\n listen 80;\n server_name example.com;\n}\n",
+            ),
+            (
+                Language::Prisma,
+                "model User {\n id Int @id @default(autoincrement())\n name String\n}\n",
+            ),
+            (
+                Language::Rst,
+                "Heading\n=======\n\nParagraph text.\n\nSection\n-------\n\nMore text.\n",
+            ),
+        ];
+        for (lang, sample) in cases {
+            let grammar = tree_sitter_grammar(*lang).unwrap();
+            let mut parser = tree_sitter::Parser::new();
+            parser
+                .set_language(&grammar)
+                .unwrap_or_else(|_| panic!("{lang} grammar should load"));
+            let tree = parser.parse(sample, None).unwrap();
+            assert!(
+                !tree.root_node().has_error(),
+                "{lang} sample should parse without errors"
+            );
+        }
     }
 
     // ── Tier 2A grammar loading tests ─────────────────────────
@@ -317,178 +330,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn objectivec_grammar_creates_valid_parser() {
-        let grammar = tree_sitter_grammar(Language::ObjectiveC).unwrap();
-        let mut parser = tree_sitter::Parser::new();
-        parser
-            .set_language(&grammar)
-            .expect("ObjC grammar should load");
-        let tree = parser
-            .parse("@interface Foo : NSObject\n- (void)bar;\n@end\n", None)
-            .unwrap();
-        assert!(!tree.root_node().has_error());
-    }
-
-    #[test]
-    fn perl_grammar_creates_valid_parser() {
-        let grammar = tree_sitter_grammar(Language::Perl).unwrap();
-        let mut parser = tree_sitter::Parser::new();
-        parser
-            .set_language(&grammar)
-            .expect("Perl grammar should load");
-        let tree = parser
-            .parse("sub hello { print \"hello\\n\"; }\n", None)
-            .unwrap();
-        assert!(!tree.root_node().has_error());
-    }
-
-    #[test]
-    fn julia_grammar_creates_valid_parser() {
-        let grammar = tree_sitter_grammar(Language::Julia).unwrap();
-        let mut parser = tree_sitter::Parser::new();
-        parser
-            .set_language(&grammar)
-            .expect("Julia grammar should load");
-        let tree = parser
-            .parse("function hello()\n  println(\"hello\")\nend\n", None)
-            .unwrap();
-        assert!(!tree.root_node().has_error());
-    }
-
-    #[test]
-    fn nix_grammar_creates_valid_parser() {
-        let grammar = tree_sitter_grammar(Language::Nix).unwrap();
-        let mut parser = tree_sitter::Parser::new();
-        parser
-            .set_language(&grammar)
-            .expect("Nix grammar should load");
-        let tree = parser
-            .parse("{ pkgs ? import <nixpkgs> {} }: pkgs.hello\n", None)
-            .unwrap();
-        assert!(!tree.root_node().has_error());
-    }
-
-    #[test]
-    fn ocaml_grammar_creates_valid_parser() {
-        let grammar = tree_sitter_grammar(Language::OCaml).unwrap();
-        let mut parser = tree_sitter::Parser::new();
-        parser
-            .set_language(&grammar)
-            .expect("OCaml grammar should load");
-        let tree = parser
-            .parse("let hello () = print_endline \"hello\"\n", None)
-            .unwrap();
-        assert!(!tree.root_node().has_error());
-    }
-
-    #[test]
-    fn groovy_grammar_creates_valid_parser() {
-        let grammar = tree_sitter_grammar(Language::Groovy).unwrap();
-        let mut parser = tree_sitter::Parser::new();
-        parser
-            .set_language(&grammar)
-            .expect("Groovy grammar should load");
-        let tree = parser
-            .parse("def hello() { println 'hello' }\n", None)
-            .unwrap();
-        assert!(!tree.root_node().has_error());
-    }
-
-    #[test]
-    fn clojure_grammar_creates_valid_parser() {
-        let grammar = tree_sitter_grammar(Language::Clojure).unwrap();
-        let mut parser = tree_sitter::Parser::new();
-        parser
-            .set_language(&grammar)
-            .expect("Clojure grammar should load");
-        let tree = parser
-            .parse("(defn hello [] (println \"hello\"))\n", None)
-            .unwrap();
-        assert!(!tree.root_node().has_error());
-    }
-
-    #[test]
-    fn commonlisp_grammar_creates_valid_parser() {
-        let grammar = tree_sitter_grammar(Language::CommonLisp).unwrap();
-        let mut parser = tree_sitter::Parser::new();
-        parser
-            .set_language(&grammar)
-            .expect("Common Lisp grammar should load");
-        let tree = parser
-            .parse("(defun hello () (format t \"hello~%\"))\n", None)
-            .unwrap();
-        assert!(!tree.root_node().has_error());
-    }
-
-    #[test]
-    fn erlang_grammar_creates_valid_parser() {
-        let grammar = tree_sitter_grammar(Language::Erlang).unwrap();
-        let mut parser = tree_sitter::Parser::new();
-        parser
-            .set_language(&grammar)
-            .expect("Erlang grammar should load");
-        let tree = parser
-            .parse("-module(hello).\nhello() -> ok.\n", None)
-            .unwrap();
-        assert!(!tree.root_node().has_error());
-    }
-
-    #[test]
-    fn fsharp_grammar_creates_valid_parser() {
-        let grammar = tree_sitter_grammar(Language::FSharp).unwrap();
-        let mut parser = tree_sitter::Parser::new();
-        parser
-            .set_language(&grammar)
-            .expect("F# grammar should load");
-        let tree = parser
-            .parse("let hello () = printfn \"hello\"\n", None)
-            .unwrap();
-        assert!(!tree.root_node().has_error());
-    }
-
-    #[test]
-    fn fortran_grammar_creates_valid_parser() {
-        let grammar = tree_sitter_grammar(Language::Fortran).unwrap();
-        let mut parser = tree_sitter::Parser::new();
-        parser
-            .set_language(&grammar)
-            .expect("Fortran grammar should load");
-        let tree = parser
-            .parse(
-                "program hello\n  print *, 'hello'\nend program hello\n",
-                None,
-            )
-            .unwrap();
-        assert!(!tree.root_node().has_error());
-    }
-
-    #[test]
-    fn powershell_grammar_creates_valid_parser() {
-        let grammar = tree_sitter_grammar(Language::PowerShell).unwrap();
-        let mut parser = tree_sitter::Parser::new();
-        parser
-            .set_language(&grammar)
-            .expect("PowerShell grammar should load");
-        let tree = parser
-            .parse("function Hello { Write-Host 'hello' }\n", None)
-            .unwrap();
-        assert!(!tree.root_node().has_error());
-    }
-
-    #[test]
-    fn r_grammar_creates_valid_parser() {
-        let grammar = tree_sitter_grammar(Language::R).unwrap();
-        let mut parser = tree_sitter::Parser::new();
-        parser
-            .set_language(&grammar)
-            .expect("R grammar should load");
-        let tree = parser
-            .parse("hello <- function() { print(\"hello\") }\n", None)
-            .unwrap();
-        assert!(!tree.root_node().has_error());
-    }
-
     // ── Tier 2A batch 2 grammar loading tests ─────────────────
 
     #[test]
@@ -513,145 +354,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn matlab_grammar_creates_valid_parser() {
-        let grammar = tree_sitter_grammar(Language::Matlab).unwrap();
-        let mut parser = tree_sitter::Parser::new();
-        parser
-            .set_language(&grammar)
-            .expect("MATLAB grammar should load");
-        let tree = parser
-            .parse("function y = square(x)\n  y = x^2;\nend\n", None)
-            .unwrap();
-        assert!(!tree.root_node().has_error());
-    }
-
-    #[test]
-    fn dlang_grammar_creates_valid_parser() {
-        let grammar = tree_sitter_grammar(Language::DLang).unwrap();
-        let mut parser = tree_sitter::Parser::new();
-        parser
-            .set_language(&grammar)
-            .expect("D grammar should load");
-        let tree = parser
-            .parse("void main() { writeln(\"hello\"); }\n", None)
-            .unwrap();
-        assert!(!tree.root_node().has_error());
-    }
-
-    #[test]
-    fn fish_grammar_creates_valid_parser() {
-        let grammar = tree_sitter_grammar(Language::Fish).unwrap();
-        let mut parser = tree_sitter::Parser::new();
-        parser
-            .set_language(&grammar)
-            .expect("Fish grammar should load");
-        let tree = parser
-            .parse("function hello\n  echo hello\nend\n", None)
-            .unwrap();
-        assert!(!tree.root_node().has_error());
-    }
-
-    #[test]
-    fn zsh_grammar_creates_valid_parser() {
-        let grammar = tree_sitter_grammar(Language::Zsh).unwrap();
-        let mut parser = tree_sitter::Parser::new();
-        parser
-            .set_language(&grammar)
-            .expect("Zsh grammar should load");
-        let tree = parser
-            .parse("function hello() {\n  echo hello\n}\n", None)
-            .unwrap();
-        assert!(!tree.root_node().has_error());
-    }
-
-    #[test]
-    fn luau_grammar_creates_valid_parser() {
-        let grammar = tree_sitter_grammar(Language::Luau).unwrap();
-        let mut parser = tree_sitter::Parser::new();
-        parser
-            .set_language(&grammar)
-            .expect("Luau grammar should load");
-        let tree = parser
-            .parse("local function hello()\n  print(\"hello\")\nend\n", None)
-            .unwrap();
-        assert!(!tree.root_node().has_error());
-    }
-
-    #[test]
-    fn scheme_grammar_creates_valid_parser() {
-        let grammar = tree_sitter_grammar(Language::Scheme).unwrap();
-        let mut parser = tree_sitter::Parser::new();
-        parser
-            .set_language(&grammar)
-            .expect("Scheme grammar should load");
-        let tree = parser
-            .parse("(define (hello) (display \"hello\"))\n", None)
-            .unwrap();
-        assert!(!tree.root_node().has_error());
-    }
-
-    #[test]
-    fn racket_grammar_creates_valid_parser() {
-        let grammar = tree_sitter_grammar(Language::Racket).unwrap();
-        let mut parser = tree_sitter::Parser::new();
-        parser
-            .set_language(&grammar)
-            .expect("Racket grammar should load");
-        let tree = parser
-            .parse(
-                "#lang racket\n(define (hello) (displayln \"hello\"))\n",
-                None,
-            )
-            .unwrap();
-        assert!(!tree.root_node().has_error());
-    }
-
-    #[test]
-    fn elm_grammar_creates_valid_parser() {
-        let grammar = tree_sitter_grammar(Language::Elm).unwrap();
-        let mut parser = tree_sitter::Parser::new();
-        parser
-            .set_language(&grammar)
-            .expect("Elm grammar should load");
-        let tree = parser
-            .parse(
-                "module Main exposing (main)\n\nmain =\n  text \"hello\"\n",
-                None,
-            )
-            .unwrap();
-        assert!(!tree.root_node().has_error());
-    }
-
-    #[test]
-    fn glsl_grammar_creates_valid_parser() {
-        let grammar = tree_sitter_grammar(Language::Glsl).unwrap();
-        let mut parser = tree_sitter::Parser::new();
-        parser
-            .set_language(&grammar)
-            .expect("GLSL grammar should load");
-        let tree = parser
-            .parse("void main() {\n  gl_FragColor = vec4(1.0);\n}\n", None)
-            .unwrap();
-        assert!(!tree.root_node().has_error());
-    }
-
-    #[test]
-    fn hlsl_grammar_creates_valid_parser() {
-        let grammar = tree_sitter_grammar(Language::Hlsl).unwrap();
-        let mut parser = tree_sitter::Parser::new();
-        parser
-            .set_language(&grammar)
-            .expect("HLSL grammar should load");
-        let tree = parser
-            .parse(
-                "float4 main(float4 pos : SV_Position) : SV_Target {\n  return float4(1, 0, 0, 1);\n}\n",
-                None,
-            )
-            .unwrap();
-        assert!(!tree.root_node().has_error());
-    }
-
     // ── Tier 2B grammar loading tests ─────────────────
 
     #[test]
@@ -671,109 +373,5 @@ mod tests {
                 "{lang} should have a tree-sitter grammar"
             );
         }
-    }
-
-    #[test]
-    fn svelte_grammar_creates_valid_parser() {
-        let grammar = tree_sitter_grammar(Language::Svelte).unwrap();
-        let mut parser = tree_sitter::Parser::new();
-        parser
-            .set_language(&grammar)
-            .expect("Svelte grammar should load");
-        let tree = parser
-            .parse(
-                "<script>\n  let count = 0;\n</script>\n<button>{count}</button>\n",
-                None,
-            )
-            .unwrap();
-        assert!(!tree.root_node().has_error());
-    }
-
-    #[test]
-    fn astro_grammar_creates_valid_parser() {
-        let grammar = tree_sitter_grammar(Language::Astro).unwrap();
-        let mut parser = tree_sitter::Parser::new();
-        parser
-            .set_language(&grammar)
-            .expect("Astro grammar should load");
-        let tree = parser
-            .parse(
-                "---\nconst title = \"Hello\";\n---\n<h1>{title}</h1>\n",
-                None,
-            )
-            .unwrap();
-        assert!(!tree.root_node().has_error());
-    }
-
-    #[test]
-    fn makefile_grammar_creates_valid_parser() {
-        let grammar = tree_sitter_grammar(Language::Makefile).unwrap();
-        let mut parser = tree_sitter::Parser::new();
-        parser
-            .set_language(&grammar)
-            .expect("Makefile grammar should load");
-        let tree = parser
-            .parse("all: build\n\nbuild:\n\tgcc -o main main.c\n", None)
-            .unwrap();
-        assert!(!tree.root_node().has_error());
-    }
-
-    #[test]
-    fn ini_grammar_creates_valid_parser() {
-        let grammar = tree_sitter_grammar(Language::Ini).unwrap();
-        let mut parser = tree_sitter::Parser::new();
-        parser
-            .set_language(&grammar)
-            .expect("INI grammar should load");
-        let tree = parser.parse("[section]\nkey = value\n", None).unwrap();
-        assert!(!tree.root_node().has_error());
-    }
-
-    #[test]
-    fn nginx_grammar_creates_valid_parser() {
-        let grammar = tree_sitter_grammar(Language::Nginx).unwrap();
-        let mut parser = tree_sitter::Parser::new();
-        parser
-            .set_language(&grammar)
-            .expect("Nginx grammar should load");
-        let tree = parser
-            .parse(
-                "server {\n  listen 80;\n  server_name example.com;\n}\n",
-                None,
-            )
-            .unwrap();
-        assert!(!tree.root_node().has_error());
-    }
-
-    #[test]
-    fn prisma_grammar_creates_valid_parser() {
-        let grammar = tree_sitter_grammar(Language::Prisma).unwrap();
-        let mut parser = tree_sitter::Parser::new();
-        parser
-            .set_language(&grammar)
-            .expect("Prisma grammar should load");
-        let tree = parser
-            .parse(
-                "model User {\n  id    Int     @id @default(autoincrement())\n  name  String\n}\n",
-                None,
-            )
-            .unwrap();
-        assert!(!tree.root_node().has_error());
-    }
-
-    #[test]
-    fn rst_grammar_creates_valid_parser() {
-        let grammar = tree_sitter_grammar(Language::Rst).unwrap();
-        let mut parser = tree_sitter::Parser::new();
-        parser
-            .set_language(&grammar)
-            .expect("reStructuredText grammar should load");
-        let tree = parser
-            .parse(
-                "Heading\n=======\n\nParagraph text.\n\nSection\n-------\n\nMore text.\n",
-                None,
-            )
-            .unwrap();
-        assert!(!tree.root_node().has_error());
     }
 }

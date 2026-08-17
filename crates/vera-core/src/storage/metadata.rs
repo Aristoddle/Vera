@@ -4,8 +4,9 @@
 //! in a SQLite database. Uses WAL mode for concurrent read performance.
 
 use anyhow::{Context, Result};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 
+use crate::parsing::type_relations::{RawTypeRelation, TypeRelationKind};
 use crate::types::{Chunk, Language, SymbolType};
 
 /// A call site where a symbol is called from.
@@ -31,6 +32,75 @@ pub struct DeadSymbol {
     pub file_path: String,
     pub line: u32,
     pub symbol_type: Option<String>,
+}
+
+/// An explicit type relation pointing at a target symbol.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TypeRelationRef {
+    pub file_path: String,
+    pub line: u32,
+    pub owner: String,
+    pub target: String,
+    pub kind: TypeRelationKind,
+}
+
+/// Persisted file-level indexing state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileIndexStatus {
+    Indexed,
+    ParseError,
+}
+
+impl FileIndexStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Indexed => "indexed",
+            Self::ParseError => "parse_error",
+        }
+    }
+
+    fn from_db(value: &str) -> std::result::Result<Self, std::io::Error> {
+        match value {
+            "indexed" => Ok(Self::Indexed),
+            "parse_error" => Ok(Self::ParseError),
+            other => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("unknown file index status: {other}"),
+            )),
+        }
+    }
+}
+
+/// File-level indexing state captured during indexing/update.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct FileIndexState {
+    pub file_path: String,
+    pub language: String,
+    pub status: FileIndexStatus,
+    pub tree_has_error: bool,
+    pub tier0_fallback: bool,
+    pub chunk_count: u64,
+}
+
+/// Aggregate index health derived from persisted file states.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct IndexHealth {
+    pub files_indexed: u64,
+    pub files_with_tree_sitter_errors: u64,
+    pub files_using_tier0_fallback: u64,
+    pub files_with_parse_failures: u64,
+    pub by_language: Vec<LanguageHealthStat>,
+}
+
+/// Per-language index health derived from persisted file states.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct LanguageHealthStat {
+    pub language: String,
+    pub files_indexed: u64,
+    pub files_with_tree_sitter_errors: u64,
+    pub files_using_tier0_fallback: u64,
+    pub files_with_parse_failures: u64,
 }
 
 /// SQLite-backed metadata store for chunk attributes.
@@ -91,11 +161,28 @@ impl MetadataStore {
         self.conn
             .execute_batch(
                 "CREATE TABLE IF NOT EXISTS file_hashes (
-                    file_path TEXT PRIMARY KEY,
-                    content_hash TEXT NOT NULL
-                );",
+                     file_path TEXT PRIMARY KEY,
+                     content_hash TEXT NOT NULL
+                 );",
             )
             .context("failed to create file_hashes table")?;
+
+        self.conn
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS file_index_state (
+                    file_path TEXT PRIMARY KEY,
+                    language TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    tree_has_error INTEGER NOT NULL,
+                    tier0_fallback INTEGER NOT NULL,
+                    chunk_count INTEGER NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_file_index_state_language
+                    ON file_index_state(language);
+                CREATE INDEX IF NOT EXISTS idx_file_index_state_status
+                    ON file_index_state(status);",
+            )
+            .context("failed to create file_index_state table")?;
 
         // Index metadata (model name, dimensions, etc.)
         self.conn
@@ -124,6 +211,24 @@ impl MetadataStore {
                     ON [references](file_path);",
             )
             .context("failed to create references table")?;
+
+        self.conn
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS type_relations (
+                    file_path TEXT NOT NULL,
+                    line INTEGER NOT NULL,
+                    owner TEXT NOT NULL,
+                    target TEXT NOT NULL,
+                    kind TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_type_relations_target
+                    ON type_relations(target);
+                CREATE INDEX IF NOT EXISTS idx_type_relations_owner
+                    ON type_relations(owner);
+                CREATE INDEX IF NOT EXISTS idx_type_relations_file_path
+                    ON type_relations(file_path);",
+            )
+            .context("failed to create type_relations table")?;
 
         Ok(())
     }
@@ -201,11 +306,7 @@ impl MetadataStore {
             .query_map(params![file_path], |row| Ok(row_to_chunk(row)))
             .context("failed to query chunks by file")?;
 
-        let mut chunks = Vec::new();
-        for row in rows {
-            chunks.push(row.context("failed to read chunk row")??);
-        }
-        Ok(chunks)
+        collect_rows(rows)?.into_iter().collect()
     }
 
     /// Get all chunks whose symbol name matches exactly (case-insensitive).
@@ -225,11 +326,7 @@ impl MetadataStore {
             .query_map(params![symbol_name], |row| Ok(row_to_chunk(row)))
             .context("failed to query chunks by symbol name")?;
 
-        let mut chunks = Vec::new();
-        for row in rows {
-            chunks.push(row.context("failed to read symbol chunk row")??);
-        }
-        Ok(chunks)
+        collect_rows(rows)?.into_iter().collect()
     }
 
     /// Get all chunks whose symbol name matches exactly (case-sensitive).
@@ -252,11 +349,7 @@ impl MetadataStore {
             .query_map(params![symbol_name], |row| Ok(row_to_chunk(row)))
             .context("failed to query chunks by symbol name (case-sensitive)")?;
 
-        let mut chunks = Vec::new();
-        for row in rows {
-            chunks.push(row.context("failed to read case-sensitive symbol chunk row")??);
-        }
-        Ok(chunks)
+        collect_rows(rows)?.into_iter().collect()
     }
 
     /// Get chunks whose symbol names contain the given term (case-insensitive).
@@ -284,11 +377,7 @@ impl MetadataStore {
             })
             .context("failed to query chunks by symbol name substring")?;
 
-        let mut chunks = Vec::new();
-        for row in rows {
-            chunks.push(row.context("failed to read substring symbol chunk row")??);
-        }
-        Ok(chunks)
+        collect_rows(rows)?.into_iter().collect()
     }
 
     /// Count total chunks in the store.
@@ -316,9 +405,57 @@ impl MetadataStore {
     pub fn clear(&self) -> Result<()> {
         self.conn
             .execute_batch(
-                "DELETE FROM chunks; DELETE FROM file_hashes; DELETE FROM index_metadata; DELETE FROM [references];",
+                "DELETE FROM chunks; DELETE FROM file_hashes; DELETE FROM file_index_state; DELETE FROM index_metadata; DELETE FROM [references]; DELETE FROM type_relations;",
             )
             .context("failed to clear metadata store")?;
+        Ok(())
+    }
+
+    /// Insert or replace a batch of file states.
+    pub fn insert_file_states(&self, states: &[FileIndexState]) -> Result<()> {
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .context("failed to begin file state transaction")?;
+        {
+            let mut stmt = self
+                .conn
+                .prepare_cached(
+                    "INSERT OR REPLACE INTO file_index_state
+                     (file_path, language, status, tree_has_error, tier0_fallback, chunk_count)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                )
+                .context("failed to prepare file state insert")?;
+
+            for state in states {
+                stmt.execute(params![
+                    state.file_path,
+                    state.language,
+                    state.status.as_str(),
+                    state.tree_has_error,
+                    state.tier0_fallback,
+                    state.chunk_count as i64,
+                ])
+                .with_context(|| format!("failed to insert file state: {}", state.file_path))?;
+            }
+        }
+        tx.commit().context("failed to commit file state inserts")?;
+        Ok(())
+    }
+
+    /// Insert or replace a single file state.
+    pub fn upsert_file_state(&self, state: &FileIndexState) -> Result<()> {
+        self.insert_file_states(std::slice::from_ref(state))
+    }
+
+    /// Delete file state for a path.
+    pub fn delete_file_state(&self, file_path: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "DELETE FROM file_index_state WHERE file_path = ?1",
+                params![file_path],
+            )
+            .context("failed to delete file state")?;
         Ok(())
     }
 
@@ -384,6 +521,51 @@ impl MetadataStore {
         Ok(())
     }
 
+    /// Get all tracked files, including parse failures that produced no chunks.
+    pub fn tracked_files(&self) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT file_path FROM file_hashes ORDER BY file_path")
+            .context("failed to prepare tracked files query")?;
+        let rows = stmt
+            .query_map([], |row| row.get(0))
+            .context("failed to query tracked files")?;
+        collect_rows(rows)
+    }
+
+    /// Get all persisted file states.
+    pub fn file_states(&self) -> Result<Vec<FileIndexState>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT file_path, language, status, tree_has_error, tier0_fallback, chunk_count
+                 FROM file_index_state
+                 ORDER BY file_path",
+            )
+            .context("failed to prepare file states query")?;
+        let rows = stmt
+            .query_map([], |row| {
+                let status: String = row.get(2)?;
+                Ok(FileIndexState {
+                    file_path: row.get(0)?,
+                    language: row.get(1)?,
+                    status: FileIndexStatus::from_db(&status).map_err(|err| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            2,
+                            rusqlite::types::Type::Text,
+                            Box::new(err),
+                        )
+                    })?,
+                    tree_has_error: row.get(3)?,
+                    tier0_fallback: row.get(4)?,
+                    chunk_count: row.get::<_, i64>(5)? as u64,
+                })
+            })
+            .context("failed to query file states")?;
+
+        collect_rows(rows)
+    }
+
     // ── Reference (call graph) operations ──────────────────────────
 
     /// Insert a batch of call-site references for a single file.
@@ -413,6 +595,40 @@ impl MetadataStore {
         Ok(())
     }
 
+    /// Insert a batch of explicit type relations for a single file.
+    pub fn insert_type_relations(
+        &self,
+        file_path: &str,
+        relations: &[RawTypeRelation],
+    ) -> Result<()> {
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .context("failed to begin type relation transaction")?;
+        {
+            let mut stmt = self
+                .conn
+                .prepare_cached(
+                    "INSERT INTO type_relations (file_path, line, owner, target, kind)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                )
+                .context("failed to prepare type relation insert")?;
+            for relation in relations {
+                stmt.execute(params![
+                    file_path,
+                    relation.line,
+                    relation.owner,
+                    relation.target,
+                    relation.kind.as_str(),
+                ])
+                .context("failed to insert type relation")?;
+            }
+        }
+        tx.commit()
+            .context("failed to commit type relation inserts")?;
+        Ok(())
+    }
+
     /// Delete all references for a given file.
     pub fn delete_references_by_file(&self, file_path: &str) -> Result<()> {
         self.conn
@@ -421,6 +637,17 @@ impl MetadataStore {
                 params![file_path],
             )
             .context("failed to delete references by file")?;
+        Ok(())
+    }
+
+    /// Delete all explicit type relations for a given file.
+    pub fn delete_type_relations_by_file(&self, file_path: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "DELETE FROM type_relations WHERE file_path = ?1",
+                params![file_path],
+            )
+            .context("failed to delete type relations by file")?;
         Ok(())
     }
 
@@ -443,11 +670,38 @@ impl MetadataStore {
                 })
             })
             .context("failed to query callers")?;
-        let mut results = Vec::new();
-        for row in rows {
-            results.push(row.context("failed to read caller row")?);
-        }
-        Ok(results)
+        collect_rows(rows)
+    }
+
+    /// Find explicit type relations that point at a given target symbol.
+    pub fn find_type_relations(&self, symbol_name: &str) -> Result<Vec<TypeRelationRef>> {
+        let mut stmt = self
+            .conn
+            .prepare_cached(
+                "SELECT file_path, line, owner, target, kind
+                 FROM type_relations
+                 WHERE lower(target) = lower(?1)
+                 ORDER BY file_path, line, owner",
+            )
+            .context("failed to prepare type relation query")?;
+        let rows = stmt
+            .query_map(params![symbol_name], |row| {
+                Ok(TypeRelationRef {
+                    file_path: row.get(0)?,
+                    line: row.get(1)?,
+                    owner: row.get(2)?,
+                    target: row.get(3)?,
+                    kind: TypeRelationKind::parse(&row.get::<_, String>(4)?).ok_or_else(|| {
+                        rusqlite::Error::InvalidColumnType(
+                            4,
+                            "kind".to_string(),
+                            rusqlite::types::Type::Text,
+                        )
+                    })?,
+                })
+            })
+            .context("failed to query type relations")?;
+        collect_rows(rows)
     }
 
     /// Find all symbols called by a given symbol name.
@@ -469,11 +723,7 @@ impl MetadataStore {
                 })
             })
             .context("failed to query callees")?;
-        let mut results = Vec::new();
-        for row in rows {
-            results.push(row.context("failed to read callee row")?);
-        }
-        Ok(results)
+        collect_rows(rows)
     }
 
     /// Find defined symbols that have zero callers (potential dead code).
@@ -506,11 +756,7 @@ impl MetadataStore {
                 })
             })
             .context("failed to query dead symbols")?;
-        let mut results = Vec::new();
-        for row in rows {
-            results.push(row.context("failed to read dead symbol row")?);
-        }
-        Ok(results)
+        collect_rows(rows)
     }
 
     /// Get distinct file paths in the index.
@@ -522,11 +768,7 @@ impl MetadataStore {
         let rows = stmt
             .query_map([], |row| row.get(0))
             .context("failed to query indexed files")?;
-        let mut files = Vec::new();
-        for row in rows {
-            files.push(row.context("failed to read file path")?);
-        }
-        Ok(files)
+        collect_rows(rows)
     }
 
     /// Count distinct files in the index.
@@ -554,12 +796,10 @@ impl MetadataStore {
                 Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
             })
             .context("failed to query language stats")?;
-        let mut stats = Vec::new();
-        for row in rows {
-            let (lang, count) = row.context("failed to read language stat")?;
-            stats.push((lang, count as u64));
-        }
-        Ok(stats)
+        Ok(collect_rows(rows)?
+            .into_iter()
+            .map(|(lang, count): (String, i64)| (lang, count as u64))
+            .collect())
     }
 
     /// Get language breakdown by file count (language -> file count).
@@ -576,12 +816,84 @@ impl MetadataStore {
                 Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
             })
             .context("failed to query language file counts")?;
-        let mut stats = Vec::new();
-        for row in rows {
-            let (lang, count) = row.context("failed to read language file count")?;
-            stats.push((lang, count as u64));
-        }
-        Ok(stats)
+        Ok(collect_rows(rows)?
+            .into_iter()
+            .map(|(lang, count): (String, i64)| (lang, count as u64))
+            .collect())
+    }
+
+    /// Collect persisted index health metrics from file-level states.
+    pub fn index_health(&self) -> Result<IndexHealth> {
+        let files_indexed: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM file_index_state WHERE status = 'indexed'",
+                [],
+                |row| row.get(0),
+            )
+            .context("failed to count indexed files for health")?;
+        let files_with_tree_sitter_errors: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM file_index_state WHERE status = 'indexed' AND tree_has_error = 1",
+                [],
+                |row| row.get(0),
+            )
+            .context("failed to count tree-sitter errors for health")?;
+        let files_using_tier0_fallback: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM file_index_state WHERE status = 'indexed' AND tier0_fallback = 1",
+                [],
+                |row| row.get(0),
+            )
+            .context("failed to count tier0 fallbacks for health")?;
+        let files_with_parse_failures: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM file_index_state WHERE status = 'parse_error'",
+                [],
+                |row| row.get(0),
+            )
+            .context("failed to count parse failures for health")?;
+
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT
+                    language,
+                    SUM(CASE WHEN status = 'indexed' THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN status = 'indexed' AND tree_has_error = 1 THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN status = 'indexed' AND tier0_fallback = 1 THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN status = 'parse_error' THEN 1 ELSE 0 END)
+                 FROM file_index_state
+                 GROUP BY language
+                 ORDER BY (SUM(CASE WHEN status = 'indexed' THEN 1 ELSE 0 END) +
+                           SUM(CASE WHEN status = 'parse_error' THEN 1 ELSE 0 END)) DESC,
+                          language ASC",
+            )
+            .context("failed to prepare index health query")?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(LanguageHealthStat {
+                    language: row.get(0)?,
+                    files_indexed: row.get::<_, i64>(1)? as u64,
+                    files_with_tree_sitter_errors: row.get::<_, i64>(2)? as u64,
+                    files_using_tier0_fallback: row.get::<_, i64>(3)? as u64,
+                    files_with_parse_failures: row.get::<_, i64>(4)? as u64,
+                })
+            })
+            .context("failed to execute index health query")?;
+
+        let by_language = collect_rows(rows)?;
+
+        Ok(IndexHealth {
+            files_indexed: files_indexed as u64,
+            files_with_tree_sitter_errors: files_with_tree_sitter_errors as u64,
+            files_using_tier0_fallback: files_using_tier0_fallback as u64,
+            files_with_parse_failures: files_with_parse_failures as u64,
+            by_language,
+        })
     }
 
     /// Get top-level directories with file counts.
@@ -607,12 +919,10 @@ impl MetadataStore {
                 Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
             })
             .context("failed to query top directories")?;
-        let mut dirs = Vec::new();
-        for row in rows {
-            let (dir, count) = row.context("failed to read directory stat")?;
-            dirs.push((dir, count as u64));
-        }
-        Ok(dirs)
+        Ok(collect_rows(rows)?
+            .into_iter()
+            .map(|(dir, count): (String, i64)| (dir, count as u64))
+            .collect())
     }
 
     /// Get total lines of code across all chunks.
@@ -643,12 +953,10 @@ impl MetadataStore {
                 Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
             })
             .context("failed to query symbol type stats")?;
-        let mut stats = Vec::new();
-        for row in rows {
-            let (sym_type, count) = row.context("failed to read symbol type stat")?;
-            stats.push((sym_type, count as u64));
-        }
-        Ok(stats)
+        Ok(collect_rows(rows)?
+            .into_iter()
+            .map(|(sym_type, count): (String, i64)| (sym_type, count as u64))
+            .collect())
     }
 
     /// Get files with the most chunks (hotspots).
@@ -665,12 +973,10 @@ impl MetadataStore {
                 Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
             })
             .context("failed to query hotspot files")?;
-        let mut files = Vec::new();
-        for row in rows {
-            let (path, count) = row.context("failed to read hotspot file")?;
-            files.push((path, count as u64));
-        }
-        Ok(files)
+        Ok(collect_rows(rows)?
+            .into_iter()
+            .map(|(path, count): (String, i64)| (path, count as u64))
+            .collect())
     }
 
     /// Find likely entry point files (main.*, index.*, app.*, etc.).
@@ -694,11 +1000,7 @@ impl MetadataStore {
         let rows = stmt
             .query_map([], |row| row.get::<_, String>(0))
             .context("failed to query entry points")?;
-        let mut files = Vec::new();
-        for row in rows {
-            files.push(row.context("failed to read entry point")?);
-        }
-        Ok(files)
+        collect_rows(rows)
     }
 }
 
@@ -752,19 +1054,13 @@ fn parse_symbol_type(s: &str) -> SymbolType {
     }
 }
 
-/// Extension trait to make `optional()` work with rusqlite.
-trait OptionalExt<T> {
-    fn optional(self) -> std::result::Result<Option<T>, rusqlite::Error>;
-}
-
-impl<T> OptionalExt<T> for std::result::Result<T, rusqlite::Error> {
-    fn optional(self) -> std::result::Result<Option<T>, rusqlite::Error> {
-        match self {
-            Ok(val) => Ok(Some(val)),
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(e),
-        }
-    }
+/// Collect fallible mapped rows into a Vec, attaching a read-failure context.
+fn collect_rows<T>(
+    rows: impl IntoIterator<Item = std::result::Result<T, rusqlite::Error>>,
+) -> Result<Vec<T>> {
+    rows.into_iter()
+        .map(|row| row.context("failed to read row"))
+        .collect()
 }
 
 #[cfg(test)]
@@ -948,6 +1244,32 @@ mod tests {
         // Rust has 2, Python has 1
         assert_eq!(stats[0], ("rust".to_string(), 2));
         assert_eq!(stats[1], ("python".to_string(), 1));
+    }
+
+    #[test]
+    fn type_relation_operations() {
+        let store = MetadataStore::open_in_memory().unwrap();
+
+        store
+            .insert_type_relations(
+                "src/types.ts",
+                &[RawTypeRelation {
+                    owner: "Repo".to_string(),
+                    target: "Loader".to_string(),
+                    line: 2,
+                    kind: TypeRelationKind::Conforms,
+                }],
+            )
+            .unwrap();
+
+        let relations = store.find_type_relations("loader").unwrap();
+        assert_eq!(relations.len(), 1);
+        assert_eq!(relations[0].owner, "Repo");
+        assert_eq!(relations[0].target, "Loader");
+        assert_eq!(relations[0].kind, TypeRelationKind::Conforms);
+
+        store.delete_type_relations_by_file("src/types.ts").unwrap();
+        assert!(store.find_type_relations("Loader").unwrap().is_empty());
     }
 
     #[test]

@@ -7,14 +7,14 @@
 //! symbols, content, and cross-file relationships.
 
 use crate::config::VeraConfig;
-use crate::embedding::embed_chunks;
 use crate::embedding::test_helpers::MockProvider;
+use crate::indexing::index_repository;
 use crate::parsing;
 use crate::retrieval::apply_filters;
 use crate::retrieval::bm25::search_bm25_with_stores;
 use crate::retrieval::hybrid::fuse_rrf;
 use crate::retrieval::vector::search_vector_with_stores;
-use crate::storage::bm25::{Bm25Document, Bm25Index};
+use crate::storage::bm25::Bm25Index;
 use crate::storage::metadata::MetadataStore;
 use crate::storage::vector::VectorStore;
 use crate::types::{Chunk, Language, SearchFilters, SearchResult, SymbolType};
@@ -314,29 +314,11 @@ async fn setup_indexed_corpus() -> (
     metadata_store.insert_chunks(&all_chunks).unwrap();
 
     let vector_store = VectorStore::open_in_memory(dim).unwrap();
-    let embeddings = embed_chunks(&provider, &all_chunks, all_chunks.len(), 0)
-        .await
-        .unwrap();
-    let batch: Vec<(&str, &[f32])> = embeddings
-        .iter()
-        .map(|(id, vec)| (id.as_str(), vec.as_slice()))
-        .collect();
-    vector_store.insert_batch(&batch).unwrap();
+    crate::embedding::test_helpers::embed_and_insert_vectors(&vector_store, &provider, &all_chunks)
+        .await;
 
     let bm25_index = Bm25Index::open_in_memory().unwrap();
-    let lang_strings: Vec<String> = all_chunks.iter().map(|c| c.language.to_string()).collect();
-    let bm25_docs: Vec<Bm25Document<'_>> = all_chunks
-        .iter()
-        .zip(lang_strings.iter())
-        .map(|(c, lang)| Bm25Document {
-            chunk_id: &c.id,
-            file_path: &c.file_path,
-            content: &c.content,
-            symbol_name: c.symbol_name.as_deref(),
-            language: lang,
-        })
-        .collect();
-    bm25_index.insert_batch(&bm25_docs).unwrap();
+    bm25_index.insert_chunks(&all_chunks).unwrap();
 
     (
         bm25_index,
@@ -357,6 +339,24 @@ fn bm25_search(
     limit: usize,
 ) -> Vec<SearchResult> {
     search_bm25_with_stores(bm25, metadata, query, limit).unwrap()
+}
+
+async fn setup_structural_repo() -> tempfile::TempDir {
+    let dir = tempfile::TempDir::new().unwrap();
+    for (file_path, source, _) in build_test_corpus() {
+        let abs = dir.path().join(&file_path);
+        if let Some(parent) = abs.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(abs, source).unwrap();
+    }
+
+    let provider = MockProvider::new(8);
+    let config = VeraConfig::default();
+    index_repository(dir.path(), &provider, &config, "mock-model")
+        .await
+        .unwrap();
+    dir
 }
 
 // ── 1. Exact symbol lookup tests (10+ queries) ─────────────────────
@@ -514,6 +514,48 @@ async fn symbol_lookup_find_by_username() {
     assert!(
         top3_have_content,
         "find_by_username should appear in content of top-3 results"
+    );
+}
+
+// ── Structural agent-task regressions ─────────────────────────────
+
+#[tokio::test]
+async fn references_search_finds_authenticate_handler() {
+    let repo = setup_structural_repo().await;
+    let results = crate::retrieval::search_callers(
+        &crate::indexing::index_dir(repo.path()),
+        "authenticate",
+        10,
+        &SearchFilters::default(),
+    )
+    .unwrap();
+
+    assert!(
+        results
+            .iter()
+            .any(|result| result.file_path == "src/handler.rs"
+                && result.content.contains("authenticate(user, pass)")),
+        "expected authenticate callsite in handler.rs, got {results:?}"
+    );
+}
+
+#[tokio::test]
+async fn structural_sql_finds_database_execution_sites() {
+    let repo = setup_structural_repo().await;
+    let results = crate::retrieval::search_structural(
+        &crate::indexing::index_dir(repo.path()),
+        crate::retrieval::StructuralSearchKind::SqlQueries,
+        None,
+        10,
+        &SearchFilters::default(),
+    )
+    .unwrap();
+
+    assert!(
+        results
+            .iter()
+            .any(|result| result.file_path == "src/database.py"),
+        "expected SQL execution site in database.py, got {results:?}"
     );
 }
 
@@ -909,7 +951,7 @@ async fn filter_by_path_glob() {
     let results = bm25_search(&bm25, &meta, "request", 20);
 
     let filters = SearchFilters {
-        path_glob: Some("**/*.rs".to_string()),
+        path_glob: vec!["**/*.rs".to_string()],
         ..Default::default()
     };
     let filtered = apply_filters(results, &filters, 20);
@@ -930,7 +972,7 @@ async fn filter_by_path_glob_specific_directory() {
     let results = bm25_search(&bm25, &meta, "function class struct", 30);
 
     let filters = SearchFilters {
-        path_glob: Some("src/auth*".to_string()),
+        path_glob: vec!["src/auth*".to_string()],
         ..Default::default()
     };
     let filtered = apply_filters(results, &filters, 30);
@@ -956,10 +998,12 @@ async fn filter_by_symbol_type_function() {
     let filtered = apply_filters(results, &filters, 20);
 
     for result in &filtered {
-        assert_eq!(
-            result.symbol_type,
-            Some(SymbolType::Function),
-            "all filtered results should be functions, got: {:?}",
+        assert!(
+            matches!(
+                result.symbol_type,
+                Some(SymbolType::Function) | Some(SymbolType::Method)
+            ),
+            "all filtered results should be functions or methods, got: {:?}",
             result.symbol_type
         );
     }
@@ -1027,7 +1071,7 @@ async fn filter_combined_path_and_lang() {
 
     let filters = SearchFilters {
         language: Some("python".to_string()),
-        path_glob: Some("**/*.py".to_string()),
+        path_glob: vec!["**/*.py".to_string()],
         ..Default::default()
     };
     let filtered = apply_filters(results, &filters, 20);

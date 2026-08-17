@@ -9,17 +9,21 @@
 //! - Graceful degradation when services are unavailable
 
 pub mod bm25;
+pub(crate) mod exact_matches;
+pub(crate) mod graph_augmentation;
 pub mod hybrid;
 pub mod query_classifier;
 pub mod ranking;
+pub mod references;
 pub mod reranker;
 pub mod search_service;
+pub mod type_relations;
 pub mod vector;
 
-pub use bm25::{search_bm25, search_bm25_with_stores};
+pub use bm25::{search_bm25, search_bm25_with_stores, search_bm25_with_stores_and_filters};
 pub use hybrid::{
-    HybridSearchError, HybridTimings, fuse_rrf, fuse_rrf_multi, fuse_rrf_multi_weighted,
-    search_hybrid, search_hybrid_reranked,
+    HybridSearchError, HybridTimings, fuse_rrf, fuse_rrf_multi_weighted, search_hybrid,
+    search_hybrid_reranked,
 };
 pub use reranker::{
     ApiReranker, RerankScore, Reranker, RerankerConfig, RerankerError, rerank_results,
@@ -29,16 +33,20 @@ pub mod dynamic_reranker;
 pub use dynamic_reranker::{DynamicReranker, create_dynamic_reranker};
 
 pub mod completion_client;
+pub(crate) mod file_scan;
 pub mod iterative_search;
 pub mod local_reranker;
 pub(crate) mod query_utils;
 pub mod rag_fusion;
 pub mod regex_search;
+pub mod structural;
 
 pub use local_reranker::LocalReranker;
+pub use references::search_callers;
 pub use regex_search::search_regex;
+pub use structural::{StructuralSearchKind, search_structural};
 
-pub use vector::{VectorSearchError, search_vector, search_vector_with_stores};
+pub use vector::{VectorSearchError, search_vector_with_stores};
 
 use crate::types::{SearchFilters, SearchResult};
 

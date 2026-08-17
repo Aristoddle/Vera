@@ -13,6 +13,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 use crate::chunk_text::{file_name, normalize_path_tokens};
@@ -22,7 +23,7 @@ use crate::types::SearchResult;
 // ── Error types ──────────────────────────────────────────────────────
 
 /// Errors specific to the reranking pipeline.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum RerankerError {
     /// Authentication failure (invalid or missing API key).
     #[error("reranker API authentication failed: {message}")]
@@ -43,6 +44,10 @@ pub enum RerankerError {
     /// Unexpected response format.
     #[error("unexpected reranker API response: {message}")]
     ResponseError { message: String },
+
+    /// Request was cancelled because the client disconnected.
+    #[error("rerank cancelled")]
+    Cancelled,
 }
 
 // ── Reranker trait ───────────────────────────────────────────────────
@@ -63,6 +68,19 @@ pub trait Reranker: Send + Sync {
         query: &str,
         documents: &[String],
     ) -> Result<Vec<RerankScore>, RerankerError>;
+
+    /// Like `rerank`, but aborts between batches if `cancel` is fired.
+    ///
+    /// The default implementation ignores the token and delegates to `rerank`.
+    async fn rerank_cancellable(
+        &self,
+        query: &str,
+        documents: &[String],
+        cancel: &CancellationToken,
+    ) -> Result<Vec<RerankScore>, RerankerError> {
+        let _ = cancel;
+        self.rerank(query, documents).await
+    }
 }
 
 /// A single reranking score for a document.
@@ -144,6 +162,13 @@ pub struct ApiReranker {
     config: RerankerConfig,
     max_rerank_batch: usize,
     max_document_chars: usize,
+    /// Whether the configured base URL points at Voyage AI.
+    ///
+    /// Voyage's `/rerank` accepts `top_k` instead of the `top_n` field
+    /// used by SiliconFlow, Jina, Cohere, and the rest of the OpenAI-style
+    /// rerank ecosystem. Detected once at construction; mirrors the
+    /// embedding-side detection in `embedding/provider.rs`.
+    is_voyage: bool,
 }
 
 impl ApiReranker {
@@ -163,11 +188,14 @@ impl ApiReranker {
             .build()
             .context("failed to create HTTP client for reranker")?;
 
+        let is_voyage = is_voyage_base_url(&config.base_url);
+
         Ok(Self {
             client,
             config,
             max_rerank_batch,
             max_document_chars,
+            is_voyage,
         })
     }
 
@@ -183,18 +211,28 @@ impl ApiReranker {
         query: &str,
         documents: &[String],
         top_n: usize,
+        cancel: &CancellationToken,
     ) -> Result<Vec<RerankScore>, RerankerError> {
         let url = self.endpoint_url();
+        let top = if self.is_voyage {
+            TopLimit::TopK { top_k: top_n }
+        } else {
+            TopLimit::TopN { top_n }
+        };
         let body = RerankRequest {
             model: &self.config.model_id,
             query,
             documents,
-            top_n: Some(top_n),
+            top,
             return_documents: Some(false),
         };
 
         let mut last_err = None;
         for attempt in 0..=self.config.max_retries {
+            if cancel.is_cancelled() {
+                return Err(RerankerError::Cancelled);
+            }
+
             if attempt > 0 {
                 let delay = Duration::from_millis(500 * 2u64.pow(attempt.min(4) - 1));
                 debug!(
@@ -202,10 +240,18 @@ impl ApiReranker {
                     delay_ms = delay.as_millis(),
                     "retrying reranker API"
                 );
-                tokio::time::sleep(delay).await;
+                tokio::select! {
+                    _ = cancel.cancelled() => return Err(RerankerError::Cancelled),
+                    _ = tokio::time::sleep(delay) => {}
+                }
             }
 
-            match self.send_request(&url, &body).await {
+            let request = tokio::select! {
+                _ = cancel.cancelled() => return Err(RerankerError::Cancelled),
+                result = self.send_request(&url, &body) => result,
+            };
+
+            match request {
                 Ok(scores) => return Ok(scores),
                 Err(e) => {
                     // Don't retry auth errors.
@@ -305,16 +351,18 @@ impl ApiReranker {
 
         Ok(scores)
     }
-}
 
-impl Reranker for ApiReranker {
-    async fn rerank(
+    async fn rerank_inner(
         &self,
         query: &str,
         documents: &[String],
+        cancel: &CancellationToken,
     ) -> Result<Vec<RerankScore>, RerankerError> {
         if documents.is_empty() {
             return Ok(Vec::new());
+        }
+        if cancel.is_cancelled() {
+            return Err(RerankerError::Cancelled);
         }
 
         // Truncate documents that exceed the reranker's context window.
@@ -326,14 +374,19 @@ impl Reranker for ApiReranker {
 
         let batch_size = self.max_rerank_batch;
         if batch_size == 0 || documents.len() <= batch_size {
-            return self.call_api(query, documents, documents.len()).await;
+            return self
+                .call_api(query, documents, documents.len(), cancel)
+                .await;
         }
 
         // Partition into batches, rerank each, merge with corrected indices.
         let mut all_scores = Vec::with_capacity(documents.len());
         for (batch_idx, batch) in documents.chunks(batch_size).enumerate() {
+            if cancel.is_cancelled() {
+                return Err(RerankerError::Cancelled);
+            }
             let offset = batch_idx * batch_size;
-            let scores = self.call_api(query, batch, batch.len()).await?;
+            let scores = self.call_api(query, batch, batch.len(), cancel).await?;
             for s in scores {
                 all_scores.push(RerankScore {
                     index: s.index + offset,
@@ -348,6 +401,26 @@ impl Reranker for ApiReranker {
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
         Ok(all_scores)
+    }
+}
+
+impl Reranker for ApiReranker {
+    async fn rerank(
+        &self,
+        query: &str,
+        documents: &[String],
+    ) -> Result<Vec<RerankScore>, RerankerError> {
+        self.rerank_inner(query, documents, &CancellationToken::new())
+            .await
+    }
+
+    async fn rerank_cancellable(
+        &self,
+        query: &str,
+        documents: &[String],
+        cancel: &CancellationToken,
+    ) -> Result<Vec<RerankScore>, RerankerError> {
+        self.rerank_inner(query, documents, cancel).await
     }
 }
 
@@ -507,15 +580,38 @@ struct RerankRequest<'a> {
     model: &'a str,
     query: &'a str,
     documents: &'a [String],
-    #[serde(skip_serializing_if = "Option::is_none")]
-    top_n: Option<usize>,
+    #[serde(flatten)]
+    top: TopLimit,
     #[serde(skip_serializing_if = "Option::is_none")]
     return_documents: Option<bool>,
 }
 
+/// Per-provider field name for the top-results limit.
+///
+/// Voyage AI's `/rerank` requires `top_k`. SiliconFlow / Jina / Cohere
+/// and other OpenAI-style rerank endpoints use `top_n`. The wire format is
+/// otherwise identical, so this is flattened into the request body.
+#[derive(Serialize)]
+#[serde(untagged)]
+enum TopLimit {
+    TopN { top_n: usize },
+    TopK { top_k: usize },
+}
+
 #[derive(Deserialize)]
 struct RerankResponse {
+    /// Voyage wraps results in `data` instead of `results`. Tolerate both.
+    #[serde(alias = "data")]
     results: Vec<RerankResult>,
+}
+
+/// Returns `true` if the configured base URL points at Voyage AI.
+///
+/// Voyage's `/rerank` accepts `top_k` instead of `top_n`. Mirrors the
+/// embedding-side detection in `embedding/provider.rs` (substring match on
+/// the canonical hostname). A custom Voyage proxy needs the same hostname.
+fn is_voyage_base_url(base_url: &str) -> bool {
+    base_url.contains("api.voyageai.com")
 }
 
 #[derive(Deserialize)]
@@ -562,24 +658,7 @@ pub(crate) mod test_helpers {
             documents: &[String],
         ) -> Result<Vec<RerankScore>, RerankerError> {
             if let Some(ref err) = self.fail_with {
-                return Err(match err {
-                    RerankerError::AuthError { message } => RerankerError::AuthError {
-                        message: message.clone(),
-                    },
-                    RerankerError::ConnectionError { message } => RerankerError::ConnectionError {
-                        message: message.clone(),
-                    },
-                    RerankerError::ApiError { status, message } => RerankerError::ApiError {
-                        status: *status,
-                        message: message.clone(),
-                    },
-                    RerankerError::RateLimitError { message } => RerankerError::RateLimitError {
-                        message: message.clone(),
-                    },
-                    RerankerError::ResponseError { message } => RerankerError::ResponseError {
-                        message: message.clone(),
-                    },
-                });
+                return Err(err.clone());
             }
 
             // Deterministic scoring: reverse order of input (last doc scores highest).
@@ -605,403 +684,91 @@ pub(crate) mod test_helpers {
 }
 
 #[cfg(test)]
-mod tests {
+mod cancellation_tests {
     use super::*;
-    use crate::types::{Language, SymbolType};
-
-    /// Helper to create a SearchResult with given parameters.
-    fn make_result(
-        file: &str,
-        line_start: u32,
-        line_end: u32,
-        score: f64,
-        symbol_name: Option<&str>,
-        content: &str,
-    ) -> SearchResult {
-        SearchResult {
-            file_path: file.to_string(),
-            line_start,
-            line_end,
-            content: content.to_string(),
-            language: Language::Rust,
-            score,
-            symbol_name: symbol_name.map(|s| s.to_string()),
-            symbol_type: Some(SymbolType::Function),
-        }
-    }
-
-    // ── RerankerConfig tests ─────────────────────────────────────────
-
-    #[test]
-    fn config_from_values() {
-        let config = RerankerConfig::new(
-            "https://api.example.com/v1".to_string(),
-            "model-1".to_string(),
-            "key-123".to_string(),
-        );
-        assert_eq!(config.base_url, "https://api.example.com/v1");
-        assert_eq!(config.model_id, "model-1");
-        assert_eq!(config.timeout, Duration::from_secs(30));
-        assert_eq!(config.max_retries, 2);
-    }
-
-    #[test]
-    fn config_with_timeout() {
-        let config = RerankerConfig::new(
-            "https://api.example.com/v1".to_string(),
-            "model-1".to_string(),
-            "key-123".to_string(),
-        )
-        .with_timeout(Duration::from_secs(10));
-        assert_eq!(config.timeout, Duration::from_secs(10));
-    }
-
-    #[test]
-    fn config_with_max_retries() {
-        let config = RerankerConfig::new(
-            "https://api.example.com/v1".to_string(),
-            "model-1".to_string(),
-            "key-123".to_string(),
-        )
-        .with_max_retries(5);
-        assert_eq!(config.max_retries, 5);
-    }
-
-    // ── MockReranker tests ───────────────────────────────────────────
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::sync::Notify;
 
     #[tokio::test]
-    async fn mock_reranker_returns_scores_for_all_documents() {
-        let reranker = test_helpers::MockReranker::new();
-        let docs = vec![
-            "doc 1".to_string(),
-            "doc 2".to_string(),
-            "doc 3".to_string(),
-        ];
-
-        let scores = reranker.rerank("query", &docs).await.unwrap();
-
-        assert_eq!(scores.len(), 3);
-    }
-
-    #[tokio::test]
-    async fn mock_reranker_scores_are_descending() {
-        let reranker = test_helpers::MockReranker::new();
-        let docs = vec!["a".to_string(), "b".to_string(), "c".to_string()];
-
-        let scores = reranker.rerank("query", &docs).await.unwrap();
-
-        for i in 1..scores.len() {
-            assert!(
-                scores[i - 1].relevance_score >= scores[i].relevance_score,
-                "scores must be descending"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn mock_reranker_empty_documents() {
-        let reranker = test_helpers::MockReranker::new();
-
-        let scores = reranker.rerank("query", &[]).await.unwrap();
-
-        assert!(scores.is_empty());
-    }
-
-    #[tokio::test]
-    async fn mock_reranker_connection_error() {
-        let reranker = test_helpers::MockReranker::failing(RerankerError::ConnectionError {
-            message: "timeout".to_string(),
-        });
-
-        let result = reranker.rerank("query", &["doc".to_string()]).await;
-
-        assert!(result.is_err());
-        assert!(matches!(
-            result.unwrap_err(),
-            RerankerError::ConnectionError { .. }
-        ));
-    }
-
-    #[tokio::test]
-    async fn mock_reranker_auth_error() {
-        let reranker = test_helpers::MockReranker::failing(RerankerError::AuthError {
-            message: "invalid key".to_string(),
-        });
-
-        let result = reranker.rerank("query", &["doc".to_string()]).await;
-
-        assert!(result.is_err());
-        assert!(matches!(
-            result.unwrap_err(),
-            RerankerError::AuthError { .. }
-        ));
-    }
-
-    // ── rerank_results tests ─────────────────────────────────────────
-
-    #[tokio::test]
-    async fn rerank_results_reorders_by_reranker_scores() {
-        let reranker = test_helpers::MockReranker::new();
-        let results = vec![
-            make_result("a.rs", 1, 10, 0.5, Some("func_a"), "fn func_a() {}"),
-            make_result("b.rs", 1, 10, 0.4, Some("func_b"), "fn func_b() {}"),
-            make_result("c.rs", 1, 10, 0.3, Some("func_c"), "fn func_c() {}"),
-        ];
-
-        let reranked = rerank_results(&reranker, "test query", &results, 10)
-            .await
-            .unwrap();
-
-        assert_eq!(reranked.len(), 3);
-        // Scores should be descending.
-        for i in 1..reranked.len() {
-            assert!(
-                reranked[i - 1].score >= reranked[i].score,
-                "reranked scores must be descending"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn rerank_results_replaces_original_scores() {
-        let reranker = test_helpers::MockReranker::new();
-        let results = vec![
-            make_result("a.rs", 1, 10, 100.0, None, "fn a() {}"),
-            make_result("b.rs", 1, 10, 50.0, None, "fn b() {}"),
-        ];
-
-        let reranked = rerank_results(&reranker, "query", &results, 10)
-            .await
-            .unwrap();
-
-        // Original scores (100.0, 50.0) should be replaced by reranker scores.
-        for result in &reranked {
-            assert!(
-                result.score <= 1.0,
-                "reranker scores should replace original (was {})",
-                result.score
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn rerank_results_preserves_metadata() {
-        let reranker = test_helpers::MockReranker::new();
-        let results = vec![make_result(
-            "auth.rs",
-            5,
-            20,
-            0.8,
-            Some("authenticate"),
-            "fn authenticate() {}",
-        )];
-
-        let reranked = rerank_results(&reranker, "auth", &results, 10)
-            .await
-            .unwrap();
-
-        assert_eq!(reranked.len(), 1);
-        let r = &reranked[0];
-        assert_eq!(r.file_path, "auth.rs");
-        assert_eq!(r.line_start, 5);
-        assert_eq!(r.line_end, 20);
-        assert_eq!(r.symbol_name.as_deref(), Some("authenticate"));
-        assert_eq!(r.symbol_type, Some(SymbolType::Function));
-        assert_eq!(r.language, Language::Rust);
-        assert!(!r.content.is_empty());
-    }
-
-    #[tokio::test]
-    async fn rerank_results_respects_top_n() {
-        let reranker = test_helpers::MockReranker::new();
-        let results = vec![
-            make_result("a.rs", 1, 10, 0.9, None, "fn a() {}"),
-            make_result("b.rs", 1, 10, 0.8, None, "fn b() {}"),
-            make_result("c.rs", 1, 10, 0.7, None, "fn c() {}"),
-            make_result("d.rs", 1, 10, 0.6, None, "fn d() {}"),
-            make_result("e.rs", 1, 10, 0.5, None, "fn e() {}"),
-        ];
-
-        // Only rerank top 2 candidates.
-        let reranked = rerank_results(&reranker, "query", &results, 2)
-            .await
-            .unwrap();
-
-        assert_eq!(
-            reranked.len(),
-            2,
-            "should only return top_n reranked results"
-        );
-    }
-
-    #[tokio::test]
-    async fn rerank_results_empty_input() {
-        let reranker = test_helpers::MockReranker::new();
-
-        let reranked = rerank_results(&reranker, "query", &[], 10).await.unwrap();
-
-        assert!(reranked.is_empty());
-    }
-
-    #[tokio::test]
-    async fn rerank_results_propagates_connection_error() {
-        let reranker = test_helpers::MockReranker::failing(RerankerError::ConnectionError {
-            message: "timeout".to_string(),
-        });
-        let results = vec![make_result("a.rs", 1, 10, 0.5, None, "fn a() {}")];
-
-        let result = rerank_results(&reranker, "query", &results, 10).await;
-
-        assert!(result.is_err());
-        assert!(matches!(
-            result.unwrap_err(),
-            RerankerError::ConnectionError { .. }
-        ));
-    }
-
-    #[tokio::test]
-    async fn rerank_results_propagates_api_error() {
-        let reranker = test_helpers::MockReranker::failing(RerankerError::ApiError {
-            status: 500,
-            message: "internal error".to_string(),
-        });
-        let results = vec![make_result("a.rs", 1, 10, 0.5, None, "fn a() {}")];
-
-        let result = rerank_results(&reranker, "query", &results, 10).await;
-
-        assert!(result.is_err());
-        assert!(matches!(
-            result.unwrap_err(),
-            RerankerError::ApiError { status: 500, .. }
-        ));
-    }
-
-    // ── format_for_reranker tests ────────────────────────────────────
-
-    #[test]
-    fn format_includes_symbol_info() {
-        let result = make_result("lib.rs", 1, 10, 0.5, Some("my_func"), "fn my_func() {}");
-        let formatted = format_for_reranker(&result);
-
-        assert!(formatted.contains("Symbol: my_func"));
-        assert!(formatted.contains("Symbol type: function"));
-        assert!(formatted.contains("Filename: lib.rs"));
-        assert!(formatted.contains("File: lib.rs"));
-        assert!(formatted.contains("fn my_func() {}"));
-    }
-
-    #[test]
-    fn format_without_symbol_info() {
-        let mut result = make_result("lib.rs", 1, 10, 0.5, None, "some code");
-        result.symbol_type = None;
-        let formatted = format_for_reranker(&result);
-
-        assert!(formatted.contains("Filename: lib.rs"));
-        assert!(formatted.contains("File: lib.rs"));
-        assert!(formatted.contains("some code"));
-        assert!(!formatted.contains("Symbol type:"));
-    }
-
-    // ── sanitize_error_message tests ─────────────────────────────────
-
-    #[test]
-    fn sanitize_truncates_long_messages() {
-        let long_msg = "a".repeat(1000);
-        let sanitized = sanitize_error_message(&long_msg);
-        assert!(sanitized.len() <= 500);
-    }
-
-    #[test]
-    fn sanitize_multibyte_utf8_boundary() {
-        // Create a string with multi-byte chars near the 500-byte boundary.
-        // Each '🦀' is 4 bytes. 125 crabs = 500 bytes exactly, but place
-        // the boundary right in the middle of a multi-byte sequence.
-        let msg = "a".repeat(499) + "🦀"; // 499 + 4 = 503 bytes
-        let sanitized = sanitize_error_message(&msg);
-        // Should truncate before the crab emoji, not panic.
-        assert!(sanitized.len() <= 500);
-        assert!(sanitized.is_char_boundary(sanitized.len()));
-    }
-
-    #[test]
-    fn sanitize_empty_message() {
-        let sanitized = sanitize_error_message("");
-        assert_eq!(sanitized, "no details available");
-    }
-
-    // ── ApiReranker endpoint URL tests ───────────────────────────────
-
-    #[test]
-    fn endpoint_url_builds_correctly() {
-        let config = RerankerConfig::new(
-            "https://api.siliconflow.com/v1".to_string(),
-            "model".to_string(),
-            "key".to_string(),
-        );
-        let reranker = ApiReranker::new(config).unwrap();
-        assert_eq!(
-            reranker.endpoint_url(),
-            "https://api.siliconflow.com/v1/rerank"
-        );
-    }
-
-    #[test]
-    fn endpoint_url_strips_trailing_slash() {
-        let config = RerankerConfig::new(
-            "https://api.siliconflow.com/v1/".to_string(),
-            "model".to_string(),
-            "key".to_string(),
-        );
-        let reranker = ApiReranker::new(config).unwrap();
-        assert_eq!(
-            reranker.endpoint_url(),
-            "https://api.siliconflow.com/v1/rerank"
-        );
-    }
-
-    // ── truncate_document tests ─────────────────────────────────────
-
-    #[test]
-    fn truncate_document_short_passthrough() {
-        assert_eq!(truncate_document("hello", 100), "hello");
-    }
-
-    #[test]
-    fn truncate_document_cuts_at_newline() {
-        let doc = "line1\nline2\nline3\nline4";
-        let result = truncate_document(doc, 15);
-        assert_eq!(result, "line1\nline2");
-    }
-
-    #[test]
-    fn truncate_document_no_newline() {
-        let doc = "abcdefghij";
-        let result = truncate_document(doc, 5);
-        assert_eq!(result, "abcde");
-    }
-
-    #[test]
-    fn truncate_document_zero_max_passthrough() {
-        assert_eq!(truncate_document("hello", 0), "hello");
-    }
-
-    #[tokio::test]
-    async fn api_reranker_unreachable_endpoint() {
+    async fn api_reranker_honors_pre_cancelled_token() {
         let config = RerankerConfig::new(
             "http://127.0.0.1:19999".to_string(),
             "model".to_string(),
             "key".to_string(),
         )
-        .with_timeout(Duration::from_millis(500))
-        .with_max_retries(0);
-
+        .with_max_retries(2);
         let reranker = ApiReranker::new(config).unwrap();
-        let result = reranker.rerank("test", &["document".to_string()]).await;
+        let cancel = CancellationToken::new();
+        cancel.cancel();
 
-        assert!(result.is_err());
-        assert!(
-            matches!(result.unwrap_err(), RerankerError::ConnectionError { .. }),
-            "unreachable endpoint should return connection error"
-        );
+        let result = reranker
+            .rerank_cancellable("query", &["document".to_string()], &cancel)
+            .await;
+
+        assert!(matches!(result, Err(RerankerError::Cancelled)));
+    }
+
+    #[tokio::test]
+    async fn api_reranker_honors_cancellation_during_retry_backoff() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let first_response = Arc::new(Notify::new());
+        let server_request_count = Arc::clone(&request_count);
+        let server_first_response = Arc::clone(&first_response);
+
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                server_request_count.fetch_add(1, Ordering::SeqCst);
+                let response_ready = Arc::clone(&server_first_response);
+                tokio::spawn(async move {
+                    let mut request = [0_u8; 4096];
+                    let _ = stream.read(&mut request).await;
+                    stream
+                        .write_all(
+                            b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        )
+                        .await
+                        .unwrap();
+                    response_ready.notify_one();
+                });
+            }
+        });
+
+        let config = RerankerConfig::new(
+            format!("http://{address}"),
+            "model".to_string(),
+            "key".to_string(),
+        )
+        .with_timeout(Duration::from_secs(2))
+        .with_max_retries(3);
+        let reranker = ApiReranker::new(config).unwrap();
+        let cancel = CancellationToken::new();
+        let task_cancel = cancel.clone();
+        let task = tokio::spawn(async move {
+            reranker
+                .rerank_cancellable("query", &["document".to_string()], &task_cancel)
+                .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), first_response.notified())
+            .await
+            .expect("reranker should receive the first failed response");
+        cancel.cancel();
+
+        let result = tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("cancellation should stop retry backoff")
+            .expect("reranker task should not panic");
+        assert!(matches!(result, Err(RerankerError::Cancelled)));
+        assert_eq!(request_count.load(Ordering::SeqCst), 1);
+        server.abort();
     }
 }
+
+#[cfg(test)]
+#[path = "reranker_tests.rs"]
+mod tests;

@@ -1,5 +1,0 @@
-# Build artifacts
-rust/target/
-ts-bun/node_modules/
-ts-bun/bun.lock
-rust/Cargo.lock

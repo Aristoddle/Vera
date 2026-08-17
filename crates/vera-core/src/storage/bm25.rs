@@ -8,7 +8,10 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use tantivy::collector::TopDocs;
 use tantivy::query::QueryParser;
-use tantivy::schema::{STORED, STRING, Schema, TEXT, Value};
+use tantivy::schema::{
+    IndexRecordOption, STORED, STRING, Schema, TextFieldIndexing, TextOptions, Value,
+};
+use tantivy::tokenizer::{LowerCaser, RemoveLongFilter, SimpleTokenizer, TextAnalyzer};
 use tantivy::{Index, IndexWriter, ReloadPolicy, TantivyDocument, doc};
 
 use crate::chunk_text;
@@ -44,6 +47,24 @@ pub struct Bm25SearchResult {
 /// Writer heap size for Tantivy (50MB).
 const WRITER_HEAP_SIZE: usize = 50_000_000;
 
+/// Custom tokenizer name: SimpleTokenizer + LowerCaser + English stemmer.
+///
+/// English stemming lets "dependency" match "dependencies", "configure" match
+/// "configuration", etc. This is standard search-engine behaviour and fixes
+/// a large class of recall failures for natural-language queries.
+const STEMMED_TOKENIZER: &str = "code_en_stem";
+
+fn register_stemmed_tokenizer(index: &Index) {
+    let analyzer = TextAnalyzer::builder(SimpleTokenizer::default())
+        .filter(RemoveLongFilter::limit(40))
+        .filter(LowerCaser)
+        .filter(tantivy::tokenizer::Stemmer::new(
+            tantivy::tokenizer::Language::English,
+        ))
+        .build();
+    index.tokenizers().register(STEMMED_TOKENIZER, analyzer);
+}
+
 impl Bm25Index {
     /// Open (or create) a BM25 index at the given directory path.
     pub fn open(index_dir: &Path) -> Result<Self> {
@@ -59,6 +80,7 @@ impl Bm25Index {
                 .with_context(|| format!("failed to create BM25 index: {}", index_dir.display()))?
         };
 
+        register_stemmed_tokenizer(&index);
         Ok(Self { index, schema })
     }
 
@@ -66,6 +88,7 @@ impl Bm25Index {
     pub fn open_in_memory() -> Result<Self> {
         let schema = build_schema();
         let index = Index::create_in_ram(schema.schema.clone());
+        register_stemmed_tokenizer(&index);
         Ok(Self { index, schema })
     }
 
@@ -116,6 +139,23 @@ impl Bm25Index {
         Ok(())
     }
 
+    /// Insert all chunks as BM25 documents in one batch.
+    pub fn insert_chunks(&self, chunks: &[crate::types::Chunk]) -> Result<()> {
+        let lang_strings: Vec<String> = chunks.iter().map(|c| c.language.to_string()).collect();
+        let docs: Vec<Bm25Document<'_>> = chunks
+            .iter()
+            .zip(lang_strings.iter())
+            .map(|(c, lang)| Bm25Document {
+                chunk_id: &c.id,
+                file_path: &c.file_path,
+                content: &c.content,
+                symbol_name: c.symbol_name.as_deref(),
+                language: lang,
+            })
+            .collect();
+        self.insert_batch(&docs)
+    }
+
     /// Search the index with a text query.
     ///
     /// Searches across content and symbol_name fields.
@@ -149,8 +189,11 @@ impl Bm25Index {
         );
         query_parser.set_field_boost(self.schema.filename, if path_weighted { 8.0 } else { 2.0 });
 
+        // Sanitize query for tantivy: strip characters that the query parser
+        // interprets as operators (e.g. `:` as field separator, `(`, `)`, etc.).
+        let sanitized = sanitize_query(query_text);
         let query = query_parser
-            .parse_query(query_text)
+            .parse_query(&sanitized)
             .with_context(|| format!("failed to parse BM25 query: {query_text}"))?;
 
         let top_docs = searcher
@@ -251,14 +294,22 @@ pub struct Bm25Document<'a> {
 /// Build the Tantivy schema for BM25 indexing.
 fn build_schema() -> Bm25Schema {
     let mut builder = Schema::builder();
+
+    // Stemmed text: indexed with English stemmer so "dependency" matches "dependencies".
+    let stemmed_indexing = TextFieldIndexing::default()
+        .set_tokenizer(STEMMED_TOKENIZER)
+        .set_index_option(IndexRecordOption::WithFreqsAndPositions);
+    let stemmed = TextOptions::default().set_indexing_options(stemmed_indexing.clone());
+    let stemmed_stored = stemmed.clone() | STORED;
+
     // chunk_id and file_path use STRING (exact match, no tokenization) for deletion.
     let chunk_id = builder.add_text_field("chunk_id", STRING | STORED);
     let file_path = builder.add_text_field("file_path", STRING | STORED);
-    let filename = builder.add_text_field("filename", TEXT | STORED);
-    let path_tokens = builder.add_text_field("path_tokens", TEXT);
-    let content = builder.add_text_field("content", TEXT | STORED);
-    let symbol_name = builder.add_text_field("symbol_name", TEXT | STORED);
-    let language = builder.add_text_field("language", TEXT | STORED);
+    let filename = builder.add_text_field("filename", stemmed_stored.clone());
+    let path_tokens = builder.add_text_field("path_tokens", stemmed.clone());
+    let content = builder.add_text_field("content", stemmed_stored.clone());
+    let symbol_name = builder.add_text_field("symbol_name", stemmed_stored);
+    let language = builder.add_text_field("language", stemmed);
     let schema = builder.build();
 
     Bm25Schema {
@@ -271,6 +322,16 @@ fn build_schema() -> Bm25Schema {
         symbol_name,
         language,
     }
+}
+
+fn sanitize_query(query_text: &str) -> String {
+    query_text
+        .chars()
+        .map(|c| match c {
+            ':' | '(' | ')' | '[' | ']' | '{' | '}' | '^' | '~' | '!' | '\'' | '"' | '`' => ' ',
+            _ => c,
+        })
+        .collect()
 }
 
 fn looks_path_weighted(query_text: &str) -> bool {
@@ -486,5 +547,34 @@ mod tests {
             .search("turbo.json pipeline configuration", 10)
             .unwrap();
         assert_eq!(results[0].chunk_id, "turbo.json:0");
+    }
+
+    #[test]
+    fn stemming_matches_morphological_variants() {
+        let index = Bm25Index::open_in_memory().unwrap();
+        index
+            .insert_batch(&[Bm25Document {
+                chunk_id: "deps.py:0",
+                file_path: "fastapi/dependencies/utils.py",
+                content: "def solve_dependencies(dependant, sub_dependant):\n    return resolved",
+                symbol_name: Some("solve_dependencies"),
+                language: "python",
+            }])
+            .unwrap();
+
+        // "dependency" should match "dependencies" via English stemming.
+        let results = index.search("dependency injection", 10).unwrap();
+        assert!(
+            !results.is_empty(),
+            "stemming should match 'dependency' to 'dependencies'"
+        );
+    }
+
+    #[test]
+    fn sanitize_query_strips_possessive_apostrophes() {
+        assert_eq!(
+            sanitize_query("how pandoc's app module orchestrates"),
+            "how pandoc s app module orchestrates"
+        );
     }
 }

@@ -1,5 +1,8 @@
 //! Shared types used across Vera's core modules.
 
+use std::collections::HashSet;
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
 
 /// Coarse scope filter for retrieval.
@@ -41,13 +44,17 @@ impl std::str::FromStr for SearchScope {
 /// Filters that can be applied to search results.
 ///
 /// All filters are optional. When set, they restrict results to only those
-/// matching all specified criteria (AND semantics).
+/// matching all specified criteria (AND semantics). Multiple path patterns
+/// use OR semantics within the path filter.
 #[derive(Debug, Clone, Default)]
 pub struct SearchFilters {
     /// Filter by programming language (case-insensitive match).
     pub language: Option<String>,
-    /// Filter by file path glob pattern (e.g., `src/**/*.rs`).
-    pub path_glob: Option<String>,
+    /// Filter by file path glob patterns (e.g., `src/**/*.rs`). Patterns use
+    /// OR semantics.
+    pub path_glob: Vec<String>,
+    /// Restrict results to an exact set of repository-relative file paths.
+    pub exact_paths: Option<Arc<HashSet<String>>>,
     /// Filter by symbol type (case-insensitive match).
     pub symbol_type: Option<String>,
     /// Coarse corpus scope filter.
@@ -64,7 +71,8 @@ impl SearchFilters {
     /// Returns true if no filters are set.
     pub fn is_empty(&self) -> bool {
         self.language.is_none()
-            && self.path_glob.is_none()
+            && self.path_glob.is_empty()
+            && self.exact_paths.is_none()
             && self.symbol_type.is_none()
             && self.scope.is_none()
             && self.include_generated.is_none()
@@ -78,8 +86,19 @@ impl SearchFilters {
             }
         }
 
-        if let Some(ref pattern) = self.path_glob {
-            if !glob_matches(pattern, file_path) {
+        if !self.path_glob.is_empty()
+            && !self
+                .path_glob
+                .iter()
+                .any(|pattern| glob_matches(pattern, file_path))
+        {
+            return false;
+        }
+
+        if let Some(ref exact_paths) = self.exact_paths {
+            // Git-scope paths are `/`-normalized; indexed paths may use `\`
+            // on Windows.
+            if !exact_paths.contains(file_path.replace('\\', "/").as_str()) {
                 return false;
             }
         }
@@ -91,7 +110,19 @@ impl SearchFilters {
     pub fn matches_symbol_type(&self, symbol_type: Option<SymbolType>) -> bool {
         if let Some(ref requested) = self.symbol_type {
             match symbol_type {
-                Some(symbol_type) => symbol_type.to_string().eq_ignore_ascii_case(requested),
+                Some(symbol_type) => {
+                    if symbol_type.to_string().eq_ignore_ascii_case(requested) {
+                        return true;
+                    }
+                    // Treat function/method as equivalent for user-facing filtering.
+                    if requested.eq_ignore_ascii_case("function") {
+                        return symbol_type == SymbolType::Method;
+                    }
+                    if requested.eq_ignore_ascii_case("method") {
+                        return symbol_type == SymbolType::Function;
+                    }
+                    false
+                }
                 None => false,
             }
         } else {
@@ -145,7 +176,31 @@ fn glob_matches(pattern: &str, path: &str) -> bool {
     let pattern = pattern.replace('\\', "/");
     let path = path.replace('\\', "/");
 
-    glob_match_recursive(&pattern, &path)
+    // Normalize a leading `./` on both sides and a trailing `/` on the
+    // pattern, so `./app/src` and `app/src/` behave like `app/src`.
+    let pattern = pattern
+        .strip_prefix("./")
+        .unwrap_or(&pattern)
+        .trim_end_matches('/');
+    let path = path.strip_prefix("./").unwrap_or(&path);
+
+    if glob_match_recursive(pattern, path) {
+        return true;
+    }
+
+    // Directory-prefix fallback: a bare pattern with no wildcards (e.g.
+    // `app/src`) should match any file beneath that directory
+    // (`app/src/foo.ts`), i.e. behave like `app/src/**`. Kept out of the
+    // recursive matcher so wildcards like `*` retain single-segment semantics.
+    //
+    // Only `*`/`**` are wildcards in this matcher; `?` and `[` are literal
+    // characters (e.g. Next.js dynamic-route dirs like `app/[slug]`), so they
+    // must stay eligible for the fallback.
+    if !pattern.is_empty() && !pattern.contains('*') {
+        return path.starts_with(pattern) && path.as_bytes().get(pattern.len()) == Some(&b'/');
+    }
+
+    false
 }
 
 /// Recursive glob matching helper.
@@ -162,8 +217,9 @@ fn glob_match_recursive(pattern: &str, text: &str) -> bool {
             return true;
         }
         // Try skipping path segments.
-        for (i, _) in text.char_indices() {
-            if text.as_bytes().get(i) == Some(&b'/') && glob_match_recursive(rest, &text[i + 1..]) {
+        for (i, ch) in text.char_indices() {
+            let next = i + ch.len_utf8();
+            if ch == '/' && glob_match_recursive(rest, &text[next..]) {
                 return true;
             }
         }
@@ -187,7 +243,8 @@ fn glob_match_recursive(pattern: &str, text: &str) -> bool {
             if ch == '/' {
                 break;
             }
-            if glob_match_recursive(rest, &text[i + 1..]) {
+            let next = i + ch.len_utf8();
+            if glob_match_recursive(rest, &text[next..]) {
                 return true;
             }
         }
@@ -227,6 +284,22 @@ pub struct Chunk {
     pub symbol_type: Option<SymbolType>,
     /// Name of the symbol (if applicable).
     pub symbol_name: Option<String>,
+}
+
+impl Chunk {
+    /// Convert the chunk into a search result with the given relevance score.
+    pub(crate) fn into_search_result(self, score: f64) -> SearchResult {
+        SearchResult {
+            file_path: self.file_path,
+            line_start: self.line_start,
+            line_end: self.line_end,
+            content: self.content,
+            language: self.language,
+            score,
+            symbol_name: self.symbol_name,
+            symbol_type: self.symbol_type,
+        }
+    }
 }
 
 /// Programming language of a source file or chunk.
@@ -1185,10 +1258,46 @@ mod tests {
             Some("Bar"),
             Some(SymbolType::Class),
         );
+        let method = make_test_result(
+            "a.ts",
+            Language::TypeScript,
+            Some("baz"),
+            Some(SymbolType::Method),
+        );
         let none_sym = make_test_result("a.rs", Language::Rust, None, None);
         assert!(filters.matches(&func));
+        assert!(filters.matches(&method));
         assert!(!filters.matches(&cls));
         assert!(!filters.matches(&none_sym));
+    }
+
+    #[test]
+    fn filter_by_symbol_type_method_matches_function() {
+        let filters = SearchFilters {
+            symbol_type: Some("method".to_string()),
+            ..Default::default()
+        };
+        let method = make_test_result(
+            "a.ts",
+            Language::TypeScript,
+            Some("baz"),
+            Some(SymbolType::Method),
+        );
+        let function = make_test_result(
+            "a.rs",
+            Language::Rust,
+            Some("foo"),
+            Some(SymbolType::Function),
+        );
+        let class = make_test_result(
+            "a.py",
+            Language::Python,
+            Some("Bar"),
+            Some(SymbolType::Class),
+        );
+        assert!(filters.matches(&method));
+        assert!(filters.matches(&function));
+        assert!(!filters.matches(&class));
     }
 
     #[test]
@@ -1209,7 +1318,7 @@ mod tests {
     #[test]
     fn filter_by_path_glob_extension() {
         let filters = SearchFilters {
-            path_glob: Some("*.rs".to_string()),
+            path_glob: vec!["*.rs".to_string()],
             ..Default::default()
         };
         let rs = make_test_result("main.rs", Language::Rust, None, None);
@@ -1221,7 +1330,7 @@ mod tests {
     #[test]
     fn filter_by_path_glob_directory() {
         let filters = SearchFilters {
-            path_glob: Some("src/**/*.rs".to_string()),
+            path_glob: vec!["src/**/*.rs".to_string()],
             ..Default::default()
         };
         let in_src = make_test_result("src/lib.rs", Language::Rust, None, None);
@@ -1235,7 +1344,7 @@ mod tests {
     #[test]
     fn filter_by_path_glob_doublestar_prefix() {
         let filters = SearchFilters {
-            path_glob: Some("**/test_*.py".to_string()),
+            path_glob: vec!["**/test_*.py".to_string()],
             ..Default::default()
         };
         let deep = make_test_result("tests/unit/test_auth.py", Language::Python, None, None);
@@ -1244,6 +1353,20 @@ mod tests {
         assert!(filters.matches(&deep));
         assert!(filters.matches(&top));
         assert!(!filters.matches(&no_match));
+    }
+
+    #[test]
+    fn filter_by_path_glob_matches_any_pattern() {
+        let filters = SearchFilters {
+            path_glob: vec!["src/**/*.rs".to_string(), "tests/**/*.py".to_string()],
+            ..Default::default()
+        };
+        let rust = make_test_result("src/lib.rs", Language::Rust, None, None);
+        let python = make_test_result("tests/unit/test_auth.py", Language::Python, None, None);
+        let other = make_test_result("docs/guide.md", Language::Markdown, None, None);
+        assert!(filters.matches(&rust));
+        assert!(filters.matches(&python));
+        assert!(!filters.matches(&other));
     }
 
     #[test]
@@ -1305,6 +1428,26 @@ mod tests {
             symbol_type: None,
         };
         assert!(!filters.matches(&generated));
+    }
+
+    #[test]
+    fn filter_by_exact_paths() {
+        let mut exact_paths = HashSet::new();
+        exact_paths.insert("src/lib.rs".to_string());
+        let filters = SearchFilters {
+            exact_paths: Some(Arc::new(exact_paths)),
+            ..Default::default()
+        };
+
+        let allowed = make_test_result("src/lib.rs", Language::Rust, None, None);
+        let blocked = make_test_result("src/main.rs", Language::Rust, None, None);
+        assert!(filters.matches(&allowed));
+        assert!(!filters.matches(&blocked));
+
+        // Git-scope paths are `/`-normalized; indexed paths may use `\` on
+        // Windows. The filter must match either separator.
+        let windows_allowed = make_test_result("src\\lib.rs", Language::Rust, None, None);
+        assert!(filters.matches(&windows_allowed));
     }
 
     #[test]
@@ -1374,5 +1517,86 @@ mod tests {
         assert!(glob_matches("src/**", "src/main.rs"));
         assert!(glob_matches("src/**", "src/a/b/c.rs"));
         assert!(!glob_matches("src/**", "tests/main.rs"));
+    }
+
+    #[test]
+    fn glob_bare_directory_matches_files_beneath() {
+        // Bare directory pattern (no wildcards) behaves like `app/src/**`.
+        assert!(glob_matches("app/src", "app/src/foo.ts"));
+        assert!(glob_matches("app/src", "app/src/bar/baz.rs"));
+        // But not siblings or unrelated directories.
+        assert!(!glob_matches("app/src", "app/srcs/foo.ts"));
+        assert!(!glob_matches("app/src", "other/src/foo.ts"));
+        // Single-segment bare directory.
+        assert!(glob_matches("src", "src/foo.rs"));
+        assert!(!glob_matches("src", "srcs/foo.rs"));
+        // The directory path itself (exact, no trailing file) still matches.
+        assert!(glob_matches("app/src", "app/src"));
+        // `?` and `[` are literals in this matcher, not wildcards, so bare
+        // directories containing them (e.g. Next.js `app/[slug]`) still get
+        // the directory-prefix fallback.
+        assert!(glob_matches("app/[slug]", "app/[slug]/page.tsx"));
+        assert!(!glob_matches("app/[slug]", "app/other/page.tsx"));
+    }
+
+    #[test]
+    fn glob_trailing_slash_pattern_matches_directory() {
+        // A trailing slash on the pattern is normalized away.
+        assert!(glob_matches("app/src/", "app/src/foo.ts"));
+        assert!(!glob_matches("app/src/", "app/srcs/foo.ts"));
+    }
+
+    #[test]
+    fn glob_leading_dot_slash_is_normalized() {
+        // `./app/src` behaves like `app/src` against unprefixed paths.
+        assert!(glob_matches("./app/src", "app/src/foo.ts"));
+        // And a `./`-prefixed path is normalized too.
+        assert!(glob_matches("app/src", "./app/src/foo.ts"));
+    }
+
+    #[test]
+    fn filter_by_path_plain_directory_prefix() {
+        let filters = SearchFilters {
+            path_glob: vec!["app/src".to_string()],
+            ..Default::default()
+        };
+        let inside = make_test_result("app/src/foo.ts", Language::TypeScript, None, None);
+        let deep = make_test_result("app/src/bar/baz.rs", Language::Rust, None, None);
+        let sibling = make_test_result("app/srcs/foo.ts", Language::TypeScript, None, None);
+        let other = make_test_result("other/src/foo.ts", Language::TypeScript, None, None);
+        assert!(filters.matches(&inside));
+        assert!(filters.matches(&deep));
+        assert!(!filters.matches(&sibling));
+        assert!(!filters.matches(&other));
+
+        // A wildcard pattern must NOT get directory-prefix treatment: `app/*`
+        // stays single-segment and does not match nested files.
+        let wildcard = SearchFilters {
+            path_glob: vec!["app/*".to_string()],
+            ..Default::default()
+        };
+        assert!(!wildcard.matches(&deep));
+    }
+
+    #[test]
+    fn single_star_does_not_cross_directory_boundary() {
+        // `src/*` must not match `src/bar/baz` — `*` is single-segment only.
+        let filters = SearchFilters {
+            path_glob: vec!["src/*".to_string()],
+            ..Default::default()
+        };
+        let shallow = make_test_result("src/foo.rs", Language::Rust, None, None);
+        let deep = make_test_result("src/bar/baz.rs", Language::Rust, None, None);
+        assert!(filters.matches(&shallow));
+        assert!(!filters.matches(&deep));
+    }
+
+    #[test]
+    fn glob_star_handles_unicode_filename_without_panicking() {
+        assert!(!glob_matches(
+            "**/*kvm*",
+            "docs/Daily Briefing — 2026-06-16.md"
+        ));
+        assert!(glob_matches("**/*kvm*", "docs/Daily Briefing — kvm.md"));
     }
 }

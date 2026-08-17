@@ -1,21 +1,34 @@
 //! `vera update <path>` — Incrementally update the index.
 
+use std::io::IsTerminal;
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::{Context, bail};
 use vera_core::config::InferenceBackend;
+use vera_core::indexing::{UpdateOptions, UpdateProgress};
 
-use crate::helpers::load_runtime_config;
+use crate::helpers::{cancel_on_signal, load_runtime_config, wait_for_interrupt};
+
+pub struct CommandOptions {
+    pub backend: InferenceBackend,
+    pub exclude: Vec<String>,
+    pub no_ignore: bool,
+    pub no_default_excludes: bool,
+    pub no_progress: bool,
+    pub max_files: Option<usize>,
+}
 
 /// Run the `vera update <path>` command.
-pub fn run(
-    path: &str,
-    json_output: bool,
-    backend: InferenceBackend,
-    exclude: Vec<String>,
-    no_ignore: bool,
-    no_default_excludes: bool,
-) -> anyhow::Result<()> {
+pub fn run(path: &str, json_output: bool, options: CommandOptions) -> anyhow::Result<()> {
+    let CommandOptions {
+        backend,
+        exclude,
+        no_ignore,
+        no_default_excludes,
+        no_progress,
+        max_files,
+    } = options;
     let repo_path = Path::new(path);
 
     if !repo_path.exists() {
@@ -53,7 +66,11 @@ pub fn run(
                 .get_index_meta("embedding_dim")
                 .unwrap_or(None),
         ) {
-            if !vera_core::config::model_names_match(&s_model, &model_name) {
+            if !vera_core::config::model_names_match_with_aliases(
+                &s_model,
+                &model_name,
+                &config.embedding.model_aliases,
+            ) {
                 bail!(
                     "Index was created with model '{}' ({} dimensions), but you are using model '{}'. Please re-index with matching provider.",
                     s_model,
@@ -64,9 +81,9 @@ pub fn run(
             if let Ok(dim) = s_dim.parse::<usize>() {
                 use vera_core::embedding::EmbeddingProvider;
                 if let Some(provider_dim) = provider.expected_dim() {
-                    if provider_dim != dim {
+                    if provider_dim < dim {
                         bail!(
-                            "Dimension mismatch: index has {} dimensions but active provider expects {}. Please re-index with matching provider.",
+                            "Dimension mismatch: index has {} dimensions but active provider only returns {}. Please re-index with matching provider.",
                             dim,
                             provider_dim
                         );
@@ -76,15 +93,94 @@ pub fn run(
         }
     }
 
-    // Run the incremental update pipeline.
-    let summary = rt
-        .block_on(vera_core::indexing::update_repository(
-            repo_path,
-            &provider,
-            &config,
-            &model_name,
+    let show_progress = !json_output && !no_progress && std::io::stderr().is_terminal();
+    let options = UpdateOptions { max_files };
+    let summary = if show_progress {
+        let multi = cliclack::multi_progress("Updating...");
+        let spinner = multi.add(cliclack::spinner());
+        spinner.start("Discovering files...");
+        let embed_bar: Arc<cliclack::ProgressBar> = Arc::new(multi.add(cliclack::progress_bar(0)));
+        let embed_started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let spinner_ref = &spinner;
+        let embed_bar_ref = embed_bar.clone();
+        let embed_started_ref = embed_started.clone();
+
+        let on_progress = move |event: UpdateProgress| match event {
+            UpdateProgress::DiscoveryDone { file_count } => {
+                spinner_ref.stop(format!("Discovered {file_count} files"));
+                spinner_ref.start("Classifying changes...");
+            }
+            UpdateProgress::ClassificationDone {
+                modified,
+                added,
+                deleted,
+                unchanged,
+                deferred,
+            } => {
+                spinner_ref.stop(format!(
+                    "Changes: {added} added, {modified} modified, {deleted} deleted; \
+                     {unchanged} unchanged, {deferred} deferred"
+                ));
+                spinner_ref.start("Parsing changed files...");
+            }
+            UpdateProgress::ParsingDone {
+                file_count,
+                chunk_count,
+            } => {
+                spinner_ref.stop(format!(
+                    "Parsed {file_count} changed files into {chunk_count} chunks"
+                ));
+            }
+            UpdateProgress::EmbeddingProgress { done, total } => {
+                if !embed_started_ref.load(std::sync::atomic::Ordering::Relaxed) {
+                    embed_started_ref.store(true, std::sync::atomic::Ordering::Relaxed);
+                    embed_bar_ref.set_length(total as u64);
+                    embed_bar_ref.start("Generating embeddings...");
+                }
+                embed_bar_ref.set_position(done as u64);
+                embed_bar_ref.set_message(format!("Generating embeddings ({done}/{total})"));
+            }
+            UpdateProgress::EmbeddingDone { count } => {
+                if embed_started_ref.load(std::sync::atomic::Ordering::Relaxed) {
+                    embed_bar_ref.stop(format!("Generated {count} embeddings"));
+                }
+                spinner_ref.start("Writing index updates...");
+            }
+            UpdateProgress::StorageDone => {
+                spinner_ref.stop("Wrote index updates");
+            }
+        };
+
+        let result = rt.block_on(cancel_on_signal(
+            vera_core::indexing::update_repository_with_options_and_progress(
+                repo_path,
+                &provider,
+                &config,
+                &model_name,
+                &options,
+                on_progress,
+            ),
+            wait_for_interrupt(),
+            "update",
+        ));
+        multi.stop();
+        result.context("update failed")?
+    } else {
+        rt.block_on(cancel_on_signal(
+            vera_core::indexing::update_repository_with_options_and_progress(
+                repo_path,
+                &provider,
+                &config,
+                &model_name,
+                &options,
+                |_| {},
+            ),
+            wait_for_interrupt(),
+            "update",
         ))
-        .context("update failed")?;
+        .context("update failed")?
+    };
 
     // Output results.
     if json_output {
@@ -106,11 +202,33 @@ fn print_update_summary(summary: &vera_core::indexing::UpdateSummary) {
     println!("  Files added:     {}", summary.files_added);
     println!("  Files deleted:   {}", summary.files_deleted);
     println!("  Files unchanged: {}", summary.files_unchanged);
+    if summary.files_with_tree_sitter_errors > 0 || summary.files_using_tier0_fallback > 0 {
+        println!(
+            "  Tree-sitter errors: {}",
+            summary.files_with_tree_sitter_errors
+        );
+        println!(
+            "  Tier 0 fallback:    {}",
+            summary.files_using_tier0_fallback
+        );
+    }
+    println!("  Files deferred:  {}", summary.files_deferred);
     println!("  Total chunks:    {}", summary.total_chunks);
     println!("  Elapsed time:    {:.2}s", summary.elapsed_secs);
 
-    let total_changed = summary.files_modified + summary.files_added + summary.files_deleted;
-    if total_changed == 0 {
+    if !summary.parse_errors.is_empty() {
+        println!();
+        println!("  Parse errors ({}):", summary.parse_errors.len());
+        for err in &summary.parse_errors {
+            println!("    {}: {}", err.file_path, err.error);
+        }
+    }
+
+    let total_pending = summary.files_modified
+        + summary.files_added
+        + summary.files_deleted
+        + summary.files_deferred;
+    if total_pending == 0 {
         println!();
         println!("  Index is up to date — no changes detected.");
     }

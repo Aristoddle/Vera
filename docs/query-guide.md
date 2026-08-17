@@ -11,7 +11,7 @@ vera search "authentication middleware"
 vera search "JWT token validation"
 vera search "request rate limiting" --lang rust
 vera search "database connection pooling"
-vera search "routes" --path "src/**/*.ts"
+vera search "routes" --path "src/**/*.ts" --path "tests/**/*.ts"
 vera search "handler" --type function --limit 5
 ```
 
@@ -30,8 +30,8 @@ Single generic words return too many results. Be specific about the behavior or 
 If your first search returns too much, add filters one at a time:
 
 - `--lang rust`: restrict to a specific language
-- `--path "src/**/*.ts"`: restrict to a file path pattern
-- `--type function`: restrict to functions, classes, methods, or structs
+- `--path "src/**/*.ts"`: restrict to a file path pattern; repeat it to OR several patterns
+- `--type function`: restrict to functions and methods (function and method are aliases in both directions)
 - `--scope docs`: restrict to docs and markdown
 - `--scope runtime`: restrict to extracted runtime trees and bundled app code
 - `--include-generated`: include dist/minified/generated artifacts
@@ -43,6 +43,22 @@ These stack, so you can combine them:
 vera search "error handling" --lang rust --type function --limit 5
 vera search "mod loader" --scope runtime --include-generated
 ```
+
+## Git-Scoped Search
+
+When the task is limited to your working tree or a PR diff, scope the search before broadening the query:
+
+```bash
+vera search "token validation" --changed
+vera grep "TODO|FIXME" --changed
+vera overview --base origin/main
+```
+
+Use:
+
+- `--changed` for modified, staged, and untracked files
+- `--since <rev>` for changes since a specific revision
+- `--base <rev>` for changes since `merge-base(HEAD, <rev>)`
 
 ## Multi-Query Search
 
@@ -89,6 +105,8 @@ Use `vera grep` when you want exact text or regex matches limited to indexed fil
 - `vera grep "TODO\(" -i`
 - `vera grep "queryClient|invalidateQueries" --path "frontend/src/**"`
 
+Vera uses Rust regex syntax. Use `|` for alternation. `\|` matches a literal pipe.
+
 Use `rg` when you need:
 
 - Counting occurrences
@@ -96,9 +114,50 @@ Use `rg` when you need:
 - File name search
 - Files outside the Vera index
 
+## Structural Search
+
+Use `vera structural` for the common structural cases where you want an intent, not raw query syntax:
+
+```bash
+vera structural definitions parse_config
+vera structural env DATABASE_URL
+vera structural routes --path "src/**"
+vera structural sql
+vera structural impls Loader
+```
+
+This is the better default for agents.
+Use `vera structural impls <symbol>` for explicit inheritance or conformance declarations. It does not infer implicit interface satisfaction.
+
+Use `vera references` for exact caller/callee questions:
+
+```bash
+vera references parse_config
+vera references parse_config --callees
+vera references parse_config --changed
+```
+
+## Missing Files Or Surprising Exclusions
+
+If a file is missing from search results and you need the exact reason, ask Vera directly:
+
+```bash
+vera explain-path path/to/file
+```
+
+If `vera search` or `vera grep` warns that the index may be stale, refresh it:
+
+```bash
+vera update .
+```
+
+Use `vera watch .` when you want the index to stay current while you work.
+
+Use `vera stats --json` when you want the repo-wide health view for parse failures, tree-sitter errors, and Tier 0 fallback.
+
 ## Output Format
 
-See [features: output formats](features.md#multiple-output-formats) for all options (`--json`, `--raw`, `--timing`). `--raw` and `--timing` work with `vera search` and `vera grep`, and can appear before or after the subcommand. `vera search --timing` prints per-stage timings; `vera grep --timing` prints total regex-search time.
+See [features: output formats](features.md#multiple-output-formats) for all options (`--json`, `--raw`, `--timing`). `--raw` works with `vera search`, `vera grep`, and `vera references`; `--timing` works with `vera search` and `vera grep`. They can appear before or after the subcommand. `vera search --timing` prints per-stage timings; `vera grep --timing` prints total regex-search time.
 
 ## Keeping Results Fresh
 

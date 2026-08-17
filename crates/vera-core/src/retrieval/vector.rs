@@ -6,8 +6,6 @@
 //! metadata store. Finds semantically related code even when query terms
 //! don't appear literally in results (e.g., "memory allocation" finds `alloc`).
 
-use std::path::Path;
-
 use anyhow::Result;
 use tracing::debug;
 
@@ -31,40 +29,6 @@ pub enum VectorSearchError {
     StorageError(#[from] anyhow::Error),
 }
 
-/// Perform a vector similarity search over the indexed chunks.
-///
-/// Opens the vector store and metadata store from the index directory,
-/// generates a query embedding via the provider, performs nearest-neighbor
-/// search, and returns hydrated results sorted by similarity (descending).
-///
-/// # Arguments
-/// - `index_dir` — Path to the `.vera` index directory
-/// - `provider` — Embedding provider for generating the query vector
-/// - `query` — The search query text
-/// - `limit` — Maximum number of results to return
-/// - `stored_dim` — Dimensionality of stored vectors (for truncation matching)
-///
-/// # Returns
-/// A vector of `SearchResult` with full chunk metadata, sorted by similarity
-/// score descending.
-pub async fn search_vector(
-    index_dir: &Path,
-    provider: &impl EmbeddingProvider,
-    query: &str,
-    limit: usize,
-    stored_dim: usize,
-) -> Result<Vec<SearchResult>, VectorSearchError> {
-    let vector_path = index_dir.join("vectors.db");
-    let metadata_path = index_dir.join("metadata.db");
-
-    let vector_store = VectorStore::open(&vector_path, stored_dim)
-        .map_err(|e| VectorSearchError::StorageError(e.context("failed to open vector store")))?;
-    let metadata_store = MetadataStore::open(&metadata_path)
-        .map_err(|e| VectorSearchError::StorageError(e.context("failed to open metadata store")))?;
-
-    search_vector_with_stores(&vector_store, &metadata_store, provider, query, limit).await
-}
-
 /// Perform vector search using pre-opened stores (useful for testing and reuse).
 ///
 /// Generates a query embedding, runs nearest-neighbor search in the vector
@@ -82,6 +46,10 @@ pub async fn search_vector_with_stores(
     query: &str,
     limit: usize,
 ) -> Result<Vec<SearchResult>, VectorSearchError> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+
     // 1. Generate query embedding.
     let query_embedding = generate_query_embedding(provider, query, vector_store.dim()).await?;
 
@@ -92,8 +60,9 @@ pub async fn search_vector_with_stores(
     );
 
     // 2. Search the vector store for nearest neighbors.
-    // Fetch more candidates than the limit to account for missing metadata.
-    let candidates = limit.saturating_mul(2).max(limit + 10);
+    // Fetch extra candidates to account for missing metadata without doubling
+    // large caller-selected candidate pools.
+    let candidates = limit.saturating_add(limit / 2).max(limit + 10);
 
     let vector_results = vector_store
         .search(&query_embedding, candidates)
@@ -127,16 +96,7 @@ pub async fn search_vector_with_stores(
         // Convert distance to similarity score: higher is better.
         let score = distance_to_similarity(vr.distance);
 
-        results.push(SearchResult {
-            file_path: chunk.file_path,
-            line_start: chunk.line_start,
-            line_end: chunk.line_end,
-            content: chunk.content,
-            language: chunk.language,
-            score,
-            symbol_name: chunk.symbol_name,
-            symbol_type: chunk.symbol_type,
-        });
+        results.push(chunk.into_search_result(score));
 
         if results.len() >= limit {
             break;
@@ -312,15 +272,8 @@ mod tests {
 
         // Generate embeddings and store vectors.
         let vector_store = VectorStore::open_in_memory(dim).unwrap();
-        let embeddings = crate::embedding::embed_chunks(&provider, &chunks, chunks.len(), 0)
-            .await
-            .unwrap();
-
-        let batch: Vec<(&str, &[f32])> = embeddings
-            .iter()
-            .map(|(id, vec)| (id.as_str(), vec.as_slice()))
-            .collect();
-        vector_store.insert_batch(&batch).unwrap();
+        crate::embedding::test_helpers::embed_and_insert_vectors(&vector_store, &provider, &chunks)
+            .await;
 
         (vector_store, metadata_store)
     }
@@ -505,6 +458,23 @@ mod tests {
                 .unwrap();
 
         assert!(results.len() <= 2, "results should respect the limit of 2");
+    }
+
+    #[tokio::test]
+    async fn search_zero_limit_skips_embedding() {
+        let dim = 8;
+        let vector_store = VectorStore::open_in_memory(dim).unwrap();
+        let metadata_store = MetadataStore::open_in_memory().unwrap();
+        let provider = MockProvider::failing(EmbeddingError::ConnectionError {
+            message: "should not be called".to_string(),
+        });
+
+        let results =
+            search_vector_with_stores(&vector_store, &metadata_store, &provider, "function", 0)
+                .await
+                .unwrap();
+
+        assert!(results.is_empty());
     }
 
     #[tokio::test]

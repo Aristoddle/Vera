@@ -5,51 +5,30 @@
 //! - `get_stats` — retrieve index statistics
 //! - `get_overview` — architecture overview for agent onboarding
 //! - `regex_search` — regex search over indexed files
+//! - `structural_search` — agent-oriented structural search intents
+//! - `find_references` — exact callers or callees from the persisted call graph
+//! - `explain_path` — explain why a path is or is not indexed
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, OnceLock};
 
-use serde::Serialize;
 use serde_json::Value;
+use vera_core::presentation::{CompactResult, truncate_to_budget};
 
 use crate::protocol::{ToolCallResult, ToolDefinition};
 use crate::watcher::WatchHandle;
 
 /// Global watcher handle. Kept alive for the lifetime of the MCP server process.
 static WATCHER: Mutex<Option<WatchHandle>> = Mutex::new(None);
+static SEARCH_CONTEXT: Mutex<Option<CachedSearchContext>> = Mutex::new(None);
+static SEARCH_RUNTIME: OnceLock<Result<tokio::runtime::Runtime, String>> = OnceLock::new();
+
+struct CachedSearchContext {
+    key: String,
+    context: Arc<vera_core::retrieval::search_service::SearchContext>,
+}
 
 /// Default total output budget for MCP responses (chars).
 const MCP_OUTPUT_BUDGET: usize = 20_000;
-
-/// Compact result representation for MCP tool responses.
-/// Drops `score` and `language` (inferrable from extension), omits null fields.
-#[derive(Serialize)]
-struct CompactResult<'a> {
-    file_path: &'a str,
-    line_start: u32,
-    line_end: u32,
-    content: std::borrow::Cow<'a, str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    symbol_name: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    symbol_type: Option<&'a vera_core::types::SymbolType>,
-}
-
-/// Truncate `content` to fit within `allowed` bytes, breaking at a line boundary.
-fn truncate_to_budget(content: &str, allowed: usize) -> std::borrow::Cow<'_, str> {
-    if content.len() <= allowed {
-        return std::borrow::Cow::Borrowed(content);
-    }
-    let end = content
-        .char_indices()
-        .take_while(|(i, _)| *i < allowed)
-        .last()
-        .map(|(i, c)| i + c.len_utf8())
-        .unwrap_or(0);
-    let break_at = content[..end].rfind('\n').unwrap_or(end);
-    let mut truncated = content[..break_at].to_string();
-    truncated.push_str("\n[...truncated]");
-    std::borrow::Cow::Owned(truncated)
-}
 
 /// Serialize search results as compact JSON, applying a total character budget.
 /// When `signatures_only` is true, function/class bodies are stripped before output.
@@ -107,6 +86,71 @@ fn compact_results_json(
     serde_json::to_string(&compact)
 }
 
+/// Git-scope filter properties shared by tool schemas: `changed`, `since`,
+/// `base`. `what` names the restricted operation (e.g. "search").
+fn git_scope_properties(what: &str) -> serde_json::Map<String, Value> {
+    serde_json::json!({
+        "changed": {
+            "type": "boolean",
+            "description": format!("Restrict {what} to modified, staged, and untracked files.")
+        },
+        "since": {
+            "type": "string",
+            "description": format!("Restrict {what} to files changed since the given revision.")
+        },
+        "base": {
+            "type": "string",
+            "description": format!("Restrict {what} to files changed since merge-base(HEAD, revision).")
+        }
+    })
+    .as_object()
+    .expect("git scope properties")
+    .clone()
+}
+
+/// Merge the shared git-scope properties into a tool schema's `properties`.
+fn with_git_scope(mut schema: Value, what: &str) -> Value {
+    schema
+        .pointer_mut("/properties")
+        .and_then(Value::as_object_mut)
+        .expect("tool schema properties")
+        .extend(git_scope_properties(what));
+    schema
+}
+
+/// Shared `scope` filter property (source/docs/runtime corpus selection).
+fn scope_prop() -> Value {
+    serde_json::json!({
+        "type": "string",
+        "enum": ["source", "docs", "runtime", "all"],
+        "description": "Coarse corpus scope. Defaults to source-first behavior."
+    })
+}
+
+/// Shared `include_generated` filter property.
+fn include_generated_prop() -> Value {
+    serde_json::json!({
+        "type": "boolean",
+        "description": "Include generated or minified files such as dist bundles."
+    })
+}
+
+/// Shared `path` property naming the project directory.
+fn project_path_prop() -> Value {
+    serde_json::json!({
+        "type": "string",
+        "description": "Path to the project directory (default: current dir)"
+    })
+}
+
+/// Shared `limit` property; `what` is the counted noun ("results", "matches").
+fn limit_prop(what: &str, default: usize) -> Value {
+    serde_json::json!({
+        "type": "integer",
+        "description": format!("Maximum number of {what} (default: {default})")
+    })
+}
+
 /// Return the list of tools the server advertises.
 pub fn tool_definitions() -> Vec<ToolDefinition> {
     vec![
@@ -126,7 +170,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                           you are looking for. Set intent to describe your higher-level goal \
                           for better reranking."
                 .to_string(),
-            input_schema: serde_json::json!({
+            input_schema: with_git_scope(serde_json::json!({
                 "type": "object",
                 "properties": {
                     "query": {
@@ -147,33 +191,24 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                         "description": "Filter by programming language (e.g., rust, python)"
                     },
                     "path": {
-                        "type": "string",
-                        "description": "Filter by file path glob (e.g., src/**/*.rs)"
+                        "type": ["string", "array"],
+                        "items": {"type": "string"},
+                        "description": "Filter by file path glob, as a string or an array of strings. Repeated patterns use OR semantics (e.g., src/**/*.rs)"
                     },
                     "symbol_type": {
                         "type": "string",
                         "description": "Filter by symbol type (function, struct, class, etc.)"
                     },
-                    "scope": {
-                        "type": "string",
-                        "enum": ["source", "docs", "runtime", "all"],
-                        "description": "Coarse corpus scope. Defaults to source-first behavior."
-                    },
-                    "include_generated": {
-                        "type": "boolean",
-                        "description": "Include generated or minified files such as dist bundles."
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "description": "Maximum number of results (default: 5)"
-                    },
+                    "scope": scope_prop(),
+                    "include_generated": include_generated_prop(),
+                    "limit": limit_prop("results", 5),
                     "compact": {
                         "type": "boolean",
                         "description": "Return only function/class signatures (omit bodies). Use for broad exploration; fits more results in fewer tokens."
                     }
                 },
-                "required": []
-            }),
+                "anyOf": [{"required": ["query"]}, {"required": ["queries"]}]
+            }), "search"),
         },
         ToolDefinition {
             name: "get_stats".to_string(),
@@ -183,10 +218,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "Path to the project directory (default: current dir)"
-                    }
+                    "path": project_path_prop()
                 }
             }),
         },
@@ -197,15 +229,12 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                           and detected project conventions (frameworks, patterns, config files). \
                           Useful for onboarding and understanding project structure."
                 .to_string(),
-            input_schema: serde_json::json!({
+            input_schema: with_git_scope(serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "Path to the project directory (default: current dir)"
-                    }
+                    "path": project_path_prop(),
                 }
-            }),
+            }), "overview"),
         },
         ToolDefinition {
             name: "regex_search".to_string(),
@@ -217,17 +246,14 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                           WHEN NOT TO USE: conceptual or behavioral queries. Use search_code \
                           for those."
                 .to_string(),
-            input_schema: serde_json::json!({
+            input_schema: with_git_scope(serde_json::json!({
                 "type": "object",
                 "properties": {
                     "pattern": {
                         "type": "string",
                         "description": "Regex pattern to search for"
                     },
-                    "limit": {
-                        "type": "integer",
-                        "description": "Maximum number of matches (default: 20)"
-                    },
+                    "limit": limit_prop("matches", 20),
                     "ignore_case": {
                         "type": "boolean",
                         "description": "Case-insensitive matching (default: false)"
@@ -236,21 +262,117 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                         "type": "integer",
                         "description": "Context lines before and after each match (default: 2)"
                     },
-                    "scope": {
-                        "type": "string",
-                        "enum": ["source", "docs", "runtime", "all"],
-                        "description": "Coarse corpus scope. Defaults to source-first behavior."
-                    },
-                    "include_generated": {
-                        "type": "boolean",
-                        "description": "Include generated or minified files such as dist bundles."
-                    },
+                    "scope": scope_prop(),
+                    "include_generated": include_generated_prop(),
                     "compact": {
                         "type": "boolean",
                         "description": "Return only function/class signatures (omit bodies). Use for broad exploration."
                     }
                 },
                 "required": ["pattern"]
+            }), "regex search"),
+        },
+        ToolDefinition {
+            name: "structural_search".to_string(),
+            description: "Run agent-oriented structural search intents over indexed code.\n\
+                          \n\
+                          WHEN TO USE: symbol definitions, env var reads, \
+                          HTTP route handlers, SQL execution sites, or explicit \
+                          implementations/conformances/inheritance declarations.\n\
+                          WHEN NOT TO USE: conceptual behavior queries or exact caller/callee \
+                          lookups. Use search_code or find_references for those."
+                .to_string(),
+            input_schema: with_git_scope(serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "kind": {
+                        "type": "string",
+                        "enum": ["definitions", "env_reads", "route_handlers", "sql_queries", "implementations"],
+                        "description": "Structural intent to run."
+                    },
+                    "query": {
+                        "type": "string",
+                        "description": "Required for definitions and implementation lookups. Optional for env_reads to narrow to one env var."
+                    },
+                    "lang": {
+                        "type": "string",
+                        "description": "Filter by programming language (e.g., rust, python)"
+                    },
+                    "path": {
+                        "type": ["string", "array"],
+                        "items": {"type": "string"},
+                        "description": "Filter by file path glob, as a string or an array of strings. Repeated patterns use OR semantics (e.g., src/**/*.rs)"
+                    },
+                    "symbol_type": {
+                        "type": "string",
+                        "description": "Filter by enclosing symbol type (function, class, method, etc.)"
+                    },
+                    "scope": scope_prop(),
+                    "include_generated": include_generated_prop(),
+                    "limit": limit_prop("results", 20),
+                    "compact": {
+                        "type": "boolean",
+                        "description": "Return only function/class signatures (omit bodies)."
+                    }
+                },
+                "required": ["kind"]
+            }), "search"),
+        },
+        ToolDefinition {
+            name: "find_references".to_string(),
+            description: "Find exact callers or callees of a symbol using Vera's persisted call graph.\n\
+                          \n\
+                          WHEN TO USE: who calls a symbol, what a symbol calls, or when \
+                          narrowing exact call relationships to a diff.\n\
+                          WHEN NOT TO USE: conceptual behavior queries or heuristic structural \
+                          scans. Use search_code or structural_search for those."
+                .to_string(),
+            input_schema: with_git_scope(serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "symbol": {
+                        "type": "string",
+                        "description": "Symbol name to look up."
+                    },
+                    "callees": {
+                        "type": "boolean",
+                        "description": "Return what the symbol calls instead of who calls it."
+                    },
+                    "limit": limit_prop("results", 20),
+                    "compact": {
+                        "type": "boolean",
+                        "description": "For caller lookups, return only function/class signatures."
+                    }
+                },
+                "required": ["symbol"]
+            }), "references"),
+        },
+        ToolDefinition {
+            name: "explain_path".to_string(),
+            description: "Explain why a path is or is not indexed. Returns the decisive reason such as a default exclude, .veraignore, .gitignore, binary detection, size limit, or missing file."
+                .to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Repository-relative or absolute path to explain."
+                    },
+                    "exclude": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Extra exclusion globs to apply, matching CLI --exclude semantics."
+                    },
+                    "no_ignore": {
+                        "type": "boolean",
+                        "description": "Disable .gitignore and .veraignore parsing."
+                    },
+                    "no_default_excludes": {
+                        "type": "boolean",
+                        "description": "Disable Vera's built-in default exclusions."
+                    }
+                },
+                "required": ["path"]
             }),
         },
     ]
@@ -266,7 +388,86 @@ pub fn handle_tool_call(name: &str, arguments: &Value) -> ToolCallResult {
         "get_stats" => handle_get_stats(arguments),
         "get_overview" => handle_get_overview(arguments),
         "regex_search" => handle_regex_search(arguments),
+        "structural_search" => handle_structural_search(arguments),
+        "find_references" => handle_find_references(arguments),
+        "explain_path" => handle_explain_path(arguments),
         _ => ToolCallResult::error(format!("Unknown tool: {name}")),
+    }
+}
+
+fn git_scope_from_args(args: &Value) -> Result<Option<vera_core::git_scope::GitScope>, String> {
+    let changed = args
+        .get("changed")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let since = args
+        .get("since")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let base = args
+        .get("base")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+
+    let selected = changed as u8 + since.is_some() as u8 + base.is_some() as u8;
+    if selected > 1 {
+        return Err("Only one of 'changed', 'since', or 'base' may be set".to_string());
+    }
+
+    Ok(if changed {
+        Some(vera_core::git_scope::GitScope::Changed)
+    } else if let Some(rev) = since {
+        Some(vera_core::git_scope::GitScope::Since(rev))
+    } else {
+        base.map(vera_core::git_scope::GitScope::Base)
+    })
+}
+
+fn scope_from_args(args: &Value) -> Result<Option<vera_core::types::SearchScope>, ToolCallResult> {
+    match args.get("scope").and_then(|v| v.as_str()) {
+        Some(value) => value
+            .parse()
+            .map(Some)
+            .map_err(|()| ToolCallResult::error(format!("Invalid scope: {value}"))),
+        None => Ok(None),
+    }
+}
+
+fn current_working_dir() -> Result<std::path::PathBuf, ToolCallResult> {
+    std::env::current_dir()
+        .map_err(|e| ToolCallResult::error(format!("Failed to get working directory: {e}")))
+}
+
+fn exact_paths_from_args(
+    args: &Value,
+    cwd: &std::path::Path,
+) -> Result<Option<Arc<std::collections::HashSet<String>>>, ToolCallResult> {
+    match git_scope_from_args(args) {
+        Ok(Some(scope)) => vera_core::git_scope::resolve_scope(cwd, &scope)
+            .map(|paths| Some(Arc::new(paths)))
+            .map_err(|err| ToolCallResult::error(format!("Failed to resolve git scope: {err}"))),
+        Ok(None) => Ok(None),
+        Err(err) => Err(ToolCallResult::error(err)),
+    }
+}
+
+fn apply_git_scope_filters(
+    args: &Value,
+    cwd: &std::path::Path,
+    filters: &mut vera_core::types::SearchFilters,
+) -> Result<(), ToolCallResult> {
+    filters.exact_paths = exact_paths_from_args(args, cwd)?;
+    Ok(())
+}
+
+fn existing_index_dir(cwd: &std::path::Path) -> Result<std::path::PathBuf, ToolCallResult> {
+    let index_dir = vera_core::indexing::index_dir(cwd);
+    if !index_dir.exists() {
+        Err(ToolCallResult::error(
+            "No index found in current directory. Run search_code first to auto-index.",
+        ))
+    } else {
+        Ok(index_dir)
     }
 }
 
@@ -274,9 +475,28 @@ fn search_code_filters(
     args: &Value,
     scope: Option<vera_core::types::SearchScope>,
 ) -> vera_core::types::SearchFilters {
+    let path_glob = match args.get("path") {
+        Some(value) if value.is_string() => value
+            .as_str()
+            .map(|path| vec![path.to_string()])
+            .unwrap_or_default(),
+        Some(value) => value
+            .as_array()
+            .map(|paths| {
+                paths
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(String::from)
+                    .collect()
+            })
+            .unwrap_or_default(),
+        None => Vec::new(),
+    };
+
     vera_core::types::SearchFilters {
         language: args.get("lang").and_then(|v| v.as_str()).map(String::from),
-        path_glob: args.get("path").and_then(|v| v.as_str()).map(String::from),
+        path_glob,
+        exact_paths: None,
         symbol_type: args
             .get("symbol_type")
             .and_then(|v| v.as_str())
@@ -299,6 +519,7 @@ fn regex_search_filters(
     // highest-value regex controls.
     vera_core::types::SearchFilters {
         scope,
+        exact_paths: None,
         include_generated: Some(
             args.get("include_generated")
                 .and_then(|v| v.as_bool())
@@ -330,17 +551,12 @@ fn handle_search_code(args: &Value) -> ToolCallResult {
 
     let intent = args.get("intent").and_then(|v| v.as_str());
 
-    let scope = match args.get("scope").and_then(|v| v.as_str()) {
-        Some(value) => match value.parse() {
-            Ok(scope) => Some(scope),
-            Err(()) => {
-                return ToolCallResult::error(format!("Invalid scope: {value}"));
-            }
-        },
-        None => None,
+    let scope = match scope_from_args(args) {
+        Ok(scope) => scope,
+        Err(err) => return err,
     };
 
-    let filters = search_code_filters(args, scope);
+    let mut filters = search_code_filters(args, scope);
 
     let limit = args
         .get("limit")
@@ -348,45 +564,29 @@ fn handle_search_code(args: &Value) -> ToolCallResult {
         .map(|v| v as usize);
 
     let backend = vera_core::config::resolve_backend(None);
-    let mut config = vera_core::config::VeraConfig::default();
+    let mut config = crate::saved_config::load_saved_runtime_config();
     config.adjust_for_backend(backend);
     let result_limit = limit.unwrap_or(config.retrieval.default_limit);
 
-    let cwd = match std::env::current_dir() {
-        Ok(d) => d,
-        Err(e) => return ToolCallResult::error(format!("Failed to get working directory: {e}")),
+    let cwd = match current_working_dir() {
+        Ok(cwd) => cwd,
+        Err(err) => return err,
     };
-    let index_dir = vera_core::indexing::index_dir(&cwd);
-
-    if !index_dir.exists() {
-        // Auto-index on first search.
-        let (rt, provider, idx_config, model_name) = match create_runtime_and_provider() {
-            Ok(t) => t,
-            Err(e) => return e,
-        };
-        match rt.block_on(vera_core::indexing::index_repository(
-            &cwd,
-            &provider,
-            &idx_config,
-            &model_name,
-        )) {
-            Ok(_) => {}
-            Err(e) => return ToolCallResult::error(format!("Auto-indexing failed: {e}")),
-        }
-        // Start watcher after indexing.
-        if let Ok(handle) = crate::watcher::start_watching(&cwd) {
-            let mut guard = WATCHER.lock().unwrap();
-            *guard = Some(handle);
-        }
-    } else {
-        // Start watcher if not already running.
-        let mut guard = WATCHER.lock().unwrap();
-        if guard.is_none() {
-            if let Ok(handle) = crate::watcher::start_watching(&cwd) {
-                *guard = Some(handle);
-            }
-        }
+    if let Err(err) = apply_git_scope_filters(args, &cwd, &mut filters) {
+        return err;
     }
+    let index_dir = match ensure_index_and_watcher(&cwd) {
+        Ok(index_dir) => index_dir,
+        Err(err) => return err,
+    };
+    let rt = match search_runtime() {
+        Ok(rt) => rt,
+        Err(err) => return err,
+    };
+    let search_context = match cached_search_context(rt, &config, backend) {
+        Ok(context) => context,
+        Err(err) => return err,
+    };
 
     // Run each query, collect all results.
     let mut all_results: Vec<vera_core::types::SearchResult> = Vec::new();
@@ -397,19 +597,17 @@ fn handle_search_code(args: &Value) -> ToolCallResult {
     };
 
     for query in &queries {
-        // If intent is provided, prepend it to the query for better reranking.
-        let effective_query = match intent {
-            Some(i) => format!("intent: {i} | {query}"),
-            None => query.clone(),
-        };
-        match vera_core::retrieval::search_service::execute_search(
+        // Pass the raw query plus the optional intent. Core applies the intent
+        // only to the semantic (embedding/rerank) side; BM25 gets the raw query
+        // so Tantivy does not parse `intent:` as a field. See issue #20.
+        match rt.block_on(search_context.search(
             &index_dir,
-            &effective_query,
+            query,
+            intent,
             &config,
             &filters,
             per_query_limit,
-            backend,
-        ) {
+        )) {
             Ok((results, _timings)) => all_results.extend(results),
             Err(e) => return ToolCallResult::error(format!("Search failed: {e}")),
         }
@@ -431,6 +629,31 @@ fn handle_search_code(args: &Value) -> ToolCallResult {
     }
 }
 
+fn ensure_index_and_watcher(cwd: &std::path::Path) -> Result<std::path::PathBuf, ToolCallResult> {
+    let index_dir = vera_core::indexing::index_dir(cwd);
+
+    if !index_dir.exists() {
+        let (rt, provider, idx_config, model_name) = create_runtime_and_provider()?;
+        rt.block_on(vera_core::indexing::index_repository(
+            cwd,
+            &provider,
+            &idx_config,
+            &model_name,
+        ))
+        .map_err(|e| ToolCallResult::error(format!("Auto-indexing failed: {e}")))?;
+    }
+
+    let mut guard = WATCHER.lock().unwrap_or_else(|e| e.into_inner());
+    if guard.is_none() {
+        match crate::watcher::start_watching(cwd) {
+            Ok(handle) => *guard = Some(handle),
+            Err(e) => tracing::warn!("failed to start file watcher: {e}"),
+        }
+    }
+
+    Ok(index_dir)
+}
+
 /// Create a tokio runtime, resolve backend config, and build an embedding provider.
 fn create_runtime_and_provider() -> Result<
     (
@@ -442,7 +665,7 @@ fn create_runtime_and_provider() -> Result<
     ToolCallResult,
 > {
     let backend = vera_core::config::resolve_backend(None);
-    let mut config = vera_core::config::VeraConfig::default();
+    let mut config = crate::saved_config::load_saved_runtime_config();
     config.adjust_for_backend(backend);
 
     let rt = tokio::runtime::Runtime::new()
@@ -457,12 +680,50 @@ fn create_runtime_and_provider() -> Result<
     Ok((rt, provider, config, model_name))
 }
 
+fn search_runtime() -> Result<&'static tokio::runtime::Runtime, ToolCallResult> {
+    SEARCH_RUNTIME
+        .get_or_init(|| tokio::runtime::Runtime::new().map_err(|err| err.to_string()))
+        .as_ref()
+        .map_err(|err| ToolCallResult::error(format!("Failed to create runtime: {err}")))
+}
+
+fn cached_search_context(
+    rt: &tokio::runtime::Runtime,
+    config: &vera_core::config::VeraConfig,
+    backend: vera_core::config::InferenceBackend,
+) -> Result<Arc<vera_core::retrieval::search_service::SearchContext>, ToolCallResult> {
+    let key = search_context_key(config, backend);
+    let mut guard = SEARCH_CONTEXT.lock().unwrap_or_else(|e| e.into_inner());
+
+    if let Some(cached) = guard.as_ref().filter(|cached| cached.key == key) {
+        return Ok(Arc::clone(&cached.context));
+    }
+
+    let context = Arc::new(
+        rt.block_on(vera_core::retrieval::search_service::SearchContext::new(
+            config, backend,
+        )),
+    );
+    *guard = Some(CachedSearchContext {
+        key,
+        context: Arc::clone(&context),
+    });
+    Ok(context)
+}
+
+fn search_context_key(
+    config: &vera_core::config::VeraConfig,
+    backend: vera_core::config::InferenceBackend,
+) -> String {
+    let config_json = serde_json::to_string(config).unwrap_or_default();
+    format!("{backend}|{config_json}")
+}
+
 /// Resolve an optional path argument to a validated directory path.
 fn resolve_repo_path(args: &Value) -> Result<std::path::PathBuf, ToolCallResult> {
     let repo_path = match args.get("path").and_then(|v| v.as_str()) {
         Some(p) => std::path::PathBuf::from(p),
-        None => std::env::current_dir()
-            .map_err(|e| ToolCallResult::error(format!("Failed to get working directory: {e}")))?,
+        None => current_working_dir()?,
     };
     if !repo_path.exists() {
         return Err(ToolCallResult::error(format!(
@@ -494,7 +755,17 @@ fn handle_get_overview(args: &Value) -> ToolCallResult {
         Ok(p) => p,
         Err(e) => return e,
     };
-    match vera_core::stats::collect_overview(&repo_path) {
+    let exact_paths = match git_scope_from_args(args) {
+        Ok(Some(scope)) => match vera_core::git_scope::resolve_scope(&repo_path, &scope) {
+            Ok(paths) => Some(paths),
+            Err(err) => {
+                return ToolCallResult::error(format!("Failed to resolve git scope: {err}"));
+            }
+        },
+        Ok(None) => None,
+        Err(err) => return ToolCallResult::error(err),
+    };
+    match vera_core::stats::collect_overview_filtered(&repo_path, exact_paths.as_ref()) {
         Ok(overview) => match serde_json::to_string_pretty(&overview) {
             Ok(json) => ToolCallResult::success(json),
             Err(e) => ToolCallResult::error(format!("Failed to serialize overview: {e}")),
@@ -509,14 +780,9 @@ fn handle_regex_search(args: &Value) -> ToolCallResult {
         Some(p) => p,
         None => return ToolCallResult::error("Missing required parameter: pattern"),
     };
-    let scope = match args.get("scope").and_then(|v| v.as_str()) {
-        Some(value) => match value.parse() {
-            Ok(scope) => Some(scope),
-            Err(()) => {
-                return ToolCallResult::error(format!("Invalid scope: {value}"));
-            }
-        },
-        None => None,
+    let scope = match scope_from_args(args) {
+        Ok(scope) => scope,
+        Err(err) => return err,
     };
 
     let limit = args
@@ -534,19 +800,19 @@ fn handle_regex_search(args: &Value) -> ToolCallResult {
         .map(|v| v as usize)
         .unwrap_or(2);
 
-    let cwd = match std::env::current_dir() {
-        Ok(d) => d,
-        Err(e) => return ToolCallResult::error(format!("Failed to get working directory: {e}")),
+    let cwd = match current_working_dir() {
+        Ok(cwd) => cwd,
+        Err(err) => return err,
     };
-    let index_dir = vera_core::indexing::index_dir(&cwd);
+    let index_dir = match existing_index_dir(&cwd) {
+        Ok(index_dir) => index_dir,
+        Err(err) => return err,
+    };
 
-    if !index_dir.exists() {
-        return ToolCallResult::error(
-            "No index found in current directory. Run search_code first to auto-index.",
-        );
+    let mut filters = regex_search_filters(args, scope);
+    if let Err(err) = apply_git_scope_filters(args, &cwd, &mut filters) {
+        return err;
     }
-
-    let filters = regex_search_filters(args, scope);
 
     match vera_core::retrieval::search_regex(
         &index_dir,
@@ -570,20 +836,227 @@ fn handle_regex_search(args: &Value) -> ToolCallResult {
     }
 }
 
+fn handle_structural_search(args: &Value) -> ToolCallResult {
+    let kind = match args.get("kind").and_then(|v| v.as_str()) {
+        Some(value) => match value.parse::<vera_core::retrieval::StructuralSearchKind>() {
+            Ok(kind) => kind,
+            Err(()) => {
+                return ToolCallResult::error(format!("Invalid structural kind: {value}"));
+            }
+        },
+        None => return ToolCallResult::error("Missing required parameter: kind"),
+    };
+
+    let scope = match scope_from_args(args) {
+        Ok(scope) => scope,
+        Err(err) => return err,
+    };
+    let limit = args
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize)
+        .unwrap_or(20);
+    let query = args.get("query").and_then(|v| v.as_str());
+
+    let cwd = match current_working_dir() {
+        Ok(cwd) => cwd,
+        Err(err) => return err,
+    };
+
+    let mut filters = search_code_filters(args, scope);
+    if let Err(err) = apply_git_scope_filters(args, &cwd, &mut filters) {
+        return err;
+    }
+
+    let index_dir = match ensure_index_and_watcher(&cwd) {
+        Ok(index_dir) => index_dir,
+        Err(err) => return err,
+    };
+
+    match vera_core::retrieval::search_structural(&index_dir, kind, query, limit, &filters) {
+        Ok(results) => {
+            let signatures_only = args
+                .get("compact")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            match compact_results_json(&results, MCP_OUTPUT_BUDGET, signatures_only) {
+                Ok(json) => ToolCallResult::success(json),
+                Err(e) => ToolCallResult::error(format!("Failed to serialize results: {e}")),
+            }
+        }
+        Err(e) => ToolCallResult::error(format!("Structural search failed: {e}")),
+    }
+}
+
+fn handle_find_references(args: &Value) -> ToolCallResult {
+    let symbol = match args.get("symbol").and_then(|v| v.as_str()) {
+        Some(symbol) if !symbol.trim().is_empty() => symbol.trim(),
+        Some(_) => return ToolCallResult::error("Parameter 'symbol' must not be empty"),
+        None => return ToolCallResult::error("Missing required parameter: symbol"),
+    };
+    let callees = args
+        .get("callees")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let limit = args
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize)
+        .unwrap_or(20);
+
+    let cwd = match current_working_dir() {
+        Ok(cwd) => cwd,
+        Err(err) => return err,
+    };
+
+    let exact_paths = match exact_paths_from_args(args, &cwd) {
+        Ok(paths) => paths,
+        Err(err) => return err,
+    };
+    let index_dir = match ensure_index_and_watcher(&cwd) {
+        Ok(index_dir) => index_dir,
+        Err(err) => return err,
+    };
+
+    if callees {
+        match vera_core::stats::find_callees(&cwd, symbol) {
+            Ok(mut results) => {
+                if let Some(paths) = exact_paths.as_ref() {
+                    results.retain(|result| paths.contains(&result.file_path));
+                }
+                results.truncate(limit);
+                match serde_json::to_string(&results) {
+                    Ok(json) => ToolCallResult::success(json),
+                    Err(err) => {
+                        ToolCallResult::error(format!("Failed to serialize references: {err}"))
+                    }
+                }
+            }
+            Err(err) => ToolCallResult::error(format!("Reference lookup failed: {err}")),
+        }
+    } else {
+        let filters = vera_core::types::SearchFilters {
+            scope: Some(vera_core::types::SearchScope::Source),
+            exact_paths,
+            include_generated: Some(false),
+            ..Default::default()
+        };
+        match vera_core::retrieval::search_callers(&index_dir, symbol, limit, &filters) {
+            Ok(results) => {
+                let signatures_only = args
+                    .get("compact")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                match compact_results_json(&results, MCP_OUTPUT_BUDGET, signatures_only) {
+                    Ok(json) => ToolCallResult::success(json),
+                    Err(err) => {
+                        ToolCallResult::error(format!("Failed to serialize references: {err}"))
+                    }
+                }
+            }
+            Err(err) => ToolCallResult::error(format!("Reference lookup failed: {err}")),
+        }
+    }
+}
+
+fn handle_explain_path(args: &Value) -> ToolCallResult {
+    let path = match args.get("path").and_then(|v| v.as_str()) {
+        Some(path) => path,
+        None => return ToolCallResult::error("Missing required parameter: path"),
+    };
+
+    let cwd = match current_working_dir() {
+        Ok(cwd) => cwd,
+        Err(err) => return err,
+    };
+
+    let mut config = crate::saved_config::load_saved_runtime_config();
+    config.indexing.no_ignore = args
+        .get("no_ignore")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    config.indexing.no_default_excludes = args
+        .get("no_default_excludes")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    config.indexing.extra_excludes = args
+        .get("exclude")
+        .and_then(|v| v.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    match vera_core::discovery::explain_path(&cwd, std::path::Path::new(path), &config.indexing) {
+        Ok(explanation) => match serde_json::to_string_pretty(&explanation) {
+            Ok(json) => ToolCallResult::success(json),
+            Err(e) => ToolCallResult::error(format!("Failed to serialize explanation: {e}")),
+        },
+        Err(e) => ToolCallResult::error(format!("Failed to explain path: {e}")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn tool_definitions_has_four_tools() {
+    fn tool_definitions_has_seven_tools() {
         let tools = tool_definitions();
-        assert_eq!(tools.len(), 4);
+        assert_eq!(tools.len(), 7);
 
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
         assert!(names.contains(&"search_code"));
         assert!(names.contains(&"get_stats"));
         assert!(names.contains(&"get_overview"));
         assert!(names.contains(&"regex_search"));
+        assert!(names.contains(&"structural_search"));
+        assert!(names.contains(&"find_references"));
+        assert!(names.contains(&"explain_path"));
+    }
+
+    #[test]
+    fn git_scope_schema_is_only_on_overview() {
+        let tools = tool_definitions();
+        let get_stats = tools.iter().find(|tool| tool.name == "get_stats").unwrap();
+        let get_overview = tools
+            .iter()
+            .find(|tool| tool.name == "get_overview")
+            .unwrap();
+
+        let stats_props = get_stats.input_schema["properties"].as_object().unwrap();
+        assert!(!stats_props.contains_key("changed"));
+        assert!(!stats_props.contains_key("since"));
+        assert!(!stats_props.contains_key("base"));
+
+        let overview_props = get_overview.input_schema["properties"].as_object().unwrap();
+        assert!(overview_props.contains_key("changed"));
+        assert!(overview_props.contains_key("since"));
+        assert!(overview_props.contains_key("base"));
+    }
+
+    #[test]
+    fn git_scope_descriptions_name_the_right_operation() {
+        let tools = tool_definitions();
+        for (tool_name, noun) in [
+            ("search_code", "search"),
+            ("get_overview", "overview"),
+            ("regex_search", "regex search"),
+            ("structural_search", "search"),
+            ("find_references", "references"),
+        ] {
+            let tool = tools.iter().find(|tool| tool.name == tool_name).unwrap();
+            let description = tool.input_schema["properties"]["changed"]["description"]
+                .as_str()
+                .unwrap();
+            assert!(
+                description.starts_with(&format!("Restrict {noun} to")),
+                "{tool_name} changed description should name '{noun}': {description}"
+            );
+        }
     }
 
     #[test]
@@ -625,6 +1098,18 @@ mod tests {
     }
 
     #[test]
+    fn cached_search_context_reuses_context_for_same_key() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let config = vera_core::config::VeraConfig::default();
+        let backend = vera_core::config::InferenceBackend::Api;
+
+        let first = cached_search_context(&rt, &config, backend).unwrap();
+        let second = cached_search_context(&rt, &config, backend).unwrap();
+
+        assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[test]
     fn search_code_filters_include_lang_path_and_symbol_type() {
         let filters = search_code_filters(
             &serde_json::json!({
@@ -637,10 +1122,25 @@ mod tests {
         );
 
         assert_eq!(filters.language.as_deref(), Some("rust"));
-        assert_eq!(filters.path_glob.as_deref(), Some("src/**/*.rs"));
+        assert_eq!(filters.path_glob, vec!["src/**/*.rs"]);
         assert_eq!(filters.symbol_type.as_deref(), Some("function"));
         assert_eq!(filters.scope, Some(vera_core::types::SearchScope::Source));
         assert_eq!(filters.include_generated, Some(true));
+    }
+
+    #[test]
+    fn search_code_filters_accept_path_array() {
+        let filters = search_code_filters(
+            &serde_json::json!({
+                "path": ["src/**/*.rs", "tests/**/*.py"],
+            }),
+            None,
+        );
+
+        assert_eq!(
+            filters.path_glob,
+            vec!["src/**/*.rs".to_string(), "tests/**/*.py".to_string()]
+        );
     }
 
     #[test]
@@ -661,18 +1161,44 @@ mod tests {
     }
 
     #[test]
-    fn truncate_to_budget_short_passthrough() {
-        let short = "hello world";
-        let result = truncate_to_budget(short, 1000);
-        assert_eq!(result.as_ref(), short);
+    fn structural_search_schema_exposes_kind_and_git_scope() {
+        let tools = tool_definitions();
+        let structural = tools
+            .iter()
+            .find(|tool| tool.name == "structural_search")
+            .unwrap();
+        let properties = structural.input_schema["properties"].as_object().unwrap();
+
+        assert!(properties.contains_key("kind"));
+        assert!(properties.contains_key("query"));
+        assert!(properties.contains_key("changed"));
+        assert!(properties.contains_key("since"));
+        assert!(properties.contains_key("base"));
+        assert!(
+            !properties
+                .get("kind")
+                .and_then(|kind| kind.get("enum"))
+                .and_then(|value| value.as_array())
+                .unwrap()
+                .iter()
+                .any(|value| value == "calls")
+        );
     }
 
     #[test]
-    fn truncate_to_budget_long_truncates() {
-        let long = "a".repeat(500);
-        let result = truncate_to_budget(&long, 100);
-        assert!(result.len() < long.len());
-        assert!(result.ends_with("[...truncated]"));
+    fn references_schema_exposes_symbol_and_git_scope() {
+        let tools = tool_definitions();
+        let refs = tools
+            .iter()
+            .find(|tool| tool.name == "find_references")
+            .unwrap();
+        let properties = refs.input_schema["properties"].as_object().unwrap();
+
+        assert!(properties.contains_key("symbol"));
+        assert!(properties.contains_key("callees"));
+        assert!(properties.contains_key("changed"));
+        assert!(properties.contains_key("since"));
+        assert!(properties.contains_key("base"));
     }
 
     #[test]
@@ -681,7 +1207,6 @@ mod tests {
             "index_project",
             "update_project",
             "watch_project",
-            "find_references",
             "find_dead_code",
         ] {
             let result = handle_tool_call(tool, &serde_json::json!({}));

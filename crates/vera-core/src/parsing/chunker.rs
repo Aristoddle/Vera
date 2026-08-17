@@ -6,6 +6,7 @@
 //! - Gap chunks for inter-symbol code (imports, module-level statements)
 //! - Tier 0 fallback: sliding-window line-based chunking for unknown languages
 
+use crate::chunk_text::file_name;
 use crate::config::IndexingConfig;
 use crate::types::{Chunk, Language, SymbolType};
 
@@ -427,10 +428,6 @@ pub fn tier0_line_chunks(source: &str, file_path: &str, language: Language) -> V
     }
 
     chunks
-}
-
-fn file_name(path: &str) -> &str {
-    path.rsplit(['/', '\\']).next().unwrap_or(path)
 }
 
 /// Split chunks that exceed `max_bytes` into smaller sub-chunks at line boundaries.

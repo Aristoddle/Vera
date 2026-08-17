@@ -7,6 +7,7 @@
 //! - `vera update <path>` — Incrementally update the index
 //! - `vera stats` — Show index statistics
 //! - `vera config` — Show or set configuration values
+//! - `vera structural ...` — Agent-oriented structural search intents
 
 mod commands;
 mod helpers;
@@ -16,625 +17,11 @@ mod update_check;
 
 use std::process;
 
-use clap::{Parser, Subcommand};
+use clap::Parser;
 
-#[derive(Parser)]
-#[command(
-    name = "vera",
-    about = "Hybrid code indexing and retrieval for CLI-first coding-agent workflows",
-    long_about = "Vera is a code indexing and retrieval tool for source trees. It combines \
-                  BM25 full-text search with vector similarity search using Reciprocal Rank \
-                  Fusion (RRF) and optional cross-encoder reranking to return ranked code \
-                  results for direct CLI use and installable agent skills. Vera always keeps \
-                  the index local in `.vera/`; `vera setup` only chooses the model backend.\n\n\
-                  Quick start:\n  \
-                  vera agent install                   # Interactive: choose scope + agents\n  \
-                  vera setup                          # Download built-in local models\n  \
-                  vera index .                        # Index current directory\n  \
-                  vera search \"auth\"                  # Search for authentication code\n  \
-                  vera doctor                         # Check local setup and index health\n  \
-                  vera repair                         # Re-fetch missing backend assets\n  \
-                  vera upgrade                        # Show the binary update plan",
-    after_long_help = "Output flags:\n  \
-                  --json                             Structured JSON when supported\n  \
-                  --raw                              Verbose search/grep output (before or after the subcommand)\n  \
-                  --timing                           Search/grep timings to stderr (before or after the subcommand)",
-    version
-)]
-struct Cli {
-    #[command(subcommand)]
-    command: Commands,
+mod cli;
 
-    /// Output command results as JSON when supported.
-    ///
-    /// Search commands emit compact machine-readable JSON; status and
-    /// diagnostic commands emit structured JSON summaries.
-    #[arg(long, global = true)]
-    json: bool,
-
-    /// Output all fields with pretty-printed verbose formatting.
-    ///
-    /// Search-style commands honor this flag whether it appears before or
-    /// after the subcommand.
-    #[arg(long, global = true)]
-    raw: bool,
-
-    /// Print timing information to stderr when supported.
-    ///
-    /// Search prints per-stage timings; grep prints total elapsed time.
-    #[arg(long, global = true)]
-    timing: bool,
-}
-
-#[derive(Subcommand)]
-enum Commands {
-    /// Start the MCP (Model Context Protocol) server.
-    ///
-    /// Runs a JSON-RPC 2.0 server over stdio for tool integration.
-    /// The server exposes tools: search_code, get_stats, get_overview, and regex_search.
-    /// search_code auto-indexes and starts a file watcher on first use.
-    ///
-    /// Examples:
-    ///   vera mcp
-    #[command(long_about = "Start the MCP (Model Context Protocol) server.\n\n\
-                      Runs a JSON-RPC 2.0 server over stdio so editors, assistants, and \
-                      other tools can use Vera's indexing and search capabilities.\n\n\
-                      The server reads JSON-RPC messages from stdin and writes responses \
-                      to stdout. Logs go to stderr.\n\n\
-                      Exposed tools:\n  \
-                      search_code      — Hybrid search (auto-indexes and watches on first use)\n  \
-                      get_stats        — Index statistics\n  \
-                      get_overview     — Project summary for onboarding\n  \
-                      regex_search     — Regex search over indexed files\n\n\
-                      Examples:\n  \
-                      vera mcp                       # Start MCP server on stdio")]
-    Mcp,
-
-    /// Install or manage the Vera skill for supported coding agents.
-    ///
-    /// This is the preferred agent integration path. It writes the canonical
-    /// `skills/vera` bundle into well-known skill directories for supported
-    /// clients, so agents can use the Vera CLI directly without MCP.
-    #[command(
-        long_about = "Install or manage the Vera skill for supported coding agents.\n\n\
-                      This is the preferred agent integration path. Vera installs a \
-                      CLI-centric skill bundle into known skill directories so agents \
-                      can call `vera index`, `vera search`, `vera update`, and \
-                      `vera stats` directly.\n\n\
-                      `vera agent install` detects existing installs and lets you \
-                      add or remove agents in one step. Deselecting an installed \
-                      agent removes it. If stale installs are detected, the \
-                      interactive flow can refresh them in one step before \
-                      opening the full selector.\n\n\
-                      `vera agent sync` refreshes all stale skill installs to match \
-                      the current binary version, no prompts needed.\n\n\
-                      Examples:\n  \
-                      vera agent install                       # Interactive: choose scope and agents\n  \
-                      vera agent install --client claude       # Install for Claude Code (global)\n  \
-                      vera agent install --client all --scope project  # All agents, project only\n  \
-                      vera agent sync                          # Update all stale skills\n  \
-                      vera agent status                        # Show all install status\n  \
-                      vera agent remove --client codex         # Remove the global Codex install"
-    )]
-    Agent {
-        /// Agent command: install, status, remove, or sync.
-        #[arg(value_enum)]
-        command: commands::agent::AgentCommand,
-        /// Which agent client to target. Without this flag, interactive mode
-        /// presents a checklist of all supported agents.
-        #[arg(long, value_enum)]
-        client: Option<commands::agent::AgentClient>,
-        /// Install scope: global, project, or all. Without this flag,
-        /// interactive mode prompts for scope selection.
-        #[arg(long, value_enum)]
-        scope: Option<commands::agent::AgentScope>,
-    },
-
-    /// Remove Vera: binary, models, config, agent skills, and PATH shim.
-    ///
-    /// Per-project indexes (.vera/) are not removed.
-    #[command(
-        long_about = "Remove Vera: binary cache, models, ONNX Runtime libs, config, \n\
-                      credentials, agent skill files, and the PATH shim.\n\n\
-                      Per-project indexes (.vera/ inside each project) are not touched.\n\n\
-                      Examples:\n  \
-                      vera uninstall\n  \
-                      vera uninstall --json"
-    )]
-    Uninstall,
-
-    /// Interactive first-time setup wizard.
-    ///
-    /// Walks through backend selection, agent skill installation, and
-    /// optional project indexing in one guided flow.
-    #[command(long_about = "Interactive first-time setup wizard.\n\n\
-                      Walks through three steps:\n  \
-                      1. Backend selection (ONNX runtime + GPU, or API mode)\n  \
-                      2. Agent skill installation (choose scope and agents)\n  \
-                      3. Optional project indexing\n\n\
-                      For backend-only changes, use `vera backend`. For skill-only \
-                      changes, use `vera agent install`.\n\n\
-                      Pass flags to skip the interactive wizard:\n  \
-                      vera setup --onnx-jina-cuda      # NVIDIA GPU, skip wizard\n  \
-                      vera setup --api                 # API mode from env vars\n  \
-                      vera setup --yes                 # Auto-detect GPU, no prompts\n\n\
-                      Examples:\n  \
-                      vera setup                       # Full interactive wizard\n  \
-                      vera setup --onnx-jina-cuda --index .   # GPU + index, no wizard")]
-    Setup {
-        #[command(flatten)]
-        backend: helpers::LocalBackendFlags,
-        #[command(flatten)]
-        embedding: helpers::LocalEmbeddingModelFlags,
-        /// Configure Vera for API-backed mode using current env vars.
-        #[arg(long, group = "backend")]
-        api: bool,
-        /// Optionally index a repository after saving config.
-        #[arg(long)]
-        index: Option<String>,
-        /// Skip the confirmation prompt.
-        #[arg(long)]
-        yes: bool,
-    },
-
-    /// Select and manage the ONNX runtime and model backend.
-    ///
-    /// Use this to switch between GPU providers, change embedding models,
-    /// or reconfigure API mode without running the full setup wizard.
-    #[command(
-        long_about = "Select and manage the ONNX runtime and model backend.\n\n\
-                      This is the focused backend configuration command. It handles \
-                      runtime selection, model downloads, and API credential persistence \
-                      without touching agent skills or project indexes.\n\n\
-                      With no flags, shows an interactive backend menu with auto-detected \
-                      GPU as the default.\n\n\
-                      Examples:\n  \
-                      vera backend                     # Interactive backend selection\n  \
-                      vera backend --onnx-jina-cuda    # NVIDIA GPU (skip menu)\n  \
-                      vera backend --code-rank-embed   # Switch to CodeRankEmbed model\n  \
-                      vera backend --api               # Persist API credentials from env\n  \
-                      vera backend --yes               # Auto-detect GPU, no prompts"
-    )]
-    Backend {
-        #[command(flatten)]
-        backend: helpers::LocalBackendFlags,
-        #[command(flatten)]
-        embedding: helpers::LocalEmbeddingModelFlags,
-        /// Configure Vera for API-backed mode using current env vars.
-        #[arg(long, group = "backend")]
-        api: bool,
-        /// Skip the confirmation prompt.
-        #[arg(long)]
-        yes: bool,
-    },
-
-    /// Inspect the current Vera setup for common configuration issues.
-    ///
-    /// Checks the persisted config, effective mode, local runtime or API env,
-    /// and whether the current repository has an index.
-    #[command(
-        long_about = "Inspect the current Vera setup for common configuration issues.\n\n\
-                      Checks the persisted config, effective mode, local runtime or \
-                      API environment variables, and whether the current repository \
-                      has a `.vera/` index. `--probe` adds a deeper read-only ONNX \
-                      session probe and never downloads or repairs missing assets.\n\n\
-                      Examples:\n  \
-                      vera doctor\n  \
-                      vera doctor --probe\n  \
-                      vera doctor --json"
-    )]
-    Doctor {
-        /// Run a deeper read-only probe of local ONNX session init.
-        #[arg(long, visible_alias = "deep")]
-        probe: bool,
-    },
-
-    /// Repair the configured Vera backend.
-    ///
-    /// Re-fetches missing local runtime/model assets for the selected local
-    /// backend, or re-persists API configuration from the current environment.
-    #[command(long_about = "Repair the configured Vera backend.\n\n\
-                      For local ONNX backends, this re-fetches missing runtime and \
-                      model assets for the selected backend. For API mode, it re-saves \
-                      the current API environment variables into Vera's config.\n\n\
-                      This is a write operation. Use `vera doctor --probe` for a read-only \
-                      diagnostic check.\n\n\
-                      Examples:\n  \
-                      vera repair\n  \
-                      vera repair --onnx-jina-cuda\n  \
-                      vera repair --api")]
-    Repair {
-        #[command(flatten)]
-        backend: helpers::LocalBackendFlags,
-        /// Repair API-backed mode using current env vars.
-        #[arg(long, group = "backend")]
-        api: bool,
-    },
-
-    /// Show the binary update plan, or apply it when the install method is known.
-    #[command(
-        long_about = "Show the binary update plan, or apply it when the install method is known.\n\n\
-                      By default, `vera upgrade` is a dry run: it checks for a newer Vera \
-                      release, resolves the saved or detected install method, and prints the \
-                      exact command it would use.\n\n\
-                      `--apply` runs the installer command only when Vera can determine a \
-                      single install method. If multiple install methods are detected, Vera \
-                      prints the manual options and refuses to guess.\n\n\
-                      Examples:\n  \
-                      vera upgrade\n  \
-                      vera upgrade --apply\n  \
-                      vera upgrade --json"
-    )]
-    Upgrade {
-        /// Run the planned installer command instead of printing it only.
-        #[arg(long)]
-        apply: bool,
-    },
-
-    /// Index a codebase for search.
-    ///
-    /// Discovers source files, parses them with tree-sitter, creates
-    /// searchable chunks, generates embeddings, and stores everything
-    /// in a local `.vera/` index directory.
-    ///
-    /// Examples:
-    ///   vera index .
-    ///   vera index /path/to/repo
-    ///   vera index . --json
-    #[command(long_about = "Index a codebase for search.\n\n\
-                      Discovers source files (respecting .gitignore), parses them with \
-                      tree-sitter for 60+ languages, creates searchable chunks at symbol \
-                      boundaries, generates embeddings using the current Vera mode, and \
-                      stores everything in a local `.vera/` index directory.\n\n\
-                      Use `vera setup` for Vera's built-in local models, or `vera setup \
-                      --api` for an OpenAI-compatible endpoint.\n\n\
-                      Examples:\n  \
-                      vera index .                  # Index current directory\n  \
-                      vera index /path/to/repo      # Index a specific repo\n  \
-                      vera index . --json           # Output summary as JSON")]
-    Index {
-        /// Path to the directory to index.
-        path: String,
-        #[command(flatten)]
-        backend: helpers::LocalBackendFlags,
-        /// Exclude files matching this glob pattern (repeatable).
-        #[arg(long = "exclude")]
-        exclude: Vec<String>,
-        /// Disable .gitignore and .veraignore parsing.
-        #[arg(long)]
-        no_ignore: bool,
-        /// Disable smart default exclusions.
-        #[arg(long)]
-        no_default_excludes: bool,
-        /// Show detailed information (e.g. paths of skipped files).
-        #[arg(long, short = 'v')]
-        verbose: bool,
-        /// Reduce GPU memory usage (batch_size=1, conservative VRAM limit).
-        #[arg(long)]
-        low_vram: bool,
-    },
-
-    /// Search the indexed codebase.
-    ///
-    /// Performs hybrid search combining BM25 keyword matching and vector
-    /// similarity, fused with Reciprocal Rank Fusion (RRF). Optional
-    /// cross-encoder reranking for improved precision.
-    ///
-    /// Examples:
-    ///   vera search "authentication logic"
-    ///   vera search "parse_config" --lang rust
-    ///   vera search "OAuth token refresh" "JWT expiry handling" "auth middleware"
-    ///   vera search "config" --intent "find where database connection strings are loaded"
-    #[command(long_about = "Search the indexed codebase.\n\n\
-                      Performs hybrid search combining BM25 keyword matching and vector \
-                      similarity via Reciprocal Rank Fusion (RRF). Optional cross-encoder \
-                      reranking for improved precision.\n\n\
-                      Pass multiple quoted queries to merge different phrasings into a \
-                      single result set. Use `--intent` when the query is short but your \
-                      higher-level goal needs to guide reranking.\n\n\
-                      Source files are favored by default. Use `--scope docs` for prose, \
-                      `--scope runtime` for extracted runtime trees, and `--include-generated` \
-                      when you intentionally want dist/minified artifacts.\n\n\
-                      Falls back gracefully: if embedding API is unavailable, uses BM25-only \
-                      search. If reranker is unavailable, returns unreranked hybrid results.\n\n\
-                      Requires an existing index (run `vera index <path>` first).\n\n\
-                      Examples:\n  \
-                      vera search \"auth logic\"                                # Semantic search\n  \
-                      vera search \"parse_config\"                               # Symbol lookup\n  \
-                      vera search \"hotkeys\" --scope docs                       # Search docs only\n  \
-                      vera search \"OAuth token refresh\" \"JWT expiry handling\" \"auth middleware\"\n  \
-                      vera search \"config\" --intent \"find env-based DB loading\"\n  \
-                      vera search \"error handling\" --lang rust                 # Filter by language\n  \
-                      vera search \"routes\" --path \"src/**/*.ts\"                # Filter by path\n  \
-                      vera search \"DB queries\" --type function                 # Filter by symbol type\n  \
-                      vera search \"config\" --limit 5 --json --timing            # JSON output + timings")]
-    Search {
-        /// One or more search queries (keyword or natural language).
-        ///
-        /// Pass multiple quoted queries to merge different phrasings in one call.
-        #[arg(required = true, num_args = 1..)]
-        queries: Vec<String>,
-
-        /// Higher-level goal used to disambiguate the query before reranking.
-        #[arg(long)]
-        intent: Option<String>,
-
-        /// Filter by programming language (case-insensitive).
-        ///
-        /// Restricts results to the specified language.
-        /// Supported: rust, typescript, python, go, java, c, cpp, etc.
-        #[arg(long)]
-        lang: Option<String>,
-
-        /// Filter by file path glob pattern (e.g., "src/**/*.rs").
-        ///
-        /// Supports * (any within segment) and ** (any depth).
-        #[arg(long)]
-        path: Option<String>,
-
-        /// Maximum number of results to return (default: 5).
-        #[arg(long, short = 'n')]
-        limit: Option<usize>,
-
-        /// Filter by symbol type.
-        ///
-        /// Options: function, method, class, struct, enum, trait,
-        /// interface, type_alias, constant, variable, module, block.
-        #[arg(long, rename_all = "snake_case")]
-        r#type: Option<String>,
-
-        /// Restrict results to a coarse corpus scope.
-        #[arg(long, value_parser = ["source", "docs", "runtime", "all"])]
-        scope: Option<String>,
-
-        /// Include generated or minified files such as dist bundles.
-        #[arg(long)]
-        include_generated: bool,
-
-        /// Deep search: RAG-fusion query expansion + merged ranking when a completion
-        /// endpoint is configured, otherwise iterative symbol-following search.
-        #[arg(long)]
-        deep: bool,
-
-        /// Show only function/class signatures (omit bodies).
-        ///
-        /// Useful for broad exploration: fits more results in fewer tokens.
-        /// Use default mode for targeted retrieval of full implementations.
-        #[arg(long)]
-        compact: bool,
-
-        #[command(flatten)]
-        backend: helpers::LocalBackendFlags,
-    },
-
-    /// Incrementally update the index for changed files.
-    ///
-    /// Detects files that have been added, modified, or deleted since
-    /// the last index/update, and only re-processes changed files.
-    /// Much faster than a full re-index.
-    ///
-    /// Examples:
-    ///   vera update .
-    ///   vera update /path/to/repo --json
-    #[command(long_about = "Incrementally update the index for changed files.\n\n\
-                      Uses content hashing to detect files that have been added, modified, \
-                      or deleted since the last index/update. Only changed files are \
-                      re-processed, making updates much faster than a full re-index.\n\n\
-                      Uses the saved Vera mode from `vera setup`, or the current shell \
-                      environment if you are configuring providers manually.\n\n\
-                      Examples:\n  \
-                      vera update .                  # Update current directory\n  \
-                      vera update /path/to/repo      # Update a specific repo\n  \
-                      vera update . --json           # Output summary as JSON")]
-    Update {
-        /// Path to the directory to update.
-        path: String,
-        #[command(flatten)]
-        backend: helpers::LocalBackendFlags,
-        /// Exclude files matching this glob pattern (repeatable).
-        #[arg(long = "exclude")]
-        exclude: Vec<String>,
-        /// Disable .gitignore and .veraignore parsing.
-        #[arg(long)]
-        no_ignore: bool,
-        /// Disable smart default exclusions.
-        #[arg(long)]
-        no_default_excludes: bool,
-    },
-
-    /// Show architecture overview of the indexed project.
-    ///
-    /// Returns a high-level summary: languages, directories, entry points,
-    /// symbol types, and complexity hotspots. Useful for onboarding.
-    ///
-    /// Examples:
-    ///   vera overview
-    ///   vera overview --json
-    #[command(long_about = "Show architecture overview of the indexed project.\n\n\
-                      Returns a high-level summary of the codebase: languages with file \n\
-                      and chunk counts, top-level directories, symbol type breakdown, \n\
-                      likely entry points, and complexity hotspots.\n\n\
-                      Useful for quick orientation when starting work on a new project.\n\n\
-                      Examples:\n  \
-                      vera overview             # Human-readable overview\n  \
-                      vera overview --json      # Machine-readable JSON output")]
-    Overview,
-
-    /// Find callers or callees of a symbol.
-    ///
-    /// Queries the call graph built during indexing to find where a symbol
-    /// is called from (callers) or what it calls (callees).
-    ///
-    /// Examples:
-    ///   vera references parse_and_chunk
-    ///   vera references parse_and_chunk --callees
-    ///   vera references parse_and_chunk --json
-    References {
-        /// Symbol name to look up.
-        symbol: String,
-        /// Show what this symbol calls instead of what calls it.
-        #[arg(long)]
-        callees: bool,
-    },
-
-    /// Regex pattern search over indexed files.
-    ///
-    /// Searches file contents using a regex pattern, returning matches
-    /// with surrounding context. Only searches files in the index.
-    ///
-    /// Examples:
-    ///   vera grep "fn\s+main"
-    ///   vera grep "TODO|FIXME" -i
-    ///   vera grep "impl.*Display" --context 5
-    #[command(long_about = "Regex pattern search over indexed files.\n\n\
-                      Searches file contents using a regex pattern, returning matches \
-                      with surrounding context lines. Only searches files that are in \
-                      the Vera index, so .gitignore and .veraignore rules apply.\n\n\
-                      Supports the same corpus filters as `vera search`: language, file \
-                      path glob, symbol type, scope, and generated-file inclusion.\n\n\
-                      Examples:\n  \
-                      vera grep \"fn\\s+main\"                            # Find main functions\n  \
-                      vera grep \"TODO|FIXME\" -i                         # Case-insensitive\n  \
-                      vera grep \"queryClient|invalidateQueries\" --path \"frontend/src/**\"\n  \
-                      vera grep \"Authorization\" --lang rust --type function\n  \
-                      vera grep \"keybind\" --scope docs                  # Search docs first\n  \
-                      vera grep \"use std::\" --context 0                 # No context lines")]
-    Grep {
-        /// Regex pattern to search for.
-        pattern: String,
-
-        /// Filter by programming language (case-insensitive).
-        #[arg(long)]
-        lang: Option<String>,
-
-        /// Filter by file path glob pattern (e.g., "src/**/*.rs").
-        #[arg(long)]
-        path: Option<String>,
-
-        /// Filter by symbol type.
-        #[arg(long, rename_all = "snake_case")]
-        r#type: Option<String>,
-
-        /// Maximum number of results (default: 20).
-        #[arg(long, short = 'n')]
-        limit: Option<usize>,
-
-        /// Case-insensitive matching.
-        #[arg(long, short = 'i')]
-        ignore_case: bool,
-
-        /// Number of context lines before and after each match (default: 2).
-        #[arg(long, default_value = "2")]
-        context: usize,
-
-        /// Restrict results to a coarse corpus scope.
-        #[arg(long, value_parser = ["source", "docs", "runtime", "all"])]
-        scope: Option<String>,
-
-        /// Include generated or minified files such as dist bundles.
-        #[arg(long)]
-        include_generated: bool,
-
-        /// Show only function/class signatures (omit bodies).
-        #[arg(long)]
-        compact: bool,
-    },
-
-    /// Find symbols with no callers (potential dead code).
-    ///
-    /// Scans the call graph for functions/methods that are never called.
-    /// Excludes common entry points (main, new, default, etc.).
-    ///
-    /// Examples:
-    ///   vera dead-code
-    ///   vera dead-code --json
-    DeadCode,
-
-    /// Show index statistics.
-    ///
-    /// Displays file count, chunk count, index size on disk,
-    /// and language breakdown for the current index.
-    ///
-    /// Examples:
-    ///   vera stats
-    ///   vera stats --json
-    #[command(long_about = "Show index statistics.\n\n\
-                      Displays file count, chunk count, index size on disk, and a breakdown \
-                      of chunks by programming language for the current index.\n\n\
-                      Looks for the index in the current working directory (`.vera/`).\n\n\
-                      Examples:\n  \
-                      vera stats             # Human-readable stats\n  \
-                      vera stats --json      # Machine-readable JSON output")]
-    Stats,
-
-    /// Watch a project directory and auto-update the index on file changes.
-    ///
-    /// Starts a background file watcher that triggers incremental index updates
-    /// when source files change. Useful for long coding sessions where you want
-    /// the index to stay fresh without manual `vera update` calls.
-    ///
-    /// Requires an existing index (run `vera index <path>` first).
-    /// Blocks until interrupted with Ctrl-C.
-    ///
-    /// Examples:
-    ///   vera watch .
-    ///   vera watch /path/to/repo
-    #[command(
-        long_about = "Watch a project directory and auto-update the index on file changes.\n\n\
-                      Starts a background file watcher that triggers incremental index updates \n\
-                      when source files change. Changes are debounced (2s) to avoid redundant \n\
-                      updates during rapid edits.\n\n\
-                      Requires an existing index (run `vera index <path>` first). \n\
-                      Blocks until interrupted with Ctrl-C.\n\n\
-                      Examples:\n  \
-                      vera watch .                   # Watch current directory\n  \
-                      vera watch /path/to/repo       # Watch a specific repo\n  \
-                      vera watch . --json            # JSON status output"
-    )]
-    Watch {
-        /// Path to the directory to watch.
-        path: String,
-    },
-
-    /// Show or set configuration values.
-    ///
-    /// Without arguments, shows the current configuration. Use subcommands
-    /// to get or set individual values.
-    ///
-    /// Examples:
-    ///   vera config
-    ///   vera config get retrieval.default_limit
-    ///   vera config set retrieval.default_limit 20
-    #[command(long_about = "Show or set configuration values.\n\n\
-                      Without arguments or with `show`, displays the full current \
-                      configuration as a table (or JSON with --json).\n\n\
-                      Use `get <key>` to read a specific value, or `set <key> <value>` \
-                      to update it.\n\n\
-                      Configuration keys use dot notation:\n  \
-                      indexing.max_chunk_lines       Max lines per chunk (default: 200)\n  \
-                      indexing.max_file_size_bytes   Max file size to index (default: 1000000)\n  \
-                      retrieval.default_limit        Default result count (default: 5)\n  \
-                      retrieval.rrf_k                RRF fusion constant (default: 60)\n  \
-                      retrieval.rerank_candidates    Reranker candidate count (default: 50)\n  \
-                      retrieval.reranking_enabled    Enable reranking (default: true)\n  \
-                      retrieval.max_output_chars     Total output char budget (default: 12000)\n  \
-                      embedding.batch_size           Embedding batch size (default: 128)\n  \
-                      embedding.max_concurrent_requests  Concurrent API requests (default: 8)\n  \
-                      embedding.timeout_secs         API timeout (default: 60)\n  \
-                      embedding.max_retries          API retry count (default: 3)\n  \
-                      embedding.max_stored_dim       Vector dimensionality (default: 1024)\n\n\
-                      Examples:\n  \
-                      vera config                                  # Show all settings\n  \
-                      vera config show                             # Same as above\n  \
-                      vera config get retrieval.default_limit      # Get one value\n  \
-                      vera config set retrieval.default_limit 20   # Set a value\n  \
-                      vera config --json                           # JSON output")]
-    Config {
-        /// Config action: show (default), get <key>, or set <key> <value>.
-        #[arg(trailing_var_arg = true)]
-        args: Vec<String>,
-    },
-}
+use cli::{Cli, Commands};
 
 fn main() {
     // Initialize tracing subscriber (logs go to stderr).
@@ -656,6 +43,7 @@ fn main() {
     let show_nudges = !matches!(
         cli.command,
         Commands::Mcp
+            | Commands::Serve { .. }
             | Commands::Agent { .. }
             | Commands::Uninstall
             | Commands::Upgrade { .. }
@@ -667,6 +55,33 @@ fn main() {
             tracing::info!("starting MCP server");
             commands::mcp::run();
             Ok(())
+        }
+        Commands::Serve {
+            port,
+            host,
+            mut api_key,
+            idle_timeout,
+            backend,
+            api,
+        } => {
+            tracing::info!("starting HTTP serve");
+            // Also check VERA_SERVE_KEY env var.
+            if api_key.is_none() {
+                api_key = std::env::var("VERA_SERVE_KEY").ok();
+            }
+            let resolved_backend = if api {
+                vera_core::config::InferenceBackend::Api
+            } else {
+                vera_core::config::resolve_backend(backend.explicit_backend())
+            };
+            let config = match helpers::load_runtime_config() {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("Error loading config: {e:#}");
+                    process::exit(1);
+                }
+            };
+            commands::serve::run(&host, port, api_key, resolved_backend, config, idle_timeout)
         }
         Commands::Agent {
             command,
@@ -691,6 +106,7 @@ fn main() {
                 cli.json,
                 yes,
                 embedding,
+                true,
             )
         }
         Commands::Backend {
@@ -707,6 +123,7 @@ fn main() {
                 cli.json,
                 yes,
                 embedding,
+                false,
             )
         }
         Commands::Uninstall => {
@@ -749,35 +166,47 @@ fn main() {
         Commands::Search {
             queries,
             intent,
-            lang,
-            path,
+            filters,
             limit,
-            r#type,
-            scope,
-            include_generated,
             deep,
+            git_scope,
             compact,
             backend,
         } => {
             tracing::info!(queries = ?queries, deep, "searching");
-            let filters = vera_core::types::SearchFilters {
-                language: lang,
-                path_glob: path,
-                symbol_type: r#type,
-                scope: scope.and_then(|value| value.parse().ok()),
-                include_generated: Some(include_generated),
-            };
             commands::search::run(
                 &queries,
                 intent.as_deref(),
                 limit,
-                &filters,
+                &filters.to_filters(),
                 cli.json,
                 cli.raw,
                 cli.timing,
                 deep,
+                git_scope.resolve(),
                 compact,
                 backend.resolve(),
+            )
+        }
+        Commands::Structural {
+            intent,
+            query,
+            filters,
+            limit,
+            git_scope,
+            compact,
+        } => {
+            tracing::info!("structural query");
+            commands::structural::run(
+                intent,
+                query.as_deref(),
+                limit,
+                &filters.to_filters(),
+                cli.json,
+                cli.raw,
+                cli.timing,
+                git_scope.resolve(),
+                compact,
             )
         }
         Commands::Update {
@@ -786,54 +215,74 @@ fn main() {
             exclude,
             no_ignore,
             no_default_excludes,
+            no_progress,
+            max_files,
         } => {
             tracing::info!(path = %path, "updating");
             commands::update::run(
                 &path,
                 cli.json,
-                backend.resolve(),
-                exclude,
-                no_ignore,
-                no_default_excludes,
+                commands::update::CommandOptions {
+                    backend: backend.resolve(),
+                    exclude,
+                    no_ignore,
+                    no_default_excludes,
+                    no_progress,
+                    max_files: max_files.map(std::num::NonZeroUsize::get),
+                },
             )
         }
-        Commands::Overview => {
+        Commands::Overview { git_scope } => {
             tracing::info!("showing overview");
-            commands::overview::run(cli.json)
+            commands::overview::run(cli.json, git_scope.resolve())
         }
-        Commands::References { symbol, callees } => {
+        Commands::ExplainPath {
+            path,
+            exclude,
+            no_ignore,
+            no_default_excludes,
+        } => {
+            tracing::info!(path = %path, "explaining path");
+            commands::explain_path::run(&path, cli.json, exclude, no_ignore, no_default_excludes)
+        }
+        Commands::References {
+            symbol,
+            callees,
+            limit,
+            git_scope,
+            compact,
+        } => {
             tracing::info!(symbol = %symbol, callees, "references query");
-            commands::references::run(&symbol, callees, cli.json)
+            commands::references::run(
+                &symbol,
+                callees,
+                limit,
+                git_scope.resolve(),
+                cli.json,
+                cli.raw,
+                compact,
+            )
         }
         Commands::Grep {
             pattern,
-            lang,
-            path,
-            r#type,
+            filters,
             limit,
             ignore_case,
             context,
-            scope,
-            include_generated,
+            git_scope,
             compact,
         } => {
             tracing::info!(pattern = %pattern, "grep");
-            let filters = vera_core::types::SearchFilters {
-                language: lang,
-                path_glob: path,
-                symbol_type: r#type,
-                scope: scope.and_then(|value| value.parse().ok()),
-                include_generated: Some(include_generated),
-            };
             commands::grep::run(
                 &pattern,
                 limit,
                 ignore_case,
                 context,
-                &filters,
+                &filters.to_filters(),
                 cli.json,
                 cli.raw,
                 cli.timing,
+                git_scope.resolve(),
                 compact,
             )
         }
@@ -871,16 +320,21 @@ mod tests {
     use super::*;
     use clap::CommandFactory;
 
+    /// Parse argv and return the subcommand, panicking on parse failure.
+    fn parse(argv: &[&str]) -> Commands {
+        Cli::parse_from(argv).command
+    }
+
     #[test]
     fn cli_parses_index_command() {
-        let cli = Cli::parse_from(["vera", "index", "/tmp/repo"]);
-        assert!(matches!(cli.command, Commands::Index { path, .. } if path == "/tmp/repo"));
+        assert!(
+            matches!(parse(&["vera", "index", "/tmp/repo"]), Commands::Index { path, .. } if path == "/tmp/repo")
+        );
     }
 
     #[test]
     fn cli_parses_agent_install_command() {
-        let cli = Cli::parse_from(["vera", "agent", "install", "--client", "codex"]);
-        match cli.command {
+        match parse(&["vera", "agent", "install", "--client", "codex"]) {
             Commands::Agent {
                 command,
                 client,
@@ -897,8 +351,7 @@ mod tests {
 
     #[test]
     fn cli_parses_setup_command() {
-        let cli = Cli::parse_from(["vera", "setup", "--local", "--index", "."]);
-        match cli.command {
+        match parse(&["vera", "setup", "--local", "--index", "."]) {
             Commands::Setup {
                 backend,
                 embedding,
@@ -917,8 +370,7 @@ mod tests {
 
     #[test]
     fn cli_parses_onnx_jina_cpu_flag() {
-        let cli = Cli::parse_from(["vera", "index", ".", "--onnx-jina-cpu"]);
-        match cli.command {
+        match parse(&["vera", "index", ".", "--onnx-jina-cpu"]) {
             Commands::Index { backend, .. } => {
                 assert!(backend.onnx_jina_cpu);
                 assert!(!backend.local);
@@ -928,9 +380,30 @@ mod tests {
     }
 
     #[test]
+    fn cli_parses_potion_code_flag() {
+        match parse(&["vera", "setup", "--potion-code", "--yes"]) {
+            Commands::Setup { backend, .. } => {
+                assert!(backend.potion_code);
+                assert_eq!(
+                    backend.resolve(),
+                    vera_core::config::InferenceBackend::PotionCode
+                );
+            }
+            _ => panic!("expected Setup command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_potion_cpu_alias() {
+        match parse(&["vera", "repair", "--potion-cpu"]) {
+            Commands::Repair { backend, .. } => assert!(backend.potion_code),
+            _ => panic!("expected Repair command"),
+        }
+    }
+
+    #[test]
     fn cli_parses_onnx_jina_cuda_flag() {
-        let cli = Cli::parse_from(["vera", "search", "test", "--onnx-jina-cuda"]);
-        match cli.command {
+        match parse(&["vera", "search", "test", "--onnx-jina-cuda"]) {
             Commands::Search { backend, .. } => {
                 assert!(backend.onnx_jina_cuda);
             }
@@ -953,20 +426,23 @@ mod tests {
 
     #[test]
     fn cli_parses_doctor_command() {
-        let cli = Cli::parse_from(["vera", "doctor"]);
-        assert!(matches!(cli.command, Commands::Doctor { probe: false }));
+        assert!(matches!(
+            parse(&["vera", "doctor"]),
+            Commands::Doctor { probe: false }
+        ));
     }
 
     #[test]
     fn cli_parses_doctor_probe_command() {
-        let cli = Cli::parse_from(["vera", "doctor", "--probe"]);
-        assert!(matches!(cli.command, Commands::Doctor { probe: true }));
+        assert!(matches!(
+            parse(&["vera", "doctor", "--probe"]),
+            Commands::Doctor { probe: true }
+        ));
     }
 
     #[test]
     fn cli_parses_repair_command() {
-        let cli = Cli::parse_from(["vera", "repair", "--onnx-jina-cuda"]);
-        match cli.command {
+        match parse(&["vera", "repair", "--onnx-jina-cuda"]) {
             Commands::Repair { backend, .. } => assert!(backend.onnx_jina_cuda),
             _ => panic!("expected Repair command"),
         }
@@ -974,8 +450,7 @@ mod tests {
 
     #[test]
     fn cli_parses_setup_code_rank_embed_flag() {
-        let cli = Cli::parse_from(["vera", "setup", "--code-rank-embed", "--onnx-jina-cuda"]);
-        match cli.command {
+        match parse(&["vera", "setup", "--code-rank-embed", "--onnx-jina-cuda"]) {
             Commands::Setup {
                 backend, embedding, ..
             } => {
@@ -988,21 +463,23 @@ mod tests {
 
     #[test]
     fn cli_parses_upgrade_command() {
-        let cli = Cli::parse_from(["vera", "upgrade", "--apply"]);
-        assert!(matches!(cli.command, Commands::Upgrade { apply: true }));
+        assert!(matches!(
+            parse(&["vera", "upgrade", "--apply"]),
+            Commands::Upgrade { apply: true }
+        ));
     }
 
     #[test]
     fn cli_parses_search_command() {
-        let cli = Cli::parse_from(["vera", "search", "find auth"]);
+        let command = parse(&["vera", "search", "find auth"]);
         assert!(
-            matches!(cli.command, Commands::Search { queries, .. } if queries == vec!["find auth".to_string()])
+            matches!(command, Commands::Search { queries, .. } if queries == vec!["find auth".to_string()])
         );
     }
 
     #[test]
     fn cli_parses_search_with_filters() {
-        let cli = Cli::parse_from([
+        match parse(&[
             "vera",
             "search",
             "find auth",
@@ -1010,16 +487,15 @@ mod tests {
             "rust",
             "--limit",
             "5",
-        ]);
-        match cli.command {
+        ]) {
             Commands::Search {
                 queries,
-                lang,
+                filters,
                 limit,
                 ..
             } => {
                 assert_eq!(queries, vec!["find auth".to_string()]);
-                assert_eq!(lang, Some("rust".to_string()));
+                assert_eq!(filters.lang, Some("rust".to_string()));
                 assert_eq!(limit, Some(5));
             }
             _ => panic!("expected Search command"),
@@ -1028,13 +504,12 @@ mod tests {
 
     #[test]
     fn cli_parses_search_with_type_filter() {
-        let cli = Cli::parse_from(["vera", "search", "find auth", "--type", "function"]);
-        match cli.command {
+        match parse(&["vera", "search", "find auth", "--type", "function"]) {
             Commands::Search {
-                queries, r#type, ..
+                queries, filters, ..
             } => {
                 assert_eq!(queries, vec!["find auth".to_string()]);
-                assert_eq!(r#type, Some("function".to_string()));
+                assert_eq!(filters.r#type, Some("function".to_string()));
             }
             _ => panic!("expected Search command"),
         }
@@ -1042,11 +517,23 @@ mod tests {
 
     #[test]
     fn cli_parses_search_with_path_filter() {
-        let cli = Cli::parse_from(["vera", "search", "config", "--path", "src/**/*.rs"]);
-        match cli.command {
-            Commands::Search { queries, path, .. } => {
+        match parse(&[
+            "vera",
+            "search",
+            "config",
+            "--path",
+            "src/**/*.rs",
+            "--path",
+            "tests/**/*.rs",
+        ]) {
+            Commands::Search {
+                queries, filters, ..
+            } => {
                 assert_eq!(queries, vec!["config".to_string()]);
-                assert_eq!(path, Some("src/**/*.rs".to_string()));
+                assert_eq!(
+                    filters.path,
+                    vec!["src/**/*.rs".to_string(), "tests/**/*.rs".to_string()]
+                );
             }
             _ => panic!("expected Search command"),
         }
@@ -1054,7 +541,7 @@ mod tests {
 
     #[test]
     fn cli_parses_search_with_all_filters() {
-        let cli = Cli::parse_from([
+        match parse(&[
             "vera",
             "search",
             "handle request",
@@ -1066,20 +553,17 @@ mod tests {
             "function",
             "--limit",
             "3",
-        ]);
-        match cli.command {
+        ]) {
             Commands::Search {
                 queries,
-                lang,
-                path,
+                filters,
                 limit,
-                r#type,
                 ..
             } => {
                 assert_eq!(queries, vec!["handle request".to_string()]);
-                assert_eq!(lang, Some("typescript".to_string()));
-                assert_eq!(path, Some("src/**/*.ts".to_string()));
-                assert_eq!(r#type, Some("function".to_string()));
+                assert_eq!(filters.lang, Some("typescript".to_string()));
+                assert_eq!(filters.path, vec!["src/**/*.ts".to_string()]);
+                assert_eq!(filters.r#type, Some("function".to_string()));
                 assert_eq!(limit, Some(3));
             }
             _ => panic!("expected Search command"),
@@ -1088,7 +572,7 @@ mod tests {
 
     #[test]
     fn cli_parses_search_with_multiple_queries_and_intent() {
-        let cli = Cli::parse_from([
+        match parse(&[
             "vera",
             "search",
             "OAuth token refresh",
@@ -1096,8 +580,7 @@ mod tests {
             "auth middleware",
             "--intent",
             "find where tokens are refreshed and validated",
-        ]);
-        match cli.command {
+        ]) {
             Commands::Search {
                 queries, intent, ..
             } => {
@@ -1148,22 +631,17 @@ mod tests {
 
     #[test]
     fn cli_parses_search_scope_flags() {
-        let cli = Cli::parse_from([
+        match parse(&[
             "vera",
             "search",
             "mod loader",
             "--scope",
             "runtime",
             "--include-generated",
-        ]);
-        match cli.command {
-            Commands::Search {
-                scope,
-                include_generated,
-                ..
-            } => {
-                assert_eq!(scope, Some("runtime".to_string()));
-                assert!(include_generated);
+        ]) {
+            Commands::Search { filters, .. } => {
+                assert_eq!(filters.scope, Some("runtime".to_string()));
+                assert!(filters.include_generated);
             }
             _ => panic!("expected Search command"),
         }
@@ -1171,28 +649,53 @@ mod tests {
 
     #[test]
     fn cli_parses_update_command() {
-        let cli = Cli::parse_from(["vera", "update", "/tmp/repo"]);
-        assert!(matches!(cli.command, Commands::Update { path, .. } if path == "/tmp/repo"));
+        assert!(
+            matches!(parse(&["vera", "update", "/tmp/repo"]), Commands::Update { path, .. } if path == "/tmp/repo")
+        );
+    }
+
+    #[test]
+    fn cli_parses_update_no_progress_flag() {
+        let command = parse(&["vera", "update", "/tmp/repo", "--no-progress"]);
+        assert!(matches!(
+            command,
+            Commands::Update {
+                no_progress: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn cli_parses_update_max_files_flag() {
+        let command = parse(&["vera", "update", "/tmp/repo", "--max-files", "250"]);
+        assert!(matches!(
+            command,
+            Commands::Update {
+                max_files: Some(max_files),
+                ..
+            } if max_files.get() == 250
+        ));
+    }
+
+    #[test]
+    fn cli_rejects_zero_update_max_files() {
+        assert!(Cli::try_parse_from(["vera", "update", "/tmp/repo", "--max-files", "0"]).is_err());
     }
 
     #[test]
     fn cli_parses_grep_scope_flags() {
-        let cli = Cli::parse_from([
+        match parse(&[
             "vera",
             "grep",
             "keybind",
             "--scope",
             "docs",
             "--include-generated",
-        ]);
-        match cli.command {
-            Commands::Grep {
-                scope,
-                include_generated,
-                ..
-            } => {
-                assert_eq!(scope, Some("docs".to_string()));
-                assert!(include_generated);
+        ]) {
+            Commands::Grep { filters, .. } => {
+                assert_eq!(filters.scope, Some("docs".to_string()));
+                assert!(filters.include_generated);
             }
             _ => panic!("expected Grep command"),
         }
@@ -1200,17 +703,18 @@ mod tests {
 
     #[test]
     fn cli_parses_grep_with_path_filter() {
-        let cli = Cli::parse_from([
+        match parse(&[
             "vera",
             "grep",
             "queryClient|invalidateQueries",
             "--path",
             "frontend/src/**",
-        ]);
-        match cli.command {
-            Commands::Grep { pattern, path, .. } => {
+        ]) {
+            Commands::Grep {
+                pattern, filters, ..
+            } => {
                 assert_eq!(pattern, "queryClient|invalidateQueries");
-                assert_eq!(path, Some("frontend/src/**".to_string()));
+                assert_eq!(filters.path, vec!["frontend/src/**".to_string()]);
             }
             _ => panic!("expected Grep command"),
         }
@@ -1218,7 +722,7 @@ mod tests {
 
     #[test]
     fn cli_parses_grep_with_all_filters() {
-        let cli = Cli::parse_from([
+        match parse(&[
             "vera",
             "grep",
             "Authorization",
@@ -1230,21 +734,15 @@ mod tests {
             "function",
             "--scope",
             "source",
-        ]);
-        match cli.command {
+        ]) {
             Commands::Grep {
-                pattern,
-                lang,
-                path,
-                r#type,
-                scope,
-                ..
+                pattern, filters, ..
             } => {
                 assert_eq!(pattern, "Authorization");
-                assert_eq!(lang, Some("rust".to_string()));
-                assert_eq!(path, Some("src/**/*.rs".to_string()));
-                assert_eq!(r#type, Some("function".to_string()));
-                assert_eq!(scope, Some("source".to_string()));
+                assert_eq!(filters.lang, Some("rust".to_string()));
+                assert_eq!(filters.path, vec!["src/**/*.rs".to_string()]);
+                assert_eq!(filters.r#type, Some("function".to_string()));
+                assert_eq!(filters.scope, Some("source".to_string()));
             }
             _ => panic!("expected Grep command"),
         }
@@ -1279,15 +777,95 @@ mod tests {
     }
 
     #[test]
+    fn cli_parses_structural_definitions_command() {
+        match parse(&["vera", "structural", "definitions", "parse_config"]) {
+            Commands::Structural { intent, query, .. } => {
+                assert!(matches!(
+                    intent,
+                    commands::structural::StructuralIntent::Definitions
+                ));
+                assert_eq!(query.as_deref(), Some("parse_config"));
+            }
+            _ => panic!("expected structural command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_structural_filters_and_git_scope() {
+        match parse(&[
+            "vera",
+            "structural",
+            "env",
+            "DATABASE_URL",
+            "--lang",
+            "rust",
+            "--path",
+            "src/**/*.rs",
+            "--type",
+            "function",
+            "--changed",
+            "--compact",
+        ]) {
+            Commands::Structural {
+                intent,
+                query,
+                filters,
+                git_scope,
+                compact,
+                ..
+            } => {
+                assert!(matches!(
+                    intent,
+                    commands::structural::StructuralIntent::Env
+                ));
+                assert_eq!(query.as_deref(), Some("DATABASE_URL"));
+                assert_eq!(filters.lang, Some("rust".to_string()));
+                assert_eq!(filters.path, vec!["src/**/*.rs".to_string()]);
+                assert_eq!(filters.r#type, Some("function".to_string()));
+                assert!(git_scope.changed);
+                assert!(compact);
+            }
+            _ => panic!("expected structural command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_references_limit_git_scope_and_compact() {
+        match parse(&[
+            "vera",
+            "references",
+            "parse_config",
+            "--limit",
+            "7",
+            "--changed",
+            "--compact",
+        ]) {
+            Commands::References {
+                symbol,
+                limit,
+                git_scope,
+                compact,
+                ..
+            } => {
+                assert_eq!(symbol, "parse_config");
+                assert_eq!(limit, Some(7));
+                assert!(git_scope.changed);
+                assert!(compact);
+            }
+            _ => panic!("expected references command"),
+        }
+    }
+
+    #[test]
     fn cli_parses_watch_command() {
-        let cli = Cli::parse_from(["vera", "watch", "/tmp/repo"]);
-        assert!(matches!(cli.command, Commands::Watch { path } if path == "/tmp/repo"));
+        assert!(
+            matches!(parse(&["vera", "watch", "/tmp/repo"]), Commands::Watch { path } if path == "/tmp/repo")
+        );
     }
 
     #[test]
     fn cli_parses_stats_command() {
-        let cli = Cli::parse_from(["vera", "stats"]);
-        assert!(matches!(cli.command, Commands::Stats));
+        assert!(matches!(parse(&["vera", "stats"]), Commands::Stats));
     }
 
     #[test]
@@ -1306,14 +884,12 @@ mod tests {
 
     #[test]
     fn cli_parses_config_command() {
-        let cli = Cli::parse_from(["vera", "config"]);
-        assert!(matches!(cli.command, Commands::Config { args } if args.is_empty()));
+        assert!(matches!(parse(&["vera", "config"]), Commands::Config { args } if args.is_empty()));
     }
 
     #[test]
     fn cli_parses_config_show() {
-        let cli = Cli::parse_from(["vera", "config", "show"]);
-        match cli.command {
+        match parse(&["vera", "config", "show"]) {
             Commands::Config { args } => {
                 assert_eq!(args, vec!["show".to_string()]);
             }
@@ -1323,8 +899,7 @@ mod tests {
 
     #[test]
     fn cli_parses_config_get() {
-        let cli = Cli::parse_from(["vera", "config", "get", "retrieval.default_limit"]);
-        match cli.command {
+        match parse(&["vera", "config", "get", "retrieval.default_limit"]) {
             Commands::Config { args } => {
                 assert_eq!(
                     args,
@@ -1337,8 +912,7 @@ mod tests {
 
     #[test]
     fn cli_parses_config_set() {
-        let cli = Cli::parse_from(["vera", "config", "set", "retrieval.default_limit", "20"]);
-        match cli.command {
+        match parse(&["vera", "config", "set", "retrieval.default_limit", "20"]) {
             Commands::Config { args } => {
                 assert_eq!(
                     args,

@@ -7,8 +7,10 @@ vera search "authentication middleware"
 vera search "JWT token validation"
 vera search "parse_config"
 vera search "request rate limiting" --lang rust
-vera search "routes" --path "src/**/*.ts"
+vera search "routes" --path "src/**/*.ts" --path "tests/**/*.ts"
 vera search "handler" --type function --limit 5
+vera search "token validation" --changed
+vera search "config loading" --base origin/main
 ```
 
 ## Weak Vera Queries
@@ -59,7 +61,7 @@ vera grep "parse" --compact                  # signatures only
 Add one filter at a time:
 
 1. `--lang rust`: restrict to a language
-2. `--path "src/auth/**"`: restrict to a path glob
+2. `--path "src/auth/**"`: restrict to a path glob; repeat it to OR multiple patterns
 3. `--type function`: restrict to symbol type
 4. `--limit 3`: fewer, higher-confidence results
 5. `--scope source`: restrict to a corpus scope (see SKILL.md for scope table)
@@ -74,6 +76,22 @@ vera search "OAuth token refresh" "JWT expiry handling" "auth middleware"
 
 Use this when one phrasing is too narrow but the task is still one coherent search.
 
+## Git-Scoped Search
+
+When the task is limited to modified files or a PR diff, scope the search first:
+
+```sh
+vera search "auth middleware" --changed
+vera grep "TODO|FIXME" --changed
+vera overview --base origin/main
+```
+
+Use:
+
+- `--changed` for modified, staged, and untracked files
+- `--since <rev>` for changes since a specific revision
+- `--base <rev>` for changes since `merge-base(HEAD, <rev>)`
+
 ## Intent-Based Reranking
 
 Add `--intent` when the raw query is short but you know the higher-level goal:
@@ -83,3 +101,17 @@ vera search "config" --intent "find where database connection strings are loaded
 ```
 
 Use this when the raw query is too short or ambiguous to capture what you actually need.
+
+## Structural Search
+
+Use `vera structural` for the common structural tasks agents hit repeatedly:
+
+```sh
+vera structural definitions parse_config
+vera structural env DATABASE_URL
+vera structural routes --path "src/**"
+vera structural sql
+vera structural impls Loader
+```
+
+Use `vera structural impls <symbol>` for explicit inheritance or conformance declarations only. It does not infer implicit interface satisfaction.

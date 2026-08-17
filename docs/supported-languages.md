@@ -64,7 +64,7 @@ Most languages with a tree-sitter grammar get symbol-level chunking: functions, 
 |----------|-----------|:-:|
 | Go | `.go` | ✅ |
 | Swift | `.swift` | ✅ |
-| Haskell | `.hs` | ✅ |
+| Haskell | `.hs` | Tier 0 |
 | Elixir | `.ex`, `.exs` | ✅ |
 | Erlang | `.erl`, `.hrl` | ✅ |
 | OCaml | `.ml`, `.mli` | ✅ |

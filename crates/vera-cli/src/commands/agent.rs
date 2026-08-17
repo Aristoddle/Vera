@@ -89,78 +89,55 @@ pub enum AgentClient {
 }
 
 impl AgentClient {
+    /// All concrete (non-All) clients with display names, in display order.
+    const META: &[(AgentClient, &str)] = &[
+        (AgentClient::Agents, "Universal (.agents/skills/)"),
+        (AgentClient::Amp, "Amp (Sourcegraph)"),
+        (AgentClient::Antigravity, "Antigravity"),
+        (AgentClient::Augment, "Augment Code"),
+        (AgentClient::Claude, "Claude Code (Anthropic)"),
+        (AgentClient::Cline, "Cline"),
+        (AgentClient::Codebuff, "Codebuff"),
+        (AgentClient::Codebuddy, "CodeBuddy"),
+        (AgentClient::Codex, "Codex (OpenAI)"),
+        (AgentClient::Copilot, "Copilot (GitHub)"),
+        (AgentClient::Cortex, "Cortex Code (Snowflake)"),
+        (AgentClient::Crush, "Crush"),
+        (AgentClient::Cursor, "Cursor"),
+        (AgentClient::Droid, "Droid (Factory)"),
+        (AgentClient::Gemini, "Gemini CLI (Google)"),
+        (AgentClient::Goose, "Goose (Block)"),
+        (AgentClient::Iflow, "iFlow"),
+        (AgentClient::Junie, "Junie (JetBrains)"),
+        (AgentClient::Kilo, "Kilo Code"),
+        (AgentClient::Kiro, "Kiro"),
+        (AgentClient::Kimi, "Kimi (Moonshot)"),
+        (AgentClient::Vibe, "Vibe (Mistral)"),
+        (AgentClient::Mux, "Mux"),
+        (AgentClient::Opencode, "OpenCode"),
+        (AgentClient::Openhands, "OpenHands"),
+        (AgentClient::Pi, "Pi"),
+        (AgentClient::Qwen, "Qwen Code"),
+        (AgentClient::Roo, "Roo Code"),
+        (AgentClient::Trae, "Trae"),
+        (AgentClient::Windsurf, "Windsurf"),
+        (AgentClient::Zed, "Zed"),
+    ];
+
     /// All concrete (non-All) client variants, in display order.
-    fn all_concrete() -> &'static [AgentClient] {
-        &[
-            AgentClient::Agents,
-            AgentClient::Amp,
-            AgentClient::Antigravity,
-            AgentClient::Augment,
-            AgentClient::Claude,
-            AgentClient::Cline,
-            AgentClient::Codebuff,
-            AgentClient::Codebuddy,
-            AgentClient::Codex,
-            AgentClient::Copilot,
-            AgentClient::Cortex,
-            AgentClient::Crush,
-            AgentClient::Cursor,
-            AgentClient::Droid,
-            AgentClient::Gemini,
-            AgentClient::Goose,
-            AgentClient::Iflow,
-            AgentClient::Junie,
-            AgentClient::Kilo,
-            AgentClient::Kiro,
-            AgentClient::Kimi,
-            AgentClient::Vibe,
-            AgentClient::Mux,
-            AgentClient::Opencode,
-            AgentClient::Openhands,
-            AgentClient::Pi,
-            AgentClient::Qwen,
-            AgentClient::Roo,
-            AgentClient::Trae,
-            AgentClient::Windsurf,
-            AgentClient::Zed,
-        ]
+    fn all_concrete() -> impl Iterator<Item = AgentClient> + 'static {
+        Self::META.iter().map(|(client, _)| *client)
     }
 
     fn display_name(&self) -> &'static str {
-        match self {
-            AgentClient::All => "All",
-            AgentClient::Agents => "Universal (.agents/skills/)",
-            AgentClient::Amp => "Amp (Sourcegraph)",
-            AgentClient::Antigravity => "Antigravity",
-            AgentClient::Augment => "Augment Code",
-            AgentClient::Claude => "Claude Code (Anthropic)",
-            AgentClient::Cline => "Cline",
-            AgentClient::Codebuff => "Codebuff",
-            AgentClient::Codebuddy => "CodeBuddy",
-            AgentClient::Codex => "Codex (OpenAI)",
-            AgentClient::Copilot => "Copilot (GitHub)",
-            AgentClient::Cortex => "Cortex Code (Snowflake)",
-            AgentClient::Crush => "Crush",
-            AgentClient::Cursor => "Cursor",
-            AgentClient::Droid => "Droid (Factory)",
-            AgentClient::Gemini => "Gemini CLI (Google)",
-            AgentClient::Goose => "Goose (Block)",
-            AgentClient::Iflow => "iFlow",
-            AgentClient::Junie => "Junie (JetBrains)",
-            AgentClient::Kilo => "Kilo Code",
-            AgentClient::Kiro => "Kiro",
-            AgentClient::Kimi => "Kimi (Moonshot)",
-            AgentClient::Vibe => "Vibe (Mistral)",
-            AgentClient::Mux => "Mux",
-            AgentClient::Opencode => "OpenCode",
-            AgentClient::Openhands => "OpenHands",
-            AgentClient::Pi => "Pi",
-            AgentClient::Qwen => "Qwen Code",
-            AgentClient::Roo => "Roo Code",
-            AgentClient::Trae => "Trae",
-            AgentClient::Windsurf => "Windsurf",
-            AgentClient::Zed => "Zed",
+        if *self == AgentClient::All {
+            return "All";
         }
+        Self::META
+            .iter()
+            .find(|(client, _)| client == self)
+            .map(|(_, name)| *name)
+            .unwrap_or("All")
     }
 }
 
@@ -327,7 +304,7 @@ fn install_interactive() -> anyhow::Result<()> {
     let cwd = std::env::current_dir().context("failed to resolve current directory")?;
     let home = state::user_home_dir()?;
     let statuses = collect_client_install_statuses(scope, &cwd, &home)?;
-    let all_clients = AgentClient::all_concrete();
+    let all_clients: Vec<AgentClient> = AgentClient::all_concrete().collect();
     let installed_clients: Vec<AgentClient> = statuses
         .iter()
         .filter(|status| status.is_installed())
@@ -512,10 +489,10 @@ fn remove(
 fn remove_interactive() -> anyhow::Result<()> {
     let cwd = std::env::current_dir().context("failed to resolve current directory")?;
     let home = state::user_home_dir()?;
-    let all_clients = AgentClient::all_concrete();
+    let all_clients: Vec<AgentClient> = AgentClient::all_concrete().collect();
 
     let mut installed: Vec<(AgentClient, AgentScope, PathBuf)> = Vec::new();
-    for &client in all_clients {
+    for &client in &all_clients {
         for scope in [AgentScope::Global, AgentScope::Project] {
             let path = skill_path_for(client, scope, &cwd, &home)?;
             if path.join("SKILL.md").exists() {
@@ -735,7 +712,7 @@ fn resolve_locations(client: AgentClient, scope: AgentScope) -> anyhow::Result<V
 
 fn selected_clients_for(client: AgentClient) -> Vec<AgentClient> {
     match client {
-        AgentClient::All => AgentClient::all_concrete().to_vec(),
+        AgentClient::All => AgentClient::all_concrete().collect(),
         single => vec![single],
     }
 }
@@ -744,7 +721,7 @@ pub(crate) fn all_skill_paths(cwd: Option<&Path>, home: &Path) -> anyhow::Result
     let mut paths = BTreeSet::new();
     let cwd_for_globals = cwd.unwrap_or(home);
 
-    for &client in AgentClient::all_concrete() {
+    for client in AgentClient::all_concrete() {
         paths.insert(skill_path_for(
             client,
             AgentScope::Global,
@@ -772,8 +749,6 @@ fn collect_client_install_statuses(
     };
 
     AgentClient::all_concrete()
-        .iter()
-        .copied()
         .map(|client| {
             let scopes = scopes
                 .iter()
@@ -825,7 +800,7 @@ fn resolve_locations_with_roots(
     home: &Path,
 ) -> anyhow::Result<Vec<SkillLocation>> {
     let clients = match client {
-        AgentClient::All => AgentClient::all_concrete().to_vec(),
+        AgentClient::All => AgentClient::all_concrete().collect(),
         single => vec![single],
     };
     let scopes = match scope {
@@ -947,14 +922,14 @@ fn skill_path_for(
 
 fn sync(json_output: bool) -> anyhow::Result<()> {
     let home = state::user_home_dir()?;
-    let cwd = std::env::current_dir().ok();
+    let project_cwd = std::env::current_dir().ok();
     let current_version = env!("CARGO_PKG_VERSION");
-    let scan_scope = if cwd.is_some() {
+    let scan_scope = if project_cwd.is_some() {
         AgentScope::All
     } else {
         AgentScope::Global
     };
-    let cwd = cwd.unwrap_or_else(|| home.clone());
+    let cwd = project_cwd.clone().unwrap_or_else(|| home.clone());
     let statuses = collect_client_install_statuses(scan_scope, &cwd, &home)?;
     let stale_locations = stale_locations_from_statuses(&statuses, &cwd, &home)?;
 
@@ -963,6 +938,14 @@ fn sync(json_output: bool) -> anyhow::Result<()> {
         install_skill_to(&location.path)?;
         updated.push(location.path.clone());
     }
+
+    // Refresh managed markdown snippets whenever a project directory is
+    // available, regardless of which skill installs were stale.
+    let refreshed_snippets = project_cwd
+        .as_deref()
+        .map(|cwd| refresh_existing_vera_snippets(&find_agent_configs(cwd)))
+        .transpose()?
+        .unwrap_or_default();
 
     if json_output {
         let reports: Vec<_> = updated
@@ -990,18 +973,36 @@ fn sync(json_output: bool) -> anyhow::Result<()> {
         }
     }
 
+    if !json_output && !refreshed_snippets.is_empty() {
+        let green = console::Style::new().green();
+        let dim = console::Style::new().dim();
+        println!();
+        println!("Refreshed Vera snippet in:");
+        println!();
+        for path in &refreshed_snippets {
+            println!("  {} {}", green.apply_to("✓"), dim.apply_to(path.display()));
+        }
+    }
+
     Ok(())
 }
 
 /// The snippet Vera offers to inject into agent config files.
+const AGENTS_MD_SNIPPET_HEADING: &str = "## Code Search";
+const AGENTS_MD_SNIPPET_INTRO: &str = "Use Vera before opening many files or running broad text search when you need to find where logic lives or how a feature works.";
+
 const AGENTS_MD_SNIPPET: &str = r#"## Code Search
 
 Use Vera before opening many files or running broad text search when you need to find where logic lives or how a feature works.
 
 - `vera search "query"` for semantic code search. Describe behavior: "JWT validation", not "auth". If one phrasing misses, try 2-3 varied queries or add `--intent "goal"`.
+- `vera search ... --changed`, `--since <rev>`, or `--base <rev>` when the task is limited to modified files or a PR diff
 - `vera grep "pattern"` for exact text or regex in indexed files
-- `vera references <symbol>` for callers and callees
-- `vera overview` for a project summary (languages, entry points, hotspots)
+- `vera structural definitions <symbol>`, `vera structural env <NAME>`, `vera structural routes`, or `vera structural impls <symbol>` for common structural tasks and explicit type relationships
+- `vera explain-path path/to/file` to explain why a file is or is not indexed
+- `vera references <symbol>` for callers and `vera references <symbol> --callees` for callees
+- `vera overview` for a project summary (languages, entry points, hotspots). Add `--changed`, `--since <rev>`, or `--base <rev>` to scope it to modified files.
+- `vera stats --json` for index health, including tree-sitter error, parse-failure, and Tier 0 fallback counts
 - `vera search --deep "query"` for RAG-fusion query expansion + merged ranking
 - Narrow `vera search` or `vera grep` with `--lang`, `--path`, `--type`, or `--scope docs`
 - `vera watch .` to auto-update the index, or `vera update .` after edits (`vera index .` if `.vera/` is missing)
@@ -1109,6 +1110,83 @@ fn insert_vera_snippet(existing: &str, file_name: &str) -> String {
     content
 }
 
+fn refresh_existing_vera_snippets(
+    existing: &[DetectedAgentConfig],
+) -> anyhow::Result<Vec<PathBuf>> {
+    let mut updated = Vec::new();
+
+    for config in existing {
+        let content = fs::read_to_string(&config.path)
+            .with_context(|| format!("failed to read {}", config.path.display()))?;
+        let Some(refreshed) = refresh_vera_snippet(&content, config.file.name) else {
+            continue;
+        };
+        if refreshed == content {
+            continue;
+        }
+
+        fs::write(&config.path, refreshed)
+            .with_context(|| format!("failed to write {}", config.path.display()))?;
+        updated.push(config.path.clone());
+    }
+
+    Ok(updated)
+}
+
+fn refresh_vera_snippet(existing: &str, file_name: &str) -> Option<String> {
+    if file_name.ends_with(".md") {
+        return refresh_vera_snippet_in_markdown(existing);
+    }
+
+    None
+}
+
+fn refresh_vera_snippet_in_markdown(existing: &str) -> Option<String> {
+    let start = markdown_section_start(existing, AGENTS_MD_SNIPPET_HEADING)?;
+    // The managed section ends at the next heading of equal or higher level
+    // (`## ` or `# `). Deeper headings (`### ` and below) stay in the section.
+    let body_start = start + AGENTS_MD_SNIPPET_HEADING.len();
+    let end = existing[body_start..]
+        .match_indices('\n')
+        .map(|(idx, _)| body_start + idx + 1)
+        .find(|&line_start| {
+            let line = &existing[line_start..];
+            line.starts_with("# ") || line.starts_with("## ")
+        })
+        .unwrap_or(existing.len());
+    let section = &existing[start..end];
+    if !section.contains(AGENTS_MD_SNIPPET_INTRO) {
+        return None;
+    }
+
+    let before = existing[..start].trim_end_matches('\n');
+    let after = existing[end..].trim_start_matches('\n');
+    let mut content = String::new();
+    if !before.is_empty() {
+        content.push_str(before);
+        content.push_str("\n\n");
+    }
+    content.push_str(AGENTS_MD_SNIPPET.trim_end());
+    if !after.is_empty() {
+        content.push_str("\n\n");
+        content.push_str(after);
+    } else {
+        content.push('\n');
+    }
+    if !content.ends_with('\n') {
+        content.push('\n');
+    }
+    Some(content)
+}
+
+fn markdown_section_start(existing: &str, heading: &str) -> Option<usize> {
+    if existing.starts_with(heading) {
+        return Some(0);
+    }
+
+    existing.find(&format!("\n{heading}")).map(|idx| idx + 1)
+}
+
 fn insert_vera_snippet_into_markdown(existing: &str) -> String {
     let heading_insert_pos = existing
         .lines()
@@ -1209,6 +1287,11 @@ fn offer_agents_md_snippet(selected_clients: &[AgentClient]) -> anyhow::Result<(
     let cwd = std::env::current_dir().context("failed to resolve current directory")?;
     let existing = find_agent_configs(&cwd);
 
+    for path in refresh_existing_vera_snippets(&existing)? {
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        cliclack::log::success(format!("Updated Vera snippet in {name}"))?;
+    }
+
     if existing.iter().any(|config| config.mentions_vera) {
         return Ok(());
     }
@@ -1295,7 +1378,7 @@ mod tests {
     fn all_concrete_clients_have_paths() {
         let cwd = Path::new("/tmp/project");
         let home = Path::new("/tmp/home");
-        for &client in AgentClient::all_concrete() {
+        for client in AgentClient::all_concrete() {
             skill_path_for(client, AgentScope::Global, cwd, home)
                 .unwrap_or_else(|_| panic!("no global path for {:?}", client));
             skill_path_for(client, AgentScope::Project, cwd, home)
@@ -1314,7 +1397,7 @@ mod tests {
         assert_eq!(
             paths
                 .iter()
-                .filter(|path| { **path == PathBuf::from("/tmp/project/.agents/skills/vera") })
+                .filter(|path| path.as_os_str() == "/tmp/project/.agents/skills/vera")
                 .count(),
             1
         );
@@ -1351,6 +1434,42 @@ mod tests {
         let updated = insert_vera_snippet(existing, ".cursorrules");
         assert!(updated.starts_with("## Code Search\n"));
         assert!(updated.contains("- prefer concise answers"));
+    }
+
+    #[test]
+    fn refresh_vera_snippet_in_markdown_replaces_stale_managed_section() {
+        let existing = "# Repository Guidelines\n\n## Code Search\n\nUse Vera before opening many files or running broad text search when you need to find where logic lives or how a feature works.\n\n- `vera search \"query\"` for semantic code search. Describe behavior: \"JWT validation\", not \"auth\".\n- `vera grep \"pattern\"` for exact text or regex\n- `vera references <symbol>` for callers and callees\n- `vera overview` for a project summary (languages, entry points, hotspots)\n- `vera search --deep \"query\"` for RAG-fusion query expansion + merged ranking\n- Narrow results with `--lang`, `--path`, `--type`, or `--scope docs`\n- `vera watch .` to auto-update the index, or `vera update .` after edits (`vera index .` if `.vera/` is missing)\n- For detailed usage, query patterns, and troubleshooting, read the Vera skill file installed by `vera agent install`\n\n## Build\n\nRun tests.\n";
+
+        let updated = refresh_vera_snippet_in_markdown(existing).unwrap();
+
+        assert!(updated.contains(AGENTS_MD_SNIPPET.trim_end()));
+        assert!(!updated.contains("- `vera grep \"pattern\"` for exact text or regex\n"));
+        assert!(
+            !updated.contains(
+                "- Narrow results with `--lang`, `--path`, `--type`, or `--scope docs`\n"
+            )
+        );
+        assert!(updated.contains("## Build\n\nRun tests.\n"));
+    }
+
+    #[test]
+    fn refresh_vera_snippet_in_markdown_preserves_following_top_level_section() {
+        let existing = format!(
+            "{}\n\n# Guidelines\n\nRun tests first.\n",
+            AGENTS_MD_SNIPPET.trim_end()
+        );
+
+        let updated = refresh_vera_snippet_in_markdown(&existing).unwrap();
+
+        assert!(updated.contains(AGENTS_MD_SNIPPET.trim_end()));
+        assert!(updated.contains("# Guidelines\n\nRun tests first.\n"));
+    }
+
+    #[test]
+    fn refresh_vera_snippet_in_markdown_skips_custom_code_search_section() {
+        let existing = "# Repository Guidelines\n\n## Code Search\n\nUse ripgrep first.\n\n## Build\n\nRun tests.\n";
+
+        assert!(refresh_vera_snippet_in_markdown(existing).is_none());
     }
 
     #[test]

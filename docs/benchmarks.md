@@ -1,9 +1,50 @@
 # Vera Benchmarks
 
-This page tracks two benchmark snapshots:
+This page tracks the v1.0 full-pipeline results and ablations first, then older snapshots kept for historical comparison.
 
-- the current local release benchmark used to tune retrieval quality
-- the older public API benchmark kept for historical comparison
+## v1.0 Full-Pipeline Benchmark
+
+The v1.0.0-rc run used the full 1,251-task Semble suite across 63 repos on the `vera-cuda` lane: hybrid BM25+vector retrieval, RRF fusion, and a local ONNX cross-encoder reranker on CUDA, measured 2026-08-16 against the v1.0.0 release candidate. The older "BM25 scoped filters" full-suite row (`nDCG@10` 0.7267, measured in May 2026) was a BM25-only lane using an older harness. Cross-date comparisons are approximate.
+
+### Main Results
+
+| Variant | nDCG@10 | Recall@1 | Recall@5 | Mean search latency |
+|---------|---------|----------|----------|---------------------|
+| Baseline (pre-ablation HEAD) | 0.7209 | 0.5336 | 0.8088 | 310 ms |
+| v1.0.0-rc (C1+C2 merged) | 0.7327 | 0.5476 | 0.8144 | 2421 ms |
+
+### Ablations
+
+All ablations were measured on the full 1,251-task suite against the stated base.
+
+| Ablation | What it changes | nDCG delta | R@1 delta | Latency effect | Decision |
+|----------|-----------------|------------|-----------|----------------|----------|
+| C1: rerank no-surplus skip | Skip reranking when the fused pool has no surplus over the requested limit | -0.0002 | +0.0000 | -2.4 ms mean | Shipped |
+| C2: rerank path-glob searches | Always rerank path-scoped searches (removes the old skip heuristic) | +0.0113 | +0.0132 | scoped queries now pay rerank cost | Shipped |
+| GA: structural graph augmentation | Append bounded caller/implementation chunks into the rerank pool (`VERA_GRAPH_AUGMENT=1`) | +0.0047 | +0.0080 | +2018 ms mean (reranks the expanded pool) | Merged off by default: gain too small for the latency, R@5 did not move |
+
+Artifacts:
+
+- [2026-08-16-vera-cuda-v1-full.json](../benchmarks/results/semble/2026-08-16-vera-cuda-v1-full.json) (shipped configuration, full suite)
+
+The baseline, C1, C2, and GA variant JSONs were pruned from the tree; they remain in git history.
+
+### Agent-Level Benchmark
+
+This benchmark used 10 cross-file tracing questions about the Flask codebase. The question set and harness are documented in [benchmarks/agent-bench/README.md](../benchmarks/agent-bench/README.md). Each question was answered by a fresh `droid exec` agent in two arms: `with-vera`, with a Vera index and agent skill installed; and `control`, with the Vera CLI blocked and exiting 127. Answers were graded blind against a verified answer key by a judge model using a 0-10 rubric per question. Efficiency metrics came from the agent harness stream: tool calls, input tokens, and wall time.
+
+| Tested model | Arm | Mean score | Tool calls | Input tokens | Wall time |
+|--------------|-----|------------|------------|--------------|-----------|
+| claude-opus-5 (medium effort) | with-vera | 10.0/10 | 186 | 298 | 1367 s |
+| claude-opus-5 (medium effort) | control | 10.0/10 | 173 | 212 | 1252 s |
+| kimi-k3 (medium effort) | with-vera | 10.0/10 | 219 | 230,567 | 1312 s |
+| kimi-k3 (medium effort) | control | 9.9/10 | 190 | 278,041 | 1198 s |
+
+The opus table's input-token counts include only non-cached tokens because nearly everything there was cache reads. The kimi lane is the honest context-size comparison: with Vera, the agent pulled 17% fewer input tokens (230.6k vs 278.0k) to reach the same answer quality.
+
+On a small, well-organized repo, a frontier model answers these questions perfectly with plain grep+read, so quality parity is expected. Vera's measurable effect at this scale is reduced context consumption for the mid-tier model, at roughly equal wall time with slightly more tool calls. Larger and less familiar codebases are where the retrieval advantage should grow. Treat this as a floor, not a ceiling.
+
+Limitations: 10 questions, 1 repo, 1 run per cell, and no statistical power claims.
 
 ## Current Local Release Benchmark
 
@@ -31,12 +72,7 @@ From `v0.4.0` to `v0.7.0`, Vera improved by:
 - `+0.4079` MRR@10
 - `+0.3791` nDCG@10
 
-Committed artifacts:
-
-- [v0.4.0 benchmark](../benchmarks/results/local-binaries/v0.4.0-jina-cuda-onnx.json)
-- [v0.5.0 benchmark](../benchmarks/results/local-binaries/v0.5.0-jina-cuda-onnx.json)
-- [v0.7.0 benchmark](../benchmarks/results/local-binaries/v0.7.0-jina-cuda-onnx.json)
-- [`v0.7.0` accuracy improvements](./releases/v0.7.0-accuracy-improvements.md)
+The raw per-version JSONs were pruned from the tree; they remain in git history. See [`v0.7.0` accuracy improvements](./releases/v0.7.0-accuracy-improvements.md) for the per-version breakdown.
 
 ### Current Performance Snapshot
 
@@ -93,6 +129,43 @@ Quantized note:
 - the original blocker was a large `turborepo` embedding batch that hit a CUDA ONNX allocation spike inside `MultiHeadAttention`; Vera now retries those local batches at smaller sizes instead of aborting the index
 - the dynamic sequence-aware scaler keeps the same aggregate metrics as `oom-fix-jina-cuda-onnx-quantized-embed`, then trims quantized indexing time on every benchmark repo in the same 21-task run (`ripgrep 13.08s -> 12.96s`, `fastify 15.24s -> 14.57s`, `turborepo 55.28s -> 54.71s`, `flask 6.37s -> 5.82s`)
 - the scaler now also persists learned GPU windows across runs in `~/.vera/adaptive-batch-scaler.json`; when you compare cold indexing throughput, clear that file first or run all candidates against the same warmed state
+
+### Semble Comparison
+
+Vera is benchmarked against [Semble](https://github.com/MinishLab/semble), a Python code search tool using `potion-code-16M` static embeddings.
+
+**320-task subset** (16 repos, used for tuning iteration):
+
+| Tool | Backend | Recall@1 | Recall@10 | MRR | nDCG@10 | Search p50 | Search p95 | Index time |
+|------|---------|----------|-----------|-----|---------|------------|------------|------------|
+| Semble | Potion Code CPU | **0.6630** | **0.9479** | **0.8223** | **0.8311** | **1.43 ms** | **15.41 ms** | 26.06 s |
+| Vera | BM25 scoped filters | 0.5802 | 0.9172 | 0.7618 | 0.7752 | 5.05 ms | 23.33 ms | 10.40 s |
+| Vera | BM25 ranked (v4) | 0.5792 | 0.8781 | 0.7520 | 0.7567 | 2.92 ms | 10.37 ms | **10.28 s** |
+| Vera | Potion Code CPU (v5) | 0.5792 | 0.8797 | 0.7490 | 0.7550 | 10.11 ms | 41.08 ms | 16.62 s |
+| Vera | Potion Code CPU (v4) | 0.5792 | 0.8797 | 0.7490 | 0.7550 | 10.68 ms | 49.14 ms | 16.72 s |
+| Vera | BM25 ranked (v3) | 0.5573 | 0.8750 | 0.7376 | 0.7477 | 2.92 ms | 10.37 ms | 10.28 s |
+| Vera | Potion Code CPU (v3) | 0.5510 | 0.8891 | 0.7340 | 0.7468 | 13.95 ms | 54.26 ms | 16.40 s |
+| Vera | Jina CUDA ONNX | 0.5276 | 0.8578 | 0.7058 | 0.7233 | 23.50 ms | 6236.60 ms | 151.20 s |
+
+v3 = English stemming, concept-to-filename augmentation. v4 = stronger definition boost, content-based definition detection, embedded symbol extraction, proportional stem matching, stronger noise penalties. Potion v4 also benefits from parallelized BM25+embedding (24% p50 improvement). Potion v5 keeps v4 retrieval metrics and lowers vector search overfetch from 2x to 1.5x of the requested candidate pool, which trims Potion CPU p95 latency on the subset.
+
+**Full 1,251-task Semble suite** (63 repos, gate for parity claims):
+
+| Metric | Vera BM25 (v3) | Vera BM25 (v4) | Vera BM25 scoped filters |
+|--------|---------------:|---------------:|-------------------------:|
+| nDCG@10 | 0.7010 | 0.7074 | **0.7267** |
+| Recall@1 | 0.5357 | **0.5449** | 0.5448 |
+| Recall@5 | 0.7748 | 0.7832 | **0.8144** |
+| Recall@10 | 0.8128 | 0.8160 | **0.8654** |
+| MRR | 0.6857 | 0.6943 | **0.7043** |
+
+v4 per-category nDCG: symbol_lookup 0.8944, intent 0.6987 (+0.0087), cross_file 0.6141 (+0.0051). All categories improved. 100 task improvements vs 72 regressions across the full suite.
+
+Scoped-filtered BM25 expands the raw Tantivy pool only when search filters are active, then hydrates and keeps matching chunks before final ranking. On the full suite, zero-hit@10 tasks dropped from 188 to 139. Recall@10 had 82 task improvements and 4 regressions. Search p95 rose from 24.96 ms to 54.94 ms.
+
+The Jina CUDA run uses CUDA ONNX Runtime via `ORT_DYLIB_PATH`. Do not run this lane against the CPU ONNX Runtime when comparing latency.
+
+The May subset and full-suite JSONs were pruned from the tree; they remain in git history.
 
 ### Optional CodeRankEmbed Preset
 

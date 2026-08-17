@@ -5,6 +5,7 @@ use crate::retrieval::reranker::{
 };
 use anyhow::Result;
 use std::time::Duration;
+use tokio_util::sync::CancellationToken;
 
 pub enum DynamicReranker {
     Api(ApiReranker),
@@ -22,6 +23,18 @@ impl Reranker for DynamicReranker {
             Self::Local(p) => p.rerank(query, documents).await,
         }
     }
+
+    async fn rerank_cancellable(
+        &self,
+        query: &str,
+        documents: &[String],
+        cancel: &CancellationToken,
+    ) -> Result<Vec<RerankScore>, RerankerError> {
+        match self {
+            Self::Api(p) => p.rerank_cancellable(query, documents, cancel).await,
+            Self::Local(p) => p.rerank_cancellable(query, documents, cancel).await,
+        }
+    }
 }
 
 pub async fn create_dynamic_reranker(
@@ -34,11 +47,23 @@ pub async fn create_dynamic_reranker(
 
     match backend {
         InferenceBackend::OnnxJina(ep) => {
+            // Prefer a configured API reranker over the local ONNX one: hosted
+            // rerankers are typically higher quality, and setting
+            // RERANKER_MODEL_* signals explicit intent to use one.
+            if let Ok(cfg) = RerankerConfig::from_env() {
+                let cfg = cfg
+                    .with_timeout(Duration::from_secs(30))
+                    .with_max_retries(2);
+                let p = ApiReranker::new(cfg)
+                    .map_err(|err| anyhow::anyhow!("failed to init reranker: {err}"))?;
+                return Ok(Some(DynamicReranker::Api(p)));
+            }
             let p = LocalReranker::new_with_ep(ep)
                 .await
                 .map_err(|e| anyhow::anyhow!("Failed to initialize local reranker: {e}\nHint: check network connection or manually place model at ~/.vera/models/"))?;
             Ok(Some(DynamicReranker::Local(p)))
         }
+        InferenceBackend::PotionCode => Ok(None),
         InferenceBackend::Api => match RerankerConfig::from_env() {
             Ok(cfg) => {
                 let cfg = cfg

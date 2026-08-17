@@ -29,6 +29,10 @@ Code search that combines BM25 keyword matching, vector similarity, and cross-en
 
 </div>
 
+## v1.0
+
+Vera 1.0 is the first stable release. It ships measured search-quality gains on the full 1,251-task Semble suite, an agent-level benchmark showing fewer input tokens at equal answer quality, repeatable `--path` filters, `vera agent install`, the `vera serve` HTTP server, local-mode hardening, and a set of community-reported fixes. See [What's new in v1.0](docs/whats-new-v1.md) for details.
+
 ## Quick Start
 
 **1. Install**
@@ -39,7 +43,8 @@ bunx @vera-ai/cli install   # or: npx -y @vera-ai/cli install / uvx vera-ai inst
 **2. Set up models** (pick one)
 ```bash
 vera setup                       # Interactive wizard (auto-detects your hardware)
-vera setup --api                 # API mode: works everywhere, no GPU needed (recommended)
+vera setup --potion-code         # CPU-only local mode
+vera setup --api                 # Remote API mode, prompts for endpoint + key
 vera setup --onnx-jina-coreml    # Apple Silicon (M1/M2/M3/M4)
 vera setup --onnx-jina-cuda      # NVIDIA GPU
 vera setup --onnx-jina-rocm      # AMD GPU (ROCm, Linux)
@@ -79,14 +84,15 @@ Vera itself is always local: the index lives in `.vera/` per project, config and
 | You have | Run this | What happens |
 |----------|----------|-------------|
 | Not sure | `vera setup` | Interactive wizard auto-detects your hardware |
-| Any hardware | `vera setup --api` | Models run remotely via any OpenAI-compatible API. No GPU needed. **Recommended.** |
+| CPU only | `vera setup --potion-code` | Downloads Potion Code static embeddings. No ONNX Runtime needed |
+| Remote models | `vera setup --api` | Prompts for an OpenAI-compatible endpoint and key |
 | Apple Silicon (M1/M2/M3/M4) | `vera setup --onnx-jina-coreml` | Downloads local models, uses CoreML GPU acceleration |
 | NVIDIA GPU | `vera setup --onnx-jina-cuda` | Downloads local models, uses CUDA. Fastest local option |
 | AMD GPU (Linux) | `vera setup --onnx-jina-rocm` | Downloads local models, uses ROCm |
 | Intel GPU (Linux) | `vera setup --onnx-jina-openvino` | Downloads local models, uses OpenVINO |
 | DirectX 12 GPU (Windows) | `vera setup --onnx-jina-directml` | Downloads local models, uses DirectML |
 
-API mode works with any OpenAI-compatible endpoint and needs no local compute. Local mode downloads two curated ONNX models and auto-detects your GPU; a GPU is recommended since CPU-only indexing is slow. After the first index, `vera update .` only re-embeds changed files, so incremental updates are fast on any backend. Full details: [docs/models.md](docs/models.md).
+API mode works with any OpenAI-compatible endpoint and needs no local compute. Use `vera setup --api --yes` with `EMBEDDING_MODEL_*` variables for non-interactive setup. Potion Code is the CPU-first local backend. Jina ONNX is the GPU local backend and includes the local reranker. After the first index, `vera update .` only re-embeds changed files, so incremental updates are fast on any backend. Full details: [docs/models.md](docs/models.md).
 
 For step-by-step instructions, API provider options, Docker, building from source, and troubleshooting, see the full [Installation Guide](docs/installation.md).
 
@@ -96,7 +102,7 @@ For step-by-step instructions, API provider options, Docker, building from sourc
 ```bash
 vera mcp   # or: bunx @vera-ai/cli mcp / uvx vera-ai mcp
 ```
-Exposes `search_code`, `get_stats`, `get_overview`, and `regex_search` tools. `search_code` auto-indexes and starts a file watcher on first use if no index exists.
+Exposes `search_code`, `get_stats`, `get_overview`, `regex_search`, `structural_search`, `find_references`, and `explain_path`. `search_code`, `structural_search`, and `find_references` auto-index and start a file watcher on first use if no index exists.
 The MCP surface stays intentionally small; use the CLI skill path when you need the full command set.
 
 </details>
@@ -115,24 +121,38 @@ vera update .
 
 ```bash
 vera search "error handling" --lang rust
-vera search "routes" --path "src/**/*.ts"
+vera search "routes" --path "src/**/*.ts" --path "tests/**/*.ts"
 vera search "handler" --type function --limit 5
 vera search "OAuth token refresh" "JWT expiry handling" "auth middleware"
 vera search "config" --intent "find where database connection strings are loaded"
 vera search "config loading" --deep
 vera search "auth" --compact
+vera search "token validation" --changed
+vera search "config loading" --base origin/main
+vera structural definitions parse_config
+vera structural env DATABASE_URL
+vera structural routes --path "src/**/*.ts"
+vera structural impls Loader
+vera references parse_config --changed
 ```
+
+Repeat `--path` to match any of several file path patterns. Path patterns use OR semantics; other filters still combine with AND semantics.
 
 ### Common Tasks
 
 | Task | Command |
 |------|---------|
 | Regex or exact text | `vera grep "fn\s+main"` |
+| Common structural tasks | `vera structural routes` / `vera structural env DATABASE_URL` / `vera structural impls Loader` |
+| Explain why a file is missing from the index | `vera explain-path path/to/file` |
+| Inspect index health | `vera stats --json` |
 | Find callers | `vera references foo` |
 | Find callees | `vera references foo --callees` |
 | Find dead code | `vera dead-code` |
 | Get a project overview | `vera overview` |
+| Scope a search to changed files | `vera search "query" --changed` |
 | Keep the index fresh | `vera watch .` |
+| Run local HTTP inference server | `vera serve` |
 | Check your setup | `vera doctor` |
 | Repair missing local assets | `vera repair` |
 | Install agent skills | `vera agent install` |
@@ -149,13 +169,21 @@ pub fn authenticate(credentials: &Credentials) -> Result<Token> { ... }
 ```
 ````
 
-Use `--json` for compact JSON. `--raw` and `--timing` work with `vera search` and `vera grep`, and you can place them before or after the subcommand (for example, `vera --timing search "auth"` or `vera grep "TODO" --raw`).
+Use `--json` for compact JSON. `--raw` works with `vera search`, `vera grep`, and `vera references`; `--timing` works with `vera search` and `vera grep`. You can place them before or after the subcommand (for example, `vera --timing search "auth"` or `vera references parse_config --raw`).
 
 ### Excluding Files
 
 Vera respects `.gitignore` by default. Create a `.veraignore` file (gitignore syntax) for more control, or use `--exclude` flags. Details: [docs/features.md](docs/features.md#flexible-exclusions).
 
+If a file is missing from the index and you need the exact reason, run:
+
+```bash
+vera explain-path path/to/file
+```
+
 ## Benchmarks
+
+`v1.0.0-rc` full-pipeline benchmark: `nDCG@10` 0.7327 on the full 1,251-task Semble suite (63 repos). See [docs/benchmarks.md](docs/benchmarks.md) for ablation detail.
 
 21-task benchmark across `ripgrep`, `flask`, `fastify`, and `turborepo`:
 

@@ -15,69 +15,78 @@ use std::time::{Duration, Instant};
 use anyhow::{Result, anyhow};
 use tracing::{debug, warn};
 
-use crate::config::{InferenceBackend, VeraConfig};
+use crate::config::VeraConfig;
 use crate::retrieval::bm25::search_bm25;
 use crate::types::{SearchFilters, SearchResult};
 
 use super::completion_client::CompletionClient;
 use super::hybrid::fuse_rrf_multi_weighted;
-use super::search_service::{SearchTimings, execute_search};
+use super::search_service::{SearchContext, SearchTimings};
 
 /// Execute deep search: RAG-fusion if a completion endpoint is configured,
 /// otherwise fall back to iterative symbol-following search.
-pub fn execute_deep_search(
+pub async fn execute_deep_search_with_context(
+    context: &SearchContext,
     index_dir: &Path,
     query: &str,
+    intent: Option<&str>,
     config: &VeraConfig,
     filters: &SearchFilters,
     result_limit: usize,
-    backend: InferenceBackend,
 ) -> Result<(Vec<SearchResult>, SearchTimings)> {
     let completion_client = match CompletionClient::from_env_if_configured() {
         Ok(Some(client)) => client,
         Ok(None) => {
-            return super::iterative_search::execute_iterative_search(
+            return super::iterative_search::execute_iterative_search_with_context(
+                context,
                 index_dir,
                 query,
+                intent,
                 config,
                 filters,
                 result_limit,
-                backend,
                 1,
-            );
+            )
+            .await;
         }
         Err(e) => {
             warn!(error = %e, "completion client init failed, falling back to iterative search");
-            return super::iterative_search::execute_iterative_search(
+            return super::iterative_search::execute_iterative_search_with_context(
+                context,
                 index_dir,
                 query,
+                intent,
                 config,
                 filters,
                 result_limit,
-                backend,
                 1,
-            );
+            )
+            .await;
         }
     };
 
-    execute_rag_fusion(
+    execute_rag_fusion_with_context(
+        context,
         index_dir,
         query,
+        intent,
         config,
         filters,
         result_limit,
-        backend,
         &completion_client,
     )
+    .await
 }
 
-fn execute_rag_fusion(
+#[allow(clippy::too_many_arguments)]
+async fn execute_rag_fusion_with_context(
+    context: &SearchContext,
     index_dir: &Path,
     query: &str,
+    intent: Option<&str>,
     config: &VeraConfig,
     filters: &SearchFilters,
     result_limit: usize,
-    backend: InferenceBackend,
     completion_client: &CompletionClient,
 ) -> Result<(Vec<SearchResult>, SearchTimings)> {
     let overall_start = Instant::now();
@@ -104,43 +113,21 @@ fn execute_rag_fusion(
 
     let per_query_limit = compute_per_query_limit(result_limit);
 
-    // Run all sub-queries in parallel using OS threads (each execute_search
-    // creates its own tokio runtime internally).
     let query_count = queries.len();
-    #[allow(clippy::type_complexity)]
-    let results_and_timings: Vec<(usize, Result<(Vec<SearchResult>, SearchTimings)>)> =
-        std::thread::scope(|s| {
-            let handles: Vec<_> = queries
-                .iter()
-                .enumerate()
-                .map(|(idx, q)| {
-                    let q = q.clone();
-                    let index_dir = index_dir.to_path_buf();
-                    let config = config.clone();
-                    let filters = filters.clone();
-                    s.spawn(move || {
-                        (
-                            idx,
-                            execute_search(
-                                &index_dir,
-                                &q,
-                                &config,
-                                &filters,
-                                per_query_limit,
-                                backend,
-                            ),
-                        )
-                    })
-                })
-                .collect();
-            handles.into_iter().map(|h| h.join().unwrap()).collect()
-        });
 
     let mut aggregated_timings = SearchTimings::default();
     let mut per_query_results: Vec<Vec<SearchResult>> = vec![Vec::new(); query_count];
     let mut per_query_weights: Vec<f64> = vec![0.0; query_count];
 
-    for (idx, result) in results_and_timings {
+    // Run the candidate searches concurrently: latency then tracks the
+    // slowest rewrite instead of the sum. Results keep their per-query slots.
+    let outcomes =
+        futures::future::join_all(queries.iter().map(|query| {
+            context.search(index_dir, query, intent, config, filters, per_query_limit)
+        }))
+        .await;
+
+    for (idx, result) in outcomes.into_iter().enumerate() {
         match result {
             Ok((results, timings)) => {
                 merge_timings(&mut aggregated_timings, &timings);

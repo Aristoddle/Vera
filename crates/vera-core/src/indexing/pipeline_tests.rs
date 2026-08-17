@@ -6,6 +6,7 @@ use std::path::Path;
 use tempfile::TempDir;
 
 use super::*;
+use crate::CancellationToken;
 use crate::config::VeraConfig;
 use crate::embedding::test_helpers::MockProvider;
 use crate::storage::bm25::Bm25Index;
@@ -28,9 +29,10 @@ async fn index_simple_repo() {
 
     let provider = MockProvider::new(8);
     let config = default_config();
-    let summary = index_repository(dir.path(), &provider, &config, "mock-model")
-        .await
-        .unwrap();
+    let summary =
+        index_repository_with_progress(dir.path(), &provider, &config, "mock-model", |_| {})
+            .await
+            .unwrap();
 
     assert_eq!(summary.files_parsed, 2);
     assert!(summary.chunks_created > 0);
@@ -44,6 +46,31 @@ async fn index_simple_repo() {
     assert!(idx.join("metadata.db").exists());
     assert!(idx.join("vectors.db").exists());
     assert!(idx.join("bm25").exists());
+}
+
+#[tokio::test]
+async fn pre_cancelled_index_stops_before_creating_artifacts() {
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("main.rs"), "fn main() {}\n").unwrap();
+
+    let provider = MockProvider::new(8);
+    let config = default_config();
+    let cancellation = CancellationToken::new();
+    cancellation.cancel();
+
+    let error = super::index_repository_with_progress_and_cancellation(
+        dir.path(),
+        &provider,
+        &config,
+        "mock-model",
+        |_| {},
+        &cancellation,
+    )
+    .await
+    .unwrap_err();
+
+    assert!(error.to_string().contains("operation cancelled"));
+    assert!(!index_dir(dir.path()).exists());
 }
 
 #[tokio::test]
@@ -145,6 +172,53 @@ async fn index_stores_correct_metadata() {
 }
 
 #[tokio::test]
+async fn index_stores_type_relations() {
+    let dir = TempDir::new().unwrap();
+    fs::write(
+        dir.path().join("types.ts"),
+        "interface Loader {}\nclass Repo implements Loader {\n  run() {}\n}\n",
+    )
+    .unwrap();
+
+    let provider = MockProvider::new(8);
+    let config = default_config();
+    index_repository(dir.path(), &provider, &config, "mock-model")
+        .await
+        .unwrap();
+
+    let idx = index_dir(&dir.path().canonicalize().unwrap());
+    let store = MetadataStore::open(&idx.join("metadata.db")).unwrap();
+    let relations = store.find_type_relations("Loader").unwrap();
+    assert_eq!(relations.len(), 1);
+    assert_eq!(relations[0].owner, "Repo");
+    assert_eq!(relations[0].file_path, "types.ts");
+}
+
+#[tokio::test]
+async fn reindex_with_different_embedding_dim_recreates_vector_store() {
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("main.rs"), "fn main() {}").unwrap();
+
+    let config = default_config();
+
+    let first_provider = MockProvider::new(8);
+    index_repository(dir.path(), &first_provider, &config, "mock-model-8")
+        .await
+        .unwrap();
+
+    let second_provider = MockProvider::new(4);
+    let summary = index_repository(dir.path(), &second_provider, &config, "mock-model-4")
+        .await
+        .unwrap();
+
+    assert!(summary.embeddings_generated > 0);
+
+    let idx = index_dir(&dir.path().canonicalize().unwrap());
+    let vstore = VectorStore::open(&idx.join("vectors.db"), 4).unwrap();
+    assert_eq!(vstore.count().unwrap(), summary.embeddings_generated as u64);
+}
+
+#[tokio::test]
 async fn index_stores_bm25_index() {
     let dir = TempDir::new().unwrap();
     fs::write(
@@ -183,6 +257,33 @@ async fn index_summary_reports_parse_errors() {
     // No errors expected for a simple valid file.
     assert!(summary.parse_errors.is_empty());
     assert_eq!(summary.files_parsed, 1);
+}
+
+#[tokio::test]
+async fn index_persists_tree_sitter_health() {
+    let dir = TempDir::new().unwrap();
+    fs::write(
+        dir.path().join("broken.rs"),
+        "fn broken( {\n    let x = ;\n}\n",
+    )
+    .unwrap();
+
+    let provider = MockProvider::new(8);
+    let config = default_config();
+    let summary = index_repository(dir.path(), &provider, &config, "mock-model")
+        .await
+        .unwrap();
+
+    assert_eq!(summary.files_with_tree_sitter_errors, 1);
+
+    let idx = index_dir(&dir.path().canonicalize().unwrap());
+    let store = MetadataStore::open(&idx.join("metadata.db")).unwrap();
+    let states = store.file_states().unwrap();
+    assert_eq!(states.len(), 1);
+    assert!(states[0].tree_has_error);
+
+    let stats = crate::stats::collect_stats(dir.path()).unwrap();
+    assert_eq!(stats.index_health.files_with_tree_sitter_errors, 1);
 }
 
 #[tokio::test]
