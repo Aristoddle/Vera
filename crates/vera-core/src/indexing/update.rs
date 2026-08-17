@@ -418,94 +418,16 @@ where
                         }
                     };
                 let src = normalized_source.as_deref().unwrap_or(content);
-                match parsing::parse_file_with_diagnostics(
+                chunk_file_for_update(
                     src,
                     rel_path,
                     language,
-                    &config.indexing,
-                ) {
-                    Ok((chunks, _ignored_refs, diagnostics)) => {
-                        let chunk_count = chunks.len() as u64;
-                        (
-                            chunks,
-                            refs,
-                            FileIndexState {
-                                file_path: rel_path.clone(),
-                                language: language.to_string(),
-                                status: FileIndexStatus::Indexed,
-                                tree_has_error: diagnostics.tree_has_error,
-                                tier0_fallback: diagnostics.used_tier0_fallback,
-                                chunk_count,
-                            },
-                        )
-                    }
-                    Err(err) => {
-                        warn!(
-                            file = %rel_path,
-                            error = %err,
-                            refs = refs.len(),
-                            "failed to chunk rst during update; keeping extracted references"
-                        );
-                        parse_errors.push(FileError {
-                            file_path: rel_path.clone(),
-                            error: err.to_string(),
-                        });
-                        (
-                            Vec::new(),
-                            refs,
-                            FileIndexState {
-                                file_path: rel_path.clone(),
-                                language: language.to_string(),
-                                status: FileIndexStatus::ParseError,
-                                tree_has_error: false,
-                                tier0_fallback: false,
-                                chunk_count: 0,
-                            },
-                        )
-                    }
-                }
+                    config,
+                    Some(refs),
+                    &mut parse_errors,
+                )
             } else {
-                match parsing::parse_file_with_diagnostics(
-                    content,
-                    rel_path,
-                    language,
-                    &config.indexing,
-                ) {
-                    Ok((chunks, refs, diagnostics)) => {
-                        let chunk_count = chunks.len() as u64;
-                        (
-                            chunks,
-                            refs,
-                            FileIndexState {
-                                file_path: rel_path.clone(),
-                                language: language.to_string(),
-                                status: FileIndexStatus::Indexed,
-                                tree_has_error: diagnostics.tree_has_error,
-                                tier0_fallback: diagnostics.used_tier0_fallback,
-                                chunk_count,
-                            },
-                        )
-                    }
-                    Err(err) => {
-                        warn!(file = %rel_path, error = %err, "parse error during update");
-                        parse_errors.push(FileError {
-                            file_path: rel_path.clone(),
-                            error: err.to_string(),
-                        });
-                        (
-                            Vec::new(),
-                            Vec::new(),
-                            FileIndexState {
-                                file_path: rel_path.clone(),
-                                language: language.to_string(),
-                                status: FileIndexStatus::ParseError,
-                                tree_has_error: false,
-                                tier0_fallback: false,
-                                chunk_count: 0,
-                            },
-                        )
-                    }
-                }
+                chunk_file_for_update(content, rel_path, language, config, None, &mut parse_errors)
             };
 
             file_states.push(file_state);
@@ -680,6 +602,69 @@ where
 
 /// Remove parse-phase rows (references, type relations) for a file.
 /// Modified files re-insert these during parsing, so stale rows go first.
+fn chunk_file_for_update(
+    src: &str,
+    rel_path: &str,
+    language: Language,
+    config: &VeraConfig,
+    refs_override: Option<Vec<parsing::references::RawReference>>,
+    parse_errors: &mut Vec<FileError>,
+) -> (
+    Vec<crate::types::Chunk>,
+    Vec<parsing::references::RawReference>,
+    FileIndexState,
+) {
+    let state =
+        |status: FileIndexStatus, tree_has_error: bool, tier0_fallback: bool, chunk_count: u64| {
+            FileIndexState {
+                file_path: rel_path.to_string(),
+                language: language.to_string(),
+                status,
+                tree_has_error,
+                tier0_fallback,
+                chunk_count,
+            }
+        };
+    match parsing::parse_file_with_diagnostics(src, rel_path, language, &config.indexing) {
+        Ok((chunks, parsed_refs, diagnostics)) => {
+            let chunk_count = chunks.len() as u64;
+            let refs = refs_override.unwrap_or(parsed_refs);
+            (
+                chunks,
+                refs,
+                state(
+                    FileIndexStatus::Indexed,
+                    diagnostics.tree_has_error,
+                    diagnostics.used_tier0_fallback,
+                    chunk_count,
+                ),
+            )
+        }
+        Err(err) => {
+            let refs = refs_override.unwrap_or_default();
+            if refs.is_empty() {
+                warn!(file = %rel_path, error = %err, "parse error during update");
+            } else {
+                warn!(
+                    file = %rel_path,
+                    error = %err,
+                    refs = refs.len(),
+                    "failed to chunk rst during update; keeping extracted references"
+                );
+            }
+            parse_errors.push(FileError {
+                file_path: rel_path.to_string(),
+                error: err.to_string(),
+            });
+            (
+                Vec::new(),
+                refs,
+                state(FileIndexStatus::ParseError, false, false, 0),
+            )
+        }
+    }
+}
+
 fn remove_file_parse_data(metadata_store: &MetadataStore, file_path: &str) -> Result<()> {
     metadata_store
         .delete_references_by_file(file_path)
