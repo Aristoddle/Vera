@@ -46,9 +46,11 @@ jobs:
             tag_suffix: rocm
 
     steps:
-      # Checkout the dispatch ref (master): current Dockerfiles package the
-      # binary downloaded from the requested tag's release assets.
+      # Checkout the requested tag so the Dockerfiles match what the release
+      # workflow published for it, regardless of which ref was dispatched.
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
 
       - name: Download release binary
         env:
