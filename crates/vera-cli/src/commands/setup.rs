@@ -1,5 +1,7 @@
 //! `vera setup` — persist a preferred Vera mode and bootstrap first-run state.
 
+use std::io::IsTerminal;
+
 use anyhow::{Context, bail};
 use serde::Serialize;
 use vera_core::config::{InferenceBackend, OnnxExecutionProvider};
@@ -36,10 +38,22 @@ pub fn run(
     embedding_flags: LocalEmbeddingModelFlags,
     allow_wizard: bool,
 ) -> anyhow::Result<()> {
+    // Prompts need a terminal. Without one, every `cliclack` call fails with a
+    // bare "not connected", so decide up front what can run unattended.
+    let interactive = std::io::stdin().is_terminal();
+
     // If no flags at all and interactive, run the full wizard.
     let is_bare_interactive =
         !api && backend.is_none() && !json_output && !yes && !embedding_flags.any_set();
     if allow_wizard && is_bare_interactive && index_path.is_none() {
+        if !interactive {
+            bail!(
+                "`vera setup` with no flags runs an interactive wizard, and no terminal is \
+                 available for prompts.\n\
+                 Hint: pass a backend flag (for example `--onnx-jina-coreml`, \
+                 `--onnx-jina-cuda`, or `--potion-code`), `--api`, or `--yes` to auto-detect one."
+            );
+        }
         return run_wizard();
     }
 
@@ -54,6 +68,12 @@ pub fn run(
             eprintln!("Auto-detected backend: {detected}. Use a backend flag to override.");
         }
         detected
+    } else if !interactive {
+        bail!(
+            "no backend selected and no terminal is available for prompts.\n\
+             Hint: pass a backend flag (for example `--onnx-jina-coreml`, `--onnx-jina-cuda`, \
+             or `--potion-code`), `--api`, or `--yes` to auto-detect one."
+        );
     } else {
         prompt_backend()?
     };
@@ -65,8 +85,11 @@ pub fn run(
         .then(|| resolve_local_embedding_model(&embedding_flags))
         .transpose()?;
 
+    // An explicit backend flag already answers everything the confirmation asks
+    // about, so a non-interactive run has nothing left to confirm.
     if !yes
         && !json_output
+        && interactive
         && !confirm(
             &effective_backend,
             local_embedding_model.as_ref(),
@@ -79,7 +102,15 @@ pub fn run(
         return Ok(());
     }
 
-    let api_setup = should_prompt_api_config(effective_backend, json_output, yes)
+    let needs_api_prompt = should_prompt_api_config(effective_backend, json_output, yes);
+    if needs_api_prompt && !interactive {
+        bail!(
+            "API mode needs endpoint credentials and no terminal is available for prompts.\n\
+             Hint: set EMBEDDING_MODEL_BASE_URL, EMBEDDING_MODEL_ID, and \
+             EMBEDDING_MODEL_API_KEY, then re-run with `--api --yes`."
+        );
+    }
+    let api_setup = (needs_api_prompt && interactive)
         .then(prompt_api_setup)
         .transpose()?;
 
