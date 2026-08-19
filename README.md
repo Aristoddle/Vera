@@ -4,9 +4,9 @@
 
 # Vera
 
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/lemon07r/Vera/blob/master/LICENSE)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/VeraTools/Vera/blob/master/LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org)
-[![GitHub release](https://img.shields.io/github/v/release/lemon07r/Vera?include_prereleases&sort=semver)](https://github.com/lemon07r/Vera/releases)
+[![GitHub release](https://img.shields.io/github/v/release/VeraTools/Vera?include_prereleases&sort=semver)](https://github.com/VeraTools/Vera/releases)
 [![Languages](https://img.shields.io/badge/languages-65%2B-green.svg)](docs/supported-languages.md)
 
 [Install Guide](docs/installation.md)
@@ -207,7 +207,7 @@ vera agent install --client all
 If you use the [skills CLI](https://github.com/vercel-labs/skills), you can install Vera there too:
 
 ```bash
-npx skills add lemon07r/Vera
+npx skills add VeraTools/Vera
 ```
 
 If you skipped the prompt and want to add the instructions manually, use the snippet in the [Installation Guide](docs/installation.md#set-up-agent-skills).

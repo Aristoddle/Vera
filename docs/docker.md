@@ -16,25 +16,25 @@ The primary use case is running Vera's MCP server as a background process for yo
 **CPU:**
 
 ```bash
-docker run --rm -i -v $(pwd):/workspace ghcr.io/lemon07r/vera:cpu
+docker run --rm -i -v $(pwd):/workspace ghcr.io/veratools/vera:cpu
 ```
 
 **CUDA (NVIDIA):**
 
 ```bash
-docker run --rm --gpus all -i -v $(pwd):/workspace ghcr.io/lemon07r/vera:cuda
+docker run --rm --gpus all -i -v $(pwd):/workspace ghcr.io/veratools/vera:cuda
 ```
 
 **ROCm (AMD):**
 
 ```bash
-docker run --rm --device=/dev/kfd --device=/dev/dri -i -v $(pwd):/workspace ghcr.io/lemon07r/vera:rocm
+docker run --rm --device=/dev/kfd --device=/dev/dri -i -v $(pwd):/workspace ghcr.io/veratools/vera:rocm
 ```
 
 **OpenVINO (Intel):**
 
 ```bash
-docker run --rm --device=/dev/dri -i -v $(pwd):/workspace ghcr.io/lemon07r/vera:openvino
+docker run --rm --device=/dev/dri -i -v $(pwd):/workspace ghcr.io/veratools/vera:openvino
 ```
 
 The container starts `vera mcp` by default (JSON-RPC over stdio). The `-i` flag keeps stdin open for communication. The volume mount gives Vera access to your project files.
@@ -48,7 +48,7 @@ Point your MCP client (Claude Desktop, Cursor, etc.) at the Docker container:
   "mcpServers": {
     "vera": {
       "command": "docker",
-      "args": ["run", "--rm", "-i", "-v", "/path/to/project:/workspace", "ghcr.io/lemon07r/vera:cpu"]
+      "args": ["run", "--rm", "-i", "-v", "/path/to/project:/workspace", "ghcr.io/veratools/vera:cpu"]
     }
   }
 }
@@ -58,7 +58,7 @@ For GPU variants, add the appropriate device flags to `args`:
 
 ```json
 {
-  "args": ["run", "--rm", "--gpus", "all", "-i", "-v", "/path/to/project:/workspace", "ghcr.io/lemon07r/vera:cuda"]
+  "args": ["run", "--rm", "--gpus", "all", "-i", "-v", "/path/to/project:/workspace", "ghcr.io/veratools/vera:cuda"]
 }
 ```
 
@@ -70,7 +70,7 @@ On first run inside the container, Vera will download ONNX models and the ONNX R
 docker run --rm -i \
   -v $(pwd):/workspace \
   -v vera-models:/root/.vera \
-  ghcr.io/lemon07r/vera:cpu
+  ghcr.io/veratools/vera:cpu
 ```
 
 After the first run, subsequent starts skip the download.
@@ -80,9 +80,9 @@ After the first run, subsequent starts skip the download.
 Override the default `mcp` command to run any Vera command:
 
 ```bash
-docker run --rm -v $(pwd):/workspace ghcr.io/lemon07r/vera:cpu index /workspace
-docker run --rm -v $(pwd):/workspace ghcr.io/lemon07r/vera:cpu search "authentication logic"
-docker run --rm -v $(pwd):/workspace ghcr.io/lemon07r/vera:cpu stats
+docker run --rm -v $(pwd):/workspace ghcr.io/veratools/vera:cpu index /workspace
+docker run --rm -v $(pwd):/workspace ghcr.io/veratools/vera:cpu search "authentication logic"
+docker run --rm -v $(pwd):/workspace ghcr.io/veratools/vera:cpu stats
 ```
 
 ## Building locally

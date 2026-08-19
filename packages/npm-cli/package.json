@@ -3,14 +3,14 @@
   "version": "0.4.0",
   "description": "Bootstrap installer and wrapper for the Vera CLI",
   "license": "MIT",
-  "homepage": "https://github.com/lemon07r/Vera#readme",
+  "homepage": "https://github.com/VeraTools/Vera#readme",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/lemon07r/Vera.git",
+    "url": "git+https://github.com/VeraTools/Vera.git",
     "directory": "packages/npm-cli"
   },
   "bugs": {
-    "url": "https://github.com/lemon07r/Vera/issues"
+    "url": "https://github.com/VeraTools/Vera/issues"
   },
   "bin": "./bin/vera.js",
   "scripts": {

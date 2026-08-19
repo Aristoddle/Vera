@@ -16,7 +16,7 @@ from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
 
-DEFAULT_REPO = "lemon07r/Vera"
+DEFAULT_REPO = "VeraTools/Vera"
 MAX_REDIRECTS = 5
 
 
