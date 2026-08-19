@@ -365,15 +365,17 @@ impl OpenAiProvider {
         let status = response.status().as_u16();
 
         if status == 401 || status == 403 {
-            let text = read_response_text(response, "failed to read authentication error response")
-                .await?;
+            let text =
+                read_error_response_text(response, "failed to read authentication error response")
+                    .await?;
             return Err(EmbeddingError::AuthError {
                 message: sanitize_error_message(&text),
             });
         }
 
         if status == 429 {
-            let text = read_response_text(response, "failed to read rate limit response").await?;
+            let text =
+                read_error_response_text(response, "failed to read rate limit response").await?;
             return Err(EmbeddingError::RateLimitError {
                 message: sanitize_error_message(&text),
             });
@@ -381,7 +383,8 @@ impl OpenAiProvider {
 
         if !response.status().is_success() {
             let text =
-                read_response_text(response, "failed to read embedding error response").await?;
+                read_error_response_text(response, "failed to read embedding error response")
+                    .await?;
             // Some providers return 400 with "Unable to process" for transient
             // overload conditions. Treat these as rate limits so they get retried.
             if status == 400 && text.contains("Unable to process") {
@@ -432,14 +435,15 @@ fn response_read_error(error: reqwest::Error, context: &str) -> EmbeddingError {
     }
 }
 
-async fn read_response_text(
+async fn read_error_response_text(
     response: reqwest::Response,
     context: &str,
 ) -> Result<String, EmbeddingError> {
-    response
-        .text()
-        .await
-        .map_err(|error| response_read_error(error, context))
+    match response.text().await {
+        Ok(text) => Ok(text),
+        Err(error) if error.is_timeout() => Err(response_read_error(error, context)),
+        Err(error) => Ok(format!("{context}: {error}")),
+    }
 }
 
 impl EmbeddingProvider for OpenAiProvider {
@@ -872,14 +876,24 @@ fn shrink_text_for_context_limit(
 async fn embed_batch_resilient<P: EmbeddingProvider>(
     provider: &P,
     items: Vec<EmbeddingBatchItem>,
+    cancel: &CancellationToken,
 ) -> Result<Vec<(usize, String, Vec<f32>)>, EmbeddingError> {
     let mut pending = vec![items];
     let mut completed = Vec::new();
 
     while let Some(batch) = pending.pop() {
+        if cancel.is_cancelled() {
+            return Err(EmbeddingError::Cancelled);
+        }
         let texts: Vec<String> = batch.iter().map(|item| item.text.clone()).collect();
 
-        match provider.embed_batch(&texts).await {
+        let result = tokio::select! {
+            biased;
+            result = provider.embed_batch_cancellable(&texts, cancel) => result,
+            _ = cancel.cancelled() => Err(EmbeddingError::Cancelled),
+        };
+
+        match result {
             Ok(vectors) => {
                 completed.extend(
                     batch
@@ -971,6 +985,36 @@ where
     P: EmbeddingProvider,
     F: Fn(usize, usize),
 {
+    embed_chunks_concurrent_with_progress_and_cancellation(
+        provider,
+        chunks,
+        batch_size,
+        max_concurrent,
+        max_chunk_bytes,
+        &CancellationToken::new(),
+        on_progress,
+    )
+    .await
+}
+
+/// Embed chunks concurrently while allowing the caller to cancel active batches.
+///
+/// The token remains owned by the indexing operation. Cancellation drops every
+/// active provider future and returns [`EmbeddingError::Cancelled`] without
+/// reporting further progress.
+pub(crate) async fn embed_chunks_concurrent_with_progress_and_cancellation<P, F>(
+    provider: &P,
+    chunks: &[Chunk],
+    batch_size: usize,
+    max_concurrent: usize,
+    max_chunk_bytes: usize,
+    cancel: &CancellationToken,
+    on_progress: F,
+) -> Result<Vec<(String, Vec<f32>)>, EmbeddingError>
+where
+    P: EmbeddingProvider,
+    F: Fn(usize, usize),
+{
     if chunks.is_empty() {
         return Ok(Vec::new());
     }
@@ -1016,14 +1060,19 @@ where
                 let batch_idx = group_start + i;
                 async move {
                     debug!(batch = batch_idx + 1, total_batches, "embedding batch");
-                    embed_batch_resilient(provider, items.clone()).await
+                    embed_batch_resilient(provider, items.clone(), cancel).await
                 }
             })
             .collect();
 
         let results = futures::future::join_all(futures).await;
         for result in results {
+            // Batch errors (real provider failures or Cancelled) win over a
+            // pending cancellation so the caller sees the actual failure.
             let batch_results = result?;
+            if cancel.is_cancelled() {
+                return Err(EmbeddingError::Cancelled);
+            }
             done_count += batch_results.len();
             all_results.extend(batch_results);
             on_progress(done_count, total);
@@ -1192,6 +1241,53 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn provider_with_truncated_error_body(
+        status: &'static str,
+    ) -> (OpenAiProvider, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 2048];
+            let _ = stream.read(&mut request).await;
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Length: 32\r\nConnection: close\r\n\r\nshort"
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+            stream.shutdown().await.unwrap();
+        });
+        let config = EmbeddingProviderConfig::new(
+            format!("http://{address}"),
+            "test-model".into(),
+            "test-key".into(),
+        )
+        .with_max_retries(0);
+        (OpenAiProvider::new(config).unwrap(), server)
+    }
+
+    /// Cancels the token mid-request but still returns vectors, modelling an
+    /// embedding response that completes at the same moment cancellation fires.
+    struct CancelThenSucceedProvider;
+
+    impl EmbeddingProvider for CancelThenSucceedProvider {
+        async fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+            Ok(vec![vec![0.0; 8]; texts.len()])
+        }
+
+        async fn embed_batch_cancellable(
+            &self,
+            texts: &[String],
+            cancel: &CancellationToken,
+        ) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+            cancel.cancel();
+            self.embed_batch(texts).await
+        }
+
+        fn expected_dim(&self) -> Option<usize> {
+            Some(8)
+        }
+    }
 
     struct CancellationAwareProvider;
 
@@ -1440,5 +1536,72 @@ mod tests {
         assert!(matches!(error, EmbeddingError::TimeoutError { .. }));
         assert_eq!(request_count.load(Ordering::SeqCst), 1);
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn truncated_auth_body_preserves_authentication_classification() {
+        let (provider, server) = provider_with_truncated_error_body("401 Unauthorized").await;
+        let texts = ["input".to_string()];
+        let body = EmbeddingRequest {
+            model: &provider.config.model_id,
+            input: &texts,
+        };
+
+        let error = provider
+            .send_request(&provider.endpoint_url(), &body)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, EmbeddingError::AuthError { .. }));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn truncated_rate_limit_body_preserves_rate_limit_classification() {
+        let (provider, server) = provider_with_truncated_error_body("429 Too Many Requests").await;
+        let texts = ["input".to_string()];
+        let body = EmbeddingRequest {
+            model: &provider.config.model_id,
+            input: &texts,
+        };
+
+        let error = provider
+            .send_request(&provider.endpoint_url(), &body)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, EmbeddingError::RateLimitError { .. }));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_completed_batch_suppresses_further_progress() {
+        let chunks = vec![crate::types::Chunk {
+            id: "chunk-0".to_string(),
+            file_path: "src/main.rs".to_string(),
+            line_start: 1,
+            line_end: 1,
+            content: "fn main() {}".to_string(),
+            language: crate::types::Language::Rust,
+            symbol_type: None,
+            symbol_name: None,
+        }];
+        let progress_events = AtomicUsize::new(0);
+
+        let result = embed_chunks_concurrent_with_progress_and_cancellation(
+            &CancelThenSucceedProvider,
+            &chunks,
+            1,
+            1,
+            0,
+            &CancellationToken::new(),
+            |_, _| {
+                progress_events.fetch_add(1, Ordering::SeqCst);
+            },
+        )
+        .await;
+
+        assert!(matches!(result, Err(EmbeddingError::Cancelled)));
+        assert_eq!(progress_events.load(Ordering::SeqCst), 0);
     }
 }

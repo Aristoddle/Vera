@@ -15,7 +15,9 @@ use tracing::{debug, info, warn};
 use crate::CancellationToken;
 use crate::config::VeraConfig;
 use crate::discovery::{self, DiscoveryResult};
-use crate::embedding::{EmbeddingProvider, embed_chunks_concurrent_with_progress};
+use crate::embedding::{
+    EmbeddingError, EmbeddingProvider, embed_chunks_concurrent_with_progress_and_cancellation,
+};
 use crate::indexing::update::content_hash;
 use crate::parsing;
 use crate::parsing::references::RawReference;
@@ -281,16 +283,27 @@ where
     let progress_cb = |done: usize, total: usize| {
         on_progress(IndexProgress::EmbeddingProgress { done, total });
     };
-    let mut embeddings = embed_chunks_concurrent_with_progress(
+    let embedding_result = embed_chunks_concurrent_with_progress_and_cancellation(
         provider,
         &all_chunks,
         batch_size,
         max_concurrent_requests,
         config.indexing.max_chunk_bytes,
+        cancellation.as_async_token(),
         progress_cb,
     )
-    .await
-    .context("embedding generation failed")?;
+    .await;
+    let mut embeddings = match embedding_result {
+        Ok(embeddings) => embeddings,
+        Err(error) => {
+            // A completed provider error outranks a simultaneous cancellation,
+            // mirroring the biased select in the CLI's cancel_on_signal.
+            if matches!(error, EmbeddingError::Cancelled) {
+                cancellation.check()?;
+            }
+            return Err(error).context("embedding generation failed");
+        }
+    };
     cancellation.check()?;
 
     // Truncate vectors if max_stored_dim is configured.
@@ -305,6 +318,8 @@ where
     });
 
     // ── 5. Store everything on disk ──────────────────────────────
+    // Publication is synchronous, so cancellation must win before any artifact is replaced.
+    cancellation.check()?;
     let idx_dir = index_dir(&repo_root);
     store_index(
         &idx_dir,
