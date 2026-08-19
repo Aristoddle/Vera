@@ -5,8 +5,7 @@ on:
     tags: ['v*.*.*']
 
 permissions:
-  contents: write
-  packages: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -144,6 +143,8 @@ jobs:
     name: Create Release
     needs: build
     runs-on: blacksmith-2vcpu-ubuntu-2404
+    permissions:
+      contents: write
     env:
       NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
       PYPI_API_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
@@ -279,14 +280,20 @@ jobs:
           python -m twine upload --non-interactive packages/python-cli/dist/*
 
   # Images package the exact binary published in the release assets, so no
-  # separate compile is needed. Runs as soon as the linux-gnu build finishes,
-  # in parallel with the other targets.
+  # separate compile is needed. `needs: build` waits for the whole build
+  # matrix, but runner sizes are tuned so all targets finish within the same
+  # ~3 min band, so the extra wait over a dedicated linux-gnu job is marginal.
   docker:
     name: Docker (${{ matrix.variant }})
     needs: build
     runs-on: blacksmith-2vcpu-ubuntu-2404
+    permissions:
+      contents: read
+      packages: write
+    # Scoped per variant: blocks concurrent publishes of the same mutable
+    # tag across workflows while letting cpu/cuda/rocm publish in parallel.
     concurrency:
-      group: docker-image-publication
+      group: docker-image-publication-${{ matrix.variant }}
       cancel-in-progress: false
     strategy:
       fail-fast: false
