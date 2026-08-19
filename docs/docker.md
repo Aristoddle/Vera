@@ -87,7 +87,7 @@ docker run --rm -v $(pwd):/workspace ghcr.io/veratools/vera:cpu stats
 
 ## Building locally
 
-The Dockerfiles package a prebuilt binary, so build it first. From the repo root:
+The Dockerfiles package a prebuilt binary, so build it first. The binary must be a Linux build matching the image architecture (the published images are linux/amd64), so run the build on a Linux x86_64 machine, or on macOS/Windows inside a Linux container, e.g. `docker run --rm -v $(pwd):/src -w /src rust:latest bash -c './scripts/bootstrap-vendored-grammars.sh && cargo build --release -p vera-cli'`. From the repo root:
 
 ```bash
 ./scripts/bootstrap-vendored-grammars.sh  # downloads grammars required by vera-core's build script
