@@ -1,8 +1,22 @@
 name: Docker
 
+# Serialize image publication: a manual republish and a tag push must not
+# race on the same mutable :cpu/:cuda/:rocm tags.
+concurrency:
+  group: docker-image-publication
+  cancel-in-progress: false
+
 on:
   push:
     tags: ['v*.*.*']
+  # Manual recovery path: republish images for an existing tag (e.g. after a
+  # transient build failure) without re-tagging the release.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to build images for (e.g. v1.0.1)'
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -13,8 +27,54 @@ env:
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
+  # The Dockerfiles package a prebuilt binary; build it once here instead of
+  # compiling the workspace inside every image variant.
+  binary:
+    name: Build Linux binary
+    runs-on: blacksmith-8vcpu-ubuntu-2404
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: docker-linux-x86_64
+
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Configure sccache
+        run: |
+          echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
+          echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
+
+      - name: Download vendored grammars
+        run: bash scripts/bootstrap-vendored-grammars.sh
+
+      - name: Set version from tag
+        env:
+          REF: ${{ inputs.tag || github.ref_name }}
+        run: |
+          sed -i "s/^version = \".*\"/version = \"${REF#v}\"/" Cargo.toml
+          cargo generate-lockfile
+
+      - name: Build
+        run: cargo build --release -p vera-cli
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: vera-linux-binary
+          path: target/release/vera
+          retention-days: 1
+
   build:
     name: Build (${{ matrix.variant }})
+    needs: binary
     runs-on: blacksmith-2vcpu-ubuntu-2404
     strategy:
       fail-fast: false
@@ -31,7 +91,18 @@ jobs:
             tag_suffix: rocm
 
     steps:
+      # Checkout the workflow's own ref: on a tag push that is the tag itself,
+      # on manual dispatch it is master (current Dockerfiles), while the
+      # binary job above builds from the requested tag.
       - uses: actions/checkout@v4
+
+      - name: Download binary
+        uses: actions/download-artifact@v4
+        with:
+          name: vera-linux-binary
+          path: dist
+
+      - run: chmod +x dist/vera
 
       - name: Lowercase image name
         run: echo "IMAGE_NAME_LC=${IMAGE_NAME,,}" >> "$GITHUB_ENV"
@@ -46,11 +117,16 @@ jobs:
       - name: Set up Docker Buildx
         uses: useblacksmith/setup-docker-builder@v2
         with:
-          cache-key: ${{ matrix.dockerfile }}
+          # v2 keys: fresh builders. The v1 rocm builder held a corrupted
+          # layer cache that failed the v1.0.1 publish with digest mismatches.
+          cache-key: docker-v2-${{ matrix.variant }}
 
-      - name: Extract version from tag
+      - name: Extract version
         id: version
-        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+        env:
+          REF: ${{ inputs.tag || github.ref_name }}
+        run: |
+          echo "version=${REF#v}" >> "$GITHUB_OUTPUT"
 
       - name: Build and push
         uses: useblacksmith/build-push-action@v2
