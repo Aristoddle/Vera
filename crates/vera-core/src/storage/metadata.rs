@@ -103,6 +103,44 @@ pub struct LanguageHealthStat {
     pub files_with_parse_failures: u64,
 }
 
+/// Case-insensitive lookup queries, held as constants so the query-plan tests
+/// assert against the exact text the production methods run.
+///
+/// An expression index only applies when the index expression matches the
+/// query text. A test that asserted on its own copy of the SQL would keep
+/// passing after the original drifted, and the planner would silently fall
+/// back to a full scan with nothing failing.
+const SQL_CHUNKS_BY_SYMBOL_NAME: &str =
+    "SELECT id, file_path, line_start, line_end, content, language,
+                        symbol_type, symbol_name
+                 FROM chunks
+                 WHERE lower(symbol_name) = lower(?1)
+                 ORDER BY file_path, line_start";
+
+const SQL_FIND_CALLERS: &str = "SELECT file_path, line, caller FROM [references]
+                 WHERE lower(callee) = lower(?1)
+                 ORDER BY file_path, line";
+
+const SQL_FIND_CALLEES: &str = "SELECT file_path, line, callee FROM [references]
+                 WHERE lower(caller) = lower(?1)
+                 ORDER BY file_path, line";
+
+const SQL_FIND_TYPE_RELATIONS: &str = "SELECT file_path, line, owner, target, kind
+                 FROM type_relations
+                 WHERE lower(target) = lower(?1)
+                 ORDER BY file_path, line, owner";
+
+const SQL_FIND_DEAD_SYMBOLS: &str = "SELECT c.symbol_name, c.file_path, c.line_start, c.symbol_type
+                 FROM chunks c
+                 WHERE c.symbol_name IS NOT NULL
+                   AND c.symbol_type IN ('function', 'method')
+                   AND lower(c.symbol_name) NOT IN ('main', 'new', 'default', 'drop', 'clone', 'fmt', 'from', 'into', 'deref', 'init', 'setup', 'teardown')
+                   AND NOT EXISTS (
+                       SELECT 1 FROM [references] r
+                       WHERE lower(r.callee) = lower(c.symbol_name)
+                   )
+                 ORDER BY c.file_path, c.line_start";
+
 /// SQLite-backed metadata store for chunk attributes.
 pub struct MetadataStore {
     conn: Connection,
@@ -153,7 +191,12 @@ impl MetadataStore {
                 CREATE INDEX IF NOT EXISTS idx_chunks_language
                     ON chunks(language);
                 CREATE INDEX IF NOT EXISTS idx_chunks_symbol_name
-                    ON chunks(symbol_name);",
+                    ON chunks(symbol_name);
+                -- `get_chunks_by_symbol_name` matches on `lower(symbol_name)`.
+                -- An index on the bare column cannot serve a predicate over an
+                -- expression, so without this the lookup scans the table.
+                CREATE INDEX IF NOT EXISTS idx_chunks_symbol_name_lower
+                    ON chunks(lower(symbol_name));",
             )
             .context("failed to create chunks table")?;
 
@@ -208,7 +251,14 @@ impl MetadataStore {
                 CREATE INDEX IF NOT EXISTS idx_refs_caller
                     ON [references](caller);
                 CREATE INDEX IF NOT EXISTS idx_refs_file_path
-                    ON [references](file_path);",
+                    ON [references](file_path);
+                -- `find_callers`, `find_callees` and the `NOT EXISTS` subquery
+                -- in `find_dead_symbols` all match on `lower(...)`, which an
+                -- index on the bare column cannot serve.
+                CREATE INDEX IF NOT EXISTS idx_refs_callee_lower
+                    ON [references](lower(callee));
+                CREATE INDEX IF NOT EXISTS idx_refs_caller_lower
+                    ON [references](lower(caller));",
             )
             .context("failed to create references table")?;
 
@@ -226,7 +276,11 @@ impl MetadataStore {
                 CREATE INDEX IF NOT EXISTS idx_type_relations_owner
                     ON type_relations(owner);
                 CREATE INDEX IF NOT EXISTS idx_type_relations_file_path
-                    ON type_relations(file_path);",
+                    ON type_relations(file_path);
+                -- `find_type_relations` matches on `lower(target)`, which an
+                -- index on the bare column cannot serve.
+                CREATE INDEX IF NOT EXISTS idx_type_relations_target_lower
+                    ON type_relations(lower(target));",
             )
             .context("failed to create type_relations table")?;
 
@@ -313,13 +367,7 @@ impl MetadataStore {
     pub fn get_chunks_by_symbol_name(&self, symbol_name: &str) -> Result<Vec<Chunk>> {
         let mut stmt = self
             .conn
-            .prepare_cached(
-                "SELECT id, file_path, line_start, line_end, content, language,
-                        symbol_type, symbol_name
-                 FROM chunks
-                 WHERE lower(symbol_name) = lower(?1)
-                 ORDER BY file_path, line_start",
-            )
+            .prepare_cached(SQL_CHUNKS_BY_SYMBOL_NAME)
             .context("failed to prepare symbol chunks query")?;
 
         let rows = stmt
@@ -655,11 +703,7 @@ impl MetadataStore {
     pub fn find_callers(&self, symbol_name: &str) -> Result<Vec<CallerRef>> {
         let mut stmt = self
             .conn
-            .prepare_cached(
-                "SELECT file_path, line, caller FROM [references]
-                 WHERE lower(callee) = lower(?1)
-                 ORDER BY file_path, line",
-            )
+            .prepare_cached(SQL_FIND_CALLERS)
             .context("failed to prepare callers query")?;
         let rows = stmt
             .query_map(params![symbol_name], |row| {
@@ -677,12 +721,7 @@ impl MetadataStore {
     pub fn find_type_relations(&self, symbol_name: &str) -> Result<Vec<TypeRelationRef>> {
         let mut stmt = self
             .conn
-            .prepare_cached(
-                "SELECT file_path, line, owner, target, kind
-                 FROM type_relations
-                 WHERE lower(target) = lower(?1)
-                 ORDER BY file_path, line, owner",
-            )
+            .prepare_cached(SQL_FIND_TYPE_RELATIONS)
             .context("failed to prepare type relation query")?;
         let rows = stmt
             .query_map(params![symbol_name], |row| {
@@ -708,11 +747,7 @@ impl MetadataStore {
     pub fn find_callees(&self, symbol_name: &str) -> Result<Vec<CalleeRef>> {
         let mut stmt = self
             .conn
-            .prepare_cached(
-                "SELECT file_path, line, callee FROM [references]
-                 WHERE lower(caller) = lower(?1)
-                 ORDER BY file_path, line",
-            )
+            .prepare_cached(SQL_FIND_CALLEES)
             .context("failed to prepare callees query")?;
         let rows = stmt
             .query_map(params![symbol_name], |row| {
@@ -733,18 +768,7 @@ impl MetadataStore {
     pub fn find_dead_symbols(&self) -> Result<Vec<DeadSymbol>> {
         let mut stmt = self
             .conn
-            .prepare(
-                "SELECT c.symbol_name, c.file_path, c.line_start, c.symbol_type
-                 FROM chunks c
-                 WHERE c.symbol_name IS NOT NULL
-                   AND c.symbol_type IN ('function', 'method')
-                   AND lower(c.symbol_name) NOT IN ('main', 'new', 'default', 'drop', 'clone', 'fmt', 'from', 'into', 'deref', 'init', 'setup', 'teardown')
-                   AND NOT EXISTS (
-                       SELECT 1 FROM [references] r
-                       WHERE lower(r.callee) = lower(c.symbol_name)
-                   )
-                 ORDER BY c.file_path, c.line_start",
-            )
+            .prepare(SQL_FIND_DEAD_SYMBOLS)
             .context("failed to prepare dead symbols query")?;
         let rows = stmt
             .query_map([], |row| {
@@ -1108,6 +1132,78 @@ mod tests {
         let chunks = sample_chunks();
         store.insert_chunks(&chunks).unwrap();
         assert_eq!(store.chunk_count().unwrap(), 3);
+    }
+
+    /// The index expression has to match the query text exactly. If either
+    /// side is edited without the other, SQLite silently falls back to a full
+    /// scan and nothing fails — so assert on the plan, not just the results.
+    #[test]
+    fn case_insensitive_lookups_use_an_index_rather_than_scanning() {
+        let store = MetadataStore::open_in_memory().unwrap();
+
+        let plan_for = |sql: &str| -> String {
+            let mut stmt = store
+                .conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap();
+            let rows: Vec<String> = stmt
+                .query_map(params!["needle"], |row| row.get::<_, String>(3))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect();
+            rows.join(" | ")
+        };
+
+        for (label, sql, expected_index) in [
+            ("find_callers", SQL_FIND_CALLERS, "idx_refs_callee_lower"),
+            ("find_callees", SQL_FIND_CALLEES, "idx_refs_caller_lower"),
+            (
+                "find_type_relations",
+                SQL_FIND_TYPE_RELATIONS,
+                "idx_type_relations_target_lower",
+            ),
+            (
+                "get_chunks_by_symbol_name",
+                SQL_CHUNKS_BY_SYMBOL_NAME,
+                "idx_chunks_symbol_name_lower",
+            ),
+        ] {
+            let plan = plan_for(sql);
+            assert!(
+                plan.contains(&format!("USING INDEX {expected_index}")),
+                "{label} must use {expected_index}, but the plan was: {plan}"
+            );
+            assert!(
+                plan.split(" | ").all(|detail| {
+                    detail
+                        .split_whitespace()
+                        .next()
+                        .is_none_or(|operation| operation != "SCAN")
+                }),
+                "{label} still scans: {plan}"
+            );
+        }
+    }
+
+    #[test]
+    fn dead_symbol_lookup_seeks_the_reference_index() {
+        // The correlated NOT EXISTS re-runs per candidate chunk, so a scan
+        // here is O(chunks x references) rather than a constant overhead.
+        let store = MetadataStore::open_in_memory().unwrap();
+        let mut stmt = store
+            .conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {SQL_FIND_DEAD_SYMBOLS}"))
+            .unwrap();
+        let plan: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(3))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        let plan = plan.join(" | ");
+        assert!(
+            plan.contains("SEARCH r"),
+            "the reference subquery must seek, not scan: {plan}"
+        );
     }
 
     #[test]
