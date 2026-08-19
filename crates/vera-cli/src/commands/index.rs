@@ -9,20 +9,8 @@ use vera_core::config::InferenceBackend;
 use vera_core::indexing::IndexProgress;
 
 use crate::helpers::{
-    cancel_on_signal, load_runtime_config, print_human_summary, wait_for_interrupt,
+    cancel_task_on_signal, load_runtime_config, print_human_summary, wait_for_interrupt,
 };
-
-struct AbortIndexTask {
-    abort_handle: tokio::task::AbortHandle,
-    cancellation: vera_core::CancellationToken,
-}
-
-impl Drop for AbortIndexTask {
-    fn drop(&mut self) {
-        self.cancellation.cancel();
-        self.abort_handle.abort();
-    }
-}
 
 /// Run the `vera index <path>` command.
 #[allow(clippy::too_many_arguments)]
@@ -109,8 +97,8 @@ pub fn execute(
     if !show_progress {
         let cancellation = vera_core::CancellationToken::new();
         let task_cancellation = cancellation.clone();
-        let signal_cancellation = cancellation.clone();
         let task_repo_path = repo_path.to_path_buf();
+        let signal = wait_for_interrupt(rt.handle())?;
         let task = rt.handle().spawn(async move {
             vera_core::indexing::pipeline::index_repository_with_cancellation(
                 &task_repo_path,
@@ -121,17 +109,11 @@ pub fn execute(
             )
             .await
         });
-        let abort_handle = task.abort_handle();
         let summary = rt
-            .block_on(cancel_on_signal(
-                async move { task.await.context("indexing task failed")? },
-                async move {
-                    let _task_guard = AbortIndexTask {
-                        abort_handle,
-                        cancellation: signal_cancellation,
-                    };
-                    wait_for_interrupt().await;
-                },
+            .block_on(cancel_task_on_signal(
+                task,
+                signal,
+                cancellation,
                 "indexing",
             ))
             .context("indexing failed")?;
@@ -173,8 +155,8 @@ pub fn execute(
 
     let cancellation = vera_core::CancellationToken::new();
     let task_cancellation = cancellation.clone();
-    let signal_cancellation = cancellation.clone();
     let task_repo_path = repo_path.to_path_buf();
+    let signal = wait_for_interrupt(rt.handle())?;
     let task = rt.handle().spawn(async move {
         vera_core::indexing::pipeline::index_repository_with_progress_and_cancellation(
             &task_repo_path,
@@ -186,16 +168,10 @@ pub fn execute(
         )
         .await
     });
-    let abort_handle = task.abort_handle();
-    let result = rt.block_on(cancel_on_signal(
-        async move { task.await.context("indexing task failed")? },
-        async move {
-            let _task_guard = AbortIndexTask {
-                abort_handle,
-                cancellation: signal_cancellation,
-            };
-            wait_for_interrupt().await;
-        },
+    let result = rt.block_on(cancel_task_on_signal(
+        task,
+        signal,
+        cancellation,
         "indexing",
     ));
     multi.stop();
