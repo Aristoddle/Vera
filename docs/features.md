@@ -251,7 +251,7 @@ During setup, Vera offers to add a usage snippet to your project's agent config 
 
 ### Syncing Stale Skills
 
-`vera agent sync` refreshes stale agent skill installs to match the current binary version. When Vera notices stale installs during normal CLI use, it runs the same sync automatically. Project syncs also refresh managed markdown agent-config snippets such as `AGENTS.md`, `CLAUDE.md`, and `COPILOT.md`.
+`vera agent sync` refreshes stale agent skill installs to match the current binary version and updates marked project snippets. When Vera notices stale installs during normal CLI use, it refreshes skills only and leaves project markdown unchanged.
 
 ## CLI Tooling
 
