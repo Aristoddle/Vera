@@ -5,7 +5,7 @@
 Rust 1.85+ required (see `Cargo.toml` `rust-version` for exact MSRV).
 
 ```bash
-git clone https://github.com/lemon07r/Vera.git
+git clone https://github.com/VeraTools/Vera.git
 cd Vera
 cargo build
 ```

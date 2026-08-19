@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 const CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 const GITHUB_API_TIMEOUT: Duration = Duration::from_secs(5);
-const REPO: &str = "lemon07r/Vera";
+const REPO: &str = "VeraTools/Vera";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VersionCheckSource {

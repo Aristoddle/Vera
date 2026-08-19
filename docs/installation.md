@@ -18,11 +18,11 @@ The installer downloads the `vera` binary for your platform, writes a shim to a 
 <summary>Other install methods</summary>
 
 **Prebuilt binaries:**
-Download from [GitHub Releases](https://github.com/lemon07r/Vera/releases) for Linux (x86_64, aarch64), macOS (x86_64, aarch64), or Windows (x86_64). For Alpine, NixOS, or minimal containers without glibc, use the `x86_64-unknown-linux-musl` archive (fully static, zero runtime dependencies). The npm/pip wrappers auto-detect musl systems; to force a specific target, set `VERA_TARGET=x86_64-unknown-linux-musl` before running the install command.
+Download from [GitHub Releases](https://github.com/VeraTools/Vera/releases) for Linux (x86_64, aarch64), macOS (x86_64, aarch64), or Windows (x86_64). For Alpine, NixOS, or minimal containers without glibc, use the `x86_64-unknown-linux-musl` archive (fully static, zero runtime dependencies). The npm/pip wrappers auto-detect musl systems; to force a specific target, set `VERA_TARGET=x86_64-unknown-linux-musl` before running the install command.
 
 **Build from source** (Rust 1.85+):
 ```bash
-git clone https://github.com/lemon07r/Vera.git && cd Vera
+git clone https://github.com/VeraTools/Vera.git && cd Vera
 bash scripts/bootstrap-vendored-grammars.sh   # downloads the four grammars that are not tracked in git
 cargo build --release
 cp target/release/vera ~/.local/bin/
@@ -31,7 +31,7 @@ vera setup
 
 **Docker** (MCP server):
 ```bash
-docker run --rm -i -v $(pwd):/workspace ghcr.io/lemon07r/vera:cpu
+docker run --rm -i -v $(pwd):/workspace ghcr.io/veratools/vera:cpu
 ```
 CPU, CUDA, ROCm, and OpenVINO images available. See [docker.md](docker.md).
 
@@ -171,7 +171,7 @@ Use Vera before opening many files or running broad text search when you need to
 <summary>Use the Vercel skills CLI instead</summary>
 
 ```bash
-npx skills add lemon07r/Vera
+npx skills add VeraTools/Vera
 ```
 
 </details>

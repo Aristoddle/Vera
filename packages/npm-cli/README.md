@@ -45,7 +45,7 @@ vera search "authentication logic"
 | Inspect binary upgrades | `vera upgrade` |
 | Install agent skills | `vera agent install` |
 
-For the full backend matrix, model options, Docker setup, and troubleshooting, see the main [README](https://github.com/lemon07r/Vera) and [Installation Guide](https://github.com/lemon07r/Vera/blob/master/docs/installation.md).
+For the full backend matrix, model options, Docker setup, and troubleshooting, see the main [README](https://github.com/VeraTools/Vera) and [Installation Guide](https://github.com/VeraTools/Vera/blob/master/docs/installation.md).
 
 ## What you get
 
@@ -55,4 +55,4 @@ For the full backend matrix, model options, Docker setup, and troubleshooting, s
 - **Git-aware scopes and index debugging**: `--changed` / `--since` / `--base`, `explain-path`, and index health in `vera stats`
 - **Markdown codeblock output** by default with file paths, line ranges, and optional symbol info (use `--json` for compact JSON; `--raw` works with `vera search`, `vera grep`, and `vera references`; `--timing` works with `vera search` and `vera grep`, before or after the subcommand)
 
-For full documentation, including local model options and manual install steps, see the [GitHub repo](https://github.com/lemon07r/Vera).
+For full documentation, including local model options and manual install steps, see the [GitHub repo](https://github.com/VeraTools/Vera).

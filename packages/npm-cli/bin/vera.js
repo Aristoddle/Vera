@@ -13,7 +13,7 @@ const { spawnSync } = require("node:child_process");
 
 const { version: packageVersion } = require("../package.json");
 
-const DEFAULT_REPO = "lemon07r/Vera";
+const DEFAULT_REPO = "VeraTools/Vera";
 const MAX_REDIRECTS = 5;
 
 function parseArgs(argv) {

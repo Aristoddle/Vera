@@ -9,13 +9,13 @@ description = "Bootstrap installer and wrapper for the Vera CLI"
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }
-authors = [{ name = "lemon07r" }]
+authors = [{ name = "VeraTools" }]
 keywords = ["vera", "cli", "code-search", "agents"]
 
 [project.urls]
-Homepage = "https://github.com/lemon07r/Vera#readme"
-Repository = "https://github.com/lemon07r/Vera"
-Issues = "https://github.com/lemon07r/Vera/issues"
+Homepage = "https://github.com/VeraTools/Vera#readme"
+Repository = "https://github.com/VeraTools/Vera"
+Issues = "https://github.com/VeraTools/Vera/issues"
 
 [project.scripts]
 vera-ai = "vera_ai_wrapper.__main__:main"
