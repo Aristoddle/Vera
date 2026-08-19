@@ -1,5 +1,6 @@
 //! `vera index <path>` — Index a codebase for search.
 
+use std::io::IsTerminal;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -32,6 +33,7 @@ pub fn run(
     exclude: Vec<String>,
     no_ignore: bool,
     no_default_excludes: bool,
+    no_progress: bool,
     verbose: bool,
     low_vram: bool,
 ) -> anyhow::Result<()> {
@@ -42,6 +44,7 @@ pub fn run(
         exclude,
         no_ignore,
         no_default_excludes,
+        no_progress,
         low_vram,
     )?;
 
@@ -57,6 +60,7 @@ pub fn run(
 }
 
 /// Index a repository and return the resulting summary.
+#[allow(clippy::too_many_arguments)]
 pub fn execute(
     path: &str,
     json_output: bool,
@@ -64,6 +68,7 @@ pub fn execute(
     exclude: Vec<String>,
     no_ignore: bool,
     no_default_excludes: bool,
+    no_progress: bool,
     low_vram: bool,
 ) -> anyhow::Result<vera_core::indexing::IndexSummary> {
     let repo_path = Path::new(path);
@@ -97,8 +102,11 @@ pub fn execute(
         &config, backend,
     ))?;
 
-    // Use progress bar for interactive (non-JSON) output.
-    if json_output {
+    // Show the progress display only for interactive, non-JSON runs. Mirrors
+    // the same decision in `vera update` so both commands behave identically
+    // when piped, redirected, or run with --no-progress.
+    let show_progress = !json_output && !no_progress && std::io::stderr().is_terminal();
+    if !show_progress {
         let cancellation = vera_core::CancellationToken::new();
         let task_cancellation = cancellation.clone();
         let signal_cancellation = cancellation.clone();

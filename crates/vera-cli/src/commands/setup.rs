@@ -142,6 +142,7 @@ fn run_wizard() -> anyhow::Result<()> {
             false,
             false,
             false,
+            false,
         )?;
     }
 
@@ -248,6 +249,7 @@ fn configure_backend_with_api_setup(
             json_output,
             effective_backend,
             Vec::new(),
+            false,
             false,
             false,
             false,
