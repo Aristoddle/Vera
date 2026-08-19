@@ -921,14 +921,20 @@ fn skill_path_for(
 }
 
 fn sync(json_output: bool) -> anyhow::Result<()> {
-    sync_with_options(json_output, true)
+    sync_with_options(json_output, true, false)
 }
 
+/// Automatic staleness sync: refresh skill installs only, without touching
+/// project markdown or writing over the user's command output.
 pub(crate) fn sync_skills_only() -> anyhow::Result<()> {
-    sync_with_options(false, false)
+    sync_with_options(false, false, true)
 }
 
-fn sync_with_options(json_output: bool, refresh_project_snippets: bool) -> anyhow::Result<()> {
+fn sync_with_options(
+    json_output: bool,
+    refresh_project_snippets: bool,
+    quiet: bool,
+) -> anyhow::Result<()> {
     let home = state::user_home_dir()?;
     let project_cwd = std::env::current_dir().ok();
     let current_version = env!("CARGO_PKG_VERSION");
@@ -958,6 +964,10 @@ fn sync_with_options(json_output: bool, refresh_project_snippets: bool) -> anyho
     } else {
         Vec::new()
     };
+
+    if quiet {
+        return Ok(());
+    }
 
     if json_output {
         let reports: Vec<_> = updated
@@ -1166,7 +1176,7 @@ fn refresh_vera_snippet_in_markdown(existing: &str) -> Option<String> {
         let end_marker = content_start + end_marker;
         let mut content = String::with_capacity(existing.len());
         content.push_str(&existing[..content_start]);
-        content.push_str(marked_snippet_body());
+        content.push_str(&adapt_line_endings(marked_snippet_body(), existing));
         content.push_str(&existing[end_marker..]);
         return Some(content);
     }
@@ -1186,6 +1196,7 @@ fn refresh_vera_snippet_in_markdown(existing: &str) -> Option<String> {
     let section = &existing[start..end];
 
     let legacy_snippet = legacy_agents_md_snippet();
+    let legacy_snippet = adapt_line_endings(&legacy_snippet, existing);
     if !section.contains(AGENTS_MD_SNIPPET_INTRO) || section.trim_end() != legacy_snippet.trim_end()
     {
         return None;
@@ -1193,7 +1204,7 @@ fn refresh_vera_snippet_in_markdown(existing: &str) -> Option<String> {
 
     let section_without_trailing_whitespace = section.trim_end();
     let trailing_whitespace = &section[section_without_trailing_whitespace.len()..];
-    let mut replacement = String::from(AGENTS_MD_SNIPPET.trim_end());
+    let mut replacement = adapt_line_endings(AGENTS_MD_SNIPPET.trim_end(), existing).into_owned();
     if trailing_whitespace.is_empty() {
         replacement.push('\n');
     } else {
@@ -1221,6 +1232,15 @@ fn legacy_agents_md_snippet() -> String {
     AGENTS_MD_SNIPPET
         .replace(&format!("{VERA_SNIPPET_BEGIN_MARKER}\n\n"), "")
         .replace(&format!("\n{VERA_SNIPPET_END_MARKER}"), "")
+}
+
+/// Match generated content's line endings to the target file's.
+fn adapt_line_endings<'a>(generated: &'a str, file: &str) -> std::borrow::Cow<'a, str> {
+    if file.contains("\r\n") {
+        std::borrow::Cow::Owned(generated.replace('\n', "\r\n"))
+    } else {
+        std::borrow::Cow::Borrowed(generated)
+    }
 }
 
 fn markdown_marker_start(existing: &str, marker: &str) -> Option<usize> {
@@ -1524,6 +1544,37 @@ mod tests {
         assert!(updated.contains(VERA_SNIPPET_BEGIN_MARKER));
         assert!(updated.contains(VERA_SNIPPET_END_MARKER));
         assert!(updated.contains("# Guidelines\n\nRun tests first.\n"));
+    }
+
+    #[test]
+    fn refresh_vera_snippet_in_markdown_preserves_crlf_line_endings() {
+        let existing = format!(
+            "# Repo\r\n\r\n{VERA_SNIPPET_BEGIN_MARKER}\r\n\r\nOld generated content.\r\n{VERA_SNIPPET_END_MARKER}\r\n"
+        );
+
+        let updated = refresh_vera_snippet_in_markdown(&existing).unwrap();
+
+        assert!(updated.contains(marked_snippet_body().lines().next().unwrap()));
+        assert!(!updated.contains("Old generated content."));
+        // No bare LF: every line feed is part of a CRLF pair.
+        assert_eq!(
+            updated.matches('\n').count(),
+            updated.matches("\r\n").count()
+        );
+    }
+
+    #[test]
+    fn refresh_vera_snippet_in_markdown_migrates_crlf_legacy_section() {
+        let legacy = legacy_agents_md_snippet().replace('\n', "\r\n");
+        let existing = format!("# Repo\r\n\r\n{}\r\n", legacy.trim_end());
+
+        let updated = refresh_vera_snippet_in_markdown(&existing).unwrap();
+
+        assert!(updated.contains(VERA_SNIPPET_BEGIN_MARKER));
+        assert_eq!(
+            updated.matches('\n').count(),
+            updated.matches("\r\n").count()
+        );
     }
 
     #[test]

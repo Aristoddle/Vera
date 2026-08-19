@@ -251,7 +251,7 @@ During setup, Vera offers to add a usage snippet to your project's agent config 
 
 ### Syncing Stale Skills
 
-`vera agent sync` refreshes stale agent skill installs to match the current binary version and updates marked project snippets. When Vera notices stale installs during normal CLI use, it refreshes skills only and leaves project markdown unchanged.
+`vera agent sync` refreshes stale agent skill installs to match the current binary version and updates Vera-owned project markdown snippets: sections wrapped in `<!-- vera:begin -->` / `<!-- vera:end -->` markers, plus unmarked legacy sections whose text still matches the generated snippet exactly (these are migrated into markers on sync). Editing anything in the section, or deleting it, takes it out of sync scope permanently. When Vera notices stale installs during normal CLI use, it refreshes skill files only, silently, and leaves project markdown unchanged.
 
 ## CLI Tooling
 
