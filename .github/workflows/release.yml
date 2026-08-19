@@ -358,20 +358,24 @@ jobs:
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME_LC }}:${{ matrix.tag_suffix }}
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME_LC }}:${{ steps.version.outputs.version }}-${{ matrix.tag_suffix }}
 
-      # A corrupted base-image layer on the builder's sticky disk fails the
-      # build with "unexpected commit digest". Pruning evicts it and forces a
-      # clean re-pull; only runs after a failure, so healthy builds keep cache.
+      # Fallback when the buildkit path fails (seen: "unexpected commit digest"
+      # on a rocm base layer whose computed digest varied per run, i.e. fetch
+      # corruption in the sticky-builder pull path, not a poisoned cache).
+      # The retry prunes the builder, then builds via the runner's own docker
+      # daemon, an ephemeral store with a separate registry fetch path.
+      # Healthy builds never pay for this.
       - name: Repair builder cache
         if: steps.publish.outcome == 'failure'
         run: docker buildx prune -af
 
-      - name: Build and push (retry after repair)
+      - name: Build and push (retry via docker daemon)
         if: steps.publish.outcome == 'failure'
-        uses: useblacksmith/build-push-action@v2
-        with:
-          context: .
-          file: ${{ matrix.dockerfile }}
-          push: true
-          tags: |
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME_LC }}:${{ matrix.tag_suffix }}
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME_LC }}:${{ steps.version.outputs.version }}-${{ matrix.tag_suffix }}
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          TAG_SUFFIX: ${{ matrix.tag_suffix }}
+          DOCKERFILE: ${{ matrix.dockerfile }}
+        run: |
+          IMAGE="${REGISTRY}/${IMAGE_NAME_LC}"
+          docker build -f "$DOCKERFILE" -t "$IMAGE:$TAG_SUFFIX" -t "$IMAGE:$VERSION-$TAG_SUFFIX" .
+          docker push "$IMAGE:$TAG_SUFFIX"
+          docker push "$IMAGE:$VERSION-$TAG_SUFFIX"
