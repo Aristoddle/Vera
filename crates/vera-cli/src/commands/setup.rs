@@ -1,5 +1,7 @@
 //! `vera setup` — persist a preferred Vera mode and bootstrap first-run state.
 
+use std::io::IsTerminal;
+
 use anyhow::{Context, bail};
 use serde::Serialize;
 use vera_core::config::{InferenceBackend, OnnxExecutionProvider};
@@ -24,6 +26,11 @@ pub(crate) struct SetupReport {
     indexed_path: Option<String>,
 }
 
+/// Remedy shown when a non-interactive invocation cannot prompt.
+const NON_INTERACTIVE_HINT: &str = "Hint: pass a backend flag (for example `--onnx-jina-coreml`, \
+     `--onnx-jina-cuda`, or `--potion-code`), `--yes` to auto-detect one, or `--api` with \
+     EMBEDDING_MODEL_BASE_URL, EMBEDDING_MODEL_ID, and EMBEDDING_MODEL_API_KEY set.";
+
 /// `backend`: Some(local backend) for local, None + api=true for API, None + api=false defaults to auto-detect.
 /// `allow_wizard`: bare interactive invocations run the full wizard only for
 /// `vera setup`; `vera backend` always stays in the backend-only flow.
@@ -36,10 +43,20 @@ pub fn run(
     embedding_flags: LocalEmbeddingModelFlags,
     allow_wizard: bool,
 ) -> anyhow::Result<()> {
+    // Prompts need a terminal. Without one, every `cliclack` call fails with a
+    // bare "not connected", so decide up front what can run unattended.
+    let interactive = std::io::stdin().is_terminal();
+
     // If no flags at all and interactive, run the full wizard.
     let is_bare_interactive =
         !api && backend.is_none() && !json_output && !yes && !embedding_flags.any_set();
     if allow_wizard && is_bare_interactive && index_path.is_none() {
+        if !interactive {
+            bail!(
+                "`vera setup` with no flags runs an interactive wizard, and no terminal is \
+                 available for prompts.\n{NON_INTERACTIVE_HINT}"
+            );
+        }
         return run_wizard();
     }
 
@@ -54,6 +71,10 @@ pub fn run(
             eprintln!("Auto-detected backend: {detected}. Use a backend flag to override.");
         }
         detected
+    } else if !interactive {
+        bail!(
+            "no backend selected and no terminal is available for prompts.\n{NON_INTERACTIVE_HINT}"
+        );
     } else {
         prompt_backend()?
     };
@@ -65,8 +86,11 @@ pub fn run(
         .then(|| resolve_local_embedding_model(&embedding_flags))
         .transpose()?;
 
+    // An explicit backend flag already answers everything the confirmation asks
+    // about, so a non-interactive run has nothing left to confirm.
     if !yes
         && !json_output
+        && interactive
         && !confirm(
             &effective_backend,
             local_embedding_model.as_ref(),
@@ -79,7 +103,18 @@ pub fn run(
         return Ok(());
     }
 
-    let api_setup = should_prompt_api_config(effective_backend, json_output, yes)
+    let needs_api_prompt = should_prompt_api_config(effective_backend, json_output, yes);
+    if needs_api_prompt && !interactive {
+        // With complete credentials in the environment there is nothing left
+        // to prompt for; on a missing variable this error names it.
+        read_required_api_env(
+            "EMBEDDING_MODEL_BASE_URL",
+            "EMBEDDING_MODEL_ID",
+            "EMBEDDING_MODEL_API_KEY",
+        )
+        .context("API mode needs endpoint credentials and no terminal is available for prompts")?;
+    }
+    let api_setup = (needs_api_prompt && interactive)
         .then(prompt_api_setup)
         .transpose()?;
 
@@ -668,18 +703,29 @@ fn prompt_required_input(
     Ok(value)
 }
 
+/// Read an env var, treating unset and empty/whitespace-only values the same.
+fn read_api_env_var(key: &str) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
 fn read_required_api_env(
     base_key: &str,
     model_key: &str,
     api_key_key: &str,
 ) -> anyhow::Result<ApiSetupInput> {
     Ok(ApiSetupInput {
-        base_url: std::env::var(base_key)
-            .with_context(|| format!("{base_key} must be set for `vera setup --api`"))?,
-        model_id: std::env::var(model_key)
-            .with_context(|| format!("{model_key} must be set for `vera setup --api`"))?,
-        api_key: std::env::var(api_key_key)
-            .with_context(|| format!("{api_key_key} must be set for `vera setup --api`"))?,
+        base_url: read_api_env_var(base_key).with_context(|| {
+            format!("{base_key} must be set and non-empty for `vera setup --api`")
+        })?,
+        model_id: read_api_env_var(model_key).with_context(|| {
+            format!("{model_key} must be set and non-empty for `vera setup --api`")
+        })?,
+        api_key: read_api_env_var(api_key_key).with_context(|| {
+            format!("{api_key_key} must be set and non-empty for `vera setup --api`")
+        })?,
     })
 }
 
@@ -688,9 +734,9 @@ fn read_optional_api_env(
     model_key: &str,
     api_key_key: &str,
 ) -> anyhow::Result<Option<ApiSetupInput>> {
-    let base = std::env::var(base_key).ok();
-    let model = std::env::var(model_key).ok();
-    let api_key = std::env::var(api_key_key).ok();
+    let base = read_api_env_var(base_key);
+    let model = read_api_env_var(model_key);
+    let api_key = read_api_env_var(api_key_key);
 
     match (base, model, api_key) {
         (Some(base_url), Some(model_id), Some(api_key)) => Ok(Some(ApiSetupInput {
