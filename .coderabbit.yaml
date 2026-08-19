@@ -1,0 +1,45 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+language: en
+reviews:
+  # profile/tools/finishing_touches and chat.auto_reply are Pro-tier fields;
+  # on the free tier CodeRabbit ignores them and reviews continue with the
+  # remaining settings (path_instructions, toggles) unchanged.
+  profile: assertive
+  request_changes_workflow: true
+  high_level_summary: true
+  poem: false
+  collapse_walkthrough: true
+  sequence_diagrams: false
+  review_status: true
+  path_instructions:
+    - path: "crates/vera-core/src/retrieval/**"
+      instructions: |
+        Ranking/retrieval changes must obey the repo's benchmark-integrity rules: no heuristic tuning that only helps isolated benchmark tasks, every signal needs a mechanism-level rationale grounded in how developers search code, and behavior changes require Semble benchmark verification. Flag any ranking change that lacks justification or tests.
+    - path: "crates/**"
+      instructions: |
+        Enforce the repo's Rust guidelines: minimal LOC, no duplicated logic (suggest extraction), simple readable code over clever code, anyhow::Result in CLI code and thiserror in vera-core, tracing for logging, tests in #[cfg(test)] modules at file bottom. Rust edition 2024, MSRV 1.85.
+    - path: "**/*.md"
+      instructions: |
+        Docs must follow the repo's documentation rules: no em-dashes in user-facing docs, no hedging or banned words (comprehensive, robust, seamless, leverage, utilize, facilitate, empower, cutting-edge, state-of-the-art, holistic), one fact in exactly one place, and docs must be updated in the same PR as the behavior they describe. Flag stale claims (test counts, version numbers) that contradict code.
+    - path: ".github/workflows/**"
+      instructions: |
+        This repo runs CI on Blacksmith runners (blacksmith-* labels; see .github/actionlint.yaml). Do not flag blacksmith-* runner labels as unknown. Release workflows must preserve the 6 Rust targets and archive names vera-<target>.(tar.gz|zip).
+    - path: "eval/**"
+      instructions: |
+        Benchmark harness changes must not weaken integrity: no hardcoded expected answers, no silent skipping of failed tasks, metrics math must stay consistent across scripts (see benchmarks/scripts/bench_common.py).
+  tools:
+    actionlint:
+      enabled: true
+    shellcheck:
+      enabled: true
+    markdownlint:
+      enabled: true
+    ruff:
+      enabled: true
+  finishing_touches:
+    docstrings:
+      enabled: false
+    unit_tests:
+      enabled: false
+chat:
+  auto_reply: true
