@@ -44,12 +44,32 @@ pub(super) const RERANKER_REPO: &str = "jinaai/jina-reranker-v2-base-multilingua
 /// No prebuilt reranker ONNX export runs on the CoreML GPU: the quantized
 /// export contains DynamicQuantizeLinear/MatMulInteger ops the CoreML EP cannot
 /// execute, and the fp16 export stores every tensor as float16 which the CoreML
-/// EP rejects as an input dtype (ORT partitions 0 nodes and silently falls back
-/// to CPU). Since CoreML cannot accelerate the reranker either way, all backends
-/// use the quantized INT8 export — the fastest CPU path. `vera doctor` surfaces
-/// the CoreML CPU fallback so the all-green probe does not mislead users.
+/// EP rejects as an input dtype. The reranker is explicitly pinned to the CPU
+/// provider for CoreML via `reranker_execution_provider` because CoreML can
+/// accept a fused subgraph and then fail at inference. Since CoreML cannot
+/// accelerate the reranker either way, all backends use the quantized INT8
+/// export — the fastest CPU path. `vera doctor` surfaces this CPU placement so
+/// the all-green probe does not mislead users.
 pub const RERANKER_ONNX_FILE: &str = "onnx/model_quantized.onnx";
 pub(super) const RERANKER_TOKENIZER_FILE: &str = "tokenizer.json";
+
+/// Execution provider the reranker session must use for a given backend.
+///
+/// Every backend except CoreML reranks on its own provider. CoreML cannot
+/// accelerate the reranker at all (see `RERANKER_ONNX_FILE`), and registering
+/// the CoreML EP anyway is not a harmless no-op: ONNX Runtime still assigns a
+/// fused subgraph to CoreML, which then fails at inference with "Unable to
+/// compute the prediction using a neural network model". Session creation
+/// succeeds, so the CPU retry in `LocalReranker::new_with_ep` never fires and
+/// the failure reaches the caller. Select CPU up front instead.
+pub fn reranker_execution_provider(
+    ep: crate::config::OnnxExecutionProvider,
+) -> crate::config::OnnxExecutionProvider {
+    match ep {
+        crate::config::OnnxExecutionProvider::CoreMl => crate::config::OnnxExecutionProvider::Cpu,
+        other => other,
+    }
+}
 
 /// ONNX Runtime version to auto-download. Using 1.24.4 for CUDA 13 support.
 /// The `ort` crate (rc.11) uses `load-dynamic` so any ABI-compatible ORT works.
@@ -519,6 +539,26 @@ pub fn vera_home_dir() -> Result<PathBuf> {
 mod finding_tests {
     use super::*;
     use crate::config::OnnxExecutionProvider;
+
+    #[test]
+    fn reranker_runs_on_cpu_under_coreml_and_on_its_own_provider_elsewhere() {
+        // CoreML cannot execute any prebuilt reranker export. Registering the
+        // EP anyway lets ORT fuse a subgraph for it that fails at inference.
+        assert_eq!(
+            reranker_execution_provider(OnnxExecutionProvider::CoreMl),
+            OnnxExecutionProvider::Cpu
+        );
+
+        for ep in [
+            OnnxExecutionProvider::Cpu,
+            OnnxExecutionProvider::Cuda,
+            OnnxExecutionProvider::Rocm,
+            OnnxExecutionProvider::DirectMl,
+            OnnxExecutionProvider::OpenVino,
+        ] {
+            assert_eq!(reranker_execution_provider(ep), ep);
+        }
+    }
 
     #[test]
     fn gpu_adjustment_only_changes_the_default_jina_model() {

@@ -251,6 +251,7 @@ fn load_tokenizer(tokenizer_path: std::path::PathBuf) -> Result<Tokenizer> {
 }
 
 fn build_session(ep: OnnxExecutionProvider, onnx_path: std::path::PathBuf) -> Result<Session> {
+    let ep = crate::local_models::reranker_execution_provider(ep);
     let threads = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1);
