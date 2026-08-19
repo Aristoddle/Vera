@@ -1,5 +1,6 @@
 # Vera CPU Docker image
 # Packages a prebuilt binary. CI builds it once per release; to build locally:
+#   ./scripts/bootstrap-vendored-grammars.sh
 #   cargo build --release -p vera-cli && mkdir -p dist && cp target/release/vera dist/
 #   docker build -f docker/Dockerfile.cpu -t vera:cpu .
 

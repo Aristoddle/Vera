@@ -90,6 +90,7 @@ docker run --rm -v $(pwd):/workspace ghcr.io/veratools/vera:cpu stats
 The Dockerfiles package a prebuilt binary, so build it first. From the repo root:
 
 ```bash
+./scripts/bootstrap-vendored-grammars.sh  # downloads grammars required by vera-core's build script
 cargo build --release -p vera-cli
 mkdir -p dist && cp target/release/vera dist/
 
