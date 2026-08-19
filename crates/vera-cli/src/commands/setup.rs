@@ -701,18 +701,29 @@ fn prompt_required_input(
     Ok(value)
 }
 
+/// Read an env var, treating unset and empty/whitespace-only values the same.
+fn read_api_env_var(key: &str) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
 fn read_required_api_env(
     base_key: &str,
     model_key: &str,
     api_key_key: &str,
 ) -> anyhow::Result<ApiSetupInput> {
     Ok(ApiSetupInput {
-        base_url: std::env::var(base_key)
-            .with_context(|| format!("{base_key} must be set for `vera setup --api`"))?,
-        model_id: std::env::var(model_key)
-            .with_context(|| format!("{model_key} must be set for `vera setup --api`"))?,
-        api_key: std::env::var(api_key_key)
-            .with_context(|| format!("{api_key_key} must be set for `vera setup --api`"))?,
+        base_url: read_api_env_var(base_key).with_context(|| {
+            format!("{base_key} must be set and non-empty for `vera setup --api`")
+        })?,
+        model_id: read_api_env_var(model_key).with_context(|| {
+            format!("{model_key} must be set and non-empty for `vera setup --api`")
+        })?,
+        api_key: read_api_env_var(api_key_key).with_context(|| {
+            format!("{api_key_key} must be set and non-empty for `vera setup --api`")
+        })?,
     })
 }
 
@@ -721,9 +732,9 @@ fn read_optional_api_env(
     model_key: &str,
     api_key_key: &str,
 ) -> anyhow::Result<Option<ApiSetupInput>> {
-    let base = std::env::var(base_key).ok();
-    let model = std::env::var(model_key).ok();
-    let api_key = std::env::var(api_key_key).ok();
+    let base = read_api_env_var(base_key);
+    let model = read_api_env_var(model_key);
+    let api_key = read_api_env_var(api_key_key);
 
     match (base, model, api_key) {
         (Some(base_url), Some(model_id), Some(api_key)) => Ok(Some(ApiSetupInput {
