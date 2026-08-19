@@ -64,7 +64,7 @@ The `agents` client writes to the cross-agent `.agents/skills/` directory, which
 ```sh
 vera upgrade              # show update plan
 vera upgrade --apply      # execute the binary upgrade
-vera agent sync           # sync skill files and refresh managed project snippets
+vera agent sync           # sync skill files and refresh Vera-owned project snippets (marked, or verbatim legacy ones)
 ```
 
 ## Uninstalling

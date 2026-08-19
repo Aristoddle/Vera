@@ -921,6 +921,20 @@ fn skill_path_for(
 }
 
 fn sync(json_output: bool) -> anyhow::Result<()> {
+    sync_with_options(json_output, true, false)
+}
+
+/// Automatic staleness sync: refresh skill installs only, without touching
+/// project markdown or writing over the user's command output.
+pub(crate) fn sync_skills_only() -> anyhow::Result<()> {
+    sync_with_options(false, false, true)
+}
+
+fn sync_with_options(
+    json_output: bool,
+    refresh_project_snippets: bool,
+    quiet: bool,
+) -> anyhow::Result<()> {
     let home = state::user_home_dir()?;
     let project_cwd = std::env::current_dir().ok();
     let current_version = env!("CARGO_PKG_VERSION");
@@ -939,13 +953,21 @@ fn sync(json_output: bool) -> anyhow::Result<()> {
         updated.push(location.path.clone());
     }
 
-    // Refresh managed markdown snippets whenever a project directory is
-    // available, regardless of which skill installs were stale.
-    let refreshed_snippets = project_cwd
-        .as_deref()
-        .map(|cwd| refresh_existing_vera_snippets(&find_agent_configs(cwd)))
-        .transpose()?
-        .unwrap_or_default();
+    let refreshed_snippets = if refresh_project_snippets {
+        // Refresh managed markdown snippets whenever a project directory is
+        // available, regardless of which skill installs were stale.
+        project_cwd
+            .as_deref()
+            .map(|cwd| refresh_existing_vera_snippets(&find_agent_configs(cwd)))
+            .transpose()?
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
+    if quiet {
+        return Ok(());
+    }
 
     if json_output {
         let reports: Vec<_> = updated
@@ -988,10 +1010,14 @@ fn sync(json_output: bool) -> anyhow::Result<()> {
 }
 
 /// The snippet Vera offers to inject into agent config files.
+const VERA_SNIPPET_BEGIN_MARKER: &str = "<!-- vera:begin -->";
+const VERA_SNIPPET_END_MARKER: &str = "<!-- vera:end -->";
 const AGENTS_MD_SNIPPET_HEADING: &str = "## Code Search";
 const AGENTS_MD_SNIPPET_INTRO: &str = "Use Vera before opening many files or running broad text search when you need to find where logic lives or how a feature works.";
 
 const AGENTS_MD_SNIPPET: &str = r#"## Code Search
+
+<!-- vera:begin -->
 
 Use Vera before opening many files or running broad text search when you need to find where logic lives or how a feature works.
 
@@ -1007,6 +1033,7 @@ Use Vera before opening many files or running broad text search when you need to
 - Narrow `vera search` or `vera grep` with `--lang`, `--path`, `--type`, or `--scope docs`
 - `vera watch .` to auto-update the index, or `vera update .` after edits (`vera index .` if `.vera/` is missing)
 - For detailed usage, query patterns, and troubleshooting, read the Vera skill file installed by `vera agent install`
+<!-- vera:end -->
 "#;
 
 #[derive(Debug, Clone, Copy)]
@@ -1142,6 +1169,18 @@ fn refresh_vera_snippet(existing: &str, file_name: &str) -> Option<String> {
 }
 
 fn refresh_vera_snippet_in_markdown(existing: &str) -> Option<String> {
+    if let Some(begin) = markdown_marker_start(existing, VERA_SNIPPET_BEGIN_MARKER) {
+        let content_start = begin + VERA_SNIPPET_BEGIN_MARKER.len();
+        let end_marker =
+            markdown_marker_start(&existing[content_start..], VERA_SNIPPET_END_MARKER)?;
+        let end_marker = content_start + end_marker;
+        let mut content = String::with_capacity(existing.len());
+        content.push_str(&existing[..content_start]);
+        content.push_str(&adapt_line_endings(marked_snippet_body(), existing));
+        content.push_str(&existing[end_marker..]);
+        return Some(content);
+    }
+
     let start = markdown_section_start(existing, AGENTS_MD_SNIPPET_HEADING)?;
     // The managed section ends at the next heading of equal or higher level
     // (`## ` or `# `). Deeper headings (`### ` and below) stay in the section.
@@ -1155,36 +1194,75 @@ fn refresh_vera_snippet_in_markdown(existing: &str) -> Option<String> {
         })
         .unwrap_or(existing.len());
     let section = &existing[start..end];
-    if !section.contains(AGENTS_MD_SNIPPET_INTRO) {
+
+    let legacy_snippet = legacy_agents_md_snippet();
+    let legacy_snippet = adapt_line_endings(&legacy_snippet, existing);
+    if !section.contains(AGENTS_MD_SNIPPET_INTRO) || section.trim_end() != legacy_snippet.trim_end()
+    {
         return None;
     }
 
-    let before = existing[..start].trim_end_matches('\n');
-    let after = existing[end..].trim_start_matches('\n');
-    let mut content = String::new();
-    if !before.is_empty() {
-        content.push_str(before);
-        content.push_str("\n\n");
-    }
-    content.push_str(AGENTS_MD_SNIPPET.trim_end());
-    if !after.is_empty() {
-        content.push_str("\n\n");
-        content.push_str(after);
+    let section_without_trailing_whitespace = section.trim_end();
+    let trailing_whitespace = &section[section_without_trailing_whitespace.len()..];
+    let mut replacement = adapt_line_endings(AGENTS_MD_SNIPPET.trim_end(), existing).into_owned();
+    if trailing_whitespace.is_empty() {
+        replacement.push('\n');
     } else {
-        content.push('\n');
+        replacement.push_str(trailing_whitespace);
     }
-    if !content.ends_with('\n') {
-        content.push('\n');
-    }
+
+    let mut content = String::with_capacity(existing.len());
+    content.push_str(&existing[..start]);
+    content.push_str(&replacement);
+    content.push_str(&existing[end..]);
     Some(content)
 }
 
-fn markdown_section_start(existing: &str, heading: &str) -> Option<usize> {
-    if existing.starts_with(heading) {
-        return Some(0);
-    }
+fn marked_snippet_body() -> &'static str {
+    let (_, body) = AGENTS_MD_SNIPPET
+        .split_once(VERA_SNIPPET_BEGIN_MARKER)
+        .expect("AGENTS_MD_SNIPPET must contain the begin marker");
+    let (body, _) = body
+        .split_once(VERA_SNIPPET_END_MARKER)
+        .expect("AGENTS_MD_SNIPPET must contain the end marker");
+    body
+}
 
-    existing.find(&format!("\n{heading}")).map(|idx| idx + 1)
+fn legacy_agents_md_snippet() -> String {
+    AGENTS_MD_SNIPPET
+        .replace(&format!("{VERA_SNIPPET_BEGIN_MARKER}\n\n"), "")
+        .replace(&format!("\n{VERA_SNIPPET_END_MARKER}"), "")
+}
+
+/// Match generated content's line endings to the target file's.
+fn adapt_line_endings<'a>(generated: &'a str, file: &str) -> std::borrow::Cow<'a, str> {
+    if file.contains("\r\n") {
+        std::borrow::Cow::Owned(generated.replace('\n', "\r\n"))
+    } else {
+        std::borrow::Cow::Borrowed(generated)
+    }
+}
+
+fn markdown_marker_start(existing: &str, marker: &str) -> Option<usize> {
+    let mut offset = 0;
+    for line in existing.split_inclusive('\n') {
+        if line.trim_end() == marker {
+            return Some(offset);
+        }
+        offset += line.len();
+    }
+    None
+}
+
+fn markdown_section_start(existing: &str, heading: &str) -> Option<usize> {
+    let mut offset = 0;
+    for line in existing.split_inclusive('\n') {
+        if line.trim_end() == heading {
+            return Some(offset);
+        }
+        offset += line.len();
+    }
+    None
 }
 
 fn insert_vera_snippet_into_markdown(existing: &str) -> String {
@@ -1437,39 +1515,89 @@ mod tests {
     }
 
     #[test]
-    fn refresh_vera_snippet_in_markdown_replaces_stale_managed_section() {
-        let existing = "# Repository Guidelines\n\n## Code Search\n\nUse Vera before opening many files or running broad text search when you need to find where logic lives or how a feature works.\n\n- `vera search \"query\"` for semantic code search. Describe behavior: \"JWT validation\", not \"auth\".\n- `vera grep \"pattern\"` for exact text or regex\n- `vera references <symbol>` for callers and callees\n- `vera overview` for a project summary (languages, entry points, hotspots)\n- `vera search --deep \"query\"` for RAG-fusion query expansion + merged ranking\n- Narrow results with `--lang`, `--path`, `--type`, or `--scope docs`\n- `vera watch .` to auto-update the index, or `vera update .` after edits (`vera index .` if `.vera/` is missing)\n- For detailed usage, query patterns, and troubleshooting, read the Vera skill file installed by `vera agent install`\n\n## Build\n\nRun tests.\n";
-
-        let updated = refresh_vera_snippet_in_markdown(existing).unwrap();
-
-        assert!(updated.contains(AGENTS_MD_SNIPPET.trim_end()));
-        assert!(!updated.contains("- `vera grep \"pattern\"` for exact text or regex\n"));
-        assert!(
-            !updated.contains(
-                "- Narrow results with `--lang`, `--path`, `--type`, or `--scope docs`\n"
-            )
+    fn refresh_vera_snippet_in_markdown_refreshes_marked_region() {
+        let existing = format!(
+            "# Repository Guidelines\n\n## Code Search\n\nUser-owned context.\n{VERA_SNIPPET_BEGIN_MARKER}\n\nOld generated content.\n{VERA_SNIPPET_END_MARKER}\n\nUser-owned note.\n\n## Build\n\nRun tests.\n"
         );
-        assert!(updated.contains("## Build\n\nRun tests.\n"));
+
+        let updated = refresh_vera_snippet_in_markdown(&existing).unwrap();
+
+        assert!(updated.contains(&format!(
+            "{VERA_SNIPPET_BEGIN_MARKER}{}{VERA_SNIPPET_END_MARKER}",
+            marked_snippet_body()
+        )));
+        assert!(updated.contains("User-owned context.\n"));
+        assert!(updated.contains("User-owned note.\n"));
+        assert!(!updated.contains("Old generated content."));
     }
 
     #[test]
-    fn refresh_vera_snippet_in_markdown_preserves_following_top_level_section() {
+    fn refresh_vera_snippet_in_markdown_migrates_identical_legacy_section() {
         let existing = format!(
-            "{}\n\n# Guidelines\n\nRun tests first.\n",
-            AGENTS_MD_SNIPPET.trim_end()
+            "# Repository Guidelines\n\n{}\n\n# Guidelines\n\nRun tests first.\n",
+            legacy_agents_md_snippet().trim_end()
         );
 
         let updated = refresh_vera_snippet_in_markdown(&existing).unwrap();
 
         assert!(updated.contains(AGENTS_MD_SNIPPET.trim_end()));
+        assert!(updated.contains(VERA_SNIPPET_BEGIN_MARKER));
+        assert!(updated.contains(VERA_SNIPPET_END_MARKER));
         assert!(updated.contains("# Guidelines\n\nRun tests first.\n"));
     }
 
     #[test]
-    fn refresh_vera_snippet_in_markdown_skips_custom_code_search_section() {
-        let existing = "# Repository Guidelines\n\n## Code Search\n\nUse ripgrep first.\n\n## Build\n\nRun tests.\n";
+    fn refresh_vera_snippet_in_markdown_preserves_crlf_line_endings() {
+        let existing = format!(
+            "# Repo\r\n\r\n{VERA_SNIPPET_BEGIN_MARKER}\r\n\r\nOld generated content.\r\n{VERA_SNIPPET_END_MARKER}\r\n"
+        );
 
-        assert!(refresh_vera_snippet_in_markdown(existing).is_none());
+        let updated = refresh_vera_snippet_in_markdown(&existing).unwrap();
+
+        assert!(updated.contains(marked_snippet_body().lines().next().unwrap()));
+        assert!(!updated.contains("Old generated content."));
+        // No bare LF: every line feed is part of a CRLF pair.
+        assert_eq!(
+            updated.matches('\n').count(),
+            updated.matches("\r\n").count()
+        );
+    }
+
+    #[test]
+    fn refresh_vera_snippet_in_markdown_migrates_crlf_legacy_section() {
+        let legacy = legacy_agents_md_snippet().replace('\n', "\r\n");
+        let existing = format!("# Repo\r\n\r\n{}\r\n", legacy.trim_end());
+
+        let updated = refresh_vera_snippet_in_markdown(&existing).unwrap();
+
+        assert!(updated.contains(VERA_SNIPPET_BEGIN_MARKER));
+        assert_eq!(
+            updated.matches('\n').count(),
+            updated.matches("\r\n").count()
+        );
+    }
+
+    #[test]
+    fn refresh_vera_snippet_in_markdown_skips_edited_legacy_section() {
+        let edited = legacy_agents_md_snippet().replace(
+            "- `vera grep \"pattern\"` for exact text or regex in indexed files",
+            "- Use my preferred search tool instead",
+        );
+        let existing = format!(
+            "# Repository Guidelines\n\n{}\n\n## Build\n\nRun tests.\n",
+            edited.trim_end()
+        );
+
+        assert!(refresh_vera_snippet_in_markdown(&existing).is_none());
+    }
+
+    #[test]
+    fn refresh_vera_snippet_in_markdown_skips_similar_edited_heading() {
+        let existing = format!(
+            "# Repository Guidelines\n\n## Code Search (Vera)\n\n{AGENTS_MD_SNIPPET_INTRO}\n\n- Use my preferred search tool instead.\n\n## Build\n\nRun tests.\n"
+        );
+
+        assert!(refresh_vera_snippet_in_markdown(&existing).is_none());
     }
 
     #[test]

@@ -110,12 +110,7 @@ fn check_skill_staleness() {
     }
 
     // Auto-sync stale skills silently instead of nagging the user.
-    match crate::commands::agent::run(
-        crate::commands::agent::AgentCommand::Sync,
-        None,
-        None,
-        false,
-    ) {
+    match crate::commands::agent::sync_skills_only() {
         Ok(()) => {}
         Err(_) => {
             // Fall back to a hint if auto-sync fails.
