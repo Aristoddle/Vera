@@ -1,5 +1,11 @@
 name: Docker
 
+# Serialize image publication: a manual republish and a tag push must not
+# race on the same mutable :cpu/:cuda/:rocm tags.
+concurrency:
+  group: docker-image-publication
+  cancel-in-progress: false
+
 on:
   push:
     tags: ['v*.*.*']
@@ -50,8 +56,9 @@ jobs:
         run: bash scripts/bootstrap-vendored-grammars.sh
 
       - name: Set version from tag
+        env:
+          REF: ${{ inputs.tag || github.ref_name }}
         run: |
-          REF="${{ inputs.tag || github.ref_name }}"
           sed -i "s/^version = \".*\"/version = \"${REF#v}\"/" Cargo.toml
           cargo generate-lockfile
 
@@ -116,8 +123,9 @@ jobs:
 
       - name: Extract version
         id: version
+        env:
+          REF: ${{ inputs.tag || github.ref_name }}
         run: |
-          REF="${{ inputs.tag || github.ref_name }}"
           echo "version=${REF#v}" >> "$GITHUB_OUTPUT"
 
       - name: Build and push
