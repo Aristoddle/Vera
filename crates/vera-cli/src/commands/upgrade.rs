@@ -59,8 +59,8 @@ pub fn run(apply: bool, json_output: bool) -> Result<()> {
     update_check::apply_update(method)?;
 
     // The installer command exiting 0 does not mean the new version landed. A
-    // package registry can lag behind a GitHub release, in which case
-    // `<pkg>@latest` resolves to the version already installed and the upgrade
+    // package registry can lag behind a GitHub release, in which case the
+    // installer resolves the version already installed and the upgrade
     // silently no-ops. Compare what the installer recorded against what was
     // advertised rather than reporting success on the exit code alone.
     report.installed_version = state::load_install_provenance()
@@ -93,8 +93,8 @@ pub fn run(apply: bool, json_output: bool) -> Result<()> {
 /// Describe the mismatch when an applied upgrade did not produce the advertised
 /// version, or `None` when it did or when there is nothing to compare.
 ///
-/// A package registry can lag behind a GitHub release, in which case
-/// `<pkg>@latest` resolves to the version already installed, every installer
+/// A package registry can lag behind a GitHub release, in which case the
+/// installer keeps resolving the version already installed, every installer
 /// command exits 0, and the upgrade silently no-ops.
 fn applied_version_mismatch(
     method: &str,
@@ -107,10 +107,10 @@ fn applied_version_mismatch(
     }
     Some(format!(
         "upgrade did not take effect: expected {latest}, but the installer recorded {installed}.\n\
-         This usually means the {method} package for {latest} has not been published yet, so \
-         `@latest` still resolves to {installed}.\n\
+         This usually means the {method} package for {latest} has not been published yet, so the \
+         installer resolved {installed} again.\n\
          Hint: retry later, or install the {latest} binary from \
-         https://github.com/lemon07r/Vera/releases"
+         https://github.com/VeraTools/Vera/releases"
     ))
 }
 
@@ -126,13 +126,12 @@ fn verification_outcome(
     latest: Option<&str>,
     installed: Option<&str>,
 ) -> VerificationOutcome {
-    match (latest, installed) {
-        (Some(latest), Some(installed)) if latest == installed => VerificationOutcome::Confirmed,
-        (Some(latest), Some(installed)) => VerificationOutcome::Mismatch(
-            applied_version_mismatch(method, Some(latest), Some(installed))
-                .expect("known, mismatched versions must produce a mismatch message"),
-        ),
-        _ => VerificationOutcome::Unknown,
+    if latest.is_none() || installed.is_none() {
+        return VerificationOutcome::Unknown;
+    }
+    match applied_version_mismatch(method, latest, installed) {
+        Some(message) => VerificationOutcome::Mismatch(message),
+        None => VerificationOutcome::Confirmed,
     }
 }
 
