@@ -291,7 +291,7 @@ jobs:
       contents: read
       packages: write
     # Scoped per variant: blocks concurrent publishes of the same mutable
-    # tag across workflows while letting cpu/cuda/rocm publish in parallel.
+    # tag across workflows while letting cpu/cuda/rocm/openvino publish in parallel.
     concurrency:
       group: docker-image-publication-${{ matrix.variant }}
       cancel-in-progress: false
@@ -308,6 +308,9 @@ jobs:
           - variant: rocm
             dockerfile: docker/Dockerfile.rocm
             tag_suffix: rocm
+          - variant: openvino
+            dockerfile: docker/Dockerfile.openvino
+            tag_suffix: openvino
 
     steps:
       - uses: actions/checkout@v4
