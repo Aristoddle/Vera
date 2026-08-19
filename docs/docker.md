@@ -87,9 +87,12 @@ docker run --rm -v $(pwd):/workspace ghcr.io/veratools/vera:cpu stats
 
 ## Building locally
 
-From the repo root:
+The Dockerfiles package a prebuilt binary, so build it first. From the repo root:
 
 ```bash
+cargo build --release -p vera-cli
+mkdir -p dist && cp target/release/vera dist/
+
 docker build -f docker/Dockerfile.cpu -t vera:cpu .
 docker build -f docker/Dockerfile.cuda -t vera:cuda .
 docker build -f docker/Dockerfile.rocm -t vera:rocm .
