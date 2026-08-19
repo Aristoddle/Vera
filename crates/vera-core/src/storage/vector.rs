@@ -207,6 +207,13 @@ impl VectorStore {
         // it on natural-language queries, and the whole vector arm would then be
         // dropped in favour of BM25-only results. Ask for as many as the backend
         // allows instead.
+        if limit > MAX_KNN_K {
+            tracing::debug!(
+                requested = limit,
+                clamped = MAX_KNN_K,
+                "clamping vector search limit to sqlite-vec KNN cap"
+            );
+        }
         let limit = limit.min(MAX_KNN_K);
 
         let mut stmt = self

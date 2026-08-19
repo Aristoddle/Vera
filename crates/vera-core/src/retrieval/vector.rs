@@ -171,6 +171,7 @@ mod tests {
     use super::*;
     use crate::embedding::test_helpers::MockProvider;
     use crate::types::{Chunk, Language, SymbolType};
+    use anyhow::Context;
 
     /// Create sample chunks with semantic variety for testing.
     fn sample_chunks() -> Vec<Chunk> {
@@ -316,6 +317,15 @@ mod tests {
                 scores[i],
             );
         }
+    }
+
+    #[test]
+    fn storage_error_display_includes_error_chain() {
+        let error = anyhow::anyhow!("root cause").context("outer context");
+        let display = VectorSearchError::StorageError(error).to_string();
+
+        assert!(display.contains("outer context"));
+        assert!(display.contains("root cause"));
     }
 
     // ── generate_query_embedding tests ───────────────────────────────
