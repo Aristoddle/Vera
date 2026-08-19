@@ -248,13 +248,30 @@ impl Bm25Index {
 
     /// Delete all documents for a given file path.
     pub fn delete_by_file(&self, file_path: &str) -> Result<()> {
+        self.delete_by_files(std::slice::from_ref(&file_path))
+    }
+
+    /// Delete all documents for every given file path, using one writer.
+    ///
+    /// The per-call cost here is the writer lifecycle, not the deletion:
+    /// allocating a `WRITER_HEAP_SIZE` writer, committing a segment and
+    /// joining the merge threads costs on the order of tens of milliseconds
+    /// regardless of how many terms are deleted. Callers removing many files
+    /// must therefore batch, or they pay that fixed cost per file.
+    pub fn delete_by_files(&self, file_paths: &[&str]) -> Result<()> {
+        if file_paths.is_empty() {
+            return Ok(());
+        }
+
         let mut writer: IndexWriter = self
             .index
             .writer(WRITER_HEAP_SIZE)
             .context("failed to create BM25 writer for file delete")?;
 
-        let term = tantivy::Term::from_field_text(self.schema.file_path, file_path);
-        writer.delete_term(term);
+        for file_path in file_paths {
+            let term = tantivy::Term::from_field_text(self.schema.file_path, file_path);
+            writer.delete_term(term);
+        }
         writer
             .commit()
             .context("failed to commit BM25 file delete")?;
@@ -483,6 +500,67 @@ mod tests {
 
         let results = index.search("xyznonexistent", 10).unwrap();
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn delete_by_files_removes_every_path_and_keeps_the_rest() {
+        let index = Bm25Index::open_in_memory().unwrap();
+        let mut docs = sample_docs();
+        docs.push(Bm25Document {
+            chunk_id: "src/keep.rs:0",
+            file_path: "src/keep.rs",
+            content: "fn hello_survivor() {}",
+            symbol_name: Some("hello_survivor"),
+            language: "rust",
+        });
+        index.insert_batch(&docs).unwrap();
+        let before = index.doc_count().unwrap();
+
+        // src/main.rs has two documents; deleting it and one other path must
+        // take all of theirs and none of anyone else's.
+        index
+            .delete_by_files(&["src/main.rs", "src/lib.py"])
+            .unwrap();
+
+        assert_eq!(index.doc_count().unwrap(), before - 3);
+
+        // "hello" occurs in both deleted paths and in src/keep.rs, so every
+        // path assertion below can fail while the result set stays non-empty.
+        let hits = index.search("hello", 50).unwrap();
+        assert!(
+            hits.iter()
+                .any(|hit| hit.chunk_id.starts_with("src/keep.rs:")),
+            "the unrelated hello document must survive"
+        );
+        for path in ["src/main.rs:", "src/lib.py:"] {
+            assert!(
+                hits.iter().all(|hit| !hit.chunk_id.starts_with(path)),
+                "{path} should have no documents left, got {:?}",
+                hits.iter().map(|h| &h.chunk_id).collect::<Vec<_>>()
+            );
+        }
+        // An unrelated path is untouched.
+        let remaining = index.search("server", 50).unwrap();
+        assert!(
+            remaining
+                .iter()
+                .any(|hit| hit.chunk_id.starts_with("src/server.ts:")),
+            "unrelated documents must survive"
+        );
+    }
+
+    #[test]
+    fn delete_by_files_with_no_paths_is_a_no_op() {
+        // The update path calls this unconditionally, so an update with
+        // nothing deleted or modified must not touch the index — and must not
+        // pay for a writer to do nothing.
+        let index = Bm25Index::open_in_memory().unwrap();
+        index.insert_batch(&sample_docs()).unwrap();
+        let before = index.doc_count().unwrap();
+
+        index.delete_by_files(&[]).unwrap();
+
+        assert_eq!(index.doc_count().unwrap(), before);
     }
 
     #[test]
