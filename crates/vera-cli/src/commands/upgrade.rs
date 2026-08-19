@@ -57,7 +57,6 @@ pub fn run(apply: bool, json_output: bool) -> Result<()> {
         .as_deref()
         .expect("apply requires a resolved install method");
     update_check::apply_update(method)?;
-    report.applied = true;
 
     // The installer command exiting 0 does not mean the new version landed. A
     // package registry can lag behind a GitHub release, in which case
@@ -68,17 +67,24 @@ pub fn run(apply: bool, json_output: bool) -> Result<()> {
         .ok()
         .and_then(|provenance| provenance.version);
 
-    if report.installed_version.is_none() && !json_output {
-        eprintln!("Note: could not read the installed version to confirm the upgrade applied.");
-    }
-
-    if let Some(message) = applied_version_mismatch(
+    match verification_outcome(
         method,
         report.latest_version.as_deref(),
         report.installed_version.as_deref(),
     ) {
-        print_report(&report, json_output)?;
-        bail!(message);
+        VerificationOutcome::Confirmed => report.applied = true,
+        VerificationOutcome::Mismatch(message) => {
+            print_report(&report, json_output)?;
+            bail!(message);
+        }
+        VerificationOutcome::Unknown => {
+            let message = "could not confirm the upgrade applied because the installed version is unavailable";
+            if !json_output {
+                eprintln!("Warning: {message}.");
+            }
+            print_report(&report, json_output)?;
+            bail!(message);
+        }
     }
 
     print_report(&report, json_output)
@@ -108,9 +114,31 @@ fn applied_version_mismatch(
     ))
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum VerificationOutcome {
+    Confirmed,
+    Mismatch(String),
+    Unknown,
+}
+
+fn verification_outcome(
+    method: &str,
+    latest: Option<&str>,
+    installed: Option<&str>,
+) -> VerificationOutcome {
+    match (latest, installed) {
+        (Some(latest), Some(installed)) if latest == installed => VerificationOutcome::Confirmed,
+        (Some(latest), Some(installed)) => VerificationOutcome::Mismatch(
+            applied_version_mismatch(method, Some(latest), Some(installed))
+                .expect("known, mismatched versions must produce a mismatch message"),
+        ),
+        _ => VerificationOutcome::Unknown,
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::applied_version_mismatch;
+    use super::{VerificationOutcome, applied_version_mismatch, verification_outcome};
 
     #[test]
     fn reports_nothing_when_the_installed_version_matches() {
@@ -130,6 +158,30 @@ mod tests {
     fn reports_nothing_when_either_version_is_unknown() {
         assert!(applied_version_mismatch("bun", None, Some("0.12.13")).is_none());
         assert!(applied_version_mismatch("bun", Some("1.0.0"), None).is_none());
+    }
+
+    #[test]
+    fn confirms_only_when_both_versions_match() {
+        assert_eq!(
+            verification_outcome("bun", Some("1.0.0"), Some("1.0.0")),
+            VerificationOutcome::Confirmed
+        );
+    }
+
+    #[test]
+    fn keeps_mismatched_versions_unapplied() {
+        assert!(matches!(
+            verification_outcome("bun", Some("1.0.0"), Some("0.12.13")),
+            VerificationOutcome::Mismatch(_)
+        ));
+    }
+
+    #[test]
+    fn keeps_unknown_versions_unapplied() {
+        assert_eq!(
+            verification_outcome("bun", Some("1.0.0"), None),
+            VerificationOutcome::Unknown
+        );
     }
 }
 
