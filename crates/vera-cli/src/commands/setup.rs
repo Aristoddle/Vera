@@ -26,6 +26,11 @@ pub(crate) struct SetupReport {
     indexed_path: Option<String>,
 }
 
+/// Remedy shown when a non-interactive invocation cannot prompt.
+const NON_INTERACTIVE_HINT: &str = "Hint: pass a backend flag (for example `--onnx-jina-coreml`, \
+     `--onnx-jina-cuda`, or `--potion-code`), `--yes` to auto-detect one, or `--api` with \
+     EMBEDDING_MODEL_BASE_URL, EMBEDDING_MODEL_ID, and EMBEDDING_MODEL_API_KEY set.";
+
 /// `backend`: Some(local backend) for local, None + api=true for API, None + api=false defaults to auto-detect.
 /// `allow_wizard`: bare interactive invocations run the full wizard only for
 /// `vera setup`; `vera backend` always stays in the backend-only flow.
@@ -49,9 +54,7 @@ pub fn run(
         if !interactive {
             bail!(
                 "`vera setup` with no flags runs an interactive wizard, and no terminal is \
-                 available for prompts.\n\
-                 Hint: pass a backend flag (for example `--onnx-jina-coreml`, \
-                 `--onnx-jina-cuda`, or `--potion-code`), `--api`, or `--yes` to auto-detect one."
+                 available for prompts.\n{NON_INTERACTIVE_HINT}"
             );
         }
         return run_wizard();
@@ -70,9 +73,7 @@ pub fn run(
         detected
     } else if !interactive {
         bail!(
-            "no backend selected and no terminal is available for prompts.\n\
-             Hint: pass a backend flag (for example `--onnx-jina-coreml`, `--onnx-jina-cuda`, \
-             or `--potion-code`), `--api`, or `--yes` to auto-detect one."
+            "no backend selected and no terminal is available for prompts.\n{NON_INTERACTIVE_HINT}"
         );
     } else {
         prompt_backend()?
@@ -104,11 +105,14 @@ pub fn run(
 
     let needs_api_prompt = should_prompt_api_config(effective_backend, json_output, yes);
     if needs_api_prompt && !interactive {
-        bail!(
-            "API mode needs endpoint credentials and no terminal is available for prompts.\n\
-             Hint: set EMBEDDING_MODEL_BASE_URL, EMBEDDING_MODEL_ID, and \
-             EMBEDDING_MODEL_API_KEY, then re-run with `--api --yes`."
-        );
+        // With complete credentials in the environment there is nothing left
+        // to prompt for; on a missing variable this error names it.
+        read_required_api_env(
+            "EMBEDDING_MODEL_BASE_URL",
+            "EMBEDDING_MODEL_ID",
+            "EMBEDDING_MODEL_API_KEY",
+        )
+        .context("API mode needs endpoint credentials and no terminal is available for prompts")?;
     }
     let api_setup = (needs_api_prompt && interactive)
         .then(prompt_api_setup)
