@@ -366,7 +366,8 @@ jobs:
       # Healthy builds never pay for this.
       - name: Repair builder cache
         if: steps.publish.outcome == 'failure'
-        run: docker buildx prune -af
+        # Best-effort: a prune failure must not block the daemon retry below.
+        run: docker buildx prune -af || true
 
       - name: Build and push (retry via docker daemon)
         if: steps.publish.outcome == 'failure'
