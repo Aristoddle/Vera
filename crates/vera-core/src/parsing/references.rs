@@ -51,7 +51,7 @@ fn is_call_node(lang: Language, kind: &str) -> bool {
     match lang {
         Language::Rust => matches!(kind, "call_expression" | "macro_invocation"),
         Language::TypeScript | Language::JavaScript => {
-            matches!(kind, "call_expression" | "new_expression")
+            matches!(kind, "call_expression" | "new_expression") || is_jsx_element_node(kind)
         }
         Language::Python => kind == "call",
         Language::Go => kind == "call_expression",
@@ -83,6 +83,50 @@ fn is_call_node(lang: Language, kind: &str) -> bool {
         Language::Elm => kind == "function_call_expr",
         _ => false,
     }
+}
+
+/// Whether a node kind is a JSX element tag that names the component it renders.
+///
+/// `jsx_closing_element` is deliberately excluded so `<Foo></Foo>` records one
+/// reference rather than two.
+fn is_jsx_element_node(kind: &str) -> bool {
+    matches!(kind, "jsx_opening_element" | "jsx_self_closing_element")
+}
+
+/// Whether a JSX tag names a host element rather than a component in scope.
+///
+/// JSX resolves a *bare* tag beginning with a lowercase ASCII letter, such as
+/// `<div>`, to an intrinsic element string. Anything else is a value in scope,
+/// and only those are call sites; recording host elements would add an edge per
+/// HTML tag in the repository.
+///
+/// The rule mirrors TypeScript's `isIntrinsicJsxName`, which is
+/// `first char in a..z || name contains '-'`. Both halves matter:
+///
+/// - the range is ASCII on purpose. A Unicode-aware lowercase test would call
+///   `<éWidget />` a host element and drop a real component reference.
+/// - a hyphen makes the tag intrinsic whatever its case, because that is the
+///   custom-element form and TypeScript emits `<My-element />` as the string
+///   `"My-element"` rather than a value lookup.
+///
+/// The decision has to come from the tag node, not from the extracted callee.
+/// `extract_callee` returns the rightmost identifier, so `<Icons.arrow />` yields
+/// `arrow`, and judging that name alone would discard a real component
+/// reference. A dotted tag is a member expression on a value in scope whatever
+/// the case of its property.
+fn is_jsx_host_element(node: &tree_sitter::Node, source: &[u8]) -> bool {
+    if !is_jsx_element_node(node.kind()) {
+        return false;
+    }
+    let Some(name) = node.child_by_field_name("name") else {
+        return false;
+    };
+    if name.kind() == "member_expression" {
+        return false;
+    }
+    name.utf8_text(source).is_ok_and(|text| {
+        text.starts_with(|ch: char| ch.is_ascii_lowercase()) || text.contains('-')
+    })
 }
 
 /// Extract the callee name from a call node.
@@ -191,12 +235,14 @@ fn collect_calls(
         let node = cursor.node();
         if is_call_node(lang, node.kind()) {
             if let Some(callee) = extract_callee(&node, source) {
-                let caller = find_enclosing_symbol(symbols, node.start_byte());
-                refs.push(RawReference {
-                    callee,
-                    caller,
-                    line: node.start_position().row as u32 + 1,
-                });
+                if !is_jsx_host_element(&node, source) {
+                    let caller = find_enclosing_symbol(symbols, node.start_byte());
+                    refs.push(RawReference {
+                        callee,
+                        caller,
+                        line: node.start_position().row as u32 + 1,
+                    });
+                }
             }
         }
         // Depth-first: try child, then sibling, then backtrack.
@@ -220,11 +266,16 @@ fn collect_calls(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parsing::languages::tree_sitter_grammar;
+    use crate::parsing::languages::tree_sitter_grammar_for_path;
     use tree_sitter::Parser;
 
     fn parse_and_extract(source: &str, lang: Language) -> Vec<RawReference> {
-        let grammar = tree_sitter_grammar(lang).expect("grammar should exist");
+        // An extensionless path resolves to the plain per-language grammar.
+        parse_and_extract_for_path(source, "source", lang)
+    }
+
+    fn parse_and_extract_for_path(source: &str, path: &str, lang: Language) -> Vec<RawReference> {
+        let grammar = tree_sitter_grammar_for_path(lang, path).expect("grammar should exist");
         let mut parser = Parser::new();
         parser.set_language(&grammar).unwrap();
         let tree = parser.parse(source, None).unwrap();
@@ -308,6 +359,75 @@ func foo() {}
         assert!(
             callees.contains(&"foo"),
             "should find foo call: {callees:?}"
+        );
+    }
+
+    #[test]
+    fn tsx_jsx_elements_are_call_sites() {
+        let source = r#"
+import { Hello } from "./jsx";
+
+export function App() {
+    return (
+        <div className="wrap">
+            <Hello name="world" />
+            <Panel.Header title="hi"></Panel.Header>
+            <Icons.arrow />
+            <éWidget />
+            <My-element />
+        </div>
+    );
+}
+"#;
+        let refs = parse_and_extract_for_path(source, "src/app.tsx", Language::TypeScript);
+        let callees: Vec<&str> = refs.iter().map(|r| r.callee.as_str()).collect();
+        assert!(
+            callees.contains(&"Hello"),
+            "JSX element should be a call site: {callees:?}"
+        );
+        assert!(
+            callees.contains(&"Header"),
+            "dotted JSX element should be a call site: {callees:?}"
+        );
+        assert!(
+            callees.contains(&"arrow"),
+            "a dotted tag is a value in scope whatever the case of its \
+             property, so <Icons.arrow /> is a call site: {callees:?}"
+        );
+        assert!(
+            !callees.contains(&"div"),
+            "host elements should not be call sites: {callees:?}"
+        );
+        assert!(
+            callees.contains(&"éWidget"),
+            "only ASCII a-z marks an intrinsic tag, so <éWidget /> is a \
+             component reference: {callees:?}"
+        );
+        assert!(
+            !callees.contains(&"My-element"),
+            "a hyphen makes a tag intrinsic whatever its case, matching \
+             TypeScript's isIntrinsicJsxName: {callees:?}"
+        );
+        assert_eq!(
+            refs.iter().filter(|r| r.callee == "Header").count(),
+            1,
+            "paired tags should record one reference, not two"
+        );
+        assert!(
+            refs.iter()
+                .any(|r| r.callee == "Hello" && r.caller.as_deref() == Some("App")),
+            "caller should be App: {refs:?}"
+        );
+    }
+
+    #[test]
+    fn jsx_in_javascript_is_a_call_site() {
+        let source = "export function App() { return <Hello name=\"world\" />; }\n";
+        let refs = parse_and_extract(source, Language::JavaScript);
+        let callees: Vec<&str> = refs.iter().map(|r| r.callee.as_str()).collect();
+        assert!(
+            callees.contains(&"Hello"),
+            "JSX element should be a call site: {callees:?}"
         );
     }
 
