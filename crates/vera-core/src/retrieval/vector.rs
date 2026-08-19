@@ -25,7 +25,7 @@ pub enum VectorSearchError {
     },
 
     /// Storage or metadata error.
-    #[error("storage error: {0}")]
+    #[error("storage error: {0:#}")]
     StorageError(#[from] anyhow::Error),
 }
 

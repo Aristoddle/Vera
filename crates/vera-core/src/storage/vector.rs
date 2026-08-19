@@ -14,6 +14,10 @@ pub struct VectorStore {
     dim: usize,
 }
 
+/// Maximum `k` sqlite-vec accepts in a KNN query. Requesting more is a hard
+/// error from the extension, not a soft limit.
+const MAX_KNN_K: usize = 4096;
+
 /// A single vector search result: chunk ID and distance score.
 #[derive(Debug, Clone)]
 pub struct VectorSearchResult {
@@ -196,6 +200,14 @@ impl VectorStore {
                 query.len()
             );
         }
+
+        // sqlite-vec reads this LIMIT as the KNN `k` and rejects anything above
+        // MAX_KNN_K with "k value in knn query too large". Callers scale the
+        // candidate pool from the query type and result limit, which can exceed
+        // it on natural-language queries, and the whole vector arm would then be
+        // dropped in favour of BM25-only results. Ask for as many as the backend
+        // allows instead.
+        let limit = limit.min(MAX_KNN_K);
 
         let mut stmt = self
             .conn
@@ -390,6 +402,22 @@ mod tests {
         assert!(!results.is_empty());
         assert_eq!(results[0].chunk_id, "c1");
         assert!(results[0].distance < 0.001); // Self-match should be ~0 distance.
+    }
+
+    #[test]
+    fn search_clamps_limit_above_sqlite_vec_knn_cap() {
+        let store = VectorStore::open_in_memory(4).unwrap();
+        for i in 0..10 {
+            let v = vec![i as f32, 0.0, 0.0, 0.0];
+            store.insert(&format!("c{i}"), &v).unwrap();
+        }
+
+        // Without clamping, sqlite-vec fails the query outright with
+        // "k value in knn query too large".
+        let results = store
+            .search(&[5.0, 0.0, 0.0, 0.0], MAX_KNN_K + 1)
+            .expect("oversized k must be clamped, not rejected");
+        assert_eq!(results.len(), 10);
     }
 
     #[test]
