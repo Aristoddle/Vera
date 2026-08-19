@@ -207,6 +207,54 @@ pub(super) fn get_elixir_do_block<'a>(
         .find(|child| child.kind() == "do_block")
 }
 
+/// Extract function-valued `const`, `let`, and `var` bindings as named function
+/// symbols.
+///
+/// The name sits on the `variable_declarator`, not on the declaration itself,
+/// so the generic name lookup finds nothing and the symbol is stored unnamed.
+/// That is what makes function-valued bindings such as React components and
+/// utilities unreachable from `structural definitions`.
+///
+/// `let` and `var` bindings are covered too: the reported symptom was about
+/// `const` because that is the dominant style, but the missing name is a
+/// property of the declarator, not of the keyword, so scoping this to `const`
+/// would leave the same bug in place for the other two.
+///
+/// Returns `None` for anything else, including multi-declarator statements,
+/// destructuring patterns and bindings to plain values, so those keep their
+/// existing chunk shape.
+///
+/// The symbol spans the declaration node, which is what every other declaration
+/// kind in this extractor does. `export` is part of the enclosing
+/// `export_statement`, so it sits outside that span exactly as it already does
+/// for `export`-ed functions, classes and interfaces. Chunk content is expanded
+/// to whole lines afterwards, so a single-line `export const f = ...` still reads
+/// with its `export`, while a declaration split across lines does not.
+pub(super) fn extract_js_function_binding(
+    node: &tree_sitter::Node<'_>,
+    source: &[u8],
+) -> Option<RawSymbol> {
+    let mut cursor = node.walk();
+    let mut declarators = node
+        .children(&mut cursor)
+        .filter(|child| child.kind() == "variable_declarator");
+    let declarator = declarators.next()?;
+    if declarators.next().is_some() {
+        return None;
+    }
+
+    let value = declarator.child_by_field_name("value")?;
+    if !matches!(
+        value.kind(),
+        "arrow_function" | "function_expression" | "generator_function"
+    ) {
+        return None;
+    }
+
+    let name = extract_name(&declarator, source)?;
+    Some(RawSymbol::at(node, Some(name), SymbolType::Function))
+}
+
 /// Refine a Go type_spec into the correct SymbolType based on the type child.
 pub(super) fn refine_go_type_spec(node: &tree_sitter::Node<'_>, source: &[u8]) -> SymbolType {
     if let Some(type_child) = node.child_by_field_name("type") {

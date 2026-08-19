@@ -4,7 +4,7 @@
 //! Tier 0 fallback, large symbol splitting, and edge cases.
 
 use crate::config::IndexingConfig;
-use crate::parsing::test_support::{default_config, parse};
+use crate::parsing::test_support::{default_config, find_chunk, parse};
 use crate::parsing::{parse_and_chunk, parse_file_with_diagnostics};
 use crate::types::{Language, SymbolType};
 
@@ -265,6 +265,109 @@ type Point = { x: number; y: number };
         .iter()
         .find(|c| c.symbol_type == Some(SymbolType::TypeAlias));
     assert!(ta.is_some(), "should have type alias chunk");
+}
+
+#[test]
+fn typescript_const_assigned_functions_are_named() {
+    let source = r#"export function declaredFn(a: number): number { return a; }
+export const arrowFn = (a: number): number => a;
+export const typedArrow: (a: number) => number = (a) => a;
+export const asyncArrow = async () => {};
+export const exprFn = function (a: number) { return a; };
+export const plainConst = 42;
+"#;
+    let chunks = parse(source, "shapes.ts", Language::TypeScript);
+
+    for name in [
+        "declaredFn",
+        "arrowFn",
+        "typedArrow",
+        "asyncArrow",
+        "exprFn",
+    ] {
+        assert_eq!(
+            find_chunk(&chunks, name).symbol_type,
+            Some(SymbolType::Function),
+            "{name} binds a function"
+        );
+    }
+
+    // Whether plain value consts should be indexed as named symbols is a
+    // separate call; this fix deliberately leaves them as they were.
+    assert!(
+        chunks
+            .iter()
+            .all(|c| c.symbol_name.as_deref() != Some("plainConst")),
+        "value consts should keep their existing shape"
+    );
+
+    // The span covers the declaration, initialiser included, not just the name.
+    // `export` is present here because chunk content is expanded to whole lines
+    // and this declaration is on one line; see the multiline case below.
+    assert_eq!(
+        find_chunk(&chunks, "arrowFn").content.trim(),
+        "export const arrowFn = (a: number): number => a;"
+    );
+}
+
+/// A declaration split across lines from its `export` keeps the same span shape
+/// as every other declaration kind: the symbol covers the declaration, and the
+/// `export` on the preceding line falls outside it.
+///
+/// Pinned deliberately. Const bindings must not become the only declaration
+/// kind whose span swallows `export`; changing that is a repo-wide decision
+/// about `export_statement`, not something to do for one node kind.
+#[test]
+fn typescript_multiline_export_spans_match_function_declarations() {
+    let source = r#"export
+const arrowFn = (a: number): number => a;
+
+export
+function declaredFn(a: number): number { return a; }
+"#;
+    let chunks = parse(source, "multiline.ts", Language::TypeScript);
+
+    for name in ["arrowFn", "declaredFn"] {
+        let content = find_chunk(&chunks, name).content.trim().to_string();
+        assert!(
+            !content.starts_with("export"),
+            "{name} should span the declaration, not the export: {content:?}"
+        );
+    }
+}
+
+/// `let` and `var` function bindings are named too. The reported symptom was
+/// about `const` because that is the dominant style, but the cause is the name
+/// living on the declarator, which is identical for all three keywords.
+#[test]
+fn javascript_let_var_and_generator_bindings_are_named() {
+    let source = r#"export const arrowFn = (a) => a;
+let laterFn = function (a) { return a; };
+var oldStyleFn = () => {};
+export const genFn = function* () { yield 1; };
+"#;
+    let chunks = parse(source, "shapes.js", Language::JavaScript);
+
+    for name in ["arrowFn", "laterFn", "oldStyleFn", "genFn"] {
+        assert_eq!(
+            find_chunk(&chunks, name).symbol_type,
+            Some(SymbolType::Function),
+            "{name} binds a function"
+        );
+    }
+}
+
+#[test]
+fn typescript_multi_declarator_statements_are_unchanged() {
+    let source = "const a = () => 1, b = () => 2;\n";
+    let chunks = parse(source, "multi.ts", Language::TypeScript);
+
+    // The whole shape is pinned, not just the absence of names: one unnamed
+    // variable chunk spanning the statement, exactly as before this change.
+    assert_eq!(chunks.len(), 1, "unexpected chunks: {chunks:?}");
+    assert_eq!(chunks[0].symbol_name, None);
+    assert_eq!(chunks[0].symbol_type, Some(SymbolType::Variable));
+    assert_eq!(chunks[0].content.trim(), "const a = () => 1, b = () => 2;");
 }
 
 // =========================================================
