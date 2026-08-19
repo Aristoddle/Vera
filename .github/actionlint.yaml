@@ -2,12 +2,8 @@ self-hosted-runner:
   # Blacksmith runner labels (https://docs.blacksmith.sh/blacksmith-runners/overview)
   labels:
     - blacksmith-2vcpu-ubuntu-2404
-    - blacksmith-2vcpu-ubuntu-2404-arm
-    - blacksmith-4vcpu-ubuntu-2404
-    - blacksmith-4vcpu-ubuntu-2404-arm
     - blacksmith-8vcpu-ubuntu-2404
-    - blacksmith-8vcpu-ubuntu-2404-arm
+    - blacksmith-16vcpu-ubuntu-2404
+    - blacksmith-16vcpu-ubuntu-2404-arm
     - blacksmith-6vcpu-macos-15
-    - blacksmith-2vcpu-windows-2025
-    - blacksmith-4vcpu-windows-2025
-    - blacksmith-8vcpu-windows-2025
+    - blacksmith-16vcpu-windows-2025

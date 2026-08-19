@@ -15,24 +15,26 @@ jobs:
     name: Build (${{ matrix.target }})
     strategy:
       fail-fast: false
-      # Runner sizes are tuned to equalize wall-clock (slowest job gates the
-      # release). Baseline measured on 2vcpu at v1.0.1: arm 856s, windows 749s,
-      # musl 633s, gnu 554s (macOS: ~160s on 6vcpu). Observed 2->8vcpu scaling
-      # is ~3.2x, so the band below lands at ~3-5 min per target. No macOS
-      # label smaller than 6vcpu exists.
+      # Runner sizes are tuned so every target finishes near the macOS
+      # baseline (~160s on 6vcpu, the smallest macOS label). Baselines measured
+      # on 2vcpu at v1.0.1: arm 856s, windows 749s, musl 633s, gnu 554s.
+      # Observed scaling: gnu compiles in 172s on 8vcpu (measured, warm
+      # sccache); 16vcpu estimated ~4-4.5x over 2vcpu. Resulting band is
+      # roughly 2.7-3.5 min per target; nothing is sized to beat the macOS
+      # floor, since the release waits for it anyway.
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
-            os: blacksmith-4vcpu-ubuntu-2404
+            os: blacksmith-8vcpu-ubuntu-2404
             archive: tar.gz
 
           - target: x86_64-unknown-linux-musl
-            os: blacksmith-8vcpu-ubuntu-2404
+            os: blacksmith-16vcpu-ubuntu-2404
             archive: tar.gz
             musl: true
 
           - target: aarch64-unknown-linux-gnu
-            os: blacksmith-8vcpu-ubuntu-2404-arm
+            os: blacksmith-16vcpu-ubuntu-2404-arm
             archive: tar.gz
 
           # Blacksmith macOS runners are Apple Silicon; x86_64-apple-darwin is cross-compiled via the rust target.
@@ -45,7 +47,7 @@ jobs:
             archive: tar.gz
 
           - target: x86_64-pc-windows-msvc
-            os: blacksmith-8vcpu-windows-2025
+            os: blacksmith-16vcpu-windows-2025
             archive: zip
 
     runs-on: ${{ matrix.os }}
