@@ -311,6 +311,9 @@ pub enum Commands {
         /// Disable smart default exclusions.
         #[arg(long)]
         no_default_excludes: bool,
+        /// Disable the interactive indexing progress display.
+        #[arg(long)]
+        no_progress: bool,
         /// Show detailed information (e.g. paths of skipped files).
         #[arg(long, short = 'v')]
         verbose: bool,

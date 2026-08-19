@@ -148,6 +148,7 @@ fn main() {
             exclude,
             no_ignore,
             no_default_excludes,
+            no_progress,
             verbose,
             low_vram,
         } => {
@@ -159,6 +160,7 @@ fn main() {
                 exclude,
                 no_ignore,
                 no_default_excludes,
+                no_progress,
                 verbose,
                 low_vram,
             )
@@ -652,6 +654,18 @@ mod tests {
         assert!(
             matches!(parse(&["vera", "update", "/tmp/repo"]), Commands::Update { path, .. } if path == "/tmp/repo")
         );
+    }
+
+    #[test]
+    fn cli_parses_index_no_progress_flag() {
+        let command = parse(&["vera", "index", "/tmp/repo", "--no-progress"]);
+        assert!(matches!(
+            command,
+            Commands::Index {
+                no_progress: true,
+                ..
+            }
+        ));
     }
 
     #[test]
