@@ -3,6 +3,7 @@
 use anyhow::{Result, bail};
 use serde::Serialize;
 
+use crate::state;
 use crate::update_check::{self, InstallMethodSource};
 
 #[derive(Debug, Serialize)]
@@ -16,6 +17,9 @@ struct UpgradeReport {
     update_command: String,
     apply_supported: bool,
     applied: bool,
+    /// Version recorded by the installer after `--apply`, when it could be read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    installed_version: Option<String>,
 }
 
 pub fn run(apply: bool, json_output: bool) -> Result<()> {
@@ -30,6 +34,7 @@ pub fn run(apply: bool, json_output: bool) -> Result<()> {
         update_command: status.update_command(),
         apply_supported: status.can_apply_update(),
         applied: false,
+        installed_version: None,
     };
 
     if !apply {
@@ -53,7 +58,79 @@ pub fn run(apply: bool, json_output: bool) -> Result<()> {
         .expect("apply requires a resolved install method");
     update_check::apply_update(method)?;
     report.applied = true;
+
+    // The installer command exiting 0 does not mean the new version landed. A
+    // package registry can lag behind a GitHub release, in which case
+    // `<pkg>@latest` resolves to the version already installed and the upgrade
+    // silently no-ops. Compare what the installer recorded against what was
+    // advertised rather than reporting success on the exit code alone.
+    report.installed_version = state::load_install_provenance()
+        .ok()
+        .and_then(|provenance| provenance.version);
+
+    if report.installed_version.is_none() && !json_output {
+        eprintln!("Note: could not read the installed version to confirm the upgrade applied.");
+    }
+
+    if let Some(message) = applied_version_mismatch(
+        method,
+        report.latest_version.as_deref(),
+        report.installed_version.as_deref(),
+    ) {
+        print_report(&report, json_output)?;
+        bail!(message);
+    }
+
     print_report(&report, json_output)
+}
+
+/// Describe the mismatch when an applied upgrade did not produce the advertised
+/// version, or `None` when it did or when there is nothing to compare.
+///
+/// A package registry can lag behind a GitHub release, in which case
+/// `<pkg>@latest` resolves to the version already installed, every installer
+/// command exits 0, and the upgrade silently no-ops.
+fn applied_version_mismatch(
+    method: &str,
+    latest: Option<&str>,
+    installed: Option<&str>,
+) -> Option<String> {
+    let (latest, installed) = (latest?, installed?);
+    if installed == latest {
+        return None;
+    }
+    Some(format!(
+        "upgrade did not take effect: expected {latest}, but the installer recorded {installed}.\n\
+         This usually means the {method} package for {latest} has not been published yet, so \
+         `@latest` still resolves to {installed}.\n\
+         Hint: retry later, or install the {latest} binary from \
+         https://github.com/lemon07r/Vera/releases"
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::applied_version_mismatch;
+
+    #[test]
+    fn reports_nothing_when_the_installed_version_matches() {
+        assert!(applied_version_mismatch("bun", Some("1.0.0"), Some("1.0.0")).is_none());
+    }
+
+    #[test]
+    fn reports_mismatch_with_both_versions_and_the_install_method() {
+        let message = applied_version_mismatch("bun", Some("1.0.0"), Some("0.12.13"))
+            .expect("a stale registry must be reported, not treated as success");
+        assert!(message.contains("1.0.0"), "{message}");
+        assert!(message.contains("0.12.13"), "{message}");
+        assert!(message.contains("bun"), "{message}");
+    }
+
+    #[test]
+    fn reports_nothing_when_either_version_is_unknown() {
+        assert!(applied_version_mismatch("bun", None, Some("0.12.13")).is_none());
+        assert!(applied_version_mismatch("bun", Some("1.0.0"), None).is_none());
+    }
 }
 
 fn print_report(report: &UpgradeReport, json_output: bool) -> Result<()> {
