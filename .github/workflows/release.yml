@@ -15,6 +15,11 @@ jobs:
     name: Build (${{ matrix.target }})
     strategy:
       fail-fast: false
+      # Runner sizes are tuned to equalize wall-clock (slowest job gates the
+      # release). Baseline measured on 2vcpu at v1.0.1: arm 856s, windows 749s,
+      # musl 633s, gnu 554s (macOS: ~160s on 6vcpu). Observed 2->8vcpu scaling
+      # is ~3.2x, so the band below lands at ~3-5 min per target. No macOS
+      # label smaller than 6vcpu exists.
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
@@ -22,7 +27,7 @@ jobs:
             archive: tar.gz
 
           - target: x86_64-unknown-linux-musl
-            os: blacksmith-4vcpu-ubuntu-2404
+            os: blacksmith-8vcpu-ubuntu-2404
             archive: tar.gz
             musl: true
 
