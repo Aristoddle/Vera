@@ -6,9 +6,12 @@ on:
 
 permissions:
   contents: write
+  packages: write
 
 env:
   CARGO_TERM_COLOR: always
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
 
 jobs:
   build:
@@ -70,10 +73,6 @@ jobs:
             sed -i "s/^version = \".*\"/version = \"$VERSION\"/" Cargo.toml
           fi
           cargo generate-lockfile
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: ${{ matrix.target }}
 
       - name: Set up sccache
         uses: mozilla-actions/sccache-action@v0.0.9
@@ -278,3 +277,94 @@ jobs:
           python -m pip install --upgrade build twine
           python -m build packages/python-cli
           python -m twine upload --non-interactive packages/python-cli/dist/*
+
+  # Images package the exact binary published in the release assets, so no
+  # separate compile is needed. Runs as soon as the linux-gnu build finishes,
+  # in parallel with the other targets.
+  docker:
+    name: Docker (${{ matrix.variant }})
+    needs: build
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    concurrency:
+      group: docker-image-publication
+      cancel-in-progress: false
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: cpu
+            dockerfile: docker/Dockerfile.cpu
+            tag_suffix: cpu
+          - variant: cuda
+            dockerfile: docker/Dockerfile.cuda
+            tag_suffix: cuda
+          - variant: rocm
+            dockerfile: docker/Dockerfile.rocm
+            tag_suffix: rocm
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download Linux binary artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: x86_64-unknown-linux-gnu
+          path: artifacts
+
+      - name: Stage binary
+        run: |
+          mkdir -p dist
+          tar xzf artifacts/vera-x86_64-unknown-linux-gnu.tar.gz -C artifacts
+          cp artifacts/vera-x86_64-unknown-linux-gnu/vera dist/vera
+          chmod +x dist/vera
+
+      - name: Lowercase image name
+        run: echo "IMAGE_NAME_LC=${IMAGE_NAME,,}" >> "$GITHUB_ENV"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: useblacksmith/setup-docker-builder@v2
+        with:
+          # v2 keys: fresh builders. The v1 rocm builder held a corrupted
+          # layer cache that failed the v1.0.1 publish with digest mismatches.
+          cache-key: docker-v2-${{ matrix.variant }}
+
+      - name: Extract version
+        id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push
+        id: publish
+        continue-on-error: true
+        uses: useblacksmith/build-push-action@v2
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME_LC }}:${{ matrix.tag_suffix }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME_LC }}:${{ steps.version.outputs.version }}-${{ matrix.tag_suffix }}
+
+      # A corrupted base-image layer on the builder's sticky disk fails the
+      # build with "unexpected commit digest". Pruning evicts it and forces a
+      # clean re-pull; only runs after a failure, so healthy builds keep cache.
+      - name: Repair builder cache
+        if: steps.publish.outcome == 'failure'
+        run: docker buildx prune -af
+
+      - name: Build and push (retry after repair)
+        if: steps.publish.outcome == 'failure'
+        uses: useblacksmith/build-push-action@v2
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME_LC }}:${{ matrix.tag_suffix }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME_LC }}:${{ steps.version.outputs.version }}-${{ matrix.tag_suffix }}
