@@ -18,29 +18,29 @@ jobs:
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
+            os: blacksmith-2vcpu-ubuntu-2404
             archive: tar.gz
 
           - target: x86_64-unknown-linux-musl
-            os: ubuntu-latest
+            os: blacksmith-2vcpu-ubuntu-2404
             archive: tar.gz
             musl: true
 
           - target: aarch64-unknown-linux-gnu
-            os: ubuntu-latest
-            use_cross: true
+            os: blacksmith-2vcpu-ubuntu-2404-arm
             archive: tar.gz
 
+          # Blacksmith macOS runners are Apple Silicon; x86_64-apple-darwin is cross-compiled via the rust target.
           - target: x86_64-apple-darwin
-            os: macos-14
+            os: blacksmith-6vcpu-macos-15
             archive: tar.gz
 
           - target: aarch64-apple-darwin
-            os: macos-latest
+            os: blacksmith-6vcpu-macos-15
             archive: tar.gz
 
           - target: x86_64-pc-windows-msvc
-            os: windows-latest
+            os: blacksmith-2vcpu-windows-2025
             archive: zip
 
     runs-on: ${{ matrix.os }}
@@ -69,11 +69,9 @@ jobs:
           key: ${{ matrix.target }}
 
       - name: Set up sccache
-        if: ${{ !matrix.use_cross }}
         uses: mozilla-actions/sccache-action@v0.0.9
 
       - name: Configure sccache
-        if: ${{ !matrix.use_cross }}
         shell: bash
         run: |
           echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
@@ -82,10 +80,6 @@ jobs:
       - name: Download vendored grammars
         shell: bash
         run: bash scripts/bootstrap-vendored-grammars.sh
-
-      - name: Install cross
-        if: matrix.use_cross
-        run: cargo install cross --locked
 
       - name: Install musl tools
         if: matrix.musl
@@ -110,12 +104,7 @@ jobs:
           echo "CXXFLAGS=/MD" >> "$GITHUB_ENV"
 
       - name: Build (native)
-        if: ${{ !matrix.use_cross }}
         run: cargo build --release --target ${{ matrix.target }} -p vera-cli
-
-      - name: Build (cross)
-        if: ${{ matrix.use_cross }}
-        run: cross build --release --target ${{ matrix.target }} -p vera-cli
 
       - name: Package (tar.gz)
         if: matrix.archive == 'tar.gz'
@@ -148,7 +137,7 @@ jobs:
   release:
     name: Create Release
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     env:
       NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
       PYPI_API_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
