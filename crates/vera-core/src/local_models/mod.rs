@@ -44,10 +44,12 @@ pub(super) const RERANKER_REPO: &str = "jinaai/jina-reranker-v2-base-multilingua
 /// No prebuilt reranker ONNX export runs on the CoreML GPU: the quantized
 /// export contains DynamicQuantizeLinear/MatMulInteger ops the CoreML EP cannot
 /// execute, and the fp16 export stores every tensor as float16 which the CoreML
-/// EP rejects as an input dtype (ORT partitions 0 nodes and silently falls back
-/// to CPU). Since CoreML cannot accelerate the reranker either way, all backends
-/// use the quantized INT8 export — the fastest CPU path. `vera doctor` surfaces
-/// the CoreML CPU fallback so the all-green probe does not mislead users.
+/// EP rejects as an input dtype. The reranker is explicitly pinned to the CPU
+/// provider for CoreML via `reranker_execution_provider` because CoreML can
+/// accept a fused subgraph and then fail at inference. Since CoreML cannot
+/// accelerate the reranker either way, all backends use the quantized INT8
+/// export — the fastest CPU path. `vera doctor` surfaces this CPU placement so
+/// the all-green probe does not mislead users.
 pub const RERANKER_ONNX_FILE: &str = "onnx/model_quantized.onnx";
 pub(super) const RERANKER_TOKENIZER_FILE: &str = "tokenizer.json";
 
