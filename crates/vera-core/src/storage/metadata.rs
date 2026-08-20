@@ -3,6 +3,8 @@
 //! Stores chunk metadata (file path, line ranges, language, symbol info)
 //! in a SQLite database. Uses WAL mode for concurrent read performance.
 
+use std::collections::HashMap;
+
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -344,6 +346,42 @@ impl MetadataStore {
         }
     }
 
+    /// Get multiple chunks by id in a single query.
+    ///
+    /// Returns a lookup map keyed by chunk id rather than a `Vec`, because
+    /// SQLite does not preserve any particular row order for `IN (...)`
+    /// queries. Callers that need results in a specific order (e.g.
+    /// vector-distance ranking) must re-project from the map themselves.
+    pub fn get_chunks_by_ids(&self, ids: &[String]) -> Result<HashMap<String, Chunk>> {
+        if ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let placeholders = std::iter::repeat_n("?", ids.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT id, file_path, line_start, line_end, content, language,
+                    symbol_type, symbol_name
+             FROM chunks WHERE id IN ({placeholders})"
+        );
+        let mut stmt = self
+            .conn
+            .prepare(&sql)
+            .context("failed to prepare batch chunk query")?;
+
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(ids.iter()), |row| {
+                Ok(row_to_chunk(row))
+            })
+            .context("failed to query chunks by id batch")?;
+
+        let chunks: Vec<Chunk> = collect_rows(rows)?
+            .into_iter()
+            .collect::<Result<Vec<_>>>()?;
+        Ok(chunks.into_iter().map(|c| (c.id.clone(), c)).collect())
+    }
+
     /// Get all chunks for a given file path.
     pub fn get_chunks_by_file(&self, file_path: &str) -> Result<Vec<Chunk>> {
         let mut stmt = self
@@ -534,14 +572,7 @@ impl MetadataStore {
 
     /// Store a file content hash for incremental indexing.
     pub fn set_file_hash(&self, file_path: &str, hash: &str) -> Result<()> {
-        self.conn
-            .execute(
-                "INSERT OR REPLACE INTO file_hashes (file_path, content_hash)
-                 VALUES (?1, ?2)",
-                params![file_path, hash],
-            )
-            .context("failed to set file hash")?;
-        Ok(())
+        self.set_file_hashes_batch_borrowed(&[(file_path, hash)])
     }
 
     /// Get the stored content hash for a file.
@@ -622,25 +653,7 @@ impl MetadataStore {
         file_path: &str,
         refs: &[crate::parsing::references::RawReference],
     ) -> Result<()> {
-        let tx = self
-            .conn
-            .unchecked_transaction()
-            .context("failed to begin reference transaction")?;
-        {
-            let mut stmt = self
-                .conn
-                .prepare_cached(
-                    "INSERT INTO [references] (file_path, line, callee, caller)
-                     VALUES (?1, ?2, ?3, ?4)",
-                )
-                .context("failed to prepare reference insert")?;
-            for r in refs {
-                stmt.execute(params![file_path, r.line, r.callee, r.caller])
-                    .context("failed to insert reference")?;
-            }
-        }
-        tx.commit().context("failed to commit reference inserts")?;
-        Ok(())
+        self.insert_parse_artifacts_batch_borrowed(&[(file_path, refs)], &[])
     }
 
     /// Insert a batch of explicit type relations for a single file.
@@ -649,31 +662,128 @@ impl MetadataStore {
         file_path: &str,
         relations: &[RawTypeRelation],
     ) -> Result<()> {
+        self.insert_parse_artifacts_batch_borrowed(&[], &[(file_path, relations)])
+    }
+
+    /// Store content hashes for many files in a single transaction.
+    ///
+    /// Equivalent to calling [`Self::set_file_hash`] once per file, but
+    /// issues one commit for the whole batch instead of one per file.
+    pub fn set_file_hashes_batch(&self, hashes: &[(String, String)]) -> Result<()> {
+        if hashes.is_empty() {
+            return Ok(());
+        }
+
+        let borrowed: Vec<(&str, &str)> = hashes
+            .iter()
+            .map(|(file_path, hash)| (file_path.as_str(), hash.as_str()))
+            .collect();
+        self.set_file_hashes_batch_borrowed(&borrowed)
+    }
+
+    pub(crate) fn set_file_hashes_batch_borrowed(&self, hashes: &[(&str, &str)]) -> Result<()> {
+        if hashes.is_empty() {
+            return Ok(());
+        }
+
         let tx = self
             .conn
             .unchecked_transaction()
-            .context("failed to begin type relation transaction")?;
+            .context("failed to begin file hash batch transaction")?;
         {
-            let mut stmt = self
-                .conn
+            let mut stmt = tx
+                .prepare_cached(
+                    "INSERT OR REPLACE INTO file_hashes (file_path, content_hash)
+                     VALUES (?1, ?2)",
+                )
+                .context("failed to prepare batch file hash insert")?;
+            for (file_path, hash) in hashes {
+                stmt.execute(params![file_path, hash])
+                    .with_context(|| format!("failed to set file hash: {file_path}"))?;
+            }
+        }
+        tx.commit().context("failed to commit file hash batch")?;
+        Ok(())
+    }
+
+    /// Store call-site references and type relations for many files in a
+    /// single transaction.
+    ///
+    /// Equivalent to calling [`Self::insert_references`] and
+    /// [`Self::insert_type_relations`] once per file, but issues one commit
+    /// for the whole batch instead of up to two per file.
+    pub fn insert_parse_artifacts_batch(
+        &self,
+        file_refs: &[(String, Vec<crate::parsing::references::RawReference>)],
+        file_type_relations: &[(String, Vec<RawTypeRelation>)],
+    ) -> Result<()> {
+        if file_refs.is_empty() && file_type_relations.is_empty() {
+            return Ok(());
+        }
+
+        let borrowed_refs: Vec<(&str, &[crate::parsing::references::RawReference])> = file_refs
+            .iter()
+            .map(|(file_path, refs)| (file_path.as_str(), refs.as_slice()))
+            .collect();
+        let borrowed_relations: Vec<(&str, &[RawTypeRelation])> = file_type_relations
+            .iter()
+            .map(|(file_path, relations)| (file_path.as_str(), relations.as_slice()))
+            .collect();
+        self.insert_parse_artifacts_batch_borrowed(&borrowed_refs, &borrowed_relations)
+    }
+
+    pub(crate) fn insert_parse_artifacts_batch_borrowed(
+        &self,
+        file_refs: &[(&str, &[crate::parsing::references::RawReference])],
+        file_type_relations: &[(&str, &[RawTypeRelation])],
+    ) -> Result<()> {
+        if file_refs.is_empty() && file_type_relations.is_empty() {
+            return Ok(());
+        }
+
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .context("failed to begin parse artifacts batch transaction")?;
+        {
+            let mut ref_stmt = tx
+                .prepare_cached(
+                    "INSERT INTO [references] (file_path, line, callee, caller)
+                     VALUES (?1, ?2, ?3, ?4)",
+                )
+                .context("failed to prepare batch reference insert")?;
+            for &(file_path, refs) in file_refs {
+                for r in refs {
+                    ref_stmt
+                        .execute(params![file_path, r.line, r.callee, r.caller])
+                        .with_context(|| format!("failed to insert reference for {file_path}"))?;
+                }
+            }
+
+            let mut relation_stmt = tx
                 .prepare_cached(
                     "INSERT INTO type_relations (file_path, line, owner, target, kind)
                      VALUES (?1, ?2, ?3, ?4, ?5)",
                 )
-                .context("failed to prepare type relation insert")?;
-            for relation in relations {
-                stmt.execute(params![
-                    file_path,
-                    relation.line,
-                    relation.owner,
-                    relation.target,
-                    relation.kind.as_str(),
-                ])
-                .context("failed to insert type relation")?;
+                .context("failed to prepare batch type relation insert")?;
+            for &(file_path, relations) in file_type_relations {
+                for relation in relations {
+                    relation_stmt
+                        .execute(params![
+                            file_path,
+                            relation.line,
+                            relation.owner,
+                            relation.target,
+                            relation.kind.as_str(),
+                        ])
+                        .with_context(|| {
+                            format!("failed to insert type relation for {file_path}")
+                        })?;
+                }
             }
         }
         tx.commit()
-            .context("failed to commit type relation inserts")?;
+            .context("failed to commit parse artifacts batch")?;
         Ok(())
     }
 
@@ -1204,6 +1314,117 @@ mod tests {
             plan.contains("SEARCH r"),
             "the reference subquery must seek, not scan: {plan}"
         );
+    }
+
+    #[test]
+    fn set_file_hashes_batch_persists_every_row_and_replaces_on_repeat() {
+        let store = MetadataStore::open_in_memory().unwrap();
+        store
+            .set_file_hashes_batch(&[
+                ("src/main.rs".to_string(), "hash-a".to_string()),
+                ("src/lib.py".to_string(), "hash-b".to_string()),
+            ])
+            .unwrap();
+        assert_eq!(
+            store.get_file_hash("src/main.rs").unwrap().as_deref(),
+            Some("hash-a")
+        );
+        assert_eq!(
+            store.get_file_hash("src/lib.py").unwrap().as_deref(),
+            Some("hash-b")
+        );
+
+        store
+            .set_file_hashes_batch(&[("src/main.rs".to_string(), "hash-c".to_string())])
+            .unwrap();
+        assert_eq!(
+            store.get_file_hash("src/main.rs").unwrap().as_deref(),
+            Some("hash-c")
+        );
+        // Guards against a partial write taking out rows the batch never
+        // mentioned: re-checking only src/main.rs would miss that.
+        assert_eq!(
+            store.get_file_hash("src/lib.py").unwrap().as_deref(),
+            Some("hash-b")
+        );
+    }
+
+    #[test]
+    fn batch_writes_accept_empty_input() {
+        // The batch methods early-return before opening a transaction. An
+        // update run with nothing to write must not error.
+        let store = MetadataStore::open_in_memory().unwrap();
+        store.set_file_hashes_batch(&[]).unwrap();
+        store.insert_parse_artifacts_batch(&[], &[]).unwrap();
+        assert!(store.get_chunks_by_ids(&[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn insert_parse_artifacts_batch_persists_both_kinds_across_files() {
+        let store = MetadataStore::open_in_memory().unwrap();
+        let refs = vec![
+            (
+                "src/main.rs".to_string(),
+                vec![crate::parsing::references::RawReference {
+                    callee: "helper".to_string(),
+                    caller: Some("main".to_string()),
+                    line: 3,
+                }],
+            ),
+            (
+                "src/lib.py".to_string(),
+                vec![crate::parsing::references::RawReference {
+                    callee: "helper".to_string(),
+                    caller: None,
+                    line: 9,
+                }],
+            ),
+        ];
+        let relations = vec![(
+            "src/main.rs".to_string(),
+            vec![RawTypeRelation {
+                owner: "Config".to_string(),
+                target: "Display".to_string(),
+                line: 12,
+                kind: TypeRelationKind::Conforms,
+            }],
+        )];
+        store
+            .insert_parse_artifacts_batch(&refs, &relations)
+            .unwrap();
+
+        // Both files' references land, not just the first. A count of 2 alone
+        // would also pass if both rows were stored under one file path, so
+        // assert the paths themselves.
+        let mut caller_paths: Vec<String> = store
+            .find_callers("helper")
+            .unwrap()
+            .into_iter()
+            .map(|caller_ref| caller_ref.file_path)
+            .collect();
+        caller_paths.sort();
+        assert_eq!(caller_paths, vec!["src/lib.py", "src/main.rs"]);
+        assert_eq!(store.find_type_relations("Display").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn get_chunks_by_ids_returns_only_requested_rows() {
+        let store = MetadataStore::open_in_memory().unwrap();
+        store.insert_chunks(&sample_chunks()).unwrap();
+
+        let found = store
+            .get_chunks_by_ids(&["src/main.rs:0".to_string(), "src/lib.py:0".to_string()])
+            .unwrap();
+        assert_eq!(found.len(), 2);
+        assert_eq!(found["src/main.rs:0"].symbol_name.as_deref(), Some("main"));
+        assert!(!found.contains_key("src/main.rs:1"));
+
+        // A missing id is skipped rather than erroring, which is what the
+        // caller's "chunk metadata not found" branch relies on.
+        let partial = store
+            .get_chunks_by_ids(&["src/main.rs:0".to_string(), "does/not/exist:9".to_string()])
+            .unwrap();
+        assert_eq!(partial.len(), 1);
     }
 
     #[test]
