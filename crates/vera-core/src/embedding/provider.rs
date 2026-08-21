@@ -229,6 +229,7 @@ fn fetch_query_prefix_from_hf(model_id: &str) -> Option<String> {
     );
     debug!(model_id, url = %url, "fetching query prefix from HuggingFace");
 
+    crate::init_tls();
     let body = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(5))
         .build()
