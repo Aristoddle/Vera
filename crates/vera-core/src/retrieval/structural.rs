@@ -69,9 +69,13 @@ pub fn search_structural(
             search_env_reads(&repo_root, &store, query, limit, &filters)
         }
         StructuralSearchKind::RouteHandlers => {
+            reject_query(kind, query)?;
             search_route_handlers(&repo_root, &store, limit, &filters)
         }
-        StructuralSearchKind::SqlQueries => search_sql_queries(&repo_root, &store, limit, &filters),
+        StructuralSearchKind::SqlQueries => {
+            reject_query(kind, query)?;
+            search_sql_queries(&repo_root, &store, limit, &filters)
+        }
         StructuralSearchKind::Implementations => {
             let target = required_query(kind, query)?;
             search_implementations(index_dir, target, limit, &filters)
@@ -88,10 +92,24 @@ fn structural_filters(filters: &SearchFilters) -> SearchFilters {
 }
 
 fn required_query(kind: StructuralSearchKind, query: Option<&str>) -> Result<&str> {
-    query
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| anyhow::anyhow!("{} requires a query", kind_label(kind)))
+    non_blank(query).ok_or_else(|| anyhow::anyhow!("{} requires a query", kind_label(kind)))
+}
+
+fn non_blank(query: Option<&str>) -> Option<&str> {
+    query.map(str::trim).filter(|value| !value.is_empty())
+}
+
+/// `ROUTE_PATTERNS` and `SQL_PATTERNS` carry no capture group, so unlike `ENV_PATTERNS`
+/// there is no term-bearing entity for a query to narrow against. Dropping the argument
+/// instead of rejecting it makes an unfiltered result set read as a match failure.
+fn reject_query(kind: StructuralSearchKind, query: Option<&str>) -> Result<()> {
+    match non_blank(query) {
+        Some(value) => bail!(
+            "{} accepts no query term; got {value:?}. Narrow with path, language, or scope filters instead.",
+            kind_label(kind)
+        ),
+        None => Ok(()),
+    }
 }
 
 fn kind_label(kind: StructuralSearchKind) -> &'static str {
@@ -134,7 +152,7 @@ fn search_env_reads(
     limit: usize,
     filters: &SearchFilters,
 ) -> Result<Vec<SearchResult>> {
-    let target = query.map(str::trim).filter(|value| !value.is_empty());
+    let target = non_blank(query);
     search_regex_intent(
         repo_root,
         store,
@@ -953,5 +971,59 @@ mod tests {
         .unwrap();
 
         assert!(results.is_empty(), "unexpected route matches: {results:?}");
+    }
+
+    /// Routes and SQL cannot narrow by term, so a supplied query has to fail loudly.
+    /// Dropping it returned the same unfiltered set the no-query call returns, which a
+    /// caller reads as "no match for my query".
+    #[tokio::test]
+    async fn routes_and_sql_reject_a_query_they_cannot_honour() {
+        let dir = index_repo(&[
+            ("src/router.ts", "router.get('/users', handler)\n"),
+            (
+                "db.py",
+                "def load(cursor):\n    cursor.execute('SELECT * FROM users')\n",
+            ),
+        ])
+        .await;
+        let index_dir = crate::indexing::index_dir(dir.path());
+
+        for (kind, label) in [
+            (StructuralSearchKind::RouteHandlers, "route handlers"),
+            (StructuralSearchKind::SqlQueries, "SQL queries"),
+        ] {
+            let unfiltered =
+                search_structural(&index_dir, kind, None, 10, &SearchFilters::default()).unwrap();
+            assert_eq!(
+                unfiltered.len(),
+                1,
+                "{label} fixture must produce the hit a dropped query would return: {unfiltered:?}"
+            );
+
+            let error = search_structural(
+                &index_dir,
+                kind,
+                Some("find_user_by_email"),
+                10,
+                &SearchFilters::default(),
+            )
+            .expect_err(&format!("{label} accepted a query it cannot honour"))
+            .to_string();
+            assert!(
+                error.contains(label) && error.contains("find_user_by_email"),
+                "error must name the kind and the rejected term: {error}"
+            );
+
+            for blank in ["", "   "] {
+                let results =
+                    search_structural(&index_dir, kind, Some(blank), 10, &SearchFilters::default())
+                        .unwrap();
+                assert_eq!(
+                    results.len(),
+                    1,
+                    "{label} must treat a blank query as absent: {results:?}"
+                );
+            }
+        }
     }
 }
