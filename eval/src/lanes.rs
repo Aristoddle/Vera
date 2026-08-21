@@ -14,13 +14,14 @@ use vera_core::local_models::{
     LOCAL_EMBEDDING_DIM_ENV, LOCAL_EMBEDDING_DIR_ENV, LOCAL_EMBEDDING_DOCUMENT_PREFIX_ENV,
     LOCAL_EMBEDDING_MAX_LENGTH_ENV, LOCAL_EMBEDDING_ONNX_DATA_FILE_ENV,
     LOCAL_EMBEDDING_ONNX_FILE_ENV, LOCAL_EMBEDDING_POOLING_ENV, LOCAL_EMBEDDING_QUERY_PREFIX_ENV,
-    LOCAL_EMBEDDING_REPO_ENV, LOCAL_EMBEDDING_TOKENIZER_FILE_ENV, LocalEmbeddingModelConfig,
-    LocalEmbeddingSource, POTION_CODE_REPO,
+    LOCAL_EMBEDDING_REPO_ENV, LOCAL_EMBEDDING_REVISION_ENV, LOCAL_EMBEDDING_TOKENIZER_FILE_ENV,
+    LocalEmbeddingModelConfig, LocalEmbeddingSource, POTION_CODE_REPO,
 };
 
 const LOCAL_MODEL_ENV_KEYS: &[&str] = &[
     LOCAL_EMBEDDING_REPO_ENV,
     LOCAL_EMBEDDING_DIR_ENV,
+    LOCAL_EMBEDDING_REVISION_ENV,
     LOCAL_EMBEDDING_ONNX_FILE_ENV,
     LOCAL_EMBEDDING_ONNX_DATA_FILE_ENV,
     LOCAL_EMBEDDING_TOKENIZER_FILE_ENV,
@@ -60,8 +61,7 @@ pub struct LaneSpec {
     /// Local directory containing the ONNX model and tokenizer.
     #[serde(default, alias = "model_dir")]
     pub dir: Option<PathBuf>,
-    /// Declared model revision. The current local model downloader resolves
-    /// the repository's default revision; this value is recorded for audit.
+    /// Hugging Face model revision for local ONNX models. Omitted means `main`.
     #[serde(default)]
     pub revision: Option<String>,
     /// ONNX execution provider for `custom-onnx`; defaults to CPU.
@@ -164,7 +164,7 @@ impl ResolvedLane {
                 model_id: Some(POTION_CODE_REPO.to_string()),
                 model_repo: Some(POTION_CODE_REPO.to_string()),
                 model_dir: None,
-                model_revision: self.spec.revision.clone(),
+                model_revision: Some("main".to_string()),
                 onnx_file: None,
                 onnx_data_file: None,
                 tokenizer_file: None,
@@ -213,9 +213,15 @@ impl ResolvedLane {
         if let Some(provider) = self.backend.and_then(InferenceBackend::execution_provider) {
             model.adjust_for_gpu(provider);
         }
-        let (model_repo, model_dir) = match &model.source {
-            LocalEmbeddingSource::HuggingFace { repo } => (Some(repo.clone()), None),
-            LocalEmbeddingSource::Directory { path } => (None, Some(path.display().to_string())),
+        let (model_repo, model_dir, model_revision) = match &model.source {
+            LocalEmbeddingSource::HuggingFace { repo } => (
+                Some(repo.clone()),
+                None,
+                Some(model.revision.clone().unwrap_or_else(|| "main".to_string())),
+            ),
+            LocalEmbeddingSource::Directory { path } => {
+                (None, Some(path.display().to_string()), None)
+            }
         };
         let onnx_file = model.onnx_file.clone();
         let onnx_data_file = model.onnx_data_file.clone();
@@ -229,7 +235,7 @@ impl ResolvedLane {
             model_id: Some(model.display_name()),
             model_repo,
             model_dir,
-            model_revision: self.spec.revision.clone(),
+            model_revision,
             onnx_file: Some(onnx_file),
             onnx_data_file,
             tokenizer_file: Some(model.tokenizer_file),
@@ -324,12 +330,21 @@ pub fn load_file(path: &Path) -> Result<Vec<LaneSpec>> {
 }
 
 /// Resolve a spec into the backend enum and validate unsupported combinations.
-pub fn resolve(spec: LaneSpec) -> Result<ResolvedLane> {
+pub fn resolve(mut spec: LaneSpec) -> Result<ResolvedLane> {
     if spec.name.trim().is_empty() {
         anyhow::bail!("lane name cannot be empty");
     }
     if spec.repo.is_some() && spec.dir.is_some() {
         anyhow::bail!("lane '{}' cannot set both repo and dir", spec.name);
+    }
+    if let Some(revision) = spec.revision.as_deref() {
+        spec.revision = Some(vera_core::local_models::normalize_model_revision(revision)?);
+        if spec.dir.is_some() {
+            anyhow::bail!(
+                "lane '{}' cannot set revision with a directory source",
+                spec.name
+            );
+        }
     }
 
     let backend_name = spec.backend.trim().to_ascii_lowercase();
@@ -390,7 +405,8 @@ fn reject_local_fields(spec: &LaneSpec, backend: &str) -> Result<()> {
         || spec.onnx_file.is_some()
         || spec.onnx_data_file.is_some()
         || spec.no_onnx_data
-        || spec.tokenizer_file.is_some();
+        || spec.tokenizer_file.is_some()
+        || spec.revision.is_some();
     if has_local_model_fields {
         anyhow::bail!(
             "lane '{}' backend '{backend}' only supports model_id and query_prefix; local ONNX fields require custom-onnx or onnx-jina-*",
@@ -548,6 +564,12 @@ pub fn apply_environment(lane: &ResolvedLane) -> LaneEnvGuard {
         }
     }
 
+    // Set after the override block, which clears every LOCAL_MODEL_ENV_KEYS
+    // entry (including this one) before re-applying lane fields.
+    if lane.backend.is_some_and(InferenceBackend::is_onnx) {
+        set_env(LOCAL_EMBEDDING_REVISION_ENV, lane.spec.revision.as_deref());
+    }
+
     guard
 }
 
@@ -563,6 +585,7 @@ fn has_local_model_overrides(lane: &ResolvedLane) -> bool {
         || lane.spec.document_prefix.is_some()
         || lane.spec.dim.is_some()
         || lane.spec.max_length.is_some()
+        || lane.spec.revision.is_some()
 }
 
 pub struct LaneEnvGuard {
@@ -664,6 +687,45 @@ pub fn task_set_identity(tasks: &[BenchmarkTask]) -> TaskSetIdentity {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
+    use std::sync::{Mutex, MutexGuard};
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct RevisionEnvGuard {
+        previous: Option<OsString>,
+        _lock: MutexGuard<'static, ()>,
+    }
+
+    impl RevisionEnvGuard {
+        fn set(value: Option<&str>) -> Self {
+            let lock = ENV_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let previous = std::env::var_os(LOCAL_EMBEDDING_REVISION_ENV);
+            unsafe {
+                match value {
+                    Some(value) => std::env::set_var(LOCAL_EMBEDDING_REVISION_ENV, value),
+                    None => std::env::remove_var(LOCAL_EMBEDDING_REVISION_ENV),
+                }
+            }
+            Self {
+                previous,
+                _lock: lock,
+            }
+        }
+    }
+
+    impl Drop for RevisionEnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.previous {
+                    Some(value) => std::env::set_var(LOCAL_EMBEDDING_REVISION_ENV, value),
+                    None => std::env::remove_var(LOCAL_EMBEDDING_REVISION_ENV),
+                }
+            }
+        }
+    }
 
     #[test]
     fn presets_keep_legacy_lane_names() {
@@ -687,6 +749,122 @@ mod tests {
             lane.backend,
             Some(InferenceBackend::OnnxJina(OnnxExecutionProvider::Cpu))
         );
+    }
+
+    #[test]
+    fn revision_is_rejected_for_bm25_lanes() {
+        let lane = LaneSpec {
+            name: "bm25-pinned".to_string(),
+            backend: "bm25".to_string(),
+            revision: Some("abc123".to_string()),
+            ..preset("vera-bm25").unwrap()
+        };
+
+        assert!(resolve(lane).is_err());
+    }
+
+    #[test]
+    fn custom_onnx_rejects_directory_revision_combinations() {
+        let lane = LaneSpec {
+            name: "directory-pinned".to_string(),
+            backend: "custom-onnx".to_string(),
+            dir: Some(std::path::PathBuf::from("/tmp/model")),
+            revision: Some("abc123".to_string()),
+            ..preset("vera-cpu").unwrap()
+        };
+
+        assert!(resolve(lane).is_err());
+    }
+
+    #[test]
+    fn custom_onnx_revision_is_normalized_during_resolution() {
+        let lane = resolve(LaneSpec {
+            name: "repo-pinned".to_string(),
+            backend: "custom-onnx".to_string(),
+            repo: Some("org/model".to_string()),
+            revision: Some(" abc123 ".to_string()),
+            ..preset("vera-cpu").unwrap()
+        })
+        .unwrap();
+
+        assert_eq!(lane.spec.revision.as_deref(), Some("abc123"));
+    }
+
+    #[test]
+    fn apply_environment_sets_and_restores_revision_for_custom_and_preset_onnx() {
+        let _env = RevisionEnvGuard::set(Some("ambient"));
+        let custom = resolve(LaneSpec {
+            name: "custom-pinned".to_string(),
+            backend: "custom-onnx".to_string(),
+            repo: Some("org/model".to_string()),
+            revision: Some("abc123".to_string()),
+            onnx_file: Some("model.onnx".to_string()),
+            ..preset("vera-cpu").unwrap()
+        })
+        .unwrap();
+
+        {
+            let _guard = apply_environment(&custom);
+            assert_eq!(
+                std::env::var(LOCAL_EMBEDDING_REVISION_ENV),
+                Ok("abc123".to_string())
+            );
+        }
+        assert_eq!(
+            std::env::var(LOCAL_EMBEDDING_REVISION_ENV),
+            Ok("ambient".to_string())
+        );
+
+        let preset = resolve(LaneSpec {
+            revision: Some("abc123".to_string()),
+            ..preset("vera-cpu").unwrap()
+        })
+        .unwrap();
+        {
+            let _guard = apply_environment(&preset);
+            assert_eq!(
+                std::env::var(LOCAL_EMBEDDING_REVISION_ENV),
+                Ok("abc123".to_string())
+            );
+        }
+        assert_eq!(
+            std::env::var(LOCAL_EMBEDDING_REVISION_ENV),
+            Ok("ambient".to_string())
+        );
+    }
+
+    #[test]
+    fn provenance_reports_pinned_and_main_revisions() {
+        let _env = RevisionEnvGuard::set(None);
+        let pinned = resolve(LaneSpec {
+            name: "custom-pinned".to_string(),
+            backend: "custom-onnx".to_string(),
+            repo: Some("org/model".to_string()),
+            revision: Some("abc123".to_string()),
+            onnx_file: Some("model.onnx".to_string()),
+            ..preset("vera-cpu").unwrap()
+        })
+        .unwrap();
+
+        {
+            let _guard = apply_environment(&pinned);
+            let provenance = pinned.provenance().unwrap();
+            assert_eq!(provenance.model_revision.as_deref(), Some("abc123"));
+        }
+
+        let unpinned = resolve(LaneSpec {
+            name: "custom-main".to_string(),
+            backend: "custom-onnx".to_string(),
+            repo: Some("org/model".to_string()),
+            onnx_file: Some("model.onnx".to_string()),
+            ..preset("vera-cpu").unwrap()
+        })
+        .unwrap();
+        {
+            let _guard = apply_environment(&unpinned);
+            let provenance = unpinned.provenance().unwrap();
+            assert_eq!(provenance.model_revision.as_deref(), Some("main"));
+        }
     }
 
     #[test]

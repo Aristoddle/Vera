@@ -5,6 +5,41 @@ use super::*;
 use crate::config::OnnxExecutionProvider;
 use std::io::Write;
 use std::net::TcpListener;
+use std::sync::{Arc, Mutex};
+
+static LOCAL_EMBEDDING_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+struct RevisionEnvGuard {
+    previous: Option<std::ffi::OsString>,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+impl RevisionEnvGuard {
+    fn set(value: &str) -> Self {
+        let lock = LOCAL_EMBEDDING_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = std::env::var_os(LOCAL_EMBEDDING_REVISION_ENV);
+        unsafe {
+            std::env::set_var(LOCAL_EMBEDDING_REVISION_ENV, value);
+        }
+        Self {
+            previous,
+            _lock: lock,
+        }
+    }
+}
+
+impl Drop for RevisionEnvGuard {
+    fn drop(&mut self) {
+        unsafe {
+            match &self.previous {
+                Some(value) => std::env::set_var(LOCAL_EMBEDDING_REVISION_ENV, value),
+                None => std::env::remove_var(LOCAL_EMBEDDING_REVISION_ENV),
+            }
+        }
+    }
+}
 
 #[test]
 fn normalize_huggingface_repo_accepts_repo_ids_and_urls() {
@@ -16,6 +51,87 @@ fn normalize_huggingface_repo_accepts_repo_ids_and_urls() {
         normalize_huggingface_repo("https://huggingface.co/Zenabius/CodeRankEmbed-onnx").unwrap(),
         "Zenabius/CodeRankEmbed-onnx"
     );
+}
+
+#[test]
+fn legacy_model_config_deserializes_without_revision() {
+    let config: LocalEmbeddingModelConfig = serde_json::from_str(
+        r#"{
+            "source": {"source": "hugging-face", "repo": "org/model"},
+            "onnx_file": "model.onnx",
+            "tokenizer_file": "tokenizer.json",
+            "embedding_dim": 3,
+            "pooling": "mean"
+        }"#,
+    )
+    .unwrap();
+
+    assert_eq!(config.revision, None);
+    assert!(!serde_json::to_string(&config).unwrap().contains("revision"));
+}
+
+#[test]
+fn revisions_validate_and_shard_only_non_main_cache_paths() {
+    let mut config = LocalEmbeddingModelConfig::from_huggingface_repo("org/model");
+    let legacy = config.cached_asset_paths().unwrap();
+    config.revision = Some("refs/pr/42".to_string());
+    let pinned = config.cached_asset_paths().unwrap();
+    assert!(
+        legacy
+            .onnx_path
+            .ends_with("models/org/model/onnx/model_quantized.onnx")
+    );
+    assert!(
+        pinned
+            .onnx_path
+            .ends_with("models/org/model/revisions/refs/pr/42/onnx/model_quantized.onnx")
+    );
+
+    config.revision = Some("main".to_string());
+    assert_eq!(
+        config.cached_asset_paths().unwrap().onnx_path,
+        legacy.onnx_path
+    );
+
+    for revision in [
+        "",
+        "../escape",
+        "refs//main",
+        "/absolute",
+        "trailing/",
+        "refs/../main",
+        "v1|pooling=mean",
+        "has?query",
+        "has%percent",
+    ] {
+        assert!(normalize_model_revision(revision).is_err(), "{revision:?}");
+    }
+    assert_eq!(
+        normalize_model_revision(" refs/pr/42 ").unwrap(),
+        "refs/pr/42"
+    );
+}
+
+#[test]
+fn model_identity_differs_for_non_main_revisions_but_not_main() {
+    let base = LocalEmbeddingModelConfig::jina();
+    let mut pinned = base.clone();
+    pinned.revision = Some("abc123".to_string());
+    assert_ne!(base.model_identity(), pinned.model_identity());
+
+    let mut explicit_main = base;
+    explicit_main.revision = Some("main".to_string());
+    assert_eq!(
+        explicit_main.model_identity(),
+        pinned.model_identity().replace("|revision=abc123", "")
+    );
+}
+
+#[test]
+fn directory_models_reject_revisions() {
+    let mut config = LocalEmbeddingModelConfig::from_directory(PathBuf::from("/models/custom"));
+    config.revision = Some("abc123".to_string());
+    assert!(config.cached_asset_paths().is_err());
 }
 
 #[test]
@@ -434,6 +550,149 @@ async fn successful_onnx_download_replaces_invalid_cached_file() {
     assert_eq!(std::fs::read(&target).unwrap(), [0x08, 0x01]);
 }
 
+#[tokio::test]
+async fn download_uses_pinned_revision_url_and_sharded_cache() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let home = temp_dir.path().join(".vera");
+    let revision = "d59c919d0159aea2c19ed7d04288fcdd048d0f9c";
+    let request_line = Arc::new(Mutex::new(String::new()));
+
+    let listener = match TcpListener::bind("127.0.0.1:0") {
+        Ok(listener) => listener,
+        Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return,
+        Err(err) => panic!("failed to bind test listener: {err}"),
+    };
+    let port = listener.local_addr().unwrap().port();
+    let request_line_for_server = Arc::clone(&request_line);
+    let server = std::thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut request = [0u8; 4096];
+            let bytes_read = std::io::Read::read(&mut stream, &mut request).unwrap_or(0);
+            let line_end = request[..bytes_read]
+                .windows(2)
+                .position(|window| window == b"\r\n")
+                .unwrap_or(bytes_read);
+            *request_line_for_server.lock().unwrap() =
+                String::from_utf8_lossy(&request[..line_end]).into_owned();
+            let response =
+                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n\x08\x01";
+            let _ = stream.write_all(response);
+            let _ = stream.flush();
+            let _ = stream.shutdown(std::net::Shutdown::Write);
+        }
+    });
+
+    let base_url = format!("http://127.0.0.1:{port}");
+    let result = ensure_model_file_impl_with_revision(
+        "org/model",
+        "onnx/model.onnx",
+        LocalModelAssetKind::Onnx,
+        &base_url,
+        Some(&home),
+        Some(revision),
+    )
+    .await
+    .unwrap();
+    server.join().unwrap();
+
+    assert!(request_line.lock().unwrap().starts_with(&format!(
+        "GET /org/model/resolve/{revision}/onnx/model.onnx "
+    )));
+    let expected = home
+        .join("models")
+        .join("org")
+        .join("model")
+        .join("revisions")
+        .join(revision)
+        .join("onnx")
+        .join("model.onnx");
+    assert_eq!(result, expected);
+    assert_eq!(std::fs::read(result).unwrap(), [0x08, 0x01]);
+}
+
+#[tokio::test]
+async fn download_without_revision_uses_main_url_and_legacy_cache() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let home = temp_dir.path().join(".vera");
+    let request_line = Arc::new(Mutex::new(String::new()));
+
+    let listener = match TcpListener::bind("127.0.0.1:0") {
+        Ok(listener) => listener,
+        Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return,
+        Err(err) => panic!("failed to bind test listener: {err}"),
+    };
+    let port = listener.local_addr().unwrap().port();
+    let request_line_for_server = Arc::clone(&request_line);
+    let server = std::thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut request = [0u8; 4096];
+            let bytes_read = std::io::Read::read(&mut stream, &mut request).unwrap_or(0);
+            let line_end = request[..bytes_read]
+                .windows(2)
+                .position(|window| window == b"\r\n")
+                .unwrap_or(bytes_read);
+            *request_line_for_server.lock().unwrap() =
+                String::from_utf8_lossy(&request[..line_end]).into_owned();
+            let response =
+                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n\x08\x01";
+            let _ = stream.write_all(response);
+            let _ = stream.flush();
+            let _ = stream.shutdown(std::net::Shutdown::Write);
+        }
+    });
+
+    let base_url = format!("http://127.0.0.1:{port}");
+    let result = ensure_model_file_impl_with_revision(
+        "org/model",
+        "onnx/model.onnx",
+        LocalModelAssetKind::Onnx,
+        &base_url,
+        Some(&home),
+        None,
+    )
+    .await
+    .unwrap();
+    server.join().unwrap();
+
+    assert!(
+        request_line
+            .lock()
+            .unwrap()
+            .starts_with("GET /org/model/resolve/main/onnx/model.onnx ")
+    );
+    let expected = home
+        .join("models")
+        .join("org")
+        .join("model")
+        .join("onnx")
+        .join("model.onnx");
+    assert_eq!(result, expected);
+    assert_eq!(std::fs::read(result).unwrap(), [0x08, 0x01]);
+    assert!(
+        !home
+            .join("models")
+            .join("org")
+            .join("model")
+            .join("revisions")
+            .exists()
+    );
+}
+
+#[test]
+fn local_embedding_config_from_env_trims_revision() {
+    let _env = RevisionEnvGuard::set(" refs/pr/42 ");
+    let config = LocalEmbeddingModelConfig::from_env().unwrap();
+
+    assert_eq!(config.revision.as_deref(), Some("refs/pr/42"));
+}
+
+#[test]
+fn local_embedding_config_from_env_rejects_invalid_revision() {
+    let _env = RevisionEnvGuard::set("../escape");
+
+    assert!(LocalEmbeddingModelConfig::from_env().is_err());
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn resolve_macos_rpath_loader_path_without_slash() {
@@ -677,6 +936,7 @@ fn legacy_jina_literal_stays_pinned_when_the_constants_move() {
             source: LocalEmbeddingSource::HuggingFace {
                 repo: "jinaai/jina-embeddings-v5-text-nano-retrieval".to_string(),
             },
+            revision: None,
             onnx_file: "onnx/model_quantized.onnx".to_string(),
             onnx_data_file: Some("onnx/model_quantized.onnx_data".to_string()),
             tokenizer_file: "tokenizer.json".to_string(),

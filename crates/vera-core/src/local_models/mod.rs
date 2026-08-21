@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::sync::atomic::AtomicU64;
 
@@ -37,6 +37,7 @@ pub const POTION_CODE_MAX_LENGTH: usize = 512;
 
 pub const LOCAL_EMBEDDING_REPO_ENV: &str = "VERA_LOCAL_EMBEDDING_REPO";
 pub const LOCAL_EMBEDDING_DIR_ENV: &str = "VERA_LOCAL_EMBEDDING_DIR";
+pub const LOCAL_EMBEDDING_REVISION_ENV: &str = "VERA_LOCAL_EMBEDDING_REVISION";
 pub const LOCAL_EMBEDDING_ONNX_FILE_ENV: &str = "VERA_LOCAL_EMBEDDING_ONNX_FILE";
 pub const LOCAL_EMBEDDING_ONNX_DATA_FILE_ENV: &str = "VERA_LOCAL_EMBEDDING_ONNX_DATA_FILE";
 pub const LOCAL_EMBEDDING_TOKENIZER_FILE_ENV: &str = "VERA_LOCAL_EMBEDDING_TOKENIZER_FILE";
@@ -139,6 +140,8 @@ pub enum LocalEmbeddingSource {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LocalEmbeddingModelConfig {
     pub source: LocalEmbeddingSource,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<String>,
     pub onnx_file: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub onnx_data_file: Option<String>,
@@ -178,6 +181,7 @@ impl LocalEmbeddingModelConfig {
             source: LocalEmbeddingSource::HuggingFace {
                 repo: repo.to_string(),
             },
+            revision: None,
             onnx_file: EMBEDDING_ONNX_FILE.to_string(),
             onnx_data_file: onnx_data_file.map(str::to_string),
             tokenizer_file: EMBEDDING_TOKENIZER_FILE.to_string(),
@@ -229,6 +233,7 @@ impl LocalEmbeddingModelConfig {
             source: LocalEmbeddingSource::HuggingFace {
                 repo: "jinaai/jina-embeddings-v5-text-nano-retrieval".to_string(),
             },
+            revision: None,
             onnx_file: "onnx/model_quantized.onnx".to_string(),
             onnx_data_file: Some("onnx/model_quantized.onnx_data".to_string()),
             tokenizer_file: "tokenizer.json".to_string(),
@@ -345,31 +350,48 @@ impl LocalEmbeddingModelConfig {
         // Vectors pooled two different ways are not comparable, so a pooling
         // change must invalidate an existing index rather than silently query
         // mean-pooled rows with last-token vectors.
-        if self == &Self::jina() || self == &Self::coderankembed() {
-            return format!(
+        let mut identity_config = self.clone();
+        identity_config.revision = None;
+        let identity = if identity_config == Self::jina()
+            || identity_config == Self::coderankembed()
+        {
+            format!(
                 "{}|pooling={}|qp={}|dp={}",
                 self.display_name(),
                 self.pooling,
                 Self::prefix_identity(self.query_prefix.as_deref()),
                 Self::prefix_identity(self.document_prefix.as_deref()),
-            );
-        }
-
-        let source = match &self.source {
-            LocalEmbeddingSource::HuggingFace { repo } => format!("hf:{repo}"),
-            LocalEmbeddingSource::Directory { path } => format!("dir:{}", path.display()),
+            )
+        } else {
+            let source = match &self.source {
+                LocalEmbeddingSource::HuggingFace { repo } => format!("hf:{repo}"),
+                LocalEmbeddingSource::Directory { path } => format!("dir:{}", path.display()),
+            };
+            let onnx_data = self.onnx_data_file.as_deref().unwrap_or("-");
+            format!(
+                "{source}|onnx={}|onnx_data={onnx_data}|tokenizer={}|pooling={}|dim={}|max_length={}|qp={}|dp={}",
+                self.onnx_file,
+                self.tokenizer_file,
+                self.pooling,
+                self.embedding_dim,
+                self.max_length,
+                Self::prefix_identity(self.query_prefix.as_deref()),
+                Self::prefix_identity(self.document_prefix.as_deref()),
+            )
         };
-        let onnx_data = self.onnx_data_file.as_deref().unwrap_or("-");
-        format!(
-            "{source}|onnx={}|onnx_data={onnx_data}|tokenizer={}|pooling={}|dim={}|max_length={}|qp={}|dp={}",
-            self.onnx_file,
-            self.tokenizer_file,
-            self.pooling,
-            self.embedding_dim,
-            self.max_length,
-            Self::prefix_identity(self.query_prefix.as_deref()),
-            Self::prefix_identity(self.document_prefix.as_deref()),
-        )
+
+        // Normalize so a hand-edited config agrees with the validated cache
+        // path and download URL. An invalid revision fails asset resolution
+        // before it can be downloaded, so the trimmed raw value is a safe
+        // fallback that keeps such configs distinguishable.
+        match self.revision.as_deref().map(str::trim) {
+            Some(revision) if !revision.is_empty() && revision != "main" => {
+                let revision =
+                    normalize_model_revision(revision).unwrap_or_else(|_| revision.to_string());
+                format!("{identity}|revision={revision}")
+            }
+            _ => identity,
+        }
     }
 
     /// The canonical form of a configured prefix: trimmed, and absent once
@@ -422,11 +444,20 @@ impl LocalEmbeddingModelConfig {
     }
 
     pub fn cached_asset_paths(&self) -> Result<LocalEmbeddingAssetPaths> {
+        let revision = normalize_optional_model_revision(self.revision.as_deref())?;
         let base_dir = match &self.source {
             LocalEmbeddingSource::HuggingFace { repo } => {
-                vera_home_dir()?.join("models").join(repo)
+                model_cache_dir(&vera_home_dir()?, repo, revision.as_deref())?
             }
-            LocalEmbeddingSource::Directory { path } => path.clone(),
+            LocalEmbeddingSource::Directory { path } => {
+                if revision.is_some() {
+                    anyhow::bail!(
+                        "embedding revision cannot be used with a directory source: {}",
+                        path.display()
+                    );
+                }
+                path.clone()
+            }
         };
         Ok(LocalEmbeddingAssetPaths {
             onnx_path: base_dir.join(&self.onnx_file),
@@ -463,8 +494,14 @@ impl LocalEmbeddingModelConfig {
 
     fn apply_env_overrides(defaults: Self) -> Result<Self> {
         let explicit_model_env = model_source_and_onnx_file_are_set();
+        let revision = revision_from_env(defaults.revision)?;
+        if revision.is_some() && matches!(&defaults.source, LocalEmbeddingSource::Directory { .. })
+        {
+            anyhow::bail!("embedding revision cannot be used with a directory source");
+        }
         Ok(Self {
             source: defaults.source,
+            revision,
             onnx_file: env_override(LOCAL_EMBEDDING_ONNX_FILE_ENV)
                 .unwrap_or_else(|| defaults.onnx_file.clone()),
             onnx_data_file: env_optional_override(
@@ -485,6 +522,76 @@ impl LocalEmbeddingModelConfig {
             ),
         })
     }
+}
+
+/// Normalize and validate a Hugging Face revision used for local model assets.
+///
+/// Revisions may contain slash-separated refs such as `refs/pr/123`, but every
+/// component must be a normal relative path component so it cannot escape the
+/// model cache or alter the Hub URL path. `|` is rejected because
+/// `model_identity` uses it as the field delimiter.
+pub fn normalize_model_revision(value: &str) -> Result<String> {
+    let revision = value.trim();
+    if revision.is_empty() {
+        anyhow::bail!("embedding revision cannot be empty");
+    }
+    if revision.starts_with('/')
+        || revision.ends_with('/')
+        || revision.contains("//")
+        || revision.contains('\\')
+        || revision.contains('?')
+        || revision.contains('#')
+        || revision.contains('%')
+        || revision.contains('|')
+        || revision.chars().any(char::is_control)
+    {
+        anyhow::bail!("invalid embedding revision: {revision}");
+    }
+
+    for component in revision.split('/') {
+        if component.is_empty() || component == "." || component == ".." {
+            anyhow::bail!("invalid embedding revision: {revision}");
+        }
+    }
+
+    Ok(revision.to_string())
+}
+
+pub(super) fn normalize_optional_model_revision(revision: Option<&str>) -> Result<Option<String>> {
+    revision.map(normalize_model_revision).transpose()
+}
+
+fn revision_from_env(default: Option<String>) -> Result<Option<String>> {
+    match std::env::var(LOCAL_EMBEDDING_REVISION_ENV) {
+        Ok(value) if value.trim().is_empty() => Ok(None),
+        Ok(value) => Ok(Some(normalize_model_revision(&value)?)),
+        Err(std::env::VarError::NotPresent) => {
+            default.as_deref().map(normalize_model_revision).transpose()
+        }
+        Err(error) => {
+            Err(error).with_context(|| format!("failed to read {LOCAL_EMBEDDING_REVISION_ENV}"))
+        }
+    }
+}
+
+pub(super) fn model_cache_dir(
+    home_dir: &Path,
+    repo: &str,
+    revision: Option<&str>,
+) -> Result<PathBuf> {
+    let base_dir = home_dir.join("models").join(repo);
+    let Some(revision) = normalize_optional_model_revision(revision)? else {
+        return Ok(base_dir);
+    };
+    if revision == "main" {
+        return Ok(base_dir);
+    }
+
+    let mut path = base_dir.join("revisions");
+    for component in revision.split('/') {
+        path.push(component);
+    }
+    Ok(path)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]

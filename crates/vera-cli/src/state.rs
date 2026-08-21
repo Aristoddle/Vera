@@ -356,6 +356,11 @@ fn apply_local_embedding_env(
     );
     set_optional_env_value(vera_core::local_models::LOCAL_EMBEDDING_DIR_ENV, dir, force);
     set_optional_env_value(
+        vera_core::local_models::LOCAL_EMBEDDING_REVISION_ENV,
+        model.and_then(|value| value.revision.as_deref()),
+        force,
+    );
+    set_optional_env_value(
         vera_core::local_models::LOCAL_EMBEDDING_ONNX_FILE_ENV,
         model.map(|value| value.onnx_file.as_str()),
         force,
@@ -427,6 +432,7 @@ fn clear_process_env(key: &str) {
 const LOCAL_EMBEDDING_SOURCE_ENV_KEYS: &[&str] = &[
     vera_core::local_models::LOCAL_EMBEDDING_REPO_ENV,
     vera_core::local_models::LOCAL_EMBEDDING_DIR_ENV,
+    vera_core::local_models::LOCAL_EMBEDDING_REVISION_ENV,
 ];
 
 #[cfg(test)]
@@ -492,6 +498,20 @@ mod tests {
       }
     }"#;
 
+    /// A stored model pinned to an immutable upstream revision.
+    const STORED_REVISION_CONFIG: &str = r#"{
+      "local_embedding_model": {
+        "source": {"source": "hugging-face",
+                   "repo": "org/model"},
+        "revision": "d59c919d0159aea2c19ed7d04288fcdd048d0f9c",
+        "onnx_file": "onnx/model.onnx",
+        "tokenizer_file": "tokenizer.json",
+        "embedding_dim": 768,
+        "pooling": "mean",
+        "max_length": 512
+      }
+    }"#;
+
     /// Everything `apply_saved_env_impl` can write, plus the redirect itself.
     const RESTORED_ENV_KEYS: &[&str] = &[
         "VERA_HOME",
@@ -505,6 +525,7 @@ mod tests {
         "RERANKER_MODEL_API_KEY",
         vera_core::local_models::LOCAL_EMBEDDING_REPO_ENV,
         vera_core::local_models::LOCAL_EMBEDDING_DIR_ENV,
+        vera_core::local_models::LOCAL_EMBEDDING_REVISION_ENV,
         vera_core::local_models::LOCAL_EMBEDDING_ONNX_FILE_ENV,
         vera_core::local_models::LOCAL_EMBEDDING_ONNX_DATA_FILE_ENV,
         vera_core::local_models::LOCAL_EMBEDDING_TOKENIZER_FILE_ENV,
@@ -629,6 +650,40 @@ mod tests {
         // prefix that never reaches the environment is a dropped flag.
         let model = vera_core::local_models::LocalEmbeddingModelConfig::from_env().unwrap();
         assert_eq!(model.document_prefix.as_deref(), Some("Passage:"));
+    }
+
+    #[test]
+    fn stored_revision_reaches_the_env_config() {
+        let _guard = with_stored_config(STORED_REVISION_CONFIG);
+
+        apply_saved_env_force().unwrap();
+
+        // `from_env` is the only reader the embedding pipeline has, so a stored
+        // revision that never reaches the environment downloads `main` while
+        // the config claims a pin.
+        let model = vera_core::local_models::LocalEmbeddingModelConfig::from_env().unwrap();
+        assert_eq!(
+            model.revision.as_deref(),
+            Some("d59c919d0159aea2c19ed7d04288fcdd048d0f9c")
+        );
+    }
+
+    #[test]
+    fn a_stored_config_without_a_revision_clears_a_stale_one() {
+        let _guard = with_stored_config(LEGACY_JINA_CONFIG);
+        set_process_env(
+            vera_core::local_models::LOCAL_EMBEDDING_REVISION_ENV,
+            "stale-revision",
+        );
+
+        apply_saved_env_force().unwrap();
+
+        // Forcing the stored config over the environment has to remove a
+        // revision the stored config does not have, or an inherited pin would
+        // silently swap the model bytes under an unchanged config.
+        assert!(std::env::var_os(vera_core::local_models::LOCAL_EMBEDDING_REVISION_ENV).is_none());
+        let model = vera_core::local_models::LocalEmbeddingModelConfig::from_env().unwrap();
+        assert_eq!(model.revision, None);
     }
 
     #[test]

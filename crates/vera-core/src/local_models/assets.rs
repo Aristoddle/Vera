@@ -26,6 +26,16 @@ pub(super) async fn ensure_model_file_with_kind(
     ensure_model_file_impl(repo_id, file_path, asset_kind, HUB_URL, None).await
 }
 
+pub(super) async fn ensure_model_file_with_revision(
+    repo_id: &str,
+    file_path: &str,
+    asset_kind: LocalModelAssetKind,
+    revision: Option<&str>,
+) -> Result<PathBuf> {
+    ensure_model_file_impl_with_revision(repo_id, file_path, asset_kind, HUB_URL, None, revision)
+        .await
+}
+
 pub fn configured_local_model_name() -> String {
     LocalEmbeddingModelConfig::from_env()
         .map(|config| config.model_identity())
@@ -79,28 +89,42 @@ pub fn inspect_potion_code_model_files() -> Result<Vec<LocalModelAssetStatus>> {
 pub async fn ensure_local_embedding_assets(
     config: &LocalEmbeddingModelConfig,
 ) -> Result<LocalEmbeddingAssetPaths> {
+    let revision = normalize_optional_model_revision(config.revision.as_deref())?;
     match &config.source {
         LocalEmbeddingSource::HuggingFace { repo } => Ok(LocalEmbeddingAssetPaths {
-            onnx_path: ensure_model_file_with_kind(
+            onnx_path: ensure_model_file_with_revision(
                 repo,
                 &config.onnx_file,
                 LocalModelAssetKind::Onnx,
+                revision.as_deref(),
             )
             .await?,
             onnx_data_path: match config.onnx_data_file.as_deref() {
-                Some(path) => {
-                    Some(ensure_model_file_with_kind(repo, path, LocalModelAssetKind::Other).await?)
-                }
+                Some(path) => Some(
+                    ensure_model_file_with_revision(
+                        repo,
+                        path,
+                        LocalModelAssetKind::Other,
+                        revision.as_deref(),
+                    )
+                    .await?,
+                ),
                 None => None,
             },
-            tokenizer_path: ensure_model_file_with_kind(
+            tokenizer_path: ensure_model_file_with_revision(
                 repo,
                 &config.tokenizer_file,
                 LocalModelAssetKind::Other,
+                revision.as_deref(),
             )
             .await?,
         }),
-        LocalEmbeddingSource::Directory { .. } => verify_local_embedding_assets(config),
+        LocalEmbeddingSource::Directory { .. } => {
+            if revision.is_some() {
+                anyhow::bail!("embedding revision cannot be used with a directory source");
+            }
+            verify_local_embedding_assets(config)
+        }
     }
 }
 
@@ -363,14 +387,34 @@ pub(super) async fn ensure_model_file_impl(
     base_url: &str,
     home_override: Option<&std::path::Path>,
 ) -> Result<PathBuf> {
+    ensure_model_file_impl_with_revision(
+        repo_id,
+        file_path,
+        asset_kind,
+        base_url,
+        home_override,
+        None,
+    )
+    .await
+}
+
+pub(super) async fn ensure_model_file_impl_with_revision(
+    repo_id: &str,
+    file_path: &str,
+    asset_kind: LocalModelAssetKind,
+    base_url: &str,
+    home_override: Option<&std::path::Path>,
+    revision: Option<&str>,
+) -> Result<PathBuf> {
     validate_relative_model_path(repo_id, "repository")?;
     validate_relative_model_path(file_path, "asset")?;
+    let revision = normalize_optional_model_revision(revision)?;
 
     let home_dir = match home_override {
         Some(p) => p.to_path_buf(),
         None => vera_home_dir()?,
     };
-    let models_dir = home_dir.join("models").join(repo_id);
+    let models_dir = model_cache_dir(&home_dir, repo_id, revision.as_deref())?;
     let target_path = models_dir.join(file_path);
 
     if target_path.exists() {
@@ -390,7 +434,11 @@ pub(super) async fn ensure_model_file_impl(
         fs::create_dir_all(parent).await?;
     }
 
-    let url = format!("{}/{}/resolve/main/{}", base_url, repo_id, file_path);
+    let revision = revision.as_deref().unwrap_or("main");
+    let url = format!(
+        "{}/{}/resolve/{}/{}",
+        base_url, repo_id, revision, file_path
+    );
     eprintln!("Downloading {}...", url);
 
     crate::init_tls();

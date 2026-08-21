@@ -52,7 +52,7 @@ JSON example:
 }
 ```
 
-The `custom-onnx` backend defaults to CPU; set `execution_provider` to `cuda`, `rocm`, `coreml`, `openvino`, or another supported provider when needed. `repo` downloads from Hugging Face and `dir` points at an existing local model directory. API lanes use `model_id`, `query_prefix`, and `environment` for endpoint settings. Every report includes the resolved lane contract, Vera Git SHA, timestamp, command and redacted environment summary, corpus SHAs, and a SHA-256 identity of the selected task IDs.
+The `custom-onnx` backend defaults to CPU; set `execution_provider` to `cuda`, `rocm`, `coreml`, `openvino`, or another supported provider when needed. `repo` downloads from Hugging Face and `dir` points at an existing local model directory. Set `revision` to an immutable commit SHA to pin the download: pinned revisions resolve from that ref, cache under `models/<repo>/revisions/<revision>/`, and join the model identity, so an index built on one revision is never reused for another. Omitted means `main`. `revision` is only valid on Hugging Face repo lanes, not on `dir`, `bm25`, `api`, or `potion` lanes. API lanes use `model_id`, `query_prefix`, and `environment` for endpoint settings. Every report includes the resolved lane contract, Vera Git SHA, timestamp, command and redacted environment summary, corpus SHAs, and a SHA-256 identity of the selected task IDs.
 
 The lower-level Python runner supports the same task controls for its existing retrieval modes:
 
