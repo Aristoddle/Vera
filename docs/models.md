@@ -25,16 +25,7 @@ Potion Code currently uses vector/BM25 fusion plus Vera's deterministic ranking 
 
 ## CodeRankEmbed Comparison
 
-Short no-rerank check on 6 tasks across `flask` and `ripgrep` with CUDA ONNX:
-
-| Model | Recall@1 | Recall@5 | Recall@10 | MRR | nDCG | Search p50 | Flask index | Ripgrep index |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| Jina preset | 0.5556 | 0.5556 | 0.5556 | 0.8462 | 0.6442 | 761.9 ms | 5.8 s | 11.9 s |
-| CodeRankEmbed preset | 0.7222 | 0.7222 | 0.7222 | 1.0000 | 0.8108 | 611.4 ms | 14.7 s | 29.1 s |
-
-This is why CodeRankEmbed ships as an option, not the default. It showed better pure embedding retrieval on that small no-rerank slice, but Vera's full local benchmark still uses the Jina preset because the full reranked pipeline is already very strong and Jina indexes faster.
-
-See [benchmarks.md](benchmarks.md) for the full benchmark context.
+See the [canonical CodeRankEmbed comparison](benchmarks.md#optional-coderankembed-preset) for the 6-task results and context.
 
 ## Custom Local Embedding Models
 

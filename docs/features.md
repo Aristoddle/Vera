@@ -15,7 +15,7 @@ Results from both paths merge through Reciprocal Rank Fusion (RRF), so a result 
 
 ### Cross-Encoder Reranking
 
-After fusion, the top candidates go through a cross-encoder that reads query and candidate together as a single pair. This is the most impactful stage: it lifts MRR@10 from 0.39 to 0.60 (54% improvement). Most code search tools skip this step entirely.
+After fusion, the top candidates go through a cross-encoder that reads query and candidate together as a single pair. This is the most impactful stage: it lifts MRR@10 from 0.28 to 0.60. Most code search tools skip this step entirely.
 
 Vera supports local cross-encoders (Jina) and remote reranking endpoints (Jina, Cohere, or Voyage AI `rerank-2` with `RERANKER_MODEL_BASE_URL=https://api.voyageai.com/v1`, with wire format handled automatically).
 
@@ -310,13 +310,4 @@ A fully static musl-linked binary (`x86_64-unknown-linux-musl`) is available for
 
 ## Benchmarks
 
-21-task benchmark across `ripgrep`, `flask`, `fastify`, and `turborepo`:
-
-| Metric | ripgrep | cocoindex | ColGREP (149M) | Vera |
-|--------|---------|-----------|----------------|------|
-| Recall@1 | 0.15 | 0.16 | 0.57 | **0.72** |
-| Recall@5 | 0.28 | 0.37 | 0.67 | **0.78** |
-| MRR@10 | 0.26 | 0.35 | 0.62 | **0.91** |
-| nDCG@10 | 0.29 | 0.52 | 0.56 | **0.84** |
-
-Full methodology and additional comparisons: [benchmarks.md](benchmarks.md).
+See the [current local release benchmark](benchmarks.md#current-local-release-benchmark) for the canonical 21-task comparison.

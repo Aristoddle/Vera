@@ -31,6 +31,7 @@ cargo fmt --all -- --check
 | `vera-core` | Parsing, indexing, storage, embedding, retrieval pipeline |
 | `vera-cli` | CLI interface (clap) |
 | `vera-mcp` | MCP server (JSON-RPC over stdio) |
+| `vera-serve` | HTTP inference server |
 | `eval` | Benchmark harness and evaluation tasks |
 
 The core engine lives in `vera-core`. Most changes happen here:
@@ -67,4 +68,4 @@ Benchmark details: [docs/benchmarks.md](docs/benchmarks.md).
 
 ## Branch Policy
 
-Until v1.0.0 ships, feature work targets the `feat/v1-prep` integration branch; `master` takes hotfixes only. After the v1.0.0 release, PRs target `master` directly.
+Pull requests target `master` directly.

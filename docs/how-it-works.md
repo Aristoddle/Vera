@@ -56,7 +56,7 @@ This is also where Vera adds a small amount of query-aware candidate expansion, 
 
 The top fused candidates are sent to a cross-encoder reranker. Unlike embeddings (which encode query and document separately), the cross-encoder reads the query and each candidate together as a single pair, scoring relevance jointly.
 
-This is the most expensive stage but also the most impactful. Reranking lifts MRR@10 from 0.39 to 0.60, a 54% improvement in how often the best result appears at the top.
+This is the most expensive stage but also the most impactful. Reranking lifts MRR@10 from 0.28 to 0.60.
 
 With Jina ONNX local models, the reranker runs on-device via ONNX Runtime. Potion Code uses deterministic ranking heuristics instead of the ONNX reranker. With API mode, reranking calls your configured endpoint. Obvious filename and path-dominant queries can skip reranking when lexical evidence is already decisive.
 

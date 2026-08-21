@@ -149,13 +149,7 @@ Method:
 - forced model paths on CUDA so quantized and fp16 runs did not silently switch models
 - judged by the full suite, not Vera usage rate or one benchmark hole
 
-Artifacts:
-
-- pre-fix quantized: [c7bdc09-jina-cuda-onnx-quantized-embed](../benchmarks/results/local-binaries/c7bdc09-jina-cuda-onnx-quantized-embed.json)
-- pre-fix fp16: [c7bdc09-jina-cuda-onnx-fp16-embed](../benchmarks/results/local-binaries/c7bdc09-jina-cuda-onnx-fp16-embed.json)
-- current fp16 candidate-pool fix: [candidate-pool-fix-rerank50-jina-cuda-onnx-fp16-embed](../benchmarks/results/local-binaries/candidate-pool-fix-rerank50-jina-cuda-onnx-fp16-embed.json)
-- current quantized candidate-pool fix: [oom-fix-jina-cuda-onnx-quantized-embed](../benchmarks/results/local-binaries/oom-fix-jina-cuda-onnx-quantized-embed.json)
-- current quantized dynamic scaler: [dynamic-scaler-jina-cuda-onnx-quantized-embed](../benchmarks/results/local-binaries/dynamic-scaler-jina-cuda-onnx-quantized-embed.json)
+The tuning-run JSON artifacts were pruned from the tree; see git history for the original files.
 
 Current fp16 candidate-pool fix vs pre-fix fp16:
 

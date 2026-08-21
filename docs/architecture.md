@@ -9,13 +9,13 @@
 | `vera-mcp` | MCP server (JSON-RPC over stdio) | `server.rs` |
 | `vera-serve` | HTTP inference server (OpenAI/Cohere-compatible) | `lib.rs` |
 | `eval` | Benchmark harness and metrics | `src/main.rs` |
-| `tree-sitter-{sql,proto,vue,dockerfile,astro}` | Vendored C grammars (built via `cc`) | `build.rs` |
+| `tree-sitter-{sql,proto,vue,dockerfile,astro,scss}` | Vendored C grammars (built via `cc`) | `build.rs` |
 
 ## vera-core modules
 
 ### `parsing/`: Language parsing & symbol extraction
 
-Files: `mod.rs` (public API), `languages.rs` (grammar dispatch), `extractor.rs` (AST node → SymbolType), `chunker.rs` (symbol-aware, whole-file, and Tier 0 chunking).
+Files: `mod.rs` (public API), `languages.rs` (grammar dispatch), `extractor/` (AST node → SymbolType), `chunker.rs` (symbol-aware, whole-file, and Tier 0 chunking).
 
 Data flow: file → grammar lookup → tree-sitter parse (+ diagnostics) → node classification → chunk production.
 
@@ -59,8 +59,8 @@ All stored in `.vera/` at the project root.
 ### Other modules
 
 - `types.rs`: `Language` enum (60+ variants), `SearchResult`, `CodeChunk`, `SymbolType`
-- `config.rs`: `RetrievalConfig`, `IndexConfig` defaults
-- `local_models.rs`: Manages local embedding presets, custom ONNX embedding configs, and ORT/model assets under the Vera data directory (XDG-compliant)
+- `config.rs`: `RetrievalConfig`, `IndexingConfig` defaults
+- `local_models/`: Manages local embedding presets, custom ONNX embedding configs, and ORT/model assets under the Vera data directory (XDG-compliant)
 - `discovery/`: File discovery with gitignore support, binary/size filtering
 - `git_scope.rs`: Resolves `--changed`, `--since`, and `--base` into exact paths relative to the indexed directory, which may sit below the git repository root
 - `chunk_text.rs`: Line-boundary text splitting for byte-budget enforcement
@@ -79,5 +79,5 @@ All stored in `.vera/` at the project root.
 2. Add extension mapping in `Language::from_extension()`
 3. Add grammar dependency to `vera-core/Cargo.toml`
 4. Wire grammar in `parsing/languages.rs` → `tree_sitter_grammar()`
-5. Add node classifier in `parsing/extractor.rs` → `classify_node()`
+5. Add node classifier in `parsing/extractor/classify.rs` → `classify_node()`
 6. Write tests: extension mapping, grammar loading, symbol extraction
