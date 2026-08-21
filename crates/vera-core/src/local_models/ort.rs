@@ -709,12 +709,6 @@ pub fn ensure_provider_dependencies(
     anyhow::bail!("{}", message.trim_end());
 }
 
-pub fn inspect_shared_library_deps(
-    runtime_path: &std::path::Path,
-) -> Result<Option<SharedLibraryDependencyStatus>> {
-    inspect_shared_library_deps_impl(runtime_path, None)
-}
-
 pub fn inspect_provider_dependencies(
     ep: OnnxExecutionProvider,
     runtime_path: &std::path::Path,

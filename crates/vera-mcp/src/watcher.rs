@@ -115,15 +115,6 @@ impl IncrementalUpdate for EmbeddingUpdateEngine {
 /// Handle to a running file watcher. Dropping it stops the watcher.
 pub struct WatchHandle {
     _watcher: notify_debouncer_mini::Debouncer<notify::RecommendedWatcher>,
-    /// Set to true when an update is in progress.
-    updating: Arc<AtomicBool>,
-}
-
-impl WatchHandle {
-    /// True if an incremental update is currently running.
-    pub fn is_updating(&self) -> bool {
-        self.updating.load(Ordering::Relaxed)
-    }
 }
 
 /// Start watching a project directory for file changes.
@@ -294,7 +285,6 @@ fn start_watching_with_runtime(
 
     Ok(WatchHandle {
         _watcher: debouncer,
-        updating,
     })
 }
 

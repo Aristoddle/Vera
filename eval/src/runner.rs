@@ -51,17 +51,6 @@ pub trait ToolAdapter {
     fn index(&self, repo_path: &str) -> (f64, u64);
 }
 
-/// Run the complete benchmark suite with a given tool adapter.
-#[allow(dead_code)]
-pub fn run_benchmark(
-    adapter: &dyn ToolAdapter,
-    tasks: &[BenchmarkTask],
-    repo_paths: &HashMap<String, String>,
-    corpus_shas: &HashMap<String, String>,
-) -> EvalReport {
-    run_benchmark_scoped(adapter, tasks, repo_paths, corpus_shas, &HashMap::new())
-}
-
 /// Add invocation metadata to a completed report.
 pub fn attach_provenance(report: &mut EvalReport, provenance: ReportProvenance) {
     report.version_info.lane = provenance.lane;

@@ -18,7 +18,7 @@ use crate::discovery::{self, DiscoveryResult};
 use crate::embedding::{
     EmbeddingError, EmbeddingProvider, embed_chunks_concurrent_with_progress_and_cancellation,
 };
-use crate::indexing::update::content_hash;
+use crate::indexing::update::{content_hash, detect_language_for_path};
 use crate::parsing;
 use crate::parsing::references::RawReference;
 use crate::parsing::type_relations::RawTypeRelation;
@@ -427,19 +427,7 @@ fn parse_discovered_files_parallel(
                 }
             };
 
-            let language = file
-                .absolute_path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .and_then(Language::from_filename)
-                .unwrap_or_else(|| {
-                    let ext = file
-                        .absolute_path
-                        .extension()
-                        .and_then(|e| e.to_str())
-                        .unwrap_or("");
-                    Language::from_extension(ext)
-                });
+            let language = detect_language_for_path(&file.absolute_path);
 
             // RST files need preprocessing before chunking, but refs
             // come from the raw source, so they can't share a single parse.
@@ -685,14 +673,14 @@ fn store_index(
     Ok(())
 }
 
-fn count_tree_sitter_error_files(file_states: &[FileIndexState]) -> usize {
+pub(crate) fn count_tree_sitter_error_files(file_states: &[FileIndexState]) -> usize {
     file_states
         .iter()
         .filter(|state| state.status == FileIndexStatus::Indexed && state.tree_has_error)
         .count()
 }
 
-fn count_tier0_fallback_files(file_states: &[FileIndexState]) -> usize {
+pub(crate) fn count_tier0_fallback_files(file_states: &[FileIndexState]) -> usize {
     file_states
         .iter()
         .filter(|state| state.status == FileIndexStatus::Indexed && state.tier0_fallback)

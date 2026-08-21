@@ -263,10 +263,6 @@ fn default_adaptive_batch_scaler_state_version() -> u32 {
 }
 
 impl LocalEmbeddingProvider {
-    pub async fn new_with_ep(ep: OnnxExecutionProvider) -> Result<Self, EmbeddingError> {
-        Self::new_with_ep_and_mem_limit(ep, 0).await
-    }
-
     pub async fn new_with_ep_and_mem_limit(
         ep: OnnxExecutionProvider,
         gpu_mem_limit_mb: u64,
@@ -1050,9 +1046,10 @@ mod tests {
             return;
         }
         // Since test downloads ~150MB, this could take a moment.
-        let provider = LocalEmbeddingProvider::new_with_ep(OnnxExecutionProvider::Cpu)
-            .await
-            .unwrap();
+        let provider =
+            LocalEmbeddingProvider::new_with_ep_and_mem_limit(OnnxExecutionProvider::Cpu, 0)
+                .await
+                .unwrap();
         let texts = vec!["Hello world".to_string(), "Another test".to_string()];
         let embeddings = provider.embed_batch(&texts).await.unwrap();
         assert_eq!(embeddings.len(), 2);

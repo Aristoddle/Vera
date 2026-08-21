@@ -974,30 +974,6 @@ pub async fn embed_chunks_concurrent<P: EmbeddingProvider>(
     max_concurrent: usize,
     max_chunk_bytes: usize,
 ) -> Result<Vec<(String, Vec<f32>)>, EmbeddingError> {
-    embed_chunks_concurrent_with_progress(
-        provider,
-        chunks,
-        batch_size,
-        max_concurrent,
-        max_chunk_bytes,
-        |_, _| {},
-    )
-    .await
-}
-
-/// Like `embed_chunks_concurrent` but calls `on_progress(done, total)` after each batch.
-pub async fn embed_chunks_concurrent_with_progress<P, F>(
-    provider: &P,
-    chunks: &[Chunk],
-    batch_size: usize,
-    max_concurrent: usize,
-    max_chunk_bytes: usize,
-    on_progress: F,
-) -> Result<Vec<(String, Vec<f32>)>, EmbeddingError>
-where
-    P: EmbeddingProvider,
-    F: Fn(usize, usize),
-{
     embed_chunks_concurrent_with_progress_and_cancellation(
         provider,
         chunks,
@@ -1005,7 +981,7 @@ where
         max_concurrent,
         max_chunk_bytes,
         &CancellationToken::new(),
-        on_progress,
+        |_, _| {},
     )
     .await
 }

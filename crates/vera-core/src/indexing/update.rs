@@ -145,16 +145,14 @@ pub fn content_hash(content: &str) -> String {
     })
 }
 
-pub(crate) fn detect_language_for_path(file_path: &str) -> Language {
-    Path::new(file_path)
+pub(crate) fn detect_language_for_path(file_path: impl AsRef<Path>) -> Language {
+    let file_path = file_path.as_ref();
+    file_path
         .file_name()
         .and_then(|n| n.to_str())
         .and_then(Language::from_filename)
         .unwrap_or_else(|| {
-            let ext = Path::new(file_path)
-                .extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or("");
+            let ext = file_path.extension().and_then(|e| e.to_str()).unwrap_or("");
             Language::from_extension(ext)
         })
 }
@@ -632,7 +630,7 @@ where
             Bm25Index::open(&bm25_dir).context("failed to open BM25 index for update")?;
 
         // Every path whose BM25 documents have to go is removed in one pass
-        // before any per-file mutation. `delete_by_file` allocates a writer,
+        // before any per-file mutation. `delete_by_files` allocates a writer,
         // commits a segment and joins the merge threads, which costs tens of
         // milliseconds per call however little is actually deleted. The batch
         // must stay ahead of `insert_chunks`, or it would delete newly written docs.
@@ -739,14 +737,8 @@ where
         files_added: processed_added,
         files_deleted: deleted.len(),
         files_unchanged: unchanged,
-        files_with_tree_sitter_errors: file_states
-            .iter()
-            .filter(|state| state.status == FileIndexStatus::Indexed && state.tree_has_error)
-            .count(),
-        files_using_tier0_fallback: file_states
-            .iter()
-            .filter(|state| state.status == FileIndexStatus::Indexed && state.tier0_fallback)
-            .count(),
+        files_with_tree_sitter_errors: pipeline::count_tree_sitter_error_files(&file_states),
+        files_using_tier0_fallback: pipeline::count_tier0_fallback_files(&file_states),
         parse_errors,
         files_deferred,
         total_chunks,

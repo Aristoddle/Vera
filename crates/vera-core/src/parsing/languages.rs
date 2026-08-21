@@ -126,11 +126,6 @@ fn has_tsx_extension(file_path: &str) -> bool {
         .is_some_and(|ext| ext.eq_ignore_ascii_case("tsx"))
 }
 
-/// Returns whether a language has tree-sitter grammar support (Tier 1A).
-pub fn has_grammar(lang: Language) -> bool {
-    tree_sitter_grammar(lang).is_some()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -164,7 +159,7 @@ mod tests {
         ];
         for lang in tier_1a {
             assert!(
-                has_grammar(lang),
+                tree_sitter_grammar(lang).is_some(),
                 "{lang} should have a tree-sitter grammar"
             );
         }
@@ -184,7 +179,7 @@ mod tests {
         ];
         for lang in tier_1b {
             assert!(
-                has_grammar(lang),
+                tree_sitter_grammar(lang).is_some(),
                 "{lang} should have a tree-sitter grammar"
             );
         }
@@ -201,7 +196,7 @@ mod tests {
         ];
         for lang in tier_0 {
             assert!(
-                !has_grammar(lang),
+                tree_sitter_grammar(lang).is_none(),
                 "{lang} should NOT have a tree-sitter grammar"
             );
         }
@@ -386,7 +381,7 @@ mod tests {
         ];
         for lang in tier_2a {
             assert!(
-                has_grammar(lang),
+                tree_sitter_grammar(lang).is_some(),
                 "{lang} should have a tree-sitter grammar"
             );
         }
@@ -410,7 +405,7 @@ mod tests {
         ];
         for lang in tier_2a_b2 {
             assert!(
-                has_grammar(lang),
+                tree_sitter_grammar(lang).is_some(),
                 "{lang} should have a tree-sitter grammar"
             );
         }
@@ -431,7 +426,7 @@ mod tests {
         ];
         for lang in tier_2b {
             assert!(
-                has_grammar(lang),
+                tree_sitter_grammar(lang).is_some(),
                 "{lang} should have a tree-sitter grammar"
             );
         }

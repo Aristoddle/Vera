@@ -4,7 +4,8 @@ use crate::chunk_text::file_name;
 use crate::corpus::{ContentClass, classify_content};
 use crate::retrieval::query_classifier::QueryType;
 use crate::retrieval::query_utils::{
-    content_declares_public_symbol, content_starts_with_impl, path_depth, trim_query_token,
+    content_declares_public_symbol, content_starts_with_impl, file_stem, path_depth,
+    trim_query_token,
 };
 use crate::types::{SearchFilters, SearchResult, SymbolType};
 use std::collections::HashMap;
@@ -599,13 +600,6 @@ pub(super) fn is_internal_definition_path(path: &str) -> bool {
 
 pub(super) fn path_matches_fragment(path: &str, fragment: &str) -> bool {
     path == fragment || path.ends_with(fragment) || path.contains(fragment)
-}
-
-pub(super) fn file_stem(filename: &str) -> &str {
-    filename
-        .rsplit_once('.')
-        .map(|(stem, _)| stem)
-        .unwrap_or(filename)
 }
 
 /// Check if a file stem shares a 6+ char prefix with an identifier.

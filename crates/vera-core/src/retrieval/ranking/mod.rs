@@ -5,7 +5,7 @@
 //! config files at repo root, test/docs noise, symbol-type disambiguation, and
 //! same-file crowding for multi-file questions.
 
-use crate::corpus::{ContentClass, classify_path, content_class_label};
+use crate::corpus::{classify_path, content_class_label};
 use crate::types::{Language, SearchFilters, SearchResult};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,12 +76,8 @@ pub(crate) fn apply_query_ranking_with_filters(
     stamp_rank_scores(reranked)
 }
 
-pub(crate) fn classify_file_role(file_path: &str, language: Language) -> ContentClass {
-    classify_path(file_path, language)
-}
-
 pub(crate) fn file_role_label(file_path: &str, language: Language) -> &'static str {
-    content_class_label(classify_file_role(file_path, language))
+    content_class_label(classify_path(file_path, language))
 }
 
 pub(crate) fn is_path_weighted_query(query: &str) -> bool {

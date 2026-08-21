@@ -438,34 +438,6 @@ impl MetadataStore {
         collect_rows(rows)?.into_iter().collect()
     }
 
-    /// Get chunks whose symbol names contain the given term (case-insensitive).
-    pub fn get_chunks_by_symbol_name_substring(
-        &self,
-        symbol_name: &str,
-        limit: usize,
-    ) -> Result<Vec<Chunk>> {
-        let mut stmt = self
-            .conn
-            .prepare_cached(
-                "SELECT id, file_path, line_start, line_end, content, language,
-                        symbol_type, symbol_name
-                 FROM chunks
-                 WHERE symbol_name IS NOT NULL
-                   AND instr(lower(symbol_name), lower(?1)) > 0
-                 ORDER BY file_path, line_start
-                 LIMIT ?2",
-            )
-            .context("failed to prepare substring symbol chunks query")?;
-
-        let rows = stmt
-            .query_map(params![symbol_name, limit as i64], |row| {
-                Ok(row_to_chunk(row))
-            })
-            .context("failed to query chunks by symbol name substring")?;
-
-        collect_rows(rows)?.into_iter().collect()
-    }
-
     /// Count total chunks in the store.
     pub fn chunk_count(&self) -> Result<u64> {
         let count: i64 = self
@@ -527,11 +499,6 @@ impl MetadataStore {
         }
         tx.commit().context("failed to commit file state inserts")?;
         Ok(())
-    }
-
-    /// Insert or replace a single file state.
-    pub fn upsert_file_state(&self, state: &FileIndexState) -> Result<()> {
-        self.insert_file_states(std::slice::from_ref(state))
     }
 
     /// Delete file state for a path.
@@ -647,24 +614,6 @@ impl MetadataStore {
 
     // ── Reference (call graph) operations ──────────────────────────
 
-    /// Insert a batch of call-site references for a single file.
-    pub fn insert_references(
-        &self,
-        file_path: &str,
-        refs: &[crate::parsing::references::RawReference],
-    ) -> Result<()> {
-        self.insert_parse_artifacts_batch_borrowed(&[(file_path, refs)], &[])
-    }
-
-    /// Insert a batch of explicit type relations for a single file.
-    pub fn insert_type_relations(
-        &self,
-        file_path: &str,
-        relations: &[RawTypeRelation],
-    ) -> Result<()> {
-        self.insert_parse_artifacts_batch_borrowed(&[], &[(file_path, relations)])
-    }
-
     /// Store content hashes for many files in a single transaction.
     ///
     /// Equivalent to calling [`Self::set_file_hash`] once per file, but
@@ -709,9 +658,7 @@ impl MetadataStore {
     /// Store call-site references and type relations for many files in a
     /// single transaction.
     ///
-    /// Equivalent to calling [`Self::insert_references`] and
-    /// [`Self::insert_type_relations`] once per file, but issues one commit
-    /// for the whole batch instead of up to two per file.
+    /// Issues one commit for the whole batch instead of up to two per file.
     pub fn insert_parse_artifacts_batch(
         &self,
         file_refs: &[(String, Vec<crate::parsing::references::RawReference>)],
@@ -1486,18 +1433,6 @@ mod tests {
     }
 
     #[test]
-    fn get_chunks_by_symbol_name_substring() {
-        let store = MetadataStore::open_in_memory().unwrap();
-        store.insert_chunks(&sample_chunks()).unwrap();
-
-        let chunks = store
-            .get_chunks_by_symbol_name_substring("fig", 10)
-            .unwrap();
-        assert_eq!(chunks.len(), 1);
-        assert_eq!(chunks[0].id, "src/main.rs:1");
-    }
-
-    #[test]
     fn delete_chunks_by_file() {
         let store = MetadataStore::open_in_memory().unwrap();
         store.insert_chunks(&sample_chunks()).unwrap();
@@ -1567,15 +1502,16 @@ mod tests {
     fn type_relation_operations() {
         let store = MetadataStore::open_in_memory().unwrap();
 
+        let relation = RawTypeRelation {
+            owner: "Repo".to_string(),
+            target: "Loader".to_string(),
+            line: 2,
+            kind: TypeRelationKind::Conforms,
+        };
         store
-            .insert_type_relations(
-                "src/types.ts",
-                &[RawTypeRelation {
-                    owner: "Repo".to_string(),
-                    target: "Loader".to_string(),
-                    line: 2,
-                    kind: TypeRelationKind::Conforms,
-                }],
+            .insert_parse_artifacts_batch_borrowed(
+                &[],
+                &[("src/types.ts", std::slice::from_ref(&relation))],
             )
             .unwrap();
 

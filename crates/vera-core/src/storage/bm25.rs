@@ -246,11 +246,6 @@ impl Bm25Index {
         Ok(())
     }
 
-    /// Delete all documents for a given file path.
-    pub fn delete_by_file(&self, file_path: &str) -> Result<()> {
-        self.delete_by_files(std::slice::from_ref(&file_path))
-    }
-
     /// Delete all documents for every given file path, using one writer.
     ///
     /// The per-call cost here is the writer lifecycle, not the deletion:

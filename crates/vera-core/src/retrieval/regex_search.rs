@@ -18,7 +18,7 @@ use crate::retrieval::file_scan::{
 };
 use crate::retrieval::ranking::{RankingStage, apply_query_ranking_with_filters};
 use crate::storage::metadata::MetadataStore;
-use crate::types::{Chunk, SearchFilters, SearchResult, SymbolType};
+use crate::types::{Chunk, SearchFilters, SearchResult};
 
 /// Search indexed files for a regex pattern.
 ///
@@ -130,7 +130,7 @@ pub fn search_regex(
                 language,
             };
 
-            if !regex_result_matches(filters, symbol_type) {
+            if !filters.matches_symbol_type(symbol_type) {
                 continue;
             }
 
@@ -173,16 +173,12 @@ fn collect_minified_matches(
             language,
         };
 
-        if !regex_result_matches(filters, symbol_type) {
+        if !filters.matches_symbol_type(symbol_type) {
             continue;
         }
 
         results.push(result);
     }
-}
-
-fn regex_result_matches(filters: &SearchFilters, symbol_type: Option<SymbolType>) -> bool {
-    filters.matches_symbol_type(symbol_type)
 }
 
 #[cfg(test)]

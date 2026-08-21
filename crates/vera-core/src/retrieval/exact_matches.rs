@@ -12,8 +12,8 @@ use anyhow::Result;
 use crate::chunk_text::file_name;
 use crate::retrieval::apply_filters;
 use crate::retrieval::query_utils::{
-    content_declares_public_symbol, content_starts_with_impl, looks_like_compound_identifier,
-    looks_like_filename, path_depth, result_key, trim_query_token,
+    content_declares_public_symbol, content_starts_with_impl, file_stem,
+    looks_like_compound_identifier, looks_like_filename, path_depth, result_key, trim_query_token,
 };
 use crate::retrieval::ranking::{
     RankingStage, apply_query_ranking_with_filters, is_path_weighted_query,
@@ -249,7 +249,7 @@ pub(crate) fn collect_stem_matched_definitions(
             continue;
         }
         let fname = file_name(file_path).to_ascii_lowercase();
-        let stem = fname.rsplit_once('.').map(|(s, _)| s).unwrap_or(&fname);
+        let stem = file_stem(&fname);
 
         // Match stem to identifier: exact, plural, or prefix overlap.
         let is_stem_match = stem == identifier_lower
@@ -300,7 +300,7 @@ pub(crate) fn collect_concept_matched_files(
 
     for file_path in &all_files {
         let fname = file_name(file_path).to_ascii_lowercase();
-        let stem = fname.rsplit_once('.').map(|(s, _)| s).unwrap_or(&fname);
+        let stem = file_stem(&fname);
         if stem.len() < 4 {
             continue;
         }
@@ -454,7 +454,7 @@ pub(crate) fn exact_match_priority(
         } else {
             1
         };
-    let visibility_rank = u8::from(!chunk_is_public_symbol(chunk));
+    let visibility_rank = u8::from(!content_declares_public_symbol(&chunk.content));
     let type_mismatch_rank = if identifier_case
         .chars()
         .next()
@@ -484,10 +484,6 @@ pub(crate) fn chunk_looks_like_impl(chunk: &Chunk) -> bool {
         .as_deref()
         .is_some_and(|name| name.to_ascii_lowercase().contains("impl"))
         || content_starts_with_impl(&chunk.content)
-}
-
-pub(crate) fn chunk_is_public_symbol(chunk: &Chunk) -> bool {
-    content_declares_public_symbol(&chunk.content)
 }
 
 /// Definition-type symbols eligible for exact-match injection. Intentionally

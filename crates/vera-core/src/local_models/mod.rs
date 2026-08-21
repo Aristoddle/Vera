@@ -766,8 +766,8 @@ pub use assets::{
 };
 pub use ort::{
     ensure_ort_library_for_ep, ensure_ort_runtime, ensure_provider_dependencies,
-    inspect_provider_dependencies, inspect_shared_library_deps, ort_library_path_for_ep,
-    refresh_ort_library_for_ep, wrap_ort_error,
+    inspect_provider_dependencies, ort_library_path_for_ep, refresh_ort_library_for_ep,
+    wrap_ort_error,
 };
 
 /// Return Vera's home directory.

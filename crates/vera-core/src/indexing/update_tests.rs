@@ -469,9 +469,13 @@ async fn update_cleans_partial_added_file_artifacts_before_retry() {
     let source = "class Loader {}\nclass CachedLoader extends Loader {}\n";
     fs::write(dir.path().join("types.ts"), source).unwrap();
 
-    let (partial_chunks, _) =
-        crate::parsing::parse_file(source, "types.ts", Language::TypeScript, &config.indexing)
-            .unwrap();
+    let (partial_chunks, _, _) = crate::parsing::parse_file_with_diagnostics(
+        source,
+        "types.ts",
+        Language::TypeScript,
+        &config.indexing,
+    )
+    .unwrap();
     metadata.insert_chunks(&partial_chunks).unwrap();
     let partial_vectors: Vec<_> = partial_chunks
         .iter()
@@ -495,17 +499,20 @@ async fn update_cleans_partial_added_file_artifacts_before_retry() {
         kind: TypeRelationKind::Extends,
     };
     metadata
-        .insert_type_relations("types.ts", &[partial_relation])
+        .insert_parse_artifacts_batch_borrowed(
+            &[],
+            &[("types.ts", std::slice::from_ref(&partial_relation))],
+        )
         .unwrap();
     metadata
-        .upsert_file_state(&FileIndexState {
+        .insert_file_states(&[FileIndexState {
             file_path: "types.ts".to_string(),
             language: "typescript".to_string(),
             status: FileIndexStatus::Indexed,
             tree_has_error: false,
             tier0_fallback: false,
             chunk_count: 1,
-        })
+        }])
         .unwrap();
     assert!(metadata.get_file_hash("types.ts").unwrap().is_none());
 

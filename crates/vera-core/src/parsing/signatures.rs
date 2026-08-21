@@ -145,15 +145,6 @@ fn first_n_lines(content: &str, max_lines: usize) -> String {
     out
 }
 
-/// Extract a compact signature from a code snippet using the language grammar.
-///
-/// This preserves the original public API. Call [`extract_signature_for_path`]
-/// when the source path is available and the grammar dialect may depend on its
-/// extension.
-pub fn extract_signature(content: &str, lang: Language) -> String {
-    extract_signature_inner(content, lang, "").unwrap_or_else(|| first_n_lines(content, 3))
-}
-
 /// Extract a compact signature using the grammar selected for `file_path`.
 ///
 /// Tries tree-sitter body stripping first. Falls back to first 3 lines
@@ -174,7 +165,7 @@ mod tests {
     #[test]
     fn typescript_interface_signature() {
         let code = "export interface Repo extends Base {\n    get(id: string): Item;\n}\n";
-        let sig = extract_signature(code, Language::TypeScript);
+        let sig = extract_signature_for_path(code, Language::TypeScript, "");
         assert_eq!(sig, "export interface Repo extends Base { ... }");
     }
 
@@ -182,7 +173,7 @@ mod tests {
     fn tsx_signature_uses_the_tsx_grammar() {
         // JSX ahead of a declaration derails the plain TypeScript grammar
         // badly enough that no body node is found within the depth limit, so
-        // `extract_signature` silently degrades to the raw first-three-lines
+        // `extract_signature_for_path` silently degrades to the raw first-three-lines
         // fallback instead of a stripped signature. Selecting the grammar by
         // path, as indexing does, keeps it working.
         let code = "const A = <p>{ q }</p>;\nfunction Later(x: number) {\n  return x;\n}\n";
@@ -207,14 +198,14 @@ mod tests {
     #[test]
     fn rust_pub_trait_signature() {
         let code = "pub trait Child: Parent + Send {\n    fn child(&self);\n}\n";
-        let sig = extract_signature(code, Language::Rust);
+        let sig = extract_signature_for_path(code, Language::Rust, "");
         assert_eq!(sig, "pub trait Child: Parent + Send { ... }");
     }
 
     #[test]
     fn rust_function_signature() {
         let code = "pub fn authenticate(credentials: &Credentials) -> Result<Token> {\n    let user = db.find_user(&credentials.username)?;\n    validate(user)?;\n    Ok(Token::new())\n}";
-        let sig = extract_signature(code, Language::Rust);
+        let sig = extract_signature_for_path(code, Language::Rust, "");
         assert!(sig.contains("pub fn authenticate"));
         assert!(sig.contains("{ ... }"));
         assert!(!sig.contains("find_user"));
@@ -223,7 +214,7 @@ mod tests {
     #[test]
     fn python_function_signature() {
         let code = "def authenticate(credentials: Credentials) -> Token:\n    user = db.find_user(credentials.username)\n    validate(user)\n    return Token()";
-        let sig = extract_signature(code, Language::Python);
+        let sig = extract_signature_for_path(code, Language::Python, "");
         assert!(sig.contains("def authenticate"));
         assert!(sig.contains("..."));
         assert!(!sig.contains("find_user"));
@@ -232,7 +223,7 @@ mod tests {
     #[test]
     fn typescript_function_signature() {
         let code = "function authenticate(credentials: Credentials): Token {\n    const user = db.findUser(credentials.username);\n    return new Token();\n}";
-        let sig = extract_signature(code, Language::TypeScript);
+        let sig = extract_signature_for_path(code, Language::TypeScript, "");
         assert!(sig.contains("function authenticate"));
         assert!(sig.contains("{ ... }"));
         assert!(!sig.contains("findUser"));
@@ -241,7 +232,7 @@ mod tests {
     #[test]
     fn go_function_signature() {
         let code = "func authenticate(creds Credentials) (Token, error) {\n\tuser := db.FindUser(creds.Username)\n\treturn Token{}, nil\n}";
-        let sig = extract_signature(code, Language::Go);
+        let sig = extract_signature_for_path(code, Language::Go, "");
         assert!(sig.contains("func authenticate"));
         assert!(sig.contains("{ ... }"));
         assert!(!sig.contains("FindUser"));
@@ -250,7 +241,7 @@ mod tests {
     #[test]
     fn java_method_signature() {
         let code = "public Token authenticate(Credentials creds) {\n    User user = db.findUser(creds.username);\n    return new Token();\n}";
-        let sig = extract_signature(code, Language::Java);
+        let sig = extract_signature_for_path(code, Language::Java, "");
         assert!(sig.contains("public Token authenticate"));
         assert!(sig.contains("{ ... }"));
         assert!(!sig.contains("findUser"));
@@ -259,7 +250,7 @@ mod tests {
     #[test]
     fn c_function_signature() {
         let code = "int authenticate(const char* user, const char* pass) {\n    int result = check_db(user, pass);\n    return result;\n}";
-        let sig = extract_signature(code, Language::C);
+        let sig = extract_signature_for_path(code, Language::C, "");
         assert!(sig.contains("int authenticate"));
         assert!(sig.contains("{ ... }"));
         assert!(!sig.contains("check_db"));
@@ -268,7 +259,7 @@ mod tests {
     #[test]
     fn fallback_for_unknown_language() {
         let code = "line1\nline2\nline3\nline4\nline5\nline6";
-        let sig = extract_signature(code, Language::Unknown);
+        let sig = extract_signature_for_path(code, Language::Unknown, "");
         assert!(sig.contains("line1"));
         assert!(sig.contains("line3"));
         assert!(sig.contains("[... 3 more lines]"));
@@ -278,7 +269,7 @@ mod tests {
     #[test]
     fn short_content_unchanged() {
         let code = "const X: i32 = 42;";
-        let sig = extract_signature(code, Language::Rust);
+        let sig = extract_signature_for_path(code, Language::Rust, "");
         // No body to strip, fallback returns as-is since <= 3 lines.
         assert_eq!(sig, code);
     }
@@ -286,7 +277,7 @@ mod tests {
     #[test]
     fn rust_struct_signature() {
         let code = "pub struct Config {\n    pub name: String,\n    pub value: i32,\n}";
-        let sig = extract_signature(code, Language::Rust);
+        let sig = extract_signature_for_path(code, Language::Rust, "");
         assert!(sig.contains("pub struct Config"));
         assert!(sig.contains("{ ... }"));
         assert!(!sig.contains("pub name"));
