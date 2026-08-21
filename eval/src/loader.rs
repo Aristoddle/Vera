@@ -205,5 +205,36 @@ description = "A test repo"
         assert_eq!(manifest.corpus.version, 1);
         assert_eq!(manifest.repos.len(), 1);
         assert_eq!(manifest.repos[0].name, "test-repo");
+        assert!(manifest.semble.is_none());
+    }
+
+    #[test]
+    fn test_load_corpus_with_semble_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let corpus_toml = r#"
+[corpus]
+version = 1
+description = "Semble corpus"
+clone_root = ".bench/repos"
+
+[semble]
+version = "0.5.5"
+commit = "921849164e2632dd4f0e1c1370f82cfe15ed6d6c"
+task_count = 1251
+tasks_sha256 = "6d8befaa3c19211ef6c3df7d0aa7bb1711670ed32f9b0258c289909cdb5b58de"
+
+[[repos]]
+name = "test-repo"
+url = "https://github.com/test/repo.git"
+commit = "abc123"
+language = "Rust"
+description = "A test repo"
+"#;
+        let path = dir.path().join("corpus.toml");
+        fs::write(&path, corpus_toml).unwrap();
+
+        let snapshot = load_corpus(&path).unwrap().semble.unwrap();
+        assert_eq!(snapshot.version, "0.5.5");
+        assert_eq!(snapshot.task_count, 1251);
     }
 }

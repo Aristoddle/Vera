@@ -142,6 +142,21 @@ pub fn print_summary(report: &EvalReport, writer: &mut dyn Write) -> Result<()> 
         "  Corpus version: {}",
         report.version_info.corpus_version
     )?;
+    writeln!(
+        writer,
+        "  Metric contract: {}",
+        report.version_info.metric_contract
+    )?;
+    if let Some(semble) = &report.version_info.semble {
+        writeln!(
+            writer,
+            "  Semble: v{} @ {} ({} tasks, sha256:{})",
+            semble.version,
+            &semble.commit[..semble.commit.len().min(7)],
+            semble.task_count,
+            &semble.tasks_sha256[..semble.tasks_sha256.len().min(8)]
+        )?;
+    }
     if !report.version_info.repo_shas.is_empty() {
         writeln!(writer, "  Repo SHAs:")?;
         let mut shas: Vec<_> = report.version_info.repo_shas.iter().collect();
@@ -216,6 +231,8 @@ mod tests {
             version_info: VersionInfo {
                 tool_version: "0.1.0".to_string(),
                 corpus_version: 1,
+                metric_contract: "vera-graded-2-1-task-mean-v1".to_string(),
+                semble: None,
                 repo_shas: HashMap::from([("ripgrep".to_string(), "abc123".to_string())]),
                 config: HashMap::new(),
                 lane: None,

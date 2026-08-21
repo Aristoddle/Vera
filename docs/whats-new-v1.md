@@ -4,7 +4,7 @@ Vera 1.0 is the feature-complete milestone. The hybrid search pipeline, code-int
 
 ## Search Quality
 
-The v1.0.0 release candidate was measured on the full 1,251-task Semble suite across 63 repositories, using hybrid BM25 and vector retrieval, RRF fusion, and a local ONNX cross-encoder reranker on the `vera-cuda` lane.
+The v1.0.0 release candidate was measured on the full 1,251-task Semble v0.5.5 snapshot across 63 repositories, using hybrid BM25 and vector retrieval, RRF fusion, and a local ONNX cross-encoder reranker on the `vera-cuda` lane. These numbers use Vera's graded metric contract; [benchmark provenance](benchmarks.md#provenance) explains how it differs from Semble's published metric.
 
 | Metric | v1.0.0-rc |
 |--------|-----------|

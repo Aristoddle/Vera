@@ -198,6 +198,8 @@ fn cmd_verify_corpus(corpus_path: &Path) -> Result<()> {
 
 /// Repo paths, SHAs, and benchmark_root scopes from the corpus manifest.
 struct VerifiedCorpus {
+    version: u32,
+    semble: Option<types::SembleSnapshot>,
     repo_paths: HashMap<String, String>,
     repo_shas: HashMap<String, String>,
     benchmark_roots: HashMap<String, String>,
@@ -231,6 +233,8 @@ fn load_verified_corpus(corpus_path: &Path) -> Result<VerifiedCorpus> {
         .collect();
 
     Ok(VerifiedCorpus {
+        version: manifest.corpus.version,
+        semble: manifest.semble,
         repo_paths,
         repo_shas,
         benchmark_roots,
@@ -299,12 +303,16 @@ fn run_lane(
     let provenance = lane.provenance()?;
     runner::attach_provenance(
         &mut report,
-        Some(provenance.clone()),
-        lanes::task_set_identity(&evaluated_tasks),
-        lane.config_map(&provenance),
-        lanes::environment_summary(lane),
-        vera_git_sha(),
-        std::env::args().collect(),
+        runner::ReportProvenance {
+            lane: Some(provenance.clone()),
+            task_set: lanes::task_set_identity(&evaluated_tasks),
+            config: lane.config_map(&provenance),
+            environment: lanes::environment_summary(lane),
+            vera_git_sha: vera_git_sha(),
+            command: std::env::args().collect(),
+            corpus_version: corpus.version,
+            semble: corpus.semble,
+        },
     );
     Ok(report)
 }
@@ -319,12 +327,16 @@ fn run_mock(tasks: Vec<types::BenchmarkTask>, tool_name: &str) -> Result<types::
     };
     runner::attach_provenance(
         &mut report,
-        None,
-        lanes::task_set_identity(&tasks),
-        BTreeMap::new(),
-        lanes::process_environment_summary(),
-        vera_git_sha(),
-        std::env::args().collect(),
+        runner::ReportProvenance {
+            lane: None,
+            task_set: lanes::task_set_identity(&tasks),
+            config: BTreeMap::new(),
+            environment: lanes::process_environment_summary(),
+            vera_git_sha: vera_git_sha(),
+            command: std::env::args().collect(),
+            corpus_version: 1,
+            semble: None,
+        },
     );
     Ok(report)
 }

@@ -171,6 +171,12 @@ pub struct VersionInfo {
     pub tool_version: String,
     /// Corpus manifest version.
     pub corpus_version: u32,
+    /// Metric semantics used to compute the reported quality scores.
+    #[serde(default = "legacy_metric_contract")]
+    pub metric_contract: String,
+    /// Upstream Semble snapshot when this is a Semble-derived corpus.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semble: Option<SembleSnapshot>,
     /// Repo SHAs used (name -> SHA).
     pub repo_shas: HashMap<String, String>,
     /// Configuration parameters (key -> value).
@@ -234,10 +240,25 @@ pub struct TaskSetIdentity {
     pub task_ids_sha256: String,
 }
 
+/// Identity of the upstream Semble task snapshot used by a corpus manifest.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SembleSnapshot {
+    pub version: String,
+    pub commit: String,
+    pub task_count: usize,
+    pub tasks_sha256: String,
+}
+
+fn legacy_metric_contract() -> String {
+    "unknown-legacy".to_string()
+}
+
 /// Corpus manifest parsed from corpus.toml.
 #[derive(Debug, Clone, Deserialize)]
 pub struct CorpusManifest {
     pub corpus: CorpusMetadata,
+    #[serde(default)]
+    pub semble: Option<SembleSnapshot>,
     pub repos: Vec<RepoEntry>,
 }
 
@@ -263,4 +284,50 @@ pub struct RepoEntry {
     /// When set, search results are filtered to only include files under this path.
     #[serde(default)]
     pub benchmark_root: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_version_info_defaults_new_provenance_fields() {
+        let json = r#"{
+            "tool_version": "legacy",
+            "corpus_version": 1,
+            "repo_shas": {}
+        }"#;
+
+        let version: VersionInfo = serde_json::from_str(json).unwrap();
+        assert_eq!(version.metric_contract, "unknown-legacy");
+        assert!(version.semble.is_none());
+    }
+
+    #[test]
+    fn version_info_round_trips_semble_provenance() {
+        let version = VersionInfo {
+            tool_version: "test".to_string(),
+            corpus_version: 1,
+            metric_contract: "vera-graded-2-1-task-mean-v1".to_string(),
+            semble: Some(SembleSnapshot {
+                version: "0.5.5".to_string(),
+                commit: "921849164e2632dd4f0e1c1370f82cfe15ed6d6c".to_string(),
+                task_count: 1251,
+                tasks_sha256: "6d8befaa3c19211ef6c3df7d0aa7bb1711670ed32f9b0258c289909cdb5b58de"
+                    .to_string(),
+            }),
+            repo_shas: HashMap::new(),
+            config: HashMap::new(),
+            lane: None,
+            task_set: None,
+            vera_git_sha: None,
+            command: Vec::new(),
+            environment: BTreeMap::new(),
+        };
+
+        let decoded: VersionInfo =
+            serde_json::from_str(&serde_json::to_string(&version).unwrap()).unwrap();
+        assert_eq!(decoded.metric_contract, version.metric_contract);
+        assert_eq!(decoded.semble.unwrap().task_count, 1251);
+    }
 }

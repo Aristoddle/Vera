@@ -2,9 +2,15 @@
 
 This page tracks the v1.0 full-pipeline results and ablations first, then older snapshots kept for historical comparison.
 
+## Provenance
+
+Semble-derived runs use the task set from [Semble v0.5.5](https://github.com/MinishLab/semble/tree/v0.5.5) at commit `9218491`: 1,251 tasks across 63 pinned repositories. The converter and corpus manifests pin that commit and record a deterministic task-content hash. The 320-task tuning subset is an unchanged 16-repository slice of the same release.
+
+Vera reports `vera-graded-2-1-task-mean-v1`: primary targets have relevance 2, secondary targets have relevance 1, duplicate matching chunks receive credit once, and scores are averaged over tasks. Semble's published tables use binary relevance and repository/language macro averages. The task set is the same, but the two nDCG values are not directly comparable. New JSON reports record both the Semble snapshot and metric contract; older reports without those fields are `unknown-legacy` and use Vera's graded calculation.
+
 ## v1.0 Full-Pipeline Benchmark
 
-The v1.0.0-rc run used the full 1,251-task Semble suite across 63 repos on the `vera-cuda` lane: hybrid BM25+vector retrieval, RRF fusion, and a local ONNX cross-encoder reranker on CUDA, measured 2026-08-16 against the v1.0.0 release candidate. The older "BM25 scoped filters" full-suite row (`nDCG@10` 0.7267, measured in May 2026) was a BM25-only lane using an older harness. Cross-date comparisons are approximate.
+The v1.0.0-rc run used the full Semble v0.5.5 task set on the `vera-cuda` lane: hybrid BM25+vector retrieval, RRF fusion, and a local ONNX cross-encoder reranker on CUDA, measured 2026-08-16 against the v1.0.0 release candidate. The older "BM25 scoped filters" full-suite row (`nDCG@10` 0.7267, measured in May 2026) was a BM25-only lane using an older harness. Cross-date comparisons are approximate.
 
 ### Model Lanes And Partial Runs
 
@@ -182,7 +188,7 @@ Quantized note:
 
 ### Semble Comparison
 
-Vera is benchmarked against [Semble](https://github.com/MinishLab/semble), a Python code search tool using `potion-code-16M` static embeddings.
+Vera is benchmarked on Semble v0.5.5's task set. Rows labeled Semble were produced by Semble's own harness; rows labeled Vera use Vera's graded metric contract described in [Provenance](#provenance).
 
 **320-task subset** (16 repos, used for tuning iteration):
 
