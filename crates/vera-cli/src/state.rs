@@ -395,6 +395,11 @@ fn apply_local_embedding_env(
     if force {
         clear_process_env(vera_core::local_models::LEGACY_EMBEDDING_QUERY_PREFIX_ENV);
     }
+    set_optional_env_value(
+        vera_core::local_models::LOCAL_EMBEDDING_DOCUMENT_PREFIX_ENV,
+        model.and_then(|value| value.document_prefix.as_deref()),
+        force,
+    );
 }
 
 fn set_process_env(key: &str, value: &str) {
@@ -447,6 +452,46 @@ mod tests {
       }
     }"#;
 
+    /// What `vera setup --embedding-document-prefix 'Passage:'` writes. The
+    /// prefix differs from jina's preset so the preset cannot stand in for it.
+    const STORED_DOCUMENT_PREFIX_CONFIG: &str = r#"{
+      "local_embedding_model": {
+        "source": {"source": "hugging-face",
+                   "repo": "jinaai/jina-embeddings-v5-text-nano-retrieval"},
+        "onnx_file": "onnx/model_quantized.onnx",
+        "onnx_data_file": "onnx/model_quantized.onnx_data",
+        "tokenizer_file": "tokenizer.json",
+        "embedding_dim": 768,
+        "pooling": "last-token",
+        "max_length": 512,
+        "query_prefix": "Query:",
+        "document_prefix": "Passage:"
+      }
+    }"#;
+
+    /// A stored model that prefixes queries only.
+    ///
+    /// The repo is jina's so that `defaults_for_source` answers it with a preset
+    /// that *does* carry a document prefix. That is not because the resolution
+    /// consults it (the test pins the arm actually taken), but because a preset
+    /// prefix is what gives the `None` assertion something to fail against:
+    /// delete the explicit-model short-circuit and jina's
+    /// `Document:` surfaces. An unrecognised repo would fall to
+    /// `generic_defaults`, whose document prefix is `None` on both sides of that
+    /// change, so nothing could distinguish them.
+    const STORED_QUERY_PREFIX_ONLY_CONFIG: &str = r#"{
+      "local_embedding_model": {
+        "source": {"source": "hugging-face",
+                   "repo": "jinaai/jina-embeddings-v5-text-nano-retrieval"},
+        "onnx_file": "onnx/model_quantized.onnx",
+        "tokenizer_file": "tokenizer.json",
+        "embedding_dim": 384,
+        "pooling": "cls",
+        "max_length": 256,
+        "query_prefix": "Ask:"
+      }
+    }"#;
+
     /// Everything `apply_saved_env_impl` can write, plus the redirect itself.
     const RESTORED_ENV_KEYS: &[&str] = &[
         "VERA_HOME",
@@ -467,6 +512,7 @@ mod tests {
         vera_core::local_models::LOCAL_EMBEDDING_POOLING_ENV,
         vera_core::local_models::LOCAL_EMBEDDING_MAX_LENGTH_ENV,
         vera_core::local_models::LOCAL_EMBEDDING_QUERY_PREFIX_ENV,
+        vera_core::local_models::LOCAL_EMBEDDING_DOCUMENT_PREFIX_ENV,
         vera_core::local_models::LEGACY_EMBEDDING_QUERY_PREFIX_ENV,
     ];
 
@@ -571,6 +617,103 @@ mod tests {
         );
 
         assert_eq!(stored_pooling_on_disk(), "mean");
+    }
+
+    #[test]
+    fn stored_document_prefix_reaches_the_env_config() {
+        let _guard = with_stored_config(STORED_DOCUMENT_PREFIX_CONFIG);
+
+        apply_saved_env_force().unwrap();
+
+        // `from_env` is the only reader the embedding pipeline has, so a stored
+        // prefix that never reaches the environment is a dropped flag.
+        let model = vera_core::local_models::LocalEmbeddingModelConfig::from_env().unwrap();
+        assert_eq!(model.document_prefix.as_deref(), Some("Passage:"));
+    }
+
+    #[test]
+    fn a_stored_config_without_a_document_prefix_clears_a_stale_one() {
+        let _guard = with_stored_config(STORED_QUERY_PREFIX_ONLY_CONFIG);
+        set_process_env(
+            vera_core::local_models::LOCAL_EMBEDDING_DOCUMENT_PREFIX_ENV,
+            "Stale-Passage-Marker:",
+        );
+
+        apply_saved_env_force().unwrap();
+
+        // Forcing the stored config over the environment has to remove a
+        // document prefix the stored config does not have, or an inherited one
+        // would keep prefixing passages the stored model never asked for.
+        assert!(
+            std::env::var_os(vera_core::local_models::LOCAL_EMBEDDING_DOCUMENT_PREFIX_ENV)
+                .is_none()
+        );
+        // Clearing one side must not clear the other.
+        assert_eq!(
+            std::env::var(vera_core::local_models::LOCAL_EMBEDDING_QUERY_PREFIX_ENV).unwrap(),
+            "Ask:"
+        );
+
+        // The force path exports a source and an onnx file together, which is
+        // exactly the pair `model_source_and_onnx_file_are_set` tests, so
+        // `explicit_model_env` is always on downstream of it. That makes
+        // `resolve_optional_env_value` take its `None if explicit_model_env`
+        // arm; the `None => default` arm is unreachable from this entry point,
+        // so no fixture stored through `config.json` can exercise it.
+        assert!(
+            std::env::var_os(vera_core::local_models::LOCAL_EMBEDDING_REPO_ENV).is_some()
+                && std::env::var_os(vera_core::local_models::LOCAL_EMBEDDING_ONNX_FILE_ENV)
+                    .is_some(),
+            "the force path is supposed to make the model explicit through the environment"
+        );
+
+        let model = vera_core::local_models::LocalEmbeddingModelConfig::from_env().unwrap();
+        assert_eq!(model.query_prefix.as_deref(), Some("Ask:"));
+        // What is left to pin is that arm returning nothing rather than the
+        // preset's prefix. There is a preset prefix to return, so `None` below
+        // is a declined default and not an absent one.
+        assert!(
+            vera_core::local_models::LocalEmbeddingModelConfig::jina()
+                .document_prefix
+                .is_some(),
+            "the fixture's repo must have a preset document prefix, or `None` below proves nothing"
+        );
+        assert_eq!(model.document_prefix, None);
+    }
+
+    /// The opt-out has to survive the file and the environment, not just the
+    /// struct. It used to be filtered out on the way to `config.json`, whose
+    /// missing key then let jina's preset reinstate the prefix on the next run,
+    /// so disabling a prefix lasted exactly one invocation.
+    #[test]
+    fn an_explicitly_emptied_prefix_survives_a_save_and_reload() {
+        let _guard = with_stored_config("{}");
+
+        let mut model = vera_core::local_models::LocalEmbeddingModelConfig::jina();
+        model.query_prefix = Some(String::new());
+        model.document_prefix = Some(String::new());
+        save_local_embedding_model(&model).unwrap();
+
+        // The empty value has to reach the file; a skipped key is what the
+        // preset fills back in.
+        let raw = fs::read(config_path().unwrap()).unwrap();
+        let stored: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(stored["local_embedding_model"]["query_prefix"], "");
+        assert_eq!(stored["local_embedding_model"]["document_prefix"], "");
+
+        apply_saved_env_force().unwrap();
+
+        let reloaded = vera_core::local_models::LocalEmbeddingModelConfig::from_env().unwrap();
+        assert_eq!(
+            reloaded.query_prefix, None,
+            "jina's preset query prefix came back after an explicit opt-out"
+        );
+        assert_eq!(
+            reloaded.document_prefix, None,
+            "jina's preset document prefix came back after an explicit opt-out"
+        );
+        assert_eq!(reloaded.query_text("find main"), "find main");
+        assert_eq!(reloaded.document_text("fn main() {}"), "fn main() {}");
     }
 
     #[test]

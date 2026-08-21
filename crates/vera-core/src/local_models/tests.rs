@@ -596,7 +596,12 @@ fn preset_identity_changes_with_pooling_so_stale_indexes_are_detected() {
     let jina = LocalEmbeddingModelConfig::jina();
     assert_eq!(
         jina.model_identity(),
-        format!("{}|pooling=last-token", jina.display_name())
+        format!(
+            "{}|pooling=last-token|qp={}:{JINA_QUERY_PREFIX}|dp={}:{JINA_DOCUMENT_PREFIX}",
+            jina.display_name(),
+            JINA_QUERY_PREFIX.len(),
+            JINA_DOCUMENT_PREFIX.len()
+        )
     );
     // The repo still has to be recognisable in the stored name.
     assert!(jina.model_identity().starts_with(&jina.display_name()));
@@ -613,11 +618,16 @@ fn coderank_preset_identity_records_its_pooling() {
     // jina, so it carries the same obligation: pooling stays in the identity,
     // and the repo stays readable in it. Asserting the exact preset form keeps
     // this from passing on a CodeRankEmbed that quietly fell through to the
-    // generic branch.
+    // generic branch. CodeRankEmbed prefixes queries only, so it is also the
+    // preset that pins how the absent document side is spelled.
     let coderank = LocalEmbeddingModelConfig::coderankembed();
     assert_eq!(
         coderank.model_identity(),
-        format!("{}|pooling=cls", coderank.display_name())
+        format!(
+            "{}|pooling=cls|qp={}:{CODERANK_QUERY_PREFIX}|dp=none",
+            coderank.display_name(),
+            CODERANK_QUERY_PREFIX.len()
+        )
     );
     assert!(
         coderank
@@ -674,6 +684,7 @@ fn legacy_jina_literal_stays_pinned_when_the_constants_move() {
             pooling: LocalEmbeddingPooling::Mean,
             max_length: 512,
             query_prefix: None,
+            document_prefix: None,
         }
     );
 
@@ -705,36 +716,58 @@ fn legacy_jina_literal_stays_pinned_when_the_constants_move() {
     );
     assert_eq!(legacy.embedding_dim, EMBEDDING_DIM, "{GUIDANCE}");
     assert_eq!(legacy.max_length, EMBEDDING_MAX_LENGTH, "{GUIDANCE}");
+
+    // Half three: the two fields that deliberately do *not* track the preset.
+    // A pre-fix `config.json` predates the retrieval prefixes, so it carries
+    // neither. Copying `JINA_QUERY_PREFIX`/`JINA_DOCUMENT_PREFIX` in here to
+    // "match the preset" would stop the literal matching any file on any real
+    // install, and every pre-fix install would stay mean-pooled with no error.
+    assert_eq!(legacy.query_prefix, None, "{GUIDANCE}");
+    assert_eq!(legacy.document_prefix, None, "{GUIDANCE}");
 }
 
 #[test]
-fn explicit_mean_on_the_default_repo_is_repaired_with_the_legacy_default() {
-    // `--embedding-pooling mean` on the default repo, changing nothing else,
-    // writes byte-for-byte the config.json an older `vera setup` wrote on its
-    // own. Nothing in the file distinguishes the two, so the migration cannot
-    // spare this user's choice without sparing every pre-fix install as well.
-    // Overwriting it is the knowingly accepted side of that trade, not a bug
-    // to fix here, and this asserts the behaviour that actually ships rather
-    // than the behaviour the neighbouring test's comment implies.
+fn explicit_mean_on_the_default_repo_is_no_longer_the_legacy_default() {
+    // Before the retrieval prefixes, `--embedding-pooling mean` on the default
+    // repo wrote byte-for-byte the config.json an older `vera setup` wrote on
+    // its own, so the migration could not spare this user's choice without
+    // sparing every pre-fix install with it. The prefixes end that collision:
+    // a pre-fix file predates them and carries neither, so an explicit mean
+    // written today is distinguishable and is left alone.
     let mut explicit_mean = LocalEmbeddingModelConfig::jina();
     explicit_mean.pooling = LocalEmbeddingPooling::Mean;
-    assert_eq!(
+    assert_ne!(
         explicit_mean,
         LocalEmbeddingModelConfig::legacy_jina_before_pooling_fix()
     );
-
     assert_eq!(
-        explicit_mean.repair_stored_defaults(),
+        explicit_mean.clone().repair_stored_defaults(),
+        explicit_mean
+    );
+
+    // Pooling aside, that config differs from the historical file in the
+    // prefixes and in nothing else — so the prefixes are what spares it, and
+    // the historical file itself is still migrated.
+    let mut without_prefixes = explicit_mean;
+    without_prefixes.query_prefix = None;
+    without_prefixes.document_prefix = None;
+    assert_eq!(
+        without_prefixes,
+        LocalEmbeddingModelConfig::legacy_jina_before_pooling_fix()
+    );
+    assert_eq!(
+        without_prefixes.repair_stored_defaults(),
         LocalEmbeddingModelConfig::jina()
     );
 }
 
 #[test]
 fn repair_leaves_customised_and_unrelated_configs_alone() {
-    // A deliberate non-default choice on the same repo survives as long as
-    // some field other than pooling also differs from the historical default —
-    // `max_length` here. Pooling alone does not; see
-    // `explicit_mean_on_the_default_repo_is_repaired_with_the_legacy_default`.
+    // A deliberate non-default choice on the same repo survives; `max_length`
+    // here differs from the historical default on top of the pooling. Pooling
+    // alone survives too, now that the retrieval prefixes separate a config
+    // written today from the pre-fix file — see
+    // `explicit_mean_on_the_default_repo_is_no_longer_the_legacy_default`.
     let mut customised = LocalEmbeddingModelConfig::jina();
     customised.pooling = LocalEmbeddingPooling::Mean;
     customised.max_length = 256;
@@ -750,4 +783,163 @@ fn repair_leaves_customised_and_unrelated_configs_alone() {
     assert_eq!(jina.clone().repair_stored_defaults(), jina);
     let coderank = LocalEmbeddingModelConfig::coderankembed();
     assert_eq!(coderank.clone().repair_stored_defaults(), coderank);
+}
+
+#[test]
+fn jina_preset_carries_both_retrieval_prefixes() {
+    // config_sentence_transformers.json declares
+    // {"query": "Query: ", "document": "Document: "} and the card requires both
+    // sides for the retrieval variant.
+    let config = LocalEmbeddingModelConfig::jina();
+    assert_eq!(
+        config.query_text("find router code"),
+        "Query: find router code"
+    );
+    assert_eq!(
+        config.document_text("fn route() {}"),
+        "Document: fn route() {}"
+    );
+}
+
+#[test]
+fn document_prefix_is_independent_of_query_prefix() {
+    // CodeRankEmbed is query-prefixed only. A document prefix must not appear
+    // from nowhere, and the query prefix must not leak onto passages.
+    let coderank = LocalEmbeddingModelConfig::coderankembed();
+    assert!(coderank.document_prefix.is_none());
+    assert_eq!(coderank.document_text("fn route() {}"), "fn route() {}");
+    assert_eq!(
+        coderank.query_text("find router code"),
+        "Represent this query for searching relevant code: find router code"
+    );
+
+    // An unprefixed model leaves both sides untouched.
+    let plain = LocalEmbeddingModelConfig::from_huggingface_repo("some-org/some-encoder");
+    assert_eq!(plain.query_text("q"), "q");
+    assert_eq!(plain.document_text("d"), "d");
+}
+
+#[test]
+fn prefixes_are_part_of_the_model_identity() {
+    // Prefixes change the embedded text, so they change the vector space and
+    // must invalidate an index the same way pooling does. Mutating a preset
+    // would only prove that the identity switches to its custom-config form,
+    // so the comparison is between configs that already take that form and
+    // differ in nothing but a prefix.
+    let base = LocalEmbeddingModelConfig::from_huggingface_repo("some-org/some-encoder");
+
+    let mut query_prefixed = base.clone();
+    query_prefixed.query_prefix = Some("Query:".to_string());
+    assert_ne!(base.model_identity(), query_prefixed.model_identity());
+
+    let mut document_prefixed = base.clone();
+    document_prefixed.document_prefix = Some("Document:".to_string());
+    assert_ne!(base.model_identity(), document_prefixed.model_identity());
+
+    // The two sides are recorded separately, so swapping which one is set is
+    // not the same model.
+    assert_ne!(
+        query_prefixed.model_identity(),
+        document_prefixed.model_identity()
+    );
+
+    // The preset form has to name both too, or jina's own identity would not
+    // move when the prefixes were introduced.
+    let jina = LocalEmbeddingModelConfig::jina();
+    assert!(jina.model_identity().contains("qp=6:Query:"));
+    assert!(jina.model_identity().contains("dp=9:Document:"));
+}
+
+#[test]
+fn an_absent_prefix_is_not_the_same_identity_as_a_literal_dash() {
+    // `unwrap_or("-")` spelled both of these `-`, so an index embedded with no
+    // prefix at all passed the staleness check against a config whose prefix is
+    // the literal `-`, and `vera update` appended incompatible vectors to it.
+    let base = LocalEmbeddingModelConfig::from_huggingface_repo("acme/prefix-identity-fixture");
+    assert!(base.query_prefix.is_none());
+    assert!(base.document_prefix.is_none());
+
+    let mut dash_query = base.clone();
+    dash_query.query_prefix = Some("-".to_string());
+    // The two configs really do embed different text, so the identity has to
+    // move with them.
+    assert_ne!(base.query_text("q"), dash_query.query_text("q"));
+    assert_ne!(base.model_identity(), dash_query.model_identity());
+
+    let mut dash_document = base.clone();
+    dash_document.document_prefix = Some("-".to_string());
+    assert_ne!(base.document_text("d"), dash_document.document_text("d"));
+    assert_ne!(base.model_identity(), dash_document.model_identity());
+
+    // And a dash on one side is not a dash on the other.
+    assert_ne!(dash_query.model_identity(), dash_document.model_identity());
+}
+
+#[test]
+fn a_prefix_cannot_forge_an_identity_field_boundary() {
+    // `|qp=` and `|dp=` were ordinary text inside a prefix, so a value carrying
+    // one shifted where the next field started. These two configs prefix
+    // different text on both sides and encoded to a single identity string.
+    let base = LocalEmbeddingModelConfig::from_huggingface_repo("acme/prefix-identity-fixture");
+
+    let mut carried_by_query = base.clone();
+    carried_by_query.query_prefix = Some("alpha|dp=beta|qp=gamma".to_string());
+    carried_by_query.document_prefix = Some("delta".to_string());
+
+    let mut carried_by_document = base.clone();
+    carried_by_document.query_prefix = Some("alpha".to_string());
+    carried_by_document.document_prefix = Some("beta|qp=gamma|dp=delta".to_string());
+
+    assert_ne!(
+        carried_by_query.query_text("q"),
+        carried_by_document.query_text("q")
+    );
+    assert_ne!(
+        carried_by_query.model_identity(),
+        carried_by_document.model_identity()
+    );
+}
+
+#[test]
+fn identity_matches_on_prefixes_that_embed_the_same_text() {
+    // The identity is a staleness guard, not a config diff. Trimming and the
+    // empty-to-absent fold happen before the text is embedded, so configs that
+    // feed the model byte-identical input must agree, or every one of these
+    // spellings would demand its own full re-index for nothing.
+    let base = LocalEmbeddingModelConfig::from_huggingface_repo("acme/prefix-identity-fixture");
+
+    for equivalent_to_absent in ["", "   ", "\t\n"] {
+        let mut blank = base.clone();
+        blank.query_prefix = Some(equivalent_to_absent.to_string());
+        blank.document_prefix = Some(equivalent_to_absent.to_string());
+        assert_eq!(blank.query_text("q"), base.query_text("q"));
+        assert_eq!(blank.document_text("d"), base.document_text("d"));
+        assert_eq!(
+            blank.model_identity(),
+            base.model_identity(),
+            "prefix {equivalent_to_absent:?} embeds exactly what no prefix embeds"
+        );
+    }
+
+    let mut tight = base.clone();
+    tight.query_prefix = Some("Ask:".to_string());
+    let mut padded = base.clone();
+    padded.query_prefix = Some("  Ask:  ".to_string());
+    assert_eq!(tight.query_text("q"), padded.query_text("q"));
+    assert_eq!(tight.model_identity(), padded.model_identity());
+}
+
+#[test]
+fn prefix_joins_with_exactly_one_space_however_it_is_written() {
+    let mut config = LocalEmbeddingModelConfig::jina();
+    for spelling in ["Query:", "Query: ", "  Query:  "] {
+        config.query_prefix = Some(spelling.to_string());
+        assert_eq!(config.query_text("q"), "Query: q", "spelling {spelling:?}");
+    }
+    config.query_prefix = Some("   ".to_string());
+    assert_eq!(
+        config.query_text("q"),
+        "q",
+        "whitespace-only prefix should be ignored"
+    );
 }
