@@ -452,6 +452,144 @@ async fn search_hybrid_keeps_intent_out_of_bm25() {
     );
 }
 
+/// An embedding provider that spends a known amount of time in `embed_batch`,
+/// so the model cost dominates the span the storage stages share with it and
+/// its attribution is decidable from the reported stages alone.
+struct SlowProvider {
+    inner: crate::embedding::test_helpers::MockProvider,
+    delay: std::time::Duration,
+}
+
+impl crate::embedding::EmbeddingProvider for SlowProvider {
+    async fn embed_batch(
+        &self,
+        texts: &[String],
+    ) -> Result<Vec<Vec<f32>>, crate::embedding::EmbeddingError> {
+        tokio::time::sleep(self.delay).await;
+        self.inner.embed_batch(texts).await
+    }
+
+    fn expected_dim(&self) -> Option<usize> {
+        self.inner.expected_dim()
+    }
+}
+
+// Regression for issue #105: `embedding` and `vector` were both assigned the
+// span that covers the embedding, the store opens, the KNN query and
+// hydration, so `--timing` printed one measurement twice.
+//
+// The split itself is asserted by `charge_vector_span_partitions_the_span`
+// below, on values rather than on a clock. It has to be, because the span the
+// two stages are cut from is internal to `search_hybrid` and no measurement
+// available to this test stands in for it. The wall time of the whole call
+// does not: BM25 runs concurrently with the vector arm and is awaited after
+// it, so that wall time is the slower arm's. Guarding on the reported BM25
+// stage does not repair the substitution, because `bm25_elapsed` starts inside
+// the `spawn_blocking` closure and so measures the arm's duration, not when it
+// finished relative to the vector arm.
+//
+// Nor is the storage stage small enough to be bounded by the injected model
+// cost. Measured on this fixture, `vector` is 1.6 to 2.9 ms standalone but
+// 262.7 ms inside the 794-test suite, against a 300 ms sleep: a 1.14x margin.
+// Every bound of that family, absolute or relative to a second run, sits on
+// the wrong side of that number, so this test asserts none of them.
+//
+// What is left here is machine-independent and worth keeping: the provider
+// cost reaches `embedding`, the storage cost still reaches `vector`, and the
+// two are no longer one value reported twice, which is the symptom #105 was
+// filed for.
+#[tokio::test]
+async fn search_hybrid_charges_embedding_delay_to_embedding_not_vector() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (index_dir, dim) = setup_test_index(tmp.path()).await;
+
+    let delay = std::time::Duration::from_millis(300);
+    let provider = SlowProvider {
+        inner: crate::embedding::test_helpers::MockProvider::new(dim),
+        delay,
+    };
+
+    let (_results, timings) = search_hybrid(
+        &index_dir,
+        &provider,
+        "authenticate",
+        "authenticate",
+        &SearchFilters::default(),
+        5,
+        60.0,
+        dim,
+        50,
+    )
+    .await
+    .unwrap();
+
+    let embedding = timings.embedding.expect("embedding stage must be reported");
+    let vector = timings.vector.expect("vector stage must be reported");
+
+    // `sleep` never returns early, so this is a property of the provider rather
+    // than of the machine: the model cost reaches `embedding`.
+    assert!(
+        embedding >= delay,
+        "embedding must carry the provider cost: {embedding:?} < {delay:?}"
+    );
+
+    // Taking the embedding out must not empty the stage: the store opens, the
+    // KNN query and hydration are still charged to `vector`. This presence has
+    // to be asserted before the non-identity below, which a zeroed `vector`
+    // would otherwise satisfy.
+    assert!(
+        vector > std::time::Duration::ZERO,
+        "vector must still carry the storage cost: {vector:?}"
+    );
+
+    // The reported symptom. Under the bug both stages were assigned the same
+    // `Duration` value, so this fails on the bug whatever the machine is doing;
+    // reaching it legitimately would need the storage cost to equal the model
+    // cost to the nanosecond.
+    assert_ne!(
+        embedding, vector,
+        "the two stages must not be one measurement printed twice"
+    );
+}
+
+// The split itself, on values. `search_hybrid` cannot expose the span it cuts,
+// so this asserts the cut where it is decidable: given a span and the embedding
+// measurement taken inside it, the two stages must partition the span. Under
+// the bug each stage got the whole span, which this rejects without a clock.
+//
+// `charge_vector_span` writes both `HybridTimings` fields rather than returning
+// two values for the caller to assign, so this test covers the assignment as
+// well as the arithmetic. That is deliberate. While the caller did the
+// assigning, a caller that kept the remainder on `vector` but charged the whole
+// span to `embedding` passed this test and the one above together, which is a
+// second way to make `embedding` unattributable. The three durations here are
+// distinct so neither field can hold the whole span by coincidence.
+#[test]
+fn charge_vector_span_partitions_the_span() {
+    let span = std::time::Duration::from_millis(500);
+    let embed = std::time::Duration::from_millis(300);
+
+    let mut timings = HybridTimings::default();
+    charge_vector_span(&mut timings, span, Some(embed));
+
+    assert_eq!(
+        (timings.embedding, timings.vector),
+        (Some(embed), Some(std::time::Duration::from_millis(200))),
+        "embedding takes the model cost and vector takes the remainder"
+    );
+
+    // A vector search that failed reports no embedding, so the whole span is
+    // storage cost rather than being dropped.
+    let mut failed = HybridTimings::default();
+    charge_vector_span(&mut failed, span, None);
+
+    assert_eq!(
+        (failed.embedding, failed.vector),
+        (None, Some(span)),
+        "an unmeasured embedding leaves the whole span on vector"
+    );
+}
+
 #[tokio::test]
 async fn search_hybrid_reranked_returns_reranked_results() {
     use crate::embedding::test_helpers::MockProvider;

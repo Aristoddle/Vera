@@ -22,7 +22,7 @@ use crate::retrieval::query_classifier::{QueryType, classify_query, params_for_q
 use crate::retrieval::query_utils::result_key;
 use crate::retrieval::ranking::is_path_weighted_query;
 use crate::retrieval::reranker::{Reranker, rerank_results};
-use crate::retrieval::vector::{VectorSearchError, search_vector_with_stores};
+use crate::retrieval::vector::{VectorSearchError, search_vector_with_stores_timed};
 use crate::storage::bm25::Bm25Index;
 use crate::storage::metadata::MetadataStore;
 use crate::storage::vector::VectorStore;
@@ -134,14 +134,14 @@ pub async fn search_hybrid(
     } else {
         vector_candidates.saturating_mul(4).max(200)
     };
-    let embed_start = Instant::now();
-    let vector_results = match VectorStore::open(&index_dir.join("vectors.db"), stored_dim) {
+    let vector_start = Instant::now();
+    let vector_outcome = match VectorStore::open(&index_dir.join("vectors.db"), stored_dim) {
         Ok(vector_store) => {
             let vector_store_result =
                 MetadataStore::open(&vector_metadata_path).context("failed to open metadata store");
             match vector_store_result {
                 Ok(vector_metadata) => {
-                    match search_vector_with_stores(
+                    match search_vector_with_stores_timed(
                         &vector_store,
                         &vector_metadata,
                         provider,
@@ -150,11 +150,11 @@ pub async fn search_hybrid(
                     )
                     .await
                     {
-                        Ok(mut results) => {
+                        Ok((mut results, embed_elapsed)) => {
                             if !filters.is_empty() {
                                 results.retain(|result| filters.matches(result));
                             }
-                            Ok(results)
+                            Ok((results, embed_elapsed))
                         }
                         Err(err) => Err(err),
                     }
@@ -166,9 +166,12 @@ pub async fn search_hybrid(
             err.context("failed to open vector store"),
         )),
     };
-    let vector_elapsed = embed_start.elapsed();
-    timings.embedding = Some(vector_elapsed);
-    timings.vector = Some(vector_elapsed);
+    let embed_elapsed = vector_outcome
+        .as_ref()
+        .ok()
+        .map(|(_, embed_elapsed)| *embed_elapsed);
+    charge_vector_span(&mut timings, vector_start.elapsed(), embed_elapsed);
+    let vector_results = vector_outcome.map(|(results, _)| results);
 
     // Await the BM25 result (should already be done or nearly done).
     let (bm25_results, bm25_elapsed) = bm25_handle.await.map_err(|e| {
@@ -442,6 +445,29 @@ pub fn fuse_rrf_multi_weighted(
             result
         })
         .collect()
+}
+
+/// Charge the one wall-clock span that covers the vector arm to the two stages
+/// `--timing` reports.
+///
+/// The query embedding runs inside the vector search, so both stages come out
+/// of `vector_span`. `embedding` gets the model cost and `vector` gets the
+/// remainder, which is the storage cost: opening both stores, the KNN query and
+/// metadata hydration. A vector search that failed has no embedding measurement
+/// to report, so the whole span stays on `vector`.
+///
+/// The two must partition the span rather than each be given all of it, which
+/// is what issue #105 was: the same value reported twice made either stage
+/// unattributable. Both fields are written here rather than at the call site so
+/// that partition is decided in one place a test can reach: a caller that only
+/// received the two values could still charge the span twice.
+fn charge_vector_span(
+    timings: &mut HybridTimings,
+    vector_span: Duration,
+    embed_elapsed: Option<Duration>,
+) {
+    timings.embedding = embed_elapsed;
+    timings.vector = Some(vector_span.saturating_sub(embed_elapsed.unwrap_or_default()));
 }
 
 #[cfg(test)]
