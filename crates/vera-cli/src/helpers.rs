@@ -59,11 +59,6 @@ where
     result.with_context(|| format!("{operation_name} task failed"))?
 }
 
-/// Load the effective runtime configuration.
-pub fn load_runtime_config() -> anyhow::Result<vera_core::config::VeraConfig> {
-    crate::state::load_runtime_config()
-}
-
 pub fn warn_if_index_stale(repo_path: &Path, indexing_config: &vera_core::config::IndexingConfig) {
     match vera_core::indexing::detect_staleness(repo_path, indexing_config) {
         Ok(freshness) => {

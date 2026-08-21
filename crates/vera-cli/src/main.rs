@@ -74,7 +74,7 @@ fn main() {
             } else {
                 vera_core::config::resolve_backend(backend.explicit_backend())
             };
-            let config = match helpers::load_runtime_config() {
+            let config = match state::load_runtime_config() {
                 Ok(c) => c,
                 Err(e) => {
                     eprintln!("Error loading config: {e:#}");

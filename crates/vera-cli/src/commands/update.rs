@@ -8,7 +8,8 @@ use anyhow::{Context, bail};
 use vera_core::config::InferenceBackend;
 use vera_core::indexing::{UpdateOptions, UpdateProgress};
 
-use crate::helpers::{cancel_task_on_signal, load_runtime_config, wait_for_interrupt};
+use crate::helpers::{cancel_task_on_signal, wait_for_interrupt};
+use crate::state;
 
 pub struct CommandOptions {
     pub backend: InferenceBackend,
@@ -47,7 +48,7 @@ pub fn run(path: &str, json_output: bool, options: CommandOptions) -> anyhow::Re
     let rt = tokio::runtime::Runtime::new()
         .map_err(|e| anyhow::anyhow!("failed to create async runtime: {e}"))?;
 
-    let mut config = load_runtime_config()?;
+    let mut config = state::load_runtime_config()?;
     config.adjust_for_backend(backend);
     config.indexing.extra_excludes = exclude;
     config.indexing.no_ignore = no_ignore;

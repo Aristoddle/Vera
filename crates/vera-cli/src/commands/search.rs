@@ -8,7 +8,8 @@ use vera_core::config::{InferenceBackend, VeraConfig};
 use vera_core::retrieval::search_service::{SearchContext, SearchTimings};
 use vera_core::types::{SearchFilters, SearchResult};
 
-use crate::helpers::{load_runtime_config, output_results, prepare_indexed_search};
+use crate::helpers::{output_results, prepare_indexed_search};
+use crate::state;
 
 /// Run the `vera search <query>` command.
 #[allow(clippy::too_many_arguments)]
@@ -25,7 +26,7 @@ pub fn run(
     compact: bool,
     backend: InferenceBackend,
 ) -> anyhow::Result<()> {
-    let mut config = load_runtime_config()?;
+    let mut config = state::load_runtime_config()?;
     config.adjust_for_backend(backend);
     let result_limit = limit.unwrap_or(config.retrieval.default_limit);
     let queries = vera_core::retrieval::normalize_queries(queries);

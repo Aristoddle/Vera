@@ -8,9 +8,8 @@ use anyhow::{Context, bail};
 use vera_core::config::InferenceBackend;
 use vera_core::indexing::IndexProgress;
 
-use crate::helpers::{
-    cancel_task_on_signal, load_runtime_config, print_human_summary, wait_for_interrupt,
-};
+use crate::helpers::{cancel_task_on_signal, print_human_summary, wait_for_interrupt};
+use crate::state;
 
 /// Run the `vera index <path>` command.
 #[allow(clippy::too_many_arguments)]
@@ -77,7 +76,7 @@ pub fn execute(
     let rt = tokio::runtime::Runtime::new()
         .map_err(|e| anyhow::anyhow!("failed to create async runtime: {e}"))?;
 
-    let mut config = load_runtime_config()?;
+    let mut config = state::load_runtime_config()?;
     if low_vram {
         config.embedding.low_vram = true;
     }
