@@ -275,8 +275,12 @@ Key flags:
 - `--port <PORT>`: TCP port to listen on (default: 3000)
 - `--host <HOST>`: bind address (default: 127.0.0.1)
 - `--api-key <KEY>`: require Bearer token authentication (or set `VERA_SERVE_KEY`)
-- `--idle-timeout <SECS>`: seconds of inactivity before unloading models from memory (0 = reload per request, -1 = keep loaded indefinitely, default: 0)
+- `--idle-timeout <SECS>`: seconds of inactivity before unloading a model from memory (default: 300). Any negative value, `-1` included, keeps models loaded for the lifetime of the process. `0` disables the cache, rebuilding the model on every request and holding one live model per concurrent request; it exists to pick up model files replaced under a running server, and makes indexing through the server far slower.
 - Backend flags: `--potion-code`, `--onnx-jina-cuda`, `--onnx-jina-rocm`, `--onnx-jina-coreml`, `--onnx-jina-openvino`, `--onnx-jina-directml`, or `--api`
+
+The embedding model is loaded before the server accepts connections and kept, so the first request does not pay for a load. It is then subject to the same idle eviction as any other resident model, so under the default it is unloaded after 300 seconds with no requests and reloaded on the next one.
+
+The reranker is validated at startup too, but that probe is discarded rather than kept: a server that only answers `/v1/embeddings` would otherwise hold it for nothing. The first `/v1/rerank` request loads it again, for serving.
 
 ### Diagnostics
 
