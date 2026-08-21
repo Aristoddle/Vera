@@ -163,7 +163,7 @@ fn run_wizard() -> anyhow::Result<()> {
     // Step 3: Optional indexing
     cliclack::log::step("Step 3: Index a project")?;
     let index_now: bool = cliclack::confirm("Index a project now?")
-        .initial_value(false)
+        .initial_value(true)
         .interact()?;
     if index_now {
         let path: String = cliclack::input("Project path")

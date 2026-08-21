@@ -1,14 +1,14 @@
 //! `vera search <query>` — Search the indexed codebase.
 
 use anyhow::bail;
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::path::Path;
 use std::time::{Duration, Instant};
 use vera_core::config::{InferenceBackend, VeraConfig};
 use vera_core::retrieval::search_service::{SearchContext, SearchTimings};
 use vera_core::types::{SearchFilters, SearchResult};
 
-use crate::helpers::{output_results, prepare_indexed_search};
+use crate::helpers::{output_results, prepare_indexed_search, should_offer_auto_index};
 use crate::state;
 
 /// Run the `vera search <query>` command.
@@ -36,6 +36,29 @@ pub fn run(
             "search query is empty.\n\
              Hint: pass at least one non-empty quoted query."
         );
+    }
+
+    let cwd = std::env::current_dir()
+        .map_err(|e| anyhow::anyhow!("failed to get current directory: {e}"))?;
+    if !vera_core::indexing::index_dir(&cwd).exists()
+        && should_offer_auto_index(
+            json_output,
+            std::io::stdin().is_terminal() && std::io::stderr().is_terminal(),
+        )
+        && cliclack::confirm("No index found. Index the current directory now?")
+            .initial_value(true)
+            .interact()?
+    {
+        crate::commands::index::execute(
+            cwd.to_string_lossy().as_ref(),
+            false,
+            backend,
+            Vec::new(),
+            false,
+            false,
+            false,
+            false,
+        )?;
     }
 
     let (index_dir, filters) =

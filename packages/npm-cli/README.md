@@ -15,12 +15,11 @@ npm install -g @vera-ai/cli
 ## Quick Start
 
 ```bash
-vera setup --potion-code
-vera index .
+vera setup --potion-code --index .
 vera search "authentication logic"
 ```
 
-`vera setup` with no flags runs an interactive wizard. `vera setup --api` prompts for an OpenAI-compatible endpoint and key; use `--yes` with `EMBEDDING_MODEL_*` variables for non-interactive setup. `vera agent install` manages skill files for your coding agents and can update `AGENTS.md` / `CLAUDE.md` style project instructions.
+`vera setup` with no flags runs an interactive wizard and offers to index the current project, defaulting to yes. An interactive search also offers to create a missing index. `vera setup --api` prompts for an OpenAI-compatible endpoint and key; use `--yes` with `EMBEDDING_MODEL_*` variables for non-interactive setup. `vera agent install` manages skill files for your coding agents and can update `AGENTS.md` / `CLAUDE.md` style project instructions.
 
 ## Common Tasks
 

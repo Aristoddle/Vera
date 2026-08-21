@@ -40,23 +40,24 @@ Vera 1.0 is the feature-complete milestone: the search pipeline, code-intelligen
 bunx @vera-ai/cli install   # or: npx -y @vera-ai/cli install / uvx vera-ai install
 ```
 
-**2. Set up models** (pick one)
+**2. Set up and index** (pick one)
 ```bash
-vera setup                       # Interactive wizard (auto-detects your hardware)
-vera setup --potion-code         # CPU-only local mode
-vera setup --api                 # Remote API mode, prompts for endpoint + key
-vera setup --onnx-jina-coreml    # Apple Silicon (M1/M2/M3/M4)
-vera setup --onnx-jina-cuda      # NVIDIA GPU
-vera setup --onnx-jina-rocm      # AMD GPU (ROCm, Linux)
-vera setup --onnx-jina-openvino  # Intel GPU (OpenVINO, Linux)
-vera setup --onnx-jina-directml  # DirectX 12 GPU (Windows)
+vera setup                                  # Interactive, indexes this project by default
+vera setup --potion-code --index .          # CPU-only local mode
+vera setup --api --index .                  # Remote API mode, prompts for endpoint + key
+vera setup --onnx-jina-coreml --index .     # Apple Silicon (M1/M2/M3/M4)
+vera setup --onnx-jina-cuda --index .       # NVIDIA GPU
+vera setup --onnx-jina-rocm --index .       # AMD GPU (ROCm, Linux)
+vera setup --onnx-jina-openvino --index .   # Intel GPU (OpenVINO, Linux)
+vera setup --onnx-jina-directml --index .   # DirectX 12 GPU (Windows)
 ```
 
-**3. Index and search**
+**3. Search**
 ```bash
-vera index .
 vera search "authentication logic"
 ```
+
+If the current project has no index, interactive search offers to create one. JSON and non-interactive searches still return the missing-index error.
 
 ## What Sets Vera Apart
 
@@ -112,7 +113,6 @@ The MCP surface stays intentionally small; use the CLI skill path when you need 
 ### Core Workflow
 
 ```bash
-vera index .
 vera search "authentication logic"
 vera update .
 ```

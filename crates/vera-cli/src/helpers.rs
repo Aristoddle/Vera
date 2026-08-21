@@ -170,13 +170,17 @@ pub fn prepare_indexed_repo(
         .map_err(|e| anyhow::anyhow!("failed to get current directory: {e}"))?;
     let index_dir = vera_core::indexing::index_dir(&cwd);
     if !index_dir.exists() {
-        anyhow::bail!(
-            "no index found in current directory.\n\
-             Hint: run `vera index <path>` first to create an index."
-        );
+        anyhow::bail!(MISSING_INDEX_MESSAGE);
     }
     warn_if_index_stale(&cwd, indexing_config);
     Ok((cwd, index_dir))
+}
+
+pub const MISSING_INDEX_MESSAGE: &str = "no index found in current directory.\n\
+Hint: run `vera index <path>` first to create an index.";
+
+pub fn should_offer_auto_index(json_output: bool, is_terminal: bool) -> bool {
+    !json_output && is_terminal
 }
 
 pub fn apply_git_scope(
@@ -579,6 +583,22 @@ mod tests {
             files_deleted: 3,
         };
         assert_eq!(freshness.summary(), "2 added, 1 modified, 3 deleted");
+    }
+
+    #[test]
+    fn auto_index_offer_requires_human_output_and_a_terminal() {
+        assert!(should_offer_auto_index(false, true));
+        assert!(!should_offer_auto_index(true, true));
+        assert!(!should_offer_auto_index(false, false));
+        assert!(!should_offer_auto_index(true, false));
+    }
+
+    #[test]
+    fn missing_index_message_preserves_the_cli_contract() {
+        assert_eq!(
+            MISSING_INDEX_MESSAGE,
+            "no index found in current directory.\nHint: run `vera index <path>` first to create an index."
+        );
     }
 
     #[tokio::test]

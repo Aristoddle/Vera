@@ -15,12 +15,11 @@ pip install vera-ai
 ## Quick Start
 
 ```bash
-vera-ai setup --potion-code
-vera-ai index .
+vera-ai setup --potion-code --index .
 vera-ai search "authentication logic"
 ```
 
-`vera-ai setup` with no flags runs an interactive wizard. `vera-ai setup --api` prompts for an OpenAI-compatible endpoint and key; use `--yes` with `EMBEDDING_MODEL_*` variables for non-interactive setup. `vera-ai agent install` manages skill files for your coding agents and can update `AGENTS.md` / `CLAUDE.md` style project instructions.
+`vera-ai setup` with no flags runs an interactive wizard and offers to index the current project, defaulting to yes. An interactive search also offers to create a missing index. `vera-ai setup --api` prompts for an OpenAI-compatible endpoint and key; use `--yes` with `EMBEDDING_MODEL_*` variables for non-interactive setup. `vera-ai agent install` manages skill files for your coding agents and can update `AGENTS.md` / `CLAUDE.md` style project instructions.
 
 ## Common Tasks
 

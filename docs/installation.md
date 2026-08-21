@@ -123,12 +123,16 @@ vera doctor --probe  # deeper local backend diagnostics
 
 ## Index and Search
 
+Add `--index .` to an explicit setup command to configure the backend and index the current project in one step:
+
 ```bash
-vera index .                          # index the current project
-vera search "authentication logic"    # search
+vera setup --potion-code --index .
+vera search "authentication logic"
 ```
 
-That's it. See the [query guide](query-guide.md) for tips on writing effective queries.
+The interactive `vera setup` wizard also offers to index the current project and defaults to yes. If you skip indexing, an interactive `vera search` offers to create the missing index. JSON and non-interactive searches return the existing missing-index error instead of prompting.
+
+See the [query guide](query-guide.md) for tips on writing effective queries.
 
 ## Set Up Agent Skills
 
