@@ -136,6 +136,7 @@ pub fn run(
         json_output,
         "Vera setup complete.",
         api_setup,
+        true,
     )
 }
 
@@ -210,6 +211,24 @@ pub(crate) fn configure_backend(
         json_output,
         success_header,
         None,
+        true,
+    )
+}
+
+pub(crate) fn repair_backend(
+    effective_backend: InferenceBackend,
+    local_embedding_model: Option<LocalEmbeddingModelConfig>,
+    json_output: bool,
+    success_header: &str,
+) -> anyhow::Result<()> {
+    configure_backend_with_api_setup(
+        effective_backend,
+        local_embedding_model,
+        None,
+        json_output,
+        success_header,
+        None,
+        false,
     )
 }
 
@@ -220,6 +239,7 @@ fn configure_backend_with_api_setup(
     json_output: bool,
     success_header: &str,
     api_setup: Option<(ApiSetupInput, Option<ApiSetupInput>)>,
+    persist_state: bool,
 ) -> anyhow::Result<()> {
     let use_local = effective_backend.is_local();
     let mut models_prefetched = 0usize;
@@ -243,9 +263,11 @@ fn configure_backend_with_api_setup(
                 )
                 .is_ok(),
             );
-            state::save_backend(effective_backend)?;
-            state::save_local_embedding_model(&local_embedding_model)?;
-            state::clear_reranker_setup()?;
+            if persist_state {
+                state::save_backend(effective_backend)?;
+                state::save_local_embedding_model(&local_embedding_model)?;
+                state::clear_reranker_setup()?;
+            }
             state::apply_saved_env_force()?;
             local_embedding_summary = Some(local_embedding_model.display_name());
         }
@@ -255,8 +277,10 @@ fn configure_backend_with_api_setup(
             rt.block_on(vera_core::local_models::ensure_potion_code_assets())?;
             models_prefetched = vera_core::local_models::inspect_potion_code_model_files()?.len();
             onnx_runtime_ready = None;
-            state::save_backend(effective_backend)?;
-            state::clear_reranker_setup()?;
+            if persist_state {
+                state::save_backend(effective_backend)?;
+                state::clear_reranker_setup()?;
+            }
             state::apply_saved_env_force()?;
             local_embedding_summary = Some(vera_core::local_models::potion_code_model_name());
         }
@@ -276,13 +300,15 @@ fn configure_backend_with_api_setup(
                     )?,
                 ),
             };
-            state::save_api_setup(&embedding, reranker.as_ref())?;
+            if persist_state {
+                state::save_api_setup(&embedding, reranker.as_ref())?;
+            }
             state::apply_saved_env_force()?;
             onnx_runtime_ready = None;
         }
     }
 
-    if state::load_saved_config()?.install_method.is_none() {
+    if persist_state && state::load_saved_config()?.install_method.is_none() {
         if let Some(install_method) = crate::update_check::resolve_install_method().install_method {
             state::save_install_method(Some(&install_method))?;
         }

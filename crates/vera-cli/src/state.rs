@@ -602,12 +602,11 @@ mod tests {
         let _guard = with_stored_config(LEGACY_JINA_CONFIG);
         assert_eq!(stored_pooling_on_disk(), "mean");
 
-        // `vera repair` resolves an embedding model and hands it to
-        // `setup::configure_backend`, which persists it verbatim. Sourcing it
-        // from the repaired accessor put `last-token` in the file and bricked
-        // an older Vera installed alongside — and unlike `vera setup`, the user
-        // never picked a pooling mode here.
-        let model = crate::commands::repair::embedding_model_to_persist(
+        // `vera repair` resolves an embedding model for asset preparation but
+        // does not persist it. Sourcing it from the repaired accessor would
+        // put `last-token` in the file and brick an older Vera installed
+        // alongside.
+        let model = crate::commands::repair::embedding_model_for_repair(
             vera_core::config::InferenceBackend::OnnxJina(
                 vera_core::config::OnnxExecutionProvider::Cpu,
             ),
@@ -617,6 +616,38 @@ mod tests {
         save_local_embedding_model(&model).unwrap();
 
         assert_eq!(stored_pooling_on_disk(), "mean");
+    }
+
+    #[test]
+    fn repair_api_does_not_switch_backend_or_clear_reranker() {
+        let _guard = with_stored_config(
+            r#"{
+              "backend": "potion-code",
+              "local_mode": true,
+              "reranker_api": {"base_url": "https://reranker.example", "model_id": "rerank"}
+            }"#,
+        );
+        fs::write(
+            credentials_path().unwrap(),
+            r#"{"reranker_api_key":"reranker-secret"}"#,
+        )
+        .unwrap();
+        set_process_env("EMBEDDING_MODEL_BASE_URL", "https://embedding.example");
+        set_process_env("EMBEDDING_MODEL_ID", "embedding");
+        set_process_env("EMBEDDING_MODEL_API_KEY", "embedding-secret");
+
+        crate::commands::repair::run(None, true, true).unwrap();
+
+        assert_eq!(
+            saved_backend().unwrap(),
+            Some(vera_core::config::InferenceBackend::PotionCode)
+        );
+        let config = load_saved_config().unwrap();
+        assert_eq!(config.reranker_api.unwrap().model_id, "rerank");
+        assert_eq!(
+            load_saved_secrets().unwrap().reranker_api_key.as_deref(),
+            Some("reranker-secret")
+        );
     }
 
     #[test]
