@@ -113,7 +113,7 @@ pub async fn create_dynamic_provider(
             })?;
             Ok((
                 DynamicProvider::Model2Vec(p),
-                crate::local_models::potion_code_model_name().to_string(),
+                crate::local_models::potion_code_model_name(),
             ))
         }
         InferenceBackend::Api => {

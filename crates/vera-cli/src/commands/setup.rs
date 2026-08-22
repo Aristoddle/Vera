@@ -27,11 +27,20 @@ pub(crate) struct SetupReport {
 }
 
 /// Remedy shown when a non-interactive invocation cannot prompt.
-const NON_INTERACTIVE_HINT: &str = "Hint: pass a backend flag (for example `--onnx-jina-coreml`, \
-     `--onnx-jina-cuda`, or `--potion-code`), `--yes` to auto-detect one, or `--api` with \
+const NON_INTERACTIVE_HINT: &str = "Hint: pass `--yes` for the default Potion Code backend, a GPU flag \
+     (for example `--onnx-jina-cuda` or `--onnx-jina-coreml`), or `--api` with \
      EMBEDDING_MODEL_BASE_URL, EMBEDDING_MODEL_ID, and EMBEDDING_MODEL_API_KEY set.";
 
-/// `backend`: Some(local backend) for local, None + api=true for API, None + api=false defaults to auto-detect.
+/// The backend `vera setup` and `vera backend` pick when no flag is given.
+///
+/// Potion Code runs on any CPU with a ~50 MB download and no ONNX runtime, so
+/// it is the default on every machine. GPU ONNX backends stay available
+/// through flags and the interactive menu's auto-detect entry.
+pub(crate) fn default_setup_backend() -> InferenceBackend {
+    InferenceBackend::PotionCode
+}
+
+/// `backend`: Some(local backend) for local, None + api=true for API, None + api=false uses the default.
 /// `allow_wizard`: bare interactive invocations run the full wizard only for
 /// `vera setup`; `vera backend` always stays in the backend-only flow.
 pub fn run(
@@ -60,17 +69,19 @@ pub fn run(
         return run_wizard();
     }
 
-    // Resolve: explicit backend flag wins, then --api, then auto-detect.
+    // Resolve: explicit backend flag wins, then --api, then the default.
     let effective_backend = if api {
         InferenceBackend::Api
     } else if let Some(b) = backend {
         b
     } else if json_output || yes {
-        let detected = detect_gpu();
         if !json_output {
-            eprintln!("Auto-detected backend: {detected}. Use a backend flag to override.");
+            eprintln!(
+                "Using default backend: {}. Use a backend flag (e.g. `--onnx-jina-cuda`) to override.",
+                default_setup_backend()
+            );
         }
-        detected
+        default_setup_backend()
     } else if !interactive {
         bail!(
             "no backend selected and no terminal is available for prompts.\n{NON_INTERACTIVE_HINT}"
@@ -247,8 +258,7 @@ fn configure_backend_with_api_setup(
             state::save_backend(effective_backend)?;
             state::clear_reranker_setup()?;
             state::apply_saved_env_force()?;
-            local_embedding_summary =
-                Some(vera_core::local_models::potion_code_model_name().to_string());
+            local_embedding_summary = Some(vera_core::local_models::potion_code_model_name());
         }
         InferenceBackend::Api => {
             let (embedding, reranker) = match api_setup {
@@ -343,8 +353,8 @@ fn should_prompt_api_config(
     effective_backend == InferenceBackend::Api && !json_output && !yes
 }
 
-/// Probe the system for a usable GPU and return the best local backend.
-/// Falls back to Potion Code on CPU if nothing is detected.
+/// Probe the system for a usable GPU for the interactive menu's auto-detect
+/// entry. Falls back to Potion Code on CPU if nothing is detected.
 fn detect_gpu() -> InferenceBackend {
     // NVIDIA: check for nvidia-smi or vendor ID (0x10de) in sysfs
     let has_nvidia = std::process::Command::new("nvidia-smi")
@@ -406,7 +416,7 @@ fn detect_gpu() -> InferenceBackend {
     InferenceBackend::PotionCode
 }
 
-/// Show an interactive backend selection menu. Auto-detect is the default.
+/// Show an interactive backend selection menu. Potion Code is the default.
 fn prompt_backend() -> anyhow::Result<InferenceBackend> {
     cliclack::intro("vera backend")?;
     let backend = prompt_backend_select()?;
@@ -429,19 +439,19 @@ fn prompt_backend_select() -> anyhow::Result<InferenceBackend> {
 
     let backend: InferenceBackend = cliclack::select("Select a backend")
         .item(
+            InferenceBackend::PotionCode,
+            "Potion Code CPU",
+            "static embeddings, works everywhere (default)",
+        )
+        .item(
             detected,
             format!("Auto-detect ({detected_hint})"),
-            "recommended",
+            "GPU ONNX backend",
         )
         .item(
             InferenceBackend::Api,
             "API mode",
             "remote OpenAI-compatible endpoints",
-        )
-        .item(
-            InferenceBackend::PotionCode,
-            "Potion Code CPU",
-            "CPU-only machines",
         )
         .item(
             InferenceBackend::OnnxJina(OnnxExecutionProvider::Cuda),
@@ -760,6 +770,13 @@ fn read_optional_api_env(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn setup_with_no_flags_defaults_to_potion_code() {
+        // Potion Code runs on any CPU with no ONNX runtime, so it is the
+        // default on every machine; GPU ONNX backends stay opt-in via flags.
+        assert_eq!(default_setup_backend(), InferenceBackend::PotionCode);
+    }
 
     #[test]
     fn explicit_interactive_api_setup_prompts_for_config() {

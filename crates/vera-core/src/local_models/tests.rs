@@ -135,6 +135,44 @@ fn directory_models_reject_revisions() {
 }
 
 #[test]
+fn potion_code_identity_carries_the_pinned_revision() {
+    // The staleness guard in `indexing::update` compares the stored model name
+    // against this identity, so the pin has to be part of it: an index frozen
+    // on potion v1 or on the jina ONNX preset must trip the re-index error
+    // rather than answer queries with incompatible vectors.
+    let name = potion_code_model_name();
+    assert_eq!(
+        name,
+        format!("{POTION_CODE_REPO}|revision={POTION_CODE_REVISION}")
+    );
+    assert!(!crate::config::model_names_match_with_aliases(
+        "minishlab/potion-code-16M",
+        &name,
+        &[]
+    ));
+    assert!(!crate::config::model_names_match_with_aliases(
+        &name,
+        "jinaai/jina-embeddings-v5-text-nano-retrieval|pooling=last-token|qp=6:Query:|dp=9:Document:",
+        &[]
+    ));
+}
+
+#[test]
+fn potion_code_assets_live_under_the_revision_shard() {
+    // Same sharded cache layout the revisioned ONNX lanes use, so a potion
+    // re-pin lands beside the old assets instead of overwriting them.
+    let home = Path::new("/tmp/vera-test-home");
+    let dir = model_cache_dir(home, POTION_CODE_REPO, Some(POTION_CODE_REVISION)).unwrap();
+    assert_eq!(
+        dir,
+        home.join("models")
+            .join(POTION_CODE_REPO)
+            .join("revisions")
+            .join(POTION_CODE_REVISION)
+    );
+}
+
+#[test]
 fn coderankembed_preset_sets_required_query_prefix() {
     let config = LocalEmbeddingModelConfig::coderankembed();
     assert_eq!(

@@ -28,7 +28,10 @@ pub(super) const JINA_DOCUMENT_PREFIX: &str = "Document:";
 pub(super) const CODERANK_EMBEDDING_REPO: &str = "Zenabius/CodeRankEmbed-onnx";
 pub(super) const CODERANK_QUERY_PREFIX: &str = "Represent this query for searching relevant code:";
 
-pub const POTION_CODE_REPO: &str = "minishlab/potion-code-16M";
+pub const POTION_CODE_REPO: &str = "minishlab/potion-code-16M-v2";
+/// Immutable upstream revision the potion assets are pinned to, so a silent
+/// upstream update can never swap the weights under an existing index.
+pub const POTION_CODE_REVISION: &str = "e9d2a44ca6a05ac6685f3b23709ea57eb7352d5b";
 pub const POTION_CODE_TOKENIZER_FILE: &str = "tokenizer.json";
 pub const POTION_CODE_MODEL_FILE: &str = "model.safetensors";
 pub const POTION_CODE_CONFIG_FILE: &str = "config.json";

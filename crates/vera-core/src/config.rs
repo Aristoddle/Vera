@@ -234,7 +234,7 @@ pub enum InferenceBackend {
     Api,
     /// Use local ONNX models with the specified execution provider.
     OnnxJina(OnnxExecutionProvider),
-    /// Use the CPU-first Potion Code static embedding model.
+    /// Use the CPU-first Potion Code static embedding model (the default local backend).
     PotionCode,
 }
 

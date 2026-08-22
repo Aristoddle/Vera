@@ -15,7 +15,7 @@ use vera_core::local_models::{
     LOCAL_EMBEDDING_MAX_LENGTH_ENV, LOCAL_EMBEDDING_ONNX_DATA_FILE_ENV,
     LOCAL_EMBEDDING_ONNX_FILE_ENV, LOCAL_EMBEDDING_POOLING_ENV, LOCAL_EMBEDDING_QUERY_PREFIX_ENV,
     LOCAL_EMBEDDING_REPO_ENV, LOCAL_EMBEDDING_REVISION_ENV, LOCAL_EMBEDDING_TOKENIZER_FILE_ENV,
-    LocalEmbeddingModelConfig, LocalEmbeddingSource, POTION_CODE_REPO,
+    LocalEmbeddingModelConfig, LocalEmbeddingSource, POTION_CODE_REPO, POTION_CODE_REVISION,
 };
 
 const LOCAL_MODEL_ENV_KEYS: &[&str] = &[
@@ -164,7 +164,7 @@ impl ResolvedLane {
                 model_id: Some(POTION_CODE_REPO.to_string()),
                 model_repo: Some(POTION_CODE_REPO.to_string()),
                 model_dir: None,
-                model_revision: Some("main".to_string()),
+                model_revision: Some(POTION_CODE_REVISION.to_string()),
                 onnx_file: None,
                 onnx_data_file: None,
                 tokenizer_file: None,
@@ -865,6 +865,26 @@ mod tests {
             let provenance = unpinned.provenance().unwrap();
             assert_eq!(provenance.model_revision.as_deref(), Some("main"));
         }
+    }
+
+    #[test]
+    fn potion_lane_provenance_reports_the_pinned_revision() {
+        let lane = resolve(preset("vera-potion").unwrap()).unwrap();
+        let provenance = lane.provenance().unwrap();
+        assert_eq!(provenance.model_repo.as_deref(), Some(POTION_CODE_REPO));
+        assert_eq!(
+            provenance.model_revision.as_deref(),
+            Some(POTION_CODE_REVISION)
+        );
+        assert_eq!(
+            provenance.dim,
+            Some(vera_core::local_models::POTION_CODE_DIM)
+        );
+        assert_eq!(
+            provenance.max_length,
+            Some(vera_core::local_models::POTION_CODE_MAX_LENGTH)
+        );
+        assert!(!provenance.rerank);
     }
 
     #[test]

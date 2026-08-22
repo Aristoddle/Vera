@@ -110,7 +110,7 @@ impl SearchFilterArgs {
 
 #[derive(Debug, Clone, Default, Args)]
 pub struct LocalBackendFlags {
-    /// Use Potion Code static embeddings on CPU.
+    /// Use Potion Code static embeddings on CPU (the default backend).
     #[arg(long = "potion-code", visible_alias = "potion-cpu", group = "backend")]
     pub potion_code: bool,
     /// Use local ONNX models on CPU.
@@ -228,7 +228,7 @@ impl LocalBackendFlags {
 
 #[derive(Debug, Clone, Default, Args)]
 pub struct LocalEmbeddingModelFlags {
-    /// Use CodeRankEmbed instead of Vera's default Jina local embedding model.
+    /// Use CodeRankEmbed instead of Vera's default Jina ONNX embedding model.
     #[arg(
         long = "code-rank-embed",
         alias = "coderankembed",

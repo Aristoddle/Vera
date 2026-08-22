@@ -187,10 +187,10 @@ pub enum Commands {
                       For backend-only changes, use `vera backend`. For skill-only \
                       changes, use `vera agent install`.\n\n\
                       Pass flags to skip the interactive wizard:\n  \
-                      vera setup --potion-code         # CPU-only local mode\n  \
+                      vera setup --potion-code         # Local static embeddings (the default)\n  \
                       vera setup --onnx-jina-cuda      # NVIDIA GPU, skip wizard\n  \
                       vera setup --api                 # API mode from env vars\n  \
-                      vera setup --yes                 # Auto-detect GPU, no prompts\n\n\
+                      vera setup --yes                 # Default Potion Code backend, no prompts\n\n\
                       Examples:\n  \
                       vera setup                       # Full interactive wizard\n  \
                       vera setup --potion-code --index .       # CPU + index, no wizard\n  \
@@ -216,15 +216,15 @@ pub enum Commands {
                       This is the focused backend configuration command. It handles \
                       runtime selection, model downloads, and API credential persistence \
                       without touching agent skills or project indexes.\n\n\
-                      With no flags, shows an interactive backend menu with auto-detected \
-                      GPU as the default.\n\n\
+                      With no flags, shows an interactive backend menu with Potion Code \
+                      as the default.\n\n\
                       Examples:\n  \
                       vera backend                     # Interactive backend selection\n  \
-                      vera backend --potion-code        # CPU-only local mode\n  \
+                      vera backend --potion-code        # Local static embeddings (the default)\n  \
                       vera backend --onnx-jina-cuda    # NVIDIA GPU (skip menu)\n  \
                       vera backend --code-rank-embed   # Switch to CodeRankEmbed model\n  \
                       vera backend --api               # Persist API credentials from env\n  \
-                      vera backend --yes               # Auto-detect GPU, no prompts")]
+                      vera backend --yes               # Default Potion Code backend, no prompts")]
     Backend {
         #[command(flatten)]
         backend: crate::helpers::LocalBackendFlags,

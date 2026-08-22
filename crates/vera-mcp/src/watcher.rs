@@ -295,9 +295,7 @@ fn resolve_watch_runtime() -> Result<WatchRuntime, anyhow::Error> {
     let model_name = match backend {
         InferenceBackend::Api => std::env::var("EMBEDDING_MODEL_ID").unwrap_or_default(),
         InferenceBackend::OnnxJina(_) => vera_core::local_models::configured_local_model_name(),
-        InferenceBackend::PotionCode => {
-            vera_core::local_models::potion_code_model_name().to_string()
-        }
+        InferenceBackend::PotionCode => vera_core::local_models::potion_code_model_name(),
     };
     let endpoint = match backend {
         InferenceBackend::Api => std::env::var("EMBEDDING_MODEL_BASE_URL").unwrap_or_default(),

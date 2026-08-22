@@ -43,32 +43,35 @@ pub fn configured_local_model_name() -> String {
 }
 
 pub fn potion_code_model_dir() -> Result<PathBuf> {
-    Ok(vera_home_dir()?.join("models").join(POTION_CODE_REPO))
+    model_cache_dir(
+        &vera_home_dir()?,
+        POTION_CODE_REPO,
+        Some(POTION_CODE_REVISION),
+    )
 }
 
-pub fn potion_code_model_name() -> &'static str {
-    POTION_CODE_REPO
+/// Identity stored in the index metadata. The pinned revision is part of it,
+/// so an index built on older potion weights (or a different model entirely)
+/// trips the re-index guard instead of being queried with incompatible
+/// vectors.
+pub fn potion_code_model_name() -> String {
+    format!("{POTION_CODE_REPO}|revision={POTION_CODE_REVISION}")
 }
 
 pub async fn ensure_potion_code_assets() -> Result<PathBuf> {
-    ensure_model_file_with_kind(
-        POTION_CODE_REPO,
+    for file in [
         POTION_CODE_TOKENIZER_FILE,
-        LocalModelAssetKind::Other,
-    )
-    .await?;
-    ensure_model_file_with_kind(
-        POTION_CODE_REPO,
         POTION_CODE_MODEL_FILE,
-        LocalModelAssetKind::Other,
-    )
-    .await?;
-    ensure_model_file_with_kind(
-        POTION_CODE_REPO,
         POTION_CODE_CONFIG_FILE,
-        LocalModelAssetKind::Other,
-    )
-    .await?;
+    ] {
+        ensure_model_file_with_revision(
+            POTION_CODE_REPO,
+            file,
+            LocalModelAssetKind::Other,
+            Some(POTION_CODE_REVISION),
+        )
+        .await?;
+    }
     potion_code_model_dir()
 }
 

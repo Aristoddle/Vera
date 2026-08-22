@@ -102,7 +102,7 @@ pub fn run(json_output: bool, probe: bool) -> anyhow::Result<()> {
             checks.push(DoctorCheck {
                 name: "local-embedding-model",
                 status: CheckStatus::Ok,
-                detail: vera_core::local_models::potion_code_model_name().to_string(),
+                detail: vera_core::local_models::potion_code_model_name(),
             });
             let model_assets = vera_core::local_models::inspect_potion_code_model_files()?;
             checks.push(local_model_assets_check(
