@@ -97,6 +97,24 @@ Precision notes: jina lanes run its fp16 export on GPU (the automatic quantized-
 
 Artifacts (uncommitted, under `benchmarks/results/`): `harrier-screening-20260821T050037Z-subset-{vera-bm25,vera-potion,vera-cuda}.json`, `harrier-screening-20260821T082401Z-subset-harrier-270m-cuda.json`, `harrier-screening-20260821T093941Z-subset-harrier-0.6b-fp32-cuda.json`, `harrier-screening-20260821T111613Z-subset-coderankembed-cuda.json`, `harrier-screening-20260821T133638Z-subset-f2llm-80m-api.json`, `harrier-screening-20260821T135016Z-subset-potion-v2-api.json`, `harrier-screening-20260821T173032Z-subset-f2llm-160m-api.json`, `harrier-screening-20260821T173032Z-subset-f2llm-330m-api.json`, `harrier-screening-20260821T114648Z-full-vera-cuda.json`, `harrier-screening-20260821T114654Z-full-coderankembed-cuda.json`, `harrier-screening-20260821T135235Z-full-potion-v2-api.json`, `harrier-screening-20260821T174547Z-full-f2llm-330m-api.json`, `harrier-screening-20260821T180030Z-subset-bitnet-270m-api.json`.
 
+### Independent Contamination Check (2026-08-22)
+
+MinishLab publishes both potion-code-16M-v2 and Semble, so Semble alone cannot clear potion-v2 of evaluation contamination. This check reruns the top candidates on an independently built set: 10 pinned repositories disjoint from Semble's 63 (celery, jinja, rayon, viper, lodash, ky, sidekiq, okhttp, zlib, nlohmann/json), with 180 locally generated Semble-style tasks (100 intent, 50 cross_file, 30 symbol_lookup) and verified file-level ground truth. Same harness, same no-rerank contract, same revisions.
+
+| Lane | nDCG@10 | Recall@1 | Recall@5 | Recall@10 | MRR | p50 ms | Index s |
+|------|---------|----------|----------|-----------|-----|--------|---------|
+| jina v5 nano (default) | 0.7149 | 0.3889 | 0.7972 | 0.8750 | 0.7148 | 13.3 | 61 |
+| CodeRankEmbed 137M | 0.7069 | 0.4000 | 0.7731 | 0.8546 | 0.7212 | 14.8 | 153 |
+| F2LLM-v2-330M (API) | 0.7061 | 0.3944 | 0.7704 | 0.8574 | 0.7178 | 21.6 | 167 |
+| potion-code-16M-v2 (API) | 0.7019 | 0.3935 | 0.7741 | 0.8574 | 0.7050 | 10.1 | 26 |
+| BM25 (no embeddings) | 0.6506 | 0.3630 | 0.7278 | 0.7852 | 0.6682 | 3.3 | 5 |
+
+Read: the Semble ordering carries over (jina ahead, then CRE, F2LLM-330M, and potion-v2 within ~0.005 of each other, BM25 far behind). If potion-v2 were inflated by its Semble relationship it should look relatively stronger there; instead its gap to jina widens from -0.0026 (Semble subset) to -0.0130 on fresh repos. No home-field advantage: the screening comparison is trustworthy. All neural lanes drop 0.06-0.09 in absolute terms on this set (smaller repos, LLM-written queries), and the neural-over-BM25 margin roughly triples, which is the opposite of what task leakage would produce. potion-v2 remains the best permissively licensed candidate and indexes 6x faster than the runners-up.
+
+Note: a first jina pass accidentally ran with the reranker enabled (bare `--tool vera-cuda` defaults rerank on; the screening lane spec sets `rerank: false`). It scored 0.7309, which is the reranker's contribution, and its p50 was ~2.6 s from per-query reranking. The row above is the corrected no-rerank run.
+
+Artifacts (uncommitted, under `benchmarks/results/`): `indep-20260822T150853Z-{bm25,potion-v2-api,jina-cuda,coderankembed-cuda,f2llm-330m-api}.json`. The corpus manifest (`eval/indep-corpus.toml`) and task files (`eval/tasks/indep/`) live in the bench worktree.
+
 ### Main Results
 
 | Variant | nDCG@10 | Recall@1 | Recall@5 | Mean search latency |
