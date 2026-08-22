@@ -55,6 +55,19 @@ vera setup --onnx-jina-cuda \
 
 Use this when you already downloaded or exported the model yourself.
 
+### Custom Local Reranker
+
+The local cross-encoder can also be replaced with an ONNX-compatible model from Hugging Face:
+
+```bash
+export LOCAL_RERANKER_REPO=cross-encoder/ettin-reranker-32m-v1
+export LOCAL_RERANKER_REVISION=b33e5ceb5110773ea9cf5e00c9bedc83a8c2afdd
+export LOCAL_RERANKER_ONNX_FILE=onnx/model_quint8_avx2.onnx
+export LOCAL_RERANKER_TOKENIZER_FILE=tokenizer.json
+```
+
+The default remains `jinaai/jina-reranker-v2-base-multilingual` with `onnx/model_quantized.onnx` and `tokenizer.json`. Leave `LOCAL_RERANKER_REVISION` unset to use the `main` ref and the legacy cache path. A non-empty revision stores assets under `models/<repo>/revisions/<revision>/`, so different model revisions do not overwrite one another.
+
 ## Flags
 
 | Flag | Meaning |

@@ -63,6 +63,10 @@ pub(super) const RERANKER_REPO: &str = "jinaai/jina-reranker-v2-base-multilingua
 /// the all-green probe does not mislead users.
 pub const RERANKER_ONNX_FILE: &str = "onnx/model_quantized.onnx";
 pub(super) const RERANKER_TOKENIZER_FILE: &str = "tokenizer.json";
+pub const LOCAL_RERANKER_REPO_ENV: &str = "LOCAL_RERANKER_REPO";
+pub const LOCAL_RERANKER_REVISION_ENV: &str = "LOCAL_RERANKER_REVISION";
+pub const LOCAL_RERANKER_ONNX_FILE_ENV: &str = "LOCAL_RERANKER_ONNX_FILE";
+pub const LOCAL_RERANKER_TOKENIZER_FILE_ENV: &str = "LOCAL_RERANKER_TOKENIZER_FILE";
 
 /// Execution provider the reranker session must use for a given backend.
 ///
@@ -497,7 +501,7 @@ impl LocalEmbeddingModelConfig {
 
     fn apply_env_overrides(defaults: Self) -> Result<Self> {
         let explicit_model_env = model_source_and_onnx_file_are_set();
-        let revision = revision_from_env(defaults.revision)?;
+        let revision = revision_from_env(LOCAL_EMBEDDING_REVISION_ENV, defaults.revision)?;
         if revision.is_some() && matches!(&defaults.source, LocalEmbeddingSource::Directory { .. })
         {
             anyhow::bail!("embedding revision cannot be used with a directory source");
@@ -523,6 +527,56 @@ impl LocalEmbeddingModelConfig {
                 defaults.document_prefix.clone(),
                 explicit_model_env,
             ),
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalRerankerConfig {
+    pub repo: String,
+    pub revision: Option<String>,
+    pub onnx_file: String,
+    pub tokenizer_file: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct LocalRerankerAssetPaths {
+    pub onnx_path: PathBuf,
+    pub tokenizer_path: PathBuf,
+}
+
+impl Default for LocalRerankerConfig {
+    fn default() -> Self {
+        Self {
+            repo: RERANKER_REPO.to_string(),
+            revision: None,
+            onnx_file: RERANKER_ONNX_FILE.to_string(),
+            tokenizer_file: RERANKER_TOKENIZER_FILE.to_string(),
+        }
+    }
+}
+
+impl LocalRerankerConfig {
+    pub fn from_env() -> Result<Self> {
+        let defaults = Self::default();
+        Ok(Self {
+            repo: env_override(LOCAL_RERANKER_REPO_ENV)
+                .map(|repo| normalize_huggingface_repo(&repo))
+                .transpose()?
+                .unwrap_or(defaults.repo),
+            revision: revision_from_env(LOCAL_RERANKER_REVISION_ENV, defaults.revision)?,
+            onnx_file: env_override(LOCAL_RERANKER_ONNX_FILE_ENV).unwrap_or(defaults.onnx_file),
+            tokenizer_file: env_override(LOCAL_RERANKER_TOKENIZER_FILE_ENV)
+                .unwrap_or(defaults.tokenizer_file),
+        })
+    }
+
+    pub fn cached_asset_paths(&self) -> Result<LocalRerankerAssetPaths> {
+        let revision = normalize_optional_model_revision(self.revision.as_deref())?;
+        let model_dir = model_cache_dir(&vera_home_dir()?, &self.repo, revision.as_deref())?;
+        Ok(LocalRerankerAssetPaths {
+            onnx_path: model_dir.join(&self.onnx_file),
+            tokenizer_path: model_dir.join(&self.tokenizer_file),
         })
     }
 }
@@ -564,16 +618,14 @@ pub(super) fn normalize_optional_model_revision(revision: Option<&str>) -> Resul
     revision.map(normalize_model_revision).transpose()
 }
 
-fn revision_from_env(default: Option<String>) -> Result<Option<String>> {
-    match std::env::var(LOCAL_EMBEDDING_REVISION_ENV) {
+fn revision_from_env(key: &str, default: Option<String>) -> Result<Option<String>> {
+    match std::env::var(key) {
         Ok(value) if value.trim().is_empty() => Ok(None),
         Ok(value) => Ok(Some(normalize_model_revision(&value)?)),
         Err(std::env::VarError::NotPresent) => {
             default.as_deref().map(normalize_model_revision).transpose()
         }
-        Err(error) => {
-            Err(error).with_context(|| format!("failed to read {LOCAL_EMBEDDING_REVISION_ENV}"))
-        }
+        Err(error) => Err(error).with_context(|| format!("failed to read {key}")),
     }
 }
 
@@ -763,9 +815,10 @@ pub(crate) mod ort;
 mod tests;
 
 pub use assets::{
-    configured_local_model_name, ensure_local_embedding_assets, ensure_model_file,
-    ensure_potion_code_assets, inspect_local_model_files_for_ep, inspect_potion_code_model_files,
-    potion_code_model_dir, potion_code_model_name, prepare_local_models_for_ep,
+    configured_local_model_name, ensure_local_embedding_assets, ensure_local_reranker_assets,
+    ensure_model_file, ensure_potion_code_assets, inspect_local_model_files_for_ep,
+    inspect_potion_code_model_files, potion_code_model_dir, potion_code_model_name,
+    prepare_local_models_for_ep,
 };
 pub use ort::{
     ensure_ort_library_for_ep, ensure_ort_runtime, ensure_provider_dependencies,

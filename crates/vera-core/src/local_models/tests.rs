@@ -41,6 +41,58 @@ impl Drop for RevisionEnvGuard {
     }
 }
 
+struct RerankerEnvGuard {
+    previous: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+impl RerankerEnvGuard {
+    fn clear() -> Self {
+        Self::set([
+            (LOCAL_RERANKER_REPO_ENV, None),
+            (LOCAL_RERANKER_REVISION_ENV, None),
+            (LOCAL_RERANKER_ONNX_FILE_ENV, None),
+            (LOCAL_RERANKER_TOKENIZER_FILE_ENV, None),
+        ])
+    }
+
+    fn set<const N: usize>(values: [(&'static str, Option<&str>); N]) -> Self {
+        let lock = LOCAL_EMBEDDING_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = values
+            .into_iter()
+            .map(|(key, value)| {
+                let previous = std::env::var_os(key);
+                unsafe {
+                    match value {
+                        Some(value) => std::env::set_var(key, value),
+                        None => std::env::remove_var(key),
+                    }
+                }
+                (key, previous)
+            })
+            .collect();
+        Self {
+            previous,
+            _lock: lock,
+        }
+    }
+}
+
+impl Drop for RerankerEnvGuard {
+    fn drop(&mut self) {
+        unsafe {
+            for (key, value) in &self.previous {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+}
+
 #[test]
 fn normalize_huggingface_repo_accepts_repo_ids_and_urls() {
     assert_eq!(
@@ -109,6 +161,64 @@ fn revisions_validate_and_shard_only_non_main_cache_paths() {
     assert_eq!(
         normalize_model_revision(" refs/pr/42 ").unwrap(),
         "refs/pr/42"
+    );
+}
+
+#[test]
+fn local_reranker_config_defaults_match_jina_assets() {
+    let _env = RerankerEnvGuard::clear();
+    let config = LocalRerankerConfig::from_env().unwrap();
+
+    assert_eq!(config.repo, RERANKER_REPO);
+    assert_eq!(config.revision, None);
+    assert_eq!(config.onnx_file, RERANKER_ONNX_FILE);
+    assert_eq!(config.tokenizer_file, RERANKER_TOKENIZER_FILE);
+}
+
+#[test]
+fn local_reranker_config_reads_env_overrides() {
+    let _env = RerankerEnvGuard::set([
+        (
+            LOCAL_RERANKER_REPO_ENV,
+            Some("https://huggingface.co/cross-encoder/ettin-reranker-32m-v1"),
+        ),
+        (LOCAL_RERANKER_REVISION_ENV, Some(" b33e5ceb ")),
+        (
+            LOCAL_RERANKER_ONNX_FILE_ENV,
+            Some("onnx/model_qint8_avx2.onnx"),
+        ),
+        (LOCAL_RERANKER_TOKENIZER_FILE_ENV, Some("tokenizer.json")),
+    ]);
+    let config = LocalRerankerConfig::from_env().unwrap();
+
+    assert_eq!(config.repo, "cross-encoder/ettin-reranker-32m-v1");
+    assert_eq!(config.revision.as_deref(), Some("b33e5ceb"));
+    assert_eq!(config.onnx_file, "onnx/model_qint8_avx2.onnx");
+    assert_eq!(config.tokenizer_file, "tokenizer.json");
+}
+
+#[test]
+fn local_reranker_config_revision_shards_cache_paths() {
+    let _env = RerankerEnvGuard::set([
+        (LOCAL_RERANKER_REPO_ENV, Some("org/model")),
+        (LOCAL_RERANKER_REVISION_ENV, Some("abc123")),
+        (LOCAL_RERANKER_ONNX_FILE_ENV, Some("onnx/model.onnx")),
+        (LOCAL_RERANKER_TOKENIZER_FILE_ENV, Some("tokenizer.json")),
+    ]);
+    let paths = LocalRerankerConfig::from_env()
+        .unwrap()
+        .cached_asset_paths()
+        .unwrap();
+
+    assert!(
+        paths
+            .onnx_path
+            .ends_with("models/org/model/revisions/abc123/onnx/model.onnx")
+    );
+    assert!(
+        paths
+            .tokenizer_path
+            .ends_with("models/org/model/revisions/abc123/tokenizer.json")
     );
 }
 

@@ -131,6 +131,28 @@ pub async fn ensure_local_embedding_assets(
     }
 }
 
+pub async fn ensure_local_reranker_assets(
+    config: &LocalRerankerConfig,
+) -> Result<LocalRerankerAssetPaths> {
+    let revision = normalize_optional_model_revision(config.revision.as_deref())?;
+    Ok(LocalRerankerAssetPaths {
+        onnx_path: ensure_model_file_with_revision(
+            &config.repo,
+            &config.onnx_file,
+            LocalModelAssetKind::Onnx,
+            revision.as_deref(),
+        )
+        .await?,
+        tokenizer_path: ensure_model_file_with_revision(
+            &config.repo,
+            &config.tokenizer_file,
+            LocalModelAssetKind::Other,
+            revision.as_deref(),
+        )
+        .await?,
+    })
+}
+
 pub(super) fn verify_local_embedding_assets(
     config: &LocalEmbeddingModelConfig,
 ) -> Result<LocalEmbeddingAssetPaths> {
@@ -190,18 +212,10 @@ pub async fn prepare_local_models_for_ep(
         paths.push(path);
     }
     paths.push(embedding_paths.tokenizer_path);
-    paths.push(
-        ensure_model_file_with_kind(RERANKER_REPO, RERANKER_ONNX_FILE, LocalModelAssetKind::Onnx)
-            .await?,
-    );
-    paths.push(
-        ensure_model_file_with_kind(
-            RERANKER_REPO,
-            RERANKER_TOKENIZER_FILE,
-            LocalModelAssetKind::Other,
-        )
-        .await?,
-    );
+    let reranker = LocalRerankerConfig::from_env()?;
+    let reranker_paths = ensure_local_reranker_assets(&reranker).await?;
+    paths.push(reranker_paths.onnx_path);
+    paths.push(reranker_paths.tokenizer_path);
     Ok(paths)
 }
 
@@ -213,15 +227,7 @@ pub fn inspect_local_model_files_for_ep(
     model.adjust_for_gpu(ep);
     let embedding_paths = model.cached_asset_paths()?;
     let ort_path = ort_library_path_for_ep(ep)?;
-    let vera_home = vera_home_dir()?;
-    let reranker_onnx = vera_home
-        .join("models")
-        .join(RERANKER_REPO)
-        .join(RERANKER_ONNX_FILE);
-    let reranker_tokenizer = vera_home
-        .join("models")
-        .join(RERANKER_REPO)
-        .join(RERANKER_TOKENIZER_FILE);
+    let reranker_paths = LocalRerankerConfig::from_env()?.cached_asset_paths()?;
     let mut assets = vec![
         inspect_asset("onnx-runtime", ort_path, LocalModelAssetKind::Other),
         inspect_asset(
@@ -234,10 +240,14 @@ pub fn inspect_local_model_files_for_ep(
             embedding_paths.tokenizer_path,
             LocalModelAssetKind::Other,
         ),
-        inspect_asset("reranker-onnx", reranker_onnx, LocalModelAssetKind::Onnx),
+        inspect_asset(
+            "reranker-onnx",
+            reranker_paths.onnx_path,
+            LocalModelAssetKind::Onnx,
+        ),
         inspect_asset(
             "reranker-tokenizer",
-            reranker_tokenizer,
+            reranker_paths.tokenizer_path,
             LocalModelAssetKind::Other,
         ),
     ];

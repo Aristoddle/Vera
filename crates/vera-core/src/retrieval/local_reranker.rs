@@ -1,5 +1,4 @@
 use crate::config::OnnxExecutionProvider;
-use crate::local_models::ensure_model_file;
 use crate::retrieval::reranker::{RerankScore, Reranker, RerankerError};
 use anyhow::{Context, Result};
 use ort::session::{Session, builder::GraphOptimizationLevel};
@@ -8,8 +7,6 @@ use tokenizers::Tokenizer;
 use tokio::task;
 use tokio_util::sync::CancellationToken;
 
-const RERANKER_REPO: &str = "jinaai/jina-reranker-v2-base-multilingual";
-const TOKENIZER_FILE: &str = "tokenizer.json";
 const MAX_RERANK_BATCH_SIZE: usize = 8;
 
 #[derive(Clone)]
@@ -244,18 +241,14 @@ impl LocalReranker {
 }
 
 async fn load_reranker_components(ep: OnnxExecutionProvider) -> Result<(Session, Tokenizer)> {
-    let onnx_path = ensure_model_file(RERANKER_REPO, crate::local_models::RERANKER_ONNX_FILE)
+    let config = crate::local_models::LocalRerankerConfig::from_env()?;
+    let paths = crate::local_models::ensure_local_reranker_assets(&config)
         .await
-        .with_context(|| {
-            format!(
-                "Failed to download ONNX model: {}",
-                crate::local_models::RERANKER_ONNX_FILE
-            )
-        })?;
-
-    let tokenizer_path = ensure_model_file(RERANKER_REPO, TOKENIZER_FILE)
-        .await
-        .context("Failed to download tokenizer")?;
+        .with_context(|| format!("Failed to download reranker model from {}", config.repo))?;
+    let crate::local_models::LocalRerankerAssetPaths {
+        onnx_path,
+        tokenizer_path,
+    } = paths;
 
     let tokenizer = task::spawn_blocking(move || load_tokenizer(tokenizer_path)).await??;
     let session = task::spawn_blocking(move || build_session(ep, onnx_path)).await??;
@@ -264,13 +257,8 @@ async fn load_reranker_components(ep: OnnxExecutionProvider) -> Result<(Session,
 }
 
 fn default_asset_paths() -> Result<(std::path::PathBuf, std::path::PathBuf)> {
-    let model_dir = crate::local_models::vera_home_dir()?
-        .join("models")
-        .join(RERANKER_REPO);
-    Ok((
-        model_dir.join(crate::local_models::RERANKER_ONNX_FILE),
-        model_dir.join(TOKENIZER_FILE),
-    ))
+    let paths = crate::local_models::LocalRerankerConfig::from_env()?.cached_asset_paths()?;
+    Ok((paths.onnx_path, paths.tokenizer_path))
 }
 
 fn load_tokenizer(tokenizer_path: std::path::PathBuf) -> Result<Tokenizer> {

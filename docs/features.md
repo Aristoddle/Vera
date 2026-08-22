@@ -202,7 +202,7 @@ Local ONNX indexing shapes micro-batches from actual token lengths rather than u
 
 ### Custom Local Embeddings
 
-Swap the Jina ONNX embedding model without changing the rest of that pipeline. Point at a Hugging Face repo, a direct URL, or a local directory with custom pooling, query prefix, and dimension settings. The local reranker stays on the curated Jina model.
+Swap the Jina ONNX embedding model without changing the rest of that pipeline. Point at a Hugging Face repo, a direct URL, or a local directory with custom pooling, query prefix, and dimension settings. The local reranker defaults to the curated Jina model and supports Hugging Face repository, revision, ONNX file, and tokenizer overrides through `LOCAL_RERANKER_*` environment variables.
 
 ## Output and Integration
 
