@@ -3,11 +3,16 @@ use crate::retrieval::reranker::{RerankScore, Reranker, RerankerError};
 use anyhow::{Context, Result};
 use ort::session::{Session, builder::GraphOptimizationLevel};
 use std::sync::{Arc, Mutex};
-use tokenizers::Tokenizer;
+use tokenizers::{Encoding, Tokenizer};
 use tokio::task;
 use tokio_util::sync::CancellationToken;
 
 const MAX_RERANK_BATCH_SIZE: usize = 8;
+
+struct TokenizedCandidate {
+    index: usize,
+    encoding: Encoding,
+}
 
 #[derive(Clone)]
 pub struct LocalReranker {
@@ -116,25 +121,11 @@ impl LocalReranker {
     }
 
     #[allow(clippy::needless_range_loop)]
-    fn do_rerank_batch(
-        &self,
-        query: &str,
-        documents: &[String],
-        index_offset: usize,
-    ) -> Result<Vec<RerankScore>> {
-        let mut encodings = Vec::with_capacity(documents.len());
-        for doc in documents {
-            let encoding = self
-                .tokenizer
-                .encode((query.to_string(), doc.clone()), true)
-                .map_err(|e| anyhow::anyhow!("Tokenizer error: {}", e))?;
-            encodings.push(encoding);
-        }
-
-        let batch_size = documents.len();
-        let mut max_len = encodings
+    fn do_rerank_batch(&self, candidates: &[TokenizedCandidate]) -> Result<Vec<RerankScore>> {
+        let batch_size = candidates.len();
+        let mut max_len = candidates
             .iter()
-            .map(|e| e.get_ids().len())
+            .map(|candidate| candidate.encoding.get_ids().len())
             .max()
             .unwrap_or(0);
         if max_len == 0 {
@@ -149,9 +140,9 @@ impl LocalReranker {
         let mut input_ids = ndarray::Array2::<i64>::zeros((batch_size, max_len));
         let mut attention_mask = ndarray::Array2::<i64>::zeros((batch_size, max_len));
 
-        for (i, encoding) in encodings.iter().enumerate() {
-            let ids = encoding.get_ids();
-            let mask = encoding.get_attention_mask();
+        for (i, candidate) in candidates.iter().enumerate() {
+            let ids = candidate.encoding.get_ids();
+            let mask = candidate.encoding.get_attention_mask();
             let len = std::cmp::min(ids.len(), max_len);
             for j in 0..len {
                 input_ids[[i, j]] = ids[j] as i64;
@@ -176,27 +167,14 @@ impl LocalReranker {
         let (shape, data) = output_value.try_extract_tensor::<f32>()?;
         let ndim = shape.len();
 
-        let mut results = Vec::with_capacity(batch_size);
-        if ndim == 2 {
+        let mut results = if ndim == 2 {
             let dim = shape[1] as usize;
-            for i in 0..batch_size {
-                let score = data[i * dim];
-                results.push(RerankScore {
-                    index: index_offset + i,
-                    relevance_score: score as f64,
-                });
-            }
+            map_scores_to_original_indices(candidates, (0..batch_size).map(|i| data[i * dim]))
         } else if ndim == 1 {
-            for i in 0..batch_size {
-                let score = data[i];
-                results.push(RerankScore {
-                    index: index_offset + i,
-                    relevance_score: score as f64,
-                });
-            }
+            map_scores_to_original_indices(candidates, (0..batch_size).map(|i| data[i]))
         } else {
             anyhow::bail!("Unexpected tensor shape for reranker: {:?}", shape);
-        }
+        };
 
         results.sort_by(|a, b| {
             b.relevance_score
@@ -217,13 +195,29 @@ impl LocalReranker {
             return Ok(Vec::new());
         }
 
+        let mut candidates = Vec::with_capacity(documents.len());
+        for (index, document) in documents.iter().enumerate() {
+            if cancel.is_cancelled() {
+                return Err(RerankerError::Cancelled);
+            }
+            let encoding = self
+                .tokenizer
+                .encode((query, document.as_str()), true)
+                .map_err(|e| RerankerError::ApiError {
+                    status: 500,
+                    message: format!("Tokenizer error: {e}"),
+                })?;
+            candidates.push(TokenizedCandidate { index, encoding });
+        }
+        sort_candidates_by_tokenized_length(&mut candidates);
+
         let mut combined = Vec::with_capacity(documents.len());
-        for (batch_index, batch) in documents.chunks(MAX_RERANK_BATCH_SIZE).enumerate() {
+        for batch in candidates.chunks(MAX_RERANK_BATCH_SIZE) {
             if cancel.is_cancelled() {
                 return Err(RerankerError::Cancelled);
             }
             let scores = self
-                .do_rerank_batch(query, batch, batch_index * MAX_RERANK_BATCH_SIZE)
+                .do_rerank_batch(batch)
                 .map_err(|e| RerankerError::ApiError {
                     status: 500,
                     message: e.to_string(),
@@ -238,6 +232,24 @@ impl LocalReranker {
         });
         Ok(combined)
     }
+}
+
+fn map_scores_to_original_indices(
+    candidates: &[TokenizedCandidate],
+    scores: impl Iterator<Item = f32>,
+) -> Vec<RerankScore> {
+    candidates
+        .iter()
+        .zip(scores)
+        .map(|(candidate, score)| RerankScore {
+            index: candidate.index,
+            relevance_score: score as f64,
+        })
+        .collect()
+}
+
+fn sort_candidates_by_tokenized_length(candidates: &mut [TokenizedCandidate]) {
+    candidates.sort_unstable_by_key(|candidate| candidate.encoding.get_ids().len());
 }
 
 async fn load_reranker_components(ep: OnnxExecutionProvider) -> Result<(Session, Tokenizer)> {
@@ -404,6 +416,23 @@ fn should_acquire_ort_library(
 mod tests {
     use super::*;
 
+    fn candidate(index: usize, token_count: usize) -> TokenizedCandidate {
+        TokenizedCandidate {
+            index,
+            encoding: Encoding::new(
+                vec![0; token_count],
+                vec![0; token_count],
+                vec![String::new(); token_count],
+                vec![None; token_count],
+                vec![(0, 0); token_count],
+                vec![0; token_count],
+                vec![1; token_count],
+                Vec::new(),
+                Default::default(),
+            ),
+        }
+    }
+
     /// Loads neither model assets nor ONNX Runtime, so it always runs and
     /// always asserts. Deliberate: `test_local_reranker` below early-returns
     /// when ONNX Runtime is not on the default lookup path, and would pass
@@ -440,6 +469,51 @@ mod tests {
         assert!(should_acquire_ort_library(Ep::Rocm, true));
         assert!(should_acquire_ort_library(Ep::OpenVino, true));
         assert!(should_acquire_ort_library(Ep::DirectMl, true));
+    }
+
+    #[test]
+    fn reranker_groups_batches_by_length_and_restores_original_indices() {
+        let mut candidates = vec![
+            candidate(0, 7),
+            candidate(1, 2),
+            candidate(2, 9),
+            candidate(3, 4),
+            candidate(4, 1),
+            candidate(5, 8),
+            candidate(6, 3),
+            candidate(7, 6),
+            candidate(8, 5),
+            candidate(9, 10),
+        ];
+
+        sort_candidates_by_tokenized_length(&mut candidates);
+
+        let batches: Vec<Vec<usize>> = candidates
+            .chunks(MAX_RERANK_BATCH_SIZE)
+            .map(|batch| batch.iter().map(|candidate| candidate.index).collect())
+            .collect();
+        assert_eq!(batches, vec![vec![4, 1, 6, 3, 8, 7, 0, 5], vec![2, 9]]);
+
+        let mut scores = Vec::new();
+        for (batch_index, batch) in candidates.chunks(MAX_RERANK_BATCH_SIZE).enumerate() {
+            scores.extend(map_scores_to_original_indices(
+                batch,
+                (0..batch.len()).map(|offset| (batch_index * 100 + offset) as f32),
+            ));
+        }
+        scores.sort_by_key(|score| score.index);
+
+        assert_eq!(
+            scores.iter().map(|score| score.index).collect::<Vec<_>>(),
+            (0..10).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            scores
+                .iter()
+                .map(|score| score.relevance_score)
+                .collect::<Vec<_>>(),
+            vec![6.0, 1.0, 100.0, 3.0, 0.0, 7.0, 2.0, 5.0, 4.0, 101.0]
+        );
     }
 
     #[tokio::test]
