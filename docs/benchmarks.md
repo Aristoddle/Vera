@@ -30,18 +30,18 @@ JSON example:
 {
   "lanes": [
     {
-      "name": "bitnet-270m",
+      "name": "harrier-270m",
       "backend": "custom-onnx",
-      "repo": "microsoft/bitnet-embedding-270m",
+      "repo": "onnx-community/harrier-oss-v1-270m-ONNX",
       "onnx_file": "onnx/model.onnx",
+      "onnx_data_file": "onnx/model.onnx_data",
       "tokenizer_file": "tokenizer.json",
       "pooling": "last-token",
-      "query_prefix": "Represent this query for searching relevant code:",
-      "document_prefix": "Represent this code for retrieval:",
+      "query_prefix": "Instruct: Given a code search query, retrieve relevant code passages that answer the query\nQuery:",
       "dim": 640,
       "max_length": 512,
       "rerank": false,
-      "revision": "<commit-or-tag>"
+      "revision": "d59c919d0159aea2c19ed7d04288fcdd048d0f9c"
     },
     {
       "name": "potion-control",
@@ -61,6 +61,40 @@ python3 benchmarks/scripts/run_vera_benchmarks.py \
   --modes bm25-only hybrid-norerank \
   --task-id intent-001,intent-002 --category intent --skip-index
 ```
+
+### Default-Model Screening (2026-08-21)
+
+Screening for the default local embedding model. All lanes run hybrid BM25+vector retrieval with the reranker disabled, so the table isolates the embedding model. Every model is pinned to an immutable commit SHA (see `revision` above). Measured at Vera commit `69bc514` on one CUDA GPU.
+
+Subset (320 tasks, 16 repos):
+
+| Lane | nDCG@10 | Recall@1 | Recall@5 | Recall@10 | MRR | p50 ms | p95 ms | Index s | Storage |
+|------|---------|----------|----------|-----------|-----|--------|--------|---------|---------|
+| BM25 (no embeddings) | 0.7792 | 0.5911 | 0.8609 | 0.9141 | 0.7683 | 5.0 | 17.1 | 12 | 323 MB |
+| Potion Code 16M | 0.7656 | 0.5786 | 0.8547 | 0.9000 | 0.7508 | 13.2 | 57.6 | 17 | 418 MB |
+| potion-code-16M-v2 (API) | 0.7930 | 0.5990 | 0.8812 | 0.9328 | 0.7769 | 13.5 | 56.8 | 56 | 419 MB |
+| F2LLM-v2-80M (API) | 0.7897 | 0.6068 | 0.8875 | 0.9141 | 0.7774 | 20.3 | 62.0 | 163 | 419 MB |
+| F2LLM-v2-160M (API) | 0.7932 | 0.6021 | 0.8859 | 0.9234 | 0.7807 | 29.7 | 103.5 | 300 | 609 MB |
+| F2LLM-v2-330M (API) | 0.7971 | 0.6052 | 0.8938 | 0.9328 | 0.7805 | 31.3 | 90.8 | 427 | 609 MB |
+| jina v5 nano (default) | 0.7956 | 0.6005 | 0.8859 | 0.9328 | 0.7788 | 44.9 | 148.6 | 147 | 672 MB |
+| CodeRankEmbed 137M | 0.7949 | 0.6021 | 0.8875 | 0.9328 | 0.7774 | 21.3 | 84.7 | 375 | 670 MB |
+| Harrier 270M | 0.7938 | 0.6068 | 0.8813 | 0.9281 | 0.7799 | 24.2 | 77.4 | 2391 | 609 MB |
+| Harrier 0.6B fp32 | 0.7971 | 0.5974 | 0.8906 | 0.9422 | 0.7791 | 27.4 | 94.3 | 7082 | 800 MB |
+
+Full suite (1,251 tasks, 63 repos):
+
+| Lane | nDCG@10 | Recall@1 | Recall@5 | Recall@10 | MRR | p50 ms | p95 ms | Index s |
+|------|---------|----------|----------|-----------|-----|--------|--------|---------|
+| jina v5 nano (default) | 0.7452 | 0.5560 | 0.8320 | 0.8846 | 0.7184 | 22.9 | 128.8 | 1823 |
+| F2LLM-v2-330M (API) | 0.7425 | 0.5564 | 0.8343 | 0.8778 | 0.7164 | 57.9 | 222.4 | 3446 |
+| CodeRankEmbed 137M | 0.7401 | 0.5512 | 0.8311 | 0.8802 | 0.7123 | 27.0 | 124.5 | 3308 |
+| potion-code-16M-v2 (API) | 0.7388 | 0.5516 | 0.8296 | 0.8766 | 0.7129 | 16.8 | 84.6 | 443 |
+
+Read: all neural lanes sit within ~0.005 nDCG of each other on both scales; no code-specialization premium showed up at Vera's current 512-token embedding truncation. The default-model decision therefore turns on license (CodeRankEmbed is MIT, jina v5 is CC-BY-NC-4.0) and operational cost, not retrieval quality. Harrier's index times (16x and 48x jina's on the subset) disqualify both sizes as defaults regardless of quality.
+
+Precision notes: jina lanes run its fp16 export on GPU (the automatic quantized-to-fp16 swap); CodeRankEmbed and Harrier run fp32 (CodeRankEmbed ships no fp16 export; Harrier's fp16 export uses GroupQueryAttention with attention bias, which the ONNX Runtime CUDA kernel rejects). Harrier 0.6B fp32 has multi-shard external weights (`model.onnx_data_1`), which Vera's downloader does not support yet; it ran from a pinned local directory instead. The `(API)` rows are models Vera cannot run natively, served by a local OpenAI-compatible shim and measured through the `api` lane backend: potion-code-16M-v2 (model2vec, CPU) and the F2LLM-v2 family (transformers, bf16 on CUDA, 512-token truncation to match the other lanes), all pinned by upstream commit (e9d2a44; 19a4fd85, 0e04993a, 1b8f0301).
+
+Artifacts (uncommitted, under `benchmarks/results/`): `harrier-screening-20260821T050037Z-subset-{vera-bm25,vera-potion,vera-cuda}.json`, `harrier-screening-20260821T082401Z-subset-harrier-270m-cuda.json`, `harrier-screening-20260821T093941Z-subset-harrier-0.6b-fp32-cuda.json`, `harrier-screening-20260821T111613Z-subset-coderankembed-cuda.json`, `harrier-screening-20260821T133638Z-subset-f2llm-80m-api.json`, `harrier-screening-20260821T135016Z-subset-potion-v2-api.json`, `harrier-screening-20260821T173032Z-subset-f2llm-160m-api.json`, `harrier-screening-20260821T173032Z-subset-f2llm-330m-api.json`, `harrier-screening-20260821T114648Z-full-vera-cuda.json`, `harrier-screening-20260821T114654Z-full-coderankembed-cuda.json`, `harrier-screening-20260821T135235Z-full-potion-v2-api.json`, `harrier-screening-20260821T174547Z-full-f2llm-330m-api.json`.
 
 ### Main Results
 
