@@ -112,7 +112,7 @@ impl Default for RetrievalConfig {
             default_limit: 5,
             rrf_k: 60.0,
             rerank_candidates: 50,
-            reranking_enabled: true,
+            reranking_enabled: false,
             max_rerank_batch: default_max_rerank_batch(),
             max_output_chars: 12_000,
         }
