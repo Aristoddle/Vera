@@ -1,10 +1,10 @@
 # @vera-ai/cli
 
-Code search for AI agents. Vera indexes your codebase using tree-sitter parsing and hybrid search (BM25 + vector similarity + cross-encoder reranking), then returns ranked code snippets as Markdown codeblocks by default, or JSON with `--json`.
+Code search for AI agents. Vera indexes your codebase using tree-sitter parsing and hybrid search (BM25 + vector similarity + optional cross-encoder reranking), then returns ranked code snippets as Markdown codeblocks by default, or JSON with `--json`.
 
 This package downloads and wraps the native Vera binary for your platform. On musl-based Linux (Alpine, NixOS), the correct static binary is selected automatically. Set `VERA_TARGET` to override target detection (e.g., `VERA_TARGET=x86_64-unknown-linux-musl npm install -g @vera-ai/cli`).
 
-`v1.0.0-rc` full-pipeline benchmark: `nDCG@10` `0.7327` on the 1,251-task Semble v0.5.5 snapshot (63 repos). Full details live in the main repo docs.
+The default local embedding model is `minishlab/potion-code-16M-v2`. It runs locally on CPU on any supported machine; no GPU or ONNX Runtime needed. In the 2026-08-23 Semble comparison, Vera scored `0.8447` nDCG@10 versus Semble 0.5.5 at `0.8514`, using the same embeddings, harness, graded relevance, and suffix-corrected path matching. Full details live in the main repo docs.
 
 ## Install
 
@@ -26,7 +26,7 @@ vera search "authentication logic"
 | Task | Command |
 |------|---------|
 | Use the interactive setup wizard | `vera setup` |
-| Use CPU-only local mode | `vera setup --potion-code` |
+| Use the default local model | `vera setup --potion-code` |
 | Configure API mode | `vera setup --api` |
 | Use a local NVIDIA backend | `vera setup --onnx-jina-cuda` |
 | Search semantically | `vera search "authentication middleware"` |
@@ -50,7 +50,7 @@ For the full backend matrix, model options, Docker setup, and troubleshooting, s
 
 - **61+ languages** via tree-sitter AST parsing
 - **Hybrid search**: BM25 keyword + vector similarity, fused with Reciprocal Rank Fusion
-- **Cross-encoder reranking** for precision
+- **Opt-in cross-encoder reranking** for precision, disabled by default
 - **Git-aware scopes and index debugging**: `--changed` / `--since` / `--base`, `explain-path`, and index health in `vera stats`
 - **Markdown codeblock output** by default with file paths, line ranges, and optional symbol info (use `--json` for compact JSON; `--raw` works with `vera search`, `vera grep`, and `vera references`; `--timing` works with `vera search` and `vera grep`, before or after the subcommand)
 

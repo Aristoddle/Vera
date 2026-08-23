@@ -43,6 +43,8 @@ CPU, CUDA, ROCm, and OpenVINO images available. See [docker.md](docker.md).
 
 Vera's index and search always run locally. The "backend" only controls where embedding and reranking models run.
 
+The default embedding model is `minishlab/potion-code-16M-v2`, a static embedding model that runs locally on CPU on any supported machine; no GPU or ONNX Runtime needed. Jina ONNX and CodeRankEmbed are opt-in alternatives.
+
 ### API Mode
 
 Models run on a remote server. No downloads, no GPU required, works on any hardware. You just need an API key from any OpenAI-compatible provider.
@@ -51,13 +53,13 @@ Models run on a remote server. No downloads, no GPU required, works on any hardw
 vera setup --api
 ```
 
-Vera will prompt you for your endpoint URL, model ID, and API key. These get saved to Vera's config so you only enter them once.
+Vera will prompt you for your endpoint URL, model ID, and API key. These get saved to Vera's config so you only enter them once. API mode is an alternative to the default local model.
 
 Many providers offer free tiers or generous trial credits. Any OpenAI-compatible embedding endpoint works. Some options:
 
 | Provider | Free tier? | Notes |
 |----------|-----------|-------|
-| [Jina AI](https://jina.ai/) | Yes (1M tokens free) | Vera's default local models are Jina, so the API versions work well too |
+| [Jina AI](https://jina.ai/) | Yes (1M tokens free) | Remote embedding and reranking endpoints |
 | [OpenAI](https://platform.openai.com/) | Trial credits | `text-embedding-3-small` or `text-embedding-3-large` |
 | [Voyage AI](https://www.voyageai.com/) | Free tier available | Code-optimized models (`voyage-code-3`, `rerank-2`) |
 | [Cohere](https://cohere.com/) | Trial key | `embed-english-v3.0` |
@@ -88,24 +90,24 @@ Only model calls leave your machine. Indexing, storage, and search remain local.
 
 ### CPU Local Mode
 
-Potion Code runs on CPU with static embeddings. It does not need ONNX Runtime or a GPU.
+The default `minishlab/potion-code-16M-v2` model runs locally on CPU on any supported machine; no GPU or ONNX Runtime needed.
 
 ```bash
 vera setup --potion-code
 ```
 
-Use this for CPU-only machines when you want local model calls. The interactive `vera setup` wizard selects Potion Code when it does not detect a supported GPU.
+Use this when you want the default local model. It also runs on CPU-only machines, and the interactive `vera setup` wizard selects it as the default local backend.
 
 ### GPU Local Mode
 
-Models run on your machine using ONNX Runtime. Vera downloads the Jina embedding model and the local reranker, then uses your GPU provider. No API key needed, fully offline after setup.
+Jina ONNX is an opt-in local backend. Vera downloads the Jina embedding model and local reranker, then uses your GPU provider. No API key is needed, and the setup works offline after the download.
 
 **Pick the right command for your hardware:**
 
 | You have | Command | What happens |
 |----------|---------|-------------|
 | Not sure | `vera setup` | Interactive wizard auto-detects your hardware |
-| CPU only | `vera setup --potion-code` | Uses Potion Code static embeddings |
+| CPU only | `vera setup --potion-code` | Uses the default `minishlab/potion-code-16M-v2` model |
 | Apple Silicon (M1/M2/M3/M4) | `vera setup --onnx-jina-coreml` | Uses CoreML GPU acceleration |
 | NVIDIA GPU | `vera setup --onnx-jina-cuda` | Uses CUDA. Fastest local option |
 | AMD GPU (Linux) | `vera setup --onnx-jina-rocm` | Uses ROCm |
@@ -216,5 +218,5 @@ vera uninstall   # removes config dir, skill files, PATH shim
 - Run `vera doctor` to diagnose issues.
 - Run `vera doctor --probe` for deeper local backend diagnostics.
 - Wrong backend? Run `vera setup` again with a different flag.
-- Slow Jina indexing on CPU? Switch to `--potion-code`, `--api`, or a GPU backend.
+- Slow opt-in Jina indexing on CPU? Switch to `--potion-code`, `--api`, or a GPU backend.
 - See [troubleshooting.md](troubleshooting.md) for more.

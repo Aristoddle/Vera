@@ -1,6 +1,6 @@
 # How Vera Works
 
-Vera's search pipeline has three stages: retrieve candidates, fuse results, then rerank. Every stage was chosen based on benchmarks against real codebases, not assumptions.
+Vera's search pipeline retrieves candidates, fuses results, applies deterministic ranking, and optionally reranks. Every stage was chosen based on benchmarks against real codebases, not assumptions.
 
 ## Parsing: Tree-Sitter Chunks
 
@@ -40,6 +40,8 @@ RRF is simple, parameter-light, and doesn't need training data. It consistently 
 
 After fusion, Vera applies lightweight deterministic ranking logic before final reranking.
 
+Current ranking combines BM25 and vector results with RRF (`k=60`), then applies a file-coherence boost, keyword path boost, content coverage, content-symbol definition boost, and exact-match concept pool tail injection capped at 4 definitions per file.
+
 This stage handles cases that dense retrieval alone is bad at:
 
 - exact filename and exact identifier queries
@@ -54,9 +56,9 @@ This is also where Vera adds a small amount of query-aware candidate expansion, 
 
 ## Reranking: Cross-Encoder
 
-The top fused candidates are sent to a cross-encoder reranker. Unlike embeddings (which encode query and document separately), the cross-encoder reads the query and each candidate together as a single pair, scoring relevance jointly.
+Reranking is opt-in through `retrieval.reranking_enabled` and is off by default. When enabled, the top fused candidates are sent to a cross-encoder reranker. Unlike embeddings (which encode query and document separately), the cross-encoder reads the query and each candidate together as a single pair, scoring relevance jointly.
 
-This is the most expensive stage but also the most impactful. Reranking lifts MRR@10 from 0.28 to 0.60.
+The default no-reranker path ends with the deterministic ranking stage. The 2026-08-23 dual-set cross-encoder screening scored every tested reranker below that heuristic baseline. See [models.md](models.md#reranking) for the scores and the recommended local override.
 
 With Jina ONNX local models, the reranker runs on-device via ONNX Runtime. Potion Code uses deterministic ranking heuristics instead of the ONNX reranker. With API mode, reranking calls your configured endpoint. Obvious filename and path-dominant queries can skip reranking when lexical evidence is already decisive.
 
@@ -88,7 +90,7 @@ Query
                                           │
                                     top candidates
                                           │
-                                    cross-encoder rerank
+                            optional cross-encoder rerank
                                           │
                                     final ranked results
 ```
@@ -100,4 +102,4 @@ Query
 | Vector search | Semantic similarity | Catches conceptual matches |
 | RRF fusion | Merges both result lists | Covers both exact and semantic |
 | Query-aware ranking | Applies deterministic priors and candidate shaping | Fixes exact-match, config, and cross-file failure modes |
-| Cross-encoder rerank | Joint query-document scoring | Best result lands at the top |
+| Optional cross-encoder rerank | Joint query-document scoring | Adds a second relevance signal when enabled |

@@ -23,8 +23,8 @@ Data flow: file → grammar lookup → tree-sitter parse (+ diagnostics) → nod
 
 `EmbeddingProvider` trait with three implementations:
 - `ApiEmbeddingProvider`: HTTP calls to OpenAI-compatible endpoints
-- `LocalEmbeddingProvider`: ONNX Runtime inference with Jina v5 nano
-- `Model2VecProvider`: Potion Code static embeddings on CPU
+- `LocalEmbeddingProvider`: ONNX Runtime inference for opt-in Jina/custom ONNX models
+- `Model2VecProvider`: the default `potion-code-16M-v2` static embeddings on CPU
 
 `DynamicProvider` dispatches between them at runtime based on `VERA_BACKEND` or backend CLI flags.
 
@@ -34,7 +34,7 @@ Data flow: file → grammar lookup → tree-sitter parse (+ diagnostics) → nod
 2. BM25 (`bm25.rs`) and vector search (`vector.rs`) run in parallel
 3. Results fused via RRF (`hybrid.rs`, k=60). `fuse_rrf_multi` generalizes fusion to N ranked lists.
 4. Query-aware ranking and candidate shaping apply deterministic priors (`ranking.rs`, `search_service.rs`)
-5. Top candidates reranked by cross-encoder (`reranker.rs` or `local_reranker.rs`)
+5. Top candidates optionally reranked by cross-encoder (`reranker.rs` or `local_reranker.rs`)
 6. Final `Vec<SearchResult>` returned
 
 Deep search (`--deep`): `rag_fusion.rs` runs a cheap BM25 pre-filter to collect symbol names and file paths, then passes these as context hints to the LLM (`completion_client.rs`) which decomposes the query into targeted sub-queries (default 2). Sub-queries reuse the active `SearchContext`, and results merge with weighted RRF (original query gets 2x weight). Falls back to iterative symbol-following when no completion endpoint is configured.

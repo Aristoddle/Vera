@@ -49,7 +49,7 @@ The MCP server grew from four tools to seven: `structural_search`, `find_referen
 
 ## Models And Local Backends
 
-- `vera setup --potion-code` adds a CPU-first local backend that runs without a GPU runtime.
+- `vera setup --potion-code` selects the default `minishlab/potion-code-16M-v2` static embedding model. It runs locally on CPU on any supported machine; no GPU or ONNX Runtime needed.
 - Loaded embedding and reranker models are cached and reused across repeated searches, multi-query and deep search, and MCP calls instead of being reloaded per query.
 - Voyage AI rerank endpoints are supported, including the `rerank-2` API format.
 - `VERA_EMBEDDING_MODEL_ALIASES` lets compatible deployment names share an index after the normal dimension check. Alias groups are separated with semicolons and names within a group with commas.

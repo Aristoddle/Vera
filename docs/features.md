@@ -1,6 +1,6 @@
 # Features
 
-Vera (Vector Enhanced Reranking Agent) is a code search tool that combines BM25 keyword matching, vector similarity, and cross-encoder reranking into a single retrieval pipeline. This page covers everything it can do.
+Vera (Vector Enhanced Reranking Agent) is a code search tool that combines BM25 keyword matching, vector similarity, deterministic ranking, and optional cross-encoder reranking. This page covers everything it can do.
 
 ## Search Pipeline
 
@@ -15,9 +15,11 @@ Results from both paths merge through Reciprocal Rank Fusion (RRF), so a result 
 
 ### Cross-Encoder Reranking
 
-After fusion, the top candidates go through a cross-encoder that reads query and candidate together as a single pair. This is the most impactful stage: it lifts MRR@10 from 0.28 to 0.60. Most code search tools skip this step entirely.
+After fusion, Vera can send the top candidates to a cross-encoder that reads query and candidate together as a single pair. Reranking is controlled by `retrieval.reranking_enabled` and is off by default; the deterministic heuristic stack ranks results when it is disabled.
 
 Vera supports local cross-encoders (Jina) and remote reranking endpoints (Jina, Cohere, or Voyage AI `rerank-2` with `RERANKER_MODEL_BASE_URL=https://api.voyageai.com/v1`, with wire format handled automatically).
+
+The 2026-08-23 dual-set screening found no cross-encoder improvement over the no-reranker baseline. See [models.md](models.md#reranking) for the scores and the recommended `mxbai-rerank-xsmall-v1` local override.
 
 Large candidate sets are automatically batched (default 20 per request, configurable via `VERA_MAX_RERANK_BATCH`). Individual documents exceeding the reranker's context window are truncated at the last newline boundary before the character limit (default 4800, configurable via `VERA_MAX_RERANK_DOC_CHARS`). Both settings work automatically with no required configuration.
 
@@ -160,17 +162,17 @@ Use this as the default structural workflow. Use `vera references` for exact cal
 
 Indexing, storage, and search always stay on your machine. The backend choice only affects where embeddings and reranking run:
 
-- **Potion Code CPU**: `vera setup --potion-code` downloads static code embeddings and runs without ONNX Runtime.
-- **Jina ONNX GPU**: `vera setup --onnx-jina-cuda` or another `--onnx-jina-*` flag downloads curated ONNX models. The full pipeline (BM25 + vector + rerank) runs without external calls.
+- **Potion Code**: `vera setup --potion-code` selects the default `minishlab/potion-code-16M-v2` static embedding model. It runs locally on CPU on any supported machine; no GPU or ONNX Runtime needed.
+- **Jina ONNX GPU**: `vera setup --onnx-jina-cuda` or another `--onnx-jina-*` flag selects an opt-in ONNX embedding backend. The local pipeline runs without external calls.
 - **API mode**: Point at any OpenAI-compatible endpoint (remote APIs or local servers like llama.cpp). Only model calls leave your machine. Query prefixes for asymmetric embedding models (Qwen3, CodeRankEmbed, E5, BGE) are auto-detected from the model ID. Override with `EMBEDDING_QUERY_PREFIX` for unsupported models. See [llama-cpp-setup.md](llama-cpp-setup.md) for a step-by-step guide.
 
 ### Curated Local Models
 
-Potion Code is the CPU-first local model:
+The default local embedding model is `minishlab/potion-code-16M-v2`, a static embedding model that runs locally on CPU on any supported machine; no GPU or ONNX Runtime needed:
 
 | Model | Role |
 |-------|------|
-| [minishlab/potion-code-16M](https://huggingface.co/minishlab/potion-code-16M) | Static code embedding model |
+| [minishlab/potion-code-16M-v2](https://huggingface.co/minishlab/potion-code-16M-v2) | Default local code embedding model |
 
 The Jina ONNX backends use these local models:
 
@@ -187,7 +189,7 @@ Auto-detected during setup. Supported backends:
 
 | Flag | Hardware |
 |------|----------|
-| `--potion-code` | CPU-only local inference |
+| `--potion-code` | Default local inference, runs locally on CPU; no GPU or ONNX Runtime needed |
 | `--onnx-jina-cuda` | NVIDIA (CUDA 12+) |
 | `--onnx-jina-rocm` | AMD (Linux, ROCm) |
 | `--onnx-jina-directml` | Any DirectX 12 GPU (Windows) |
@@ -202,7 +204,7 @@ Local ONNX indexing shapes micro-batches from actual token lengths rather than u
 
 ### Custom Local Embeddings
 
-Swap the Jina ONNX embedding model without changing the rest of that pipeline. Point at a Hugging Face repo, a direct URL, or a local directory with custom pooling, query prefix, and dimension settings. The local reranker defaults to the curated Jina model and supports Hugging Face repository, revision, ONNX file, and tokenizer overrides through `LOCAL_RERANKER_*` environment variables.
+Swap the opt-in Jina ONNX embedding model without changing the rest of that pipeline. Point at a Hugging Face repo, a direct URL, or a local directory with custom pooling, query prefix, and dimension settings. Local rerankers support Hugging Face repository, revision, ONNX file, and tokenizer overrides through `LOCAL_RERANKER_*` environment variables. See [models.md](models.md#reranking) for the recommended model.
 
 ## Output and Integration
 
@@ -263,7 +265,7 @@ During setup, Vera offers to add a usage snippet to your project's agent config 
 
 ### Backend Management
 
-`vera backend` manages the model backend separately from the full setup wizard. Switch GPU backends, pick Potion Code CPU, swap ONNX embedding models, or reconfigure API endpoints without re-running setup.
+`vera backend` manages the model backend separately from the full setup wizard. Switch GPU backends, pick the default Potion Code model, swap opt-in ONNX embedding models, or reconfigure API endpoints without re-running setup.
 
 ### HTTP Inference Server
 
@@ -310,4 +312,4 @@ A fully static musl-linked binary (`x86_64-unknown-linux-musl`) is available for
 
 ## Benchmarks
 
-See the [current local release benchmark](benchmarks.md#current-local-release-benchmark) for the canonical 21-task comparison.
+See the [current Semble comparison](benchmarks.md#2026-08-23-semble-comparison) for the current aggregate results.

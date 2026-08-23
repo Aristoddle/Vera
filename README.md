@@ -25,7 +25,7 @@
 
 **V**ector **E**nhanced **R**eranking **A**gent
 
-Code search that combines BM25 keyword matching, vector similarity, and cross-encoder reranking. Supports 65 languages (61 with tree-sitter parsing), runs locally, returns structured results with file paths, line ranges, symbol metadata, and relevance scores.
+Code search that combines BM25 keyword matching, vector similarity, and optional cross-encoder reranking. Supports 65 languages (61 with tree-sitter parsing), runs locally, returns structured results with file paths, line ranges, symbol metadata, and relevance scores.
 
 </div>
 
@@ -43,7 +43,7 @@ bunx @vera-ai/cli install   # or: npx -y @vera-ai/cli install / uvx vera-ai inst
 **2. Set up and index** (pick one)
 ```bash
 vera setup                                  # Interactive, indexes this project by default
-vera setup --potion-code --index .          # CPU-only local mode
+vera setup --potion-code --index .          # Default local model
 vera setup --api --index .                  # Remote API mode, prompts for endpoint + key
 vera setup --onnx-jina-coreml --index .     # Apple Silicon (M1/M2/M3/M4)
 vera setup --onnx-jina-cuda --index .       # NVIDIA GPU
@@ -59,11 +59,13 @@ vera search "authentication logic"
 
 If the current project has no index, interactive search offers to create one. JSON and non-interactive searches still return the missing-index error.
 
+The default local embedding model is [`minishlab/potion-code-16M-v2`](https://huggingface.co/minishlab/potion-code-16M-v2). It runs locally on CPU on any supported machine; no GPU or ONNX Runtime needed. Jina ONNX and CodeRankEmbed are opt-in alternatives.
+
 ## What Sets Vera Apart
 
 | | |
 |---|---|
-| **Cross-encoder reranking** | Most tools stop at retrieval. Vera scores query-candidate pairs jointly, lifting MRR@10 from 0.28 to 0.60. |
+| **Opt-in cross-encoder reranking** | Enable query-candidate scoring with `retrieval.reranking_enabled` when you need it. Reranking is off by default. |
 | **Single binary, 65 languages** | One static binary with 61 tree-sitter grammars compiled in. No Python, no language servers, no per-language toolchains. |
 | **Built-in code intelligence** | Call graph analysis, reference finding, dead code detection, and project overview, all from the same index. |
 | **Token-efficient for agents** | Returns symbol-bounded chunks, not entire files. 75-95% fewer tokens on typical queries. |
@@ -85,7 +87,7 @@ Vera itself is always local: the index lives in `.vera/` per project, config and
 | You have | Run this | What happens |
 |----------|----------|-------------|
 | Not sure | `vera setup` | Interactive wizard auto-detects your hardware |
-| CPU only | `vera setup --potion-code` | Downloads Potion Code static embeddings. No ONNX Runtime needed |
+| CPU only | `vera setup --potion-code` | Uses the default `minishlab/potion-code-16M-v2` local model on any supported machine |
 | Remote models | `vera setup --api` | Prompts for an OpenAI-compatible endpoint and key |
 | Apple Silicon (M1/M2/M3/M4) | `vera setup --onnx-jina-coreml` | Downloads local models, uses CoreML GPU acceleration |
 | NVIDIA GPU | `vera setup --onnx-jina-cuda` | Downloads local models, uses CUDA. Fastest local option |
@@ -93,7 +95,7 @@ Vera itself is always local: the index lives in `.vera/` per project, config and
 | Intel GPU (Linux) | `vera setup --onnx-jina-openvino` | Downloads local models, uses OpenVINO |
 | DirectX 12 GPU (Windows) | `vera setup --onnx-jina-directml` | Downloads local models, uses DirectML |
 
-API mode works with any OpenAI-compatible endpoint and needs no local compute. Use `vera setup --api --yes` with `EMBEDDING_MODEL_*` variables for non-interactive setup. Potion Code is the CPU-first local backend. Jina ONNX is the GPU local backend and includes the local reranker. After the first index, `vera update .` only re-embeds changed files, so incremental updates are fast on any backend. Full details: [docs/models.md](docs/models.md).
+API mode works with any OpenAI-compatible endpoint and needs no local compute. Use `vera setup --api --yes` with `EMBEDDING_MODEL_*` variables for non-interactive setup. The default `minishlab/potion-code-16M-v2` model runs locally on CPU on any supported machine; no GPU or ONNX Runtime needed. Jina ONNX and CodeRankEmbed are opt-in alternatives. Reranking is opt-in and disabled by default. After the first index, `vera update .` only re-embeds changed files, so incremental updates are fast on any backend. Full details: [docs/models.md](docs/models.md).
 
 For step-by-step instructions, API provider options, Docker, building from source, and troubleshooting, see the full [Installation Guide](docs/installation.md).
 
@@ -183,15 +185,14 @@ vera explain-path path/to/file
 
 ## Benchmarks
 
-`v1.0.0-rc` full-pipeline benchmark: `nDCG@10` 0.7327 on the 1,251-task Semble v0.5.5 snapshot (63 repos), using Vera's graded metric contract. See [docs/benchmarks.md](docs/benchmarks.md#provenance) for provenance, metric differences, and ablation detail.
+Semble benchmark comparison, measured 2026-08-23 on 1,251 tasks across 63 repositories:
 
-21-task benchmark across `ripgrep`, `flask`, `fastify`, and `turborepo`:
+| Tool | nDCG@10 | R@1 | R@5 | R@10 | MRR | Query p50 | Index time | Index size |
+|------|---------|------|------|-------|-----|-----------|------------|------------|
+| Vera | 0.8447 | 0.6731 | **0.9203** | 0.9514 | 0.8272 | 15.1 ms | 165 s | **3.9 GB** |
+| Semble 0.5.5, full rerank stack | **0.8514** | **0.6747** | 0.9177 | **0.9656** | **0.8348** | **2.3 ms** | **100 s** | 32 GB |
 
-| Metric | ripgrep | cocoindex | ColGREP (149M) | Vera |
-|--------|---------|-----------|----------------|------|
-| Recall@5 | 0.28 | 0.37 | 0.67 | **0.78** |
-| MRR@10 | 0.26 | 0.35 | 0.62 | **0.91** |
-| nDCG@10 | 0.29 | 0.52 | 0.56 | **0.84** |
+Both tools used the same `minishlab/potion-code-16M-v2` embeddings, harness, graded relevance, and suffix-corrected path matching in the scorer. On the 320-task tuning subset, Vera scored `0.8542` versus Semble at `0.8494` nDCG. On the contamination-check independent set, Vera scored `0.7644` versus Semble at `0.7655`. See [docs/benchmarks.md](docs/benchmarks.md) for the screening tables and historical comparisons.
 
 Full methodology and version history: [docs/benchmarks.md](docs/benchmarks.md).
 
