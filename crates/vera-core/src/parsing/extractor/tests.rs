@@ -547,6 +547,86 @@ bar() {
 }
 
 #[test]
+fn bash_extracts_case_items_with_first_pattern_names() {
+    let source = r#"function nvm() {
+    case "$1" in
+        use)
+            echo use
+            ;;
+        "--help")
+            echo help
+            ;;
+        a|b)
+            echo alternate
+            ;;
+    esac
+}"#;
+    let symbols = parse_and_extract(source, Language::Bash);
+
+    let named: Vec<_> = symbols
+        .iter()
+        .filter_map(|symbol| symbol.name.as_deref())
+        .collect();
+    assert_eq!(
+        named,
+        vec!["nvm", "nvm use", "nvm --help", "nvm a"],
+        "case items should use the first pattern alternative"
+    );
+    for symbol in symbols.iter().skip(1) {
+        assert_eq!(symbol.symbol_type, SymbolType::Function);
+        assert!(symbol.start_row < symbol.end_row);
+        assert!(symbol.start_byte < symbol.end_byte);
+        assert!(source[symbol.start_byte..symbol.end_byte].contains(")"));
+    }
+}
+
+#[test]
+fn bash_extracts_nested_and_multiple_case_statements() {
+    let source = r#"dispatch() {
+    case "$1" in
+        outer)
+            case "$2" in
+                inner)
+                    echo inner
+                    ;;
+            esac
+            ;;
+    esac
+    case "$3" in
+        second)
+            echo second
+            ;;
+    esac
+}"#;
+    let symbols = parse_and_extract(source, Language::Bash);
+
+    let named: Vec<_> = symbols
+        .iter()
+        .filter_map(|symbol| symbol.name.as_deref())
+        .collect();
+    assert_eq!(
+        named,
+        vec![
+            "dispatch",
+            "dispatch outer",
+            "dispatch inner",
+            "dispatch second"
+        ]
+    );
+
+    let outer = symbols
+        .iter()
+        .find(|symbol| symbol.name.as_deref() == Some("dispatch outer"))
+        .unwrap();
+    let inner = symbols
+        .iter()
+        .find(|symbol| symbol.name.as_deref() == Some("dispatch inner"))
+        .unwrap();
+    assert!(inner.start_byte > outer.start_byte);
+    assert!(inner.end_byte < outer.end_byte);
+}
+
+#[test]
 fn kotlin_extracts_types_and_functions() {
     let source = r#"
 fun foo() {}

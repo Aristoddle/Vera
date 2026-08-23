@@ -299,6 +299,13 @@ fn collect_symbols(
             return;
         }
 
+        // Bash dispatchers commonly put their branches in a case statement;
+        // keep the function and expose each case arm as a named child symbol.
+        if lang == Language::Bash && kind == "function_definition" {
+            extract_bash_case_items(&node, source, symbols);
+            return;
+        }
+
         // A Rust `mod name { ... }` is a container, not a leaf. Record the
         // module, then keep walking so the items declared inside it are
         // extracted as symbols of their own instead of being swallowed by the

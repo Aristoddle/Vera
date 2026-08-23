@@ -310,6 +310,83 @@ pub(super) fn extract_lua_function_binding(
     Some(RawSymbol::at(node, Some(name), SymbolType::Function))
 }
 
+/// Extract Bash `case` arms inside a function as named function symbols.
+///
+/// Bash dispatchers commonly put most of their useful behavior in a large
+/// `case` statement. Keeping each arm as a child symbol gives those branches
+/// their own names and spans while the enclosing function remains indexable.
+pub(super) fn extract_bash_case_items(
+    function_node: &tree_sitter::Node<'_>,
+    source: &[u8],
+    symbols: &mut Vec<RawSymbol>,
+) {
+    let function_name = extract_name(function_node, source);
+    symbols.push(RawSymbol::at(
+        function_node,
+        function_name.clone(),
+        SymbolType::Function,
+    ));
+
+    fn visit(
+        node: tree_sitter::Node<'_>,
+        source: &[u8],
+        function_name: Option<&str>,
+        symbols: &mut Vec<RawSymbol>,
+    ) {
+        if node.kind() == "case_statement" {
+            let mut cursor = node.walk();
+            for item in node
+                .named_children(&mut cursor)
+                .filter(|child| child.kind() == "case_item")
+            {
+                let mut value_cursor = item.walk();
+                let Some(pattern) = item
+                    .children_by_field_name("value", &mut value_cursor)
+                    .next()
+                    .and_then(|value| value.utf8_text(source).ok())
+                    .and_then(bash_case_pattern_name)
+                else {
+                    continue;
+                };
+
+                let name = function_name
+                    .map(|parent| format!("{parent} {pattern}"))
+                    .unwrap_or(pattern);
+                symbols.push(RawSymbol::at(&item, Some(name), SymbolType::Function));
+            }
+        }
+
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            // The generic extractor treats a function definition as a leaf;
+            // do not attribute a nested function's case arms to its parent.
+            if child.kind() != "function_definition" {
+                visit(child, source, function_name, symbols);
+            }
+        }
+    }
+
+    let mut cursor = function_node.walk();
+    for child in function_node.named_children(&mut cursor) {
+        visit(child, source, function_name.as_deref(), symbols);
+    }
+}
+
+/// Convert the first Bash case pattern into a readable symbol-name fragment.
+fn bash_case_pattern_name(text: &str) -> Option<String> {
+    let text = text.trim();
+    if text.len() >= 2
+        && matches!(
+            (text.as_bytes().first(), text.as_bytes().last()),
+            (Some(b'\''), Some(b'\'')) | (Some(b'"'), Some(b'"'))
+        )
+    {
+        let text = &text[1..text.len() - 1];
+        return (!text.is_empty()).then(|| text.to_string());
+    }
+    (!text.is_empty()).then(|| text.to_string())
+}
+
 /// Refine a Go type_spec into the correct SymbolType based on the type child.
 pub(super) fn refine_go_type_spec(node: &tree_sitter::Node<'_>, source: &[u8]) -> SymbolType {
     if let Some(type_child) = node.child_by_field_name("type") {
