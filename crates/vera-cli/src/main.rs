@@ -1009,6 +1009,6 @@ mod tests {
 
         let val =
             commands::config::get_config_value(&config, "retrieval.reranking_enabled").unwrap();
-        assert_eq!(val, serde_json::json!(true));
+        assert_eq!(val, serde_json::json!(false));
     }
 }

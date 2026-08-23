@@ -195,7 +195,7 @@ fn print_timings(timings: &SearchTimings) {
     let mut err = stderr.lock();
     let fmt = |d: Option<Duration>| -> String {
         match d {
-            Some(d) => format!("{}ms", d.as_millis()),
+            Some(d) => format!("{:.1}ms", d.as_micros() as f64 / 1000.0),
             None => "n/a".to_string(),
         }
     };

@@ -789,7 +789,8 @@ mod tests {
             ("RERANKER_MODEL_API_KEY", "dummy-key"),
         ]);
 
-        let config = VeraConfig::default();
+        let mut config = VeraConfig::default();
+        config.retrieval.reranking_enabled = true;
         let filters = SearchFilters::default();
         let context = SearchContext::new(&config, crate::config::InferenceBackend::Api).await;
 
