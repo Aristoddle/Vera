@@ -164,7 +164,10 @@ impl SearchRunner<'_> {
             &result_sets,
             self.filters,
             self.config.retrieval.rrf_k,
-            self.result_limit,
+            // Augment before truncating (issue #121): pass the wider candidate
+            // limit so exact/concept matches displace fused entries on score,
+            // not by exhausting a pre-truncated window.
+            vera_core::retrieval::multi_query_candidate_limit(self.result_limit),
             self.result_limit,
         )?;
         timings.total = Some(overall_start.elapsed());

@@ -112,11 +112,9 @@ pub fn multi_query_candidate_limit(result_limit: usize) -> usize {
 /// Merge per-subquery result sets: equally weighted RRF, then exact-match
 /// augmentation, then the cut to `result_limit`.
 ///
-/// `fuse_limit` is a parameter rather than a constant because the two callers
-/// disagree on it and are meant to. MCP passes `multi_query_candidate_limit`,
-/// so augmentation still has candidates to displace; `vera search` passes
-/// `result_limit`, truncating before augmenting, which is issue #121 and is
-/// left alone here. Collapsing them would silently change CLI results.
+/// `fuse_limit` should be `multi_query_candidate_limit(result_limit)` so
+/// augmentation has candidates to displace; both callers pass that since the
+/// issue #121 fix. It stays a parameter for tests.
 pub fn fuse_and_augment_multi_query(
     index_dir: &std::path::Path,
     queries: &[String],

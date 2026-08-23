@@ -47,10 +47,10 @@ const IDENTIFIER_PARAMS: QueryParams = QueryParams {
     vector_weight: 1.0,
 };
 
-/// Parameters for NL intent queries: balanced weights with lower RRF k to
-/// amplify vector signal, and fetch more vector candidates.
+/// Parameters for NL intent queries: balanced weights, the shared RRF k, and
+/// a larger vector candidate multiplier for broader semantic recall.
 const NL_PARAMS: QueryParams = QueryParams {
-    rrf_k: 20.0,
+    rrf_k: 60.0,
     vector_candidate_multiplier: 5,
     bm25_weight: 1.0,
     vector_weight: 1.0,
@@ -330,15 +330,16 @@ mod tests {
     // ── params_for_query_type tests ─────────────────────────────────
 
     #[test]
-    fn nl_params_have_lower_rrf_k() {
+    fn nl_params_share_identifier_rrf_k() {
         let nl = params_for_query_type(QueryType::NaturalLanguage);
         let id = params_for_query_type(QueryType::Identifier);
-        assert!(
-            nl.rrf_k < id.rrf_k,
-            "NL should have lower RRF k: {} < {}",
-            nl.rrf_k,
-            id.rrf_k
+        assert_eq!(
+            nl.rrf_k, id.rrf_k,
+            "NL and identifier should share RRF k: {} vs {}",
+            nl.rrf_k, id.rrf_k
         );
+        assert_eq!(nl.rrf_k, 60.0);
+        assert_eq!(id.rrf_k, 60.0);
     }
 
     #[test]

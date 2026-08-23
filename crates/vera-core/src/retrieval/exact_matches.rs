@@ -16,7 +16,8 @@ use crate::retrieval::query_utils::{
     looks_like_compound_identifier, looks_like_filename, path_depth, result_key, trim_query_token,
 };
 use crate::retrieval::ranking::{
-    RankingStage, apply_query_ranking_with_filters, is_path_weighted_query,
+    RankingStage, apply_query_ranking_multi_query, apply_query_ranking_with_filters,
+    is_path_weighted_query,
 };
 use crate::storage::metadata::MetadataStore;
 use crate::types::{Chunk, SearchFilters, SearchResult, SymbolType};
@@ -37,6 +38,9 @@ pub(crate) fn augment_exact_match_candidates(
     augment_exact_match_candidates_with_store(&store, query, results, stage, filters)
 }
 
+/// Maximum definition chunks one concept-matched file may contribute.
+const CONCEPT_CHUNKS_PER_FILE: usize = 4;
+
 pub(crate) fn augment_exact_match_candidates_with_store(
     store: &MetadataStore,
     query: &str,
@@ -45,14 +49,24 @@ pub(crate) fn augment_exact_match_candidates_with_store(
     filters: &SearchFilters,
 ) -> Result<Vec<SearchResult>> {
     let supplemental = collect_exact_match_candidates(store, query, 0)?;
-    if supplemental.is_empty() {
+
+    // Concept matches only fire when no exact filename or identifier matched.
+    // They join the pool tail so ranking signals can decide their position.
+    let concept = if supplemental.is_empty() {
+        collect_concept_matched_files(store, query)?
+            .into_iter()
+            .map(|chunk| chunk.into_search_result(0.0))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    if supplemental.is_empty() && concept.is_empty() {
         return Ok(apply_query_ranking_with_filters(
             query, results, stage, filters,
         ));
     }
-
-    let merged = merge_exact_matches(supplemental, results);
-
+    let mut merged = merge_exact_matches(supplemental, results);
+    append_new_candidates(&mut merged, concept);
     Ok(apply_query_ranking_with_filters(
         query, merged, stage, filters,
     ))
@@ -80,8 +94,17 @@ pub fn augment_multi_query_exact_matches(
     };
 
     let mut per_query: Vec<std::vec::IntoIter<SearchResult>> = Vec::with_capacity(queries.len());
+    let mut concept_candidates = Vec::new();
     for (query_index, query) in queries.iter().enumerate() {
-        per_query.push(collect_exact_match_candidates(&store, query, query_index)?.into_iter());
+        let exact = collect_exact_match_candidates(&store, query, query_index)?;
+        if exact.is_empty() {
+            concept_candidates.extend(
+                collect_concept_matched_files(&store, query)?
+                    .into_iter()
+                    .map(|chunk| chunk.into_search_result(0.0)),
+            );
+        }
+        per_query.push(exact.into_iter());
     }
 
     // Interleave candidates across queries (round-robin) so a high-cardinality
@@ -101,15 +124,19 @@ pub fn augment_multi_query_exact_matches(
         }
     }
 
-    if supplemental.is_empty() {
+    if supplemental.is_empty() && concept_candidates.is_empty() {
         return Ok(apply_filters(results, filters, result_limit));
     }
 
-    Ok(apply_filters(
-        merge_exact_matches(supplemental, results),
-        filters,
-        result_limit,
-    ))
+    // Exact matches enter in front; concept matches join at the pool tail so
+    // they compete on ranking signals instead of displacing fused results.
+    // Ranking runs here too: the fused pool must pass the same scoring step
+    // the single-query path applies, scored per subquery so one subquery's
+    // exact match cannot crowd out another's (issue #121).
+    let mut merged = merge_exact_matches(supplemental, results);
+    append_new_candidates(&mut merged, concept_candidates);
+    let ranked = apply_query_ranking_multi_query(queries, merged, RankingStage::Initial, filters);
+    Ok(apply_filters(ranked, filters, result_limit))
 }
 
 #[derive(Debug)]
@@ -194,25 +221,6 @@ pub(crate) fn collect_exact_match_candidates(
             };
             candidates.push(ExactMatchCandidate {
                 order,
-                result: chunk.into_search_result(0.0),
-            });
-        }
-    }
-
-    // For queries with no filename or identifier match, scan for files whose
-    // stem matches a query keyword. This catches NL queries like
-    // "configuration loading" → config.py, "testing client" → testing.py.
-    if candidates.is_empty() {
-        let concept_chunks = collect_concept_matched_files(store, query)?;
-        for chunk in concept_chunks {
-            candidates.push(ExactMatchCandidate {
-                order: ExactMatchOrder {
-                    query_index,
-                    match_kind: 2,
-                    exact_priority: (0, 0, 0, 0),
-                    path_depth: path_depth(&chunk.file_path),
-                    line_start: chunk.line_start,
-                },
                 result: chunk.into_search_result(0.0),
             });
         }
@@ -331,11 +339,17 @@ pub(crate) fn collect_concept_matched_files(
     let mut results = Vec::new();
     for file_path in &matched_files {
         let chunks = store.get_chunks_by_file(file_path)?;
+        let mut contributed = 0;
         for chunk in chunks {
             // Only inject definition chunks to avoid flooding results with
             // every line of a concept-matched file.
             if is_definition_chunk(&chunk) {
                 results.push(chunk);
+                contributed += 1;
+                // Cap per-file contribution: one file must not fill the pool.
+                if contributed >= CONCEPT_CHUNKS_PER_FILE {
+                    break;
+                }
             }
         }
     }
@@ -412,6 +426,18 @@ pub(crate) fn merge_exact_matches(
     merged
 }
 
+/// Append candidates at the pool tail, skipping duplicates of entries already
+/// in the pool. Appended candidates get the lowest base ranks, so they only
+/// surface when ranking signals (stem/keyword/definition matches) justify it.
+pub(crate) fn append_new_candidates(pool: &mut Vec<SearchResult>, candidates: Vec<SearchResult>) {
+    let mut seen: HashSet<_> = pool.iter().map(result_key).collect();
+    for candidate in candidates {
+        if seen.insert(result_key(&candidate)) {
+            pool.push(candidate);
+        }
+    }
+}
+
 pub(crate) fn extract_exact_filename(query: &str) -> Option<String> {
     query
         .split_whitespace()
@@ -428,10 +454,24 @@ pub(crate) fn extract_exact_identifier_case(query: &str) -> Option<String> {
         .map(trim_query_token)
         .filter(|token| !token.is_empty())
         .find(|token| {
-            (!looks_like_filename(token) || token.contains("::"))
+            (!looks_like_filename(token) || contains_namespace_separator(token))
                 && (looks_like_compound_identifier(token) || single_token_query)
         })
         .map(ToString::to_string)
+}
+
+fn contains_namespace_separator(token: &str) -> bool {
+    if token.contains("::") || token.contains("->") || token.contains('\\') {
+        return true;
+    }
+
+    let segments: Vec<_> = token.split('.').collect();
+    segments.len() >= 3
+        || (segments.len() == 2
+            && segments[1]
+                .chars()
+                .next()
+                .is_some_and(|ch| ch.is_ascii_uppercase()))
 }
 
 pub(crate) fn query_mentions_implementation(query: &str) -> bool {
@@ -514,6 +554,19 @@ pub(crate) fn uppercase_identifier_query(identifier: &str) -> bool {
 mod tests {
     use super::*;
 
+    fn test_chunk(symbol_name: &str, symbol_type: SymbolType) -> Chunk {
+        Chunk {
+            id: format!("src/{symbol_name}:0"),
+            file_path: "src/session.rs".to_string(),
+            line_start: 1,
+            line_end: 4,
+            content: format!("pub struct {symbol_name} {{}}"),
+            language: crate::types::Language::Rust,
+            symbol_type: Some(symbol_type),
+            symbol_name: Some(symbol_name.to_string()),
+        }
+    }
+
     #[test]
     fn extracts_lowercase_single_word_symbols() {
         assert_eq!(
@@ -529,5 +582,17 @@ mod tests {
             extract_exact_identifier_case("std::io::Error"),
             Some("std::io::Error".to_string())
         );
+    }
+
+    #[test]
+    fn symbol_identity_does_not_match_a_longer_name() {
+        let store = MetadataStore::open_in_memory().unwrap();
+        let mut chunk = test_chunk("SessionStore", SymbolType::Struct);
+        chunk.file_path = "src/other.rs".to_string();
+        store.insert_chunks(&[chunk]).unwrap();
+
+        let results = collect_exact_match_candidates(&store, "Session", 0).unwrap();
+
+        assert!(results.is_empty());
     }
 }

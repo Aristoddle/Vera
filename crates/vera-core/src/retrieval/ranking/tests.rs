@@ -301,7 +301,13 @@ fn runtime_queries_can_prefer_runtime_extracts() {
 }
 
 #[test]
-fn filename_stem_match_beats_incidental_request_helper() {
+fn content_coverage_breaks_filename_stem_ties() {
+    // Both stems match one query keyword ("request" / "validation"), so the
+    // pool-relative stem boost ties. Coverage breaks the tie: the helper's
+    // require line mentions "validation" and "schema" while the stub covers
+    // nothing. (The retired exact-stem tier would have forced validation.js
+    // first, but ablation showed the coverage-aware ordering ranks better on
+    // both benchmark sets.)
     let results = vec![
         make_result(
             "lib/handle-request.js",
@@ -314,6 +320,35 @@ fn filename_stem_match_beats_incidental_request_helper() {
             None,
             Some(SymbolType::Variable),
             "function validate () {}",
+        ),
+    ];
+
+    let ranked = apply_query_ranking(
+        "request validation and schema enforcement",
+        results,
+        RankingStage::Initial,
+    );
+
+    assert_eq!(ranked[0].file_path, "lib/handle-request.js");
+}
+
+#[test]
+fn stem_matched_file_with_content_coverage_wins() {
+    // When the stem-matched file also covers the query's concepts in its
+    // content and retrieval ranked it first, it keeps the lead: stem
+    // agreement plus coverage beats either signal alone.
+    let results = vec![
+        make_result(
+            "lib/validation.js",
+            None,
+            Some(SymbolType::Variable),
+            "function validate (request, schema) { return enforce(schema); }",
+        ),
+        make_result(
+            "lib/handle-request.js",
+            None,
+            Some(SymbolType::Variable),
+            "const helper = require('./helper')",
         ),
     ];
 

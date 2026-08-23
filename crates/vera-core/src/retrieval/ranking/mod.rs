@@ -43,21 +43,80 @@ pub(crate) fn apply_query_ranking_with_filters(
     }
 
     let features = QueryFeatures::from_query(query);
-    let file_relevance = file_relevance_counts(&features, &results);
+    let wants_diversity = features.wants_multi_file_diversity;
+    let scores = score_pool(&features, stage, filters, &results);
+    finish_ranking(results, scores, wants_diversity)
+}
+
+/// Multi-query ranking: each subquery carries its own identifier or filename
+/// target, so score the pool under every subquery's features and keep each
+/// result's best score. A single joined query would promote only the first
+/// subquery's exact match and crowd out the rest (issue #121).
+pub(crate) fn apply_query_ranking_multi_query(
+    queries: &[String],
+    results: Vec<SearchResult>,
+    stage: RankingStage,
+    filters: &SearchFilters,
+) -> Vec<SearchResult> {
+    if queries.is_empty() || results.len() <= 1 {
+        return results;
+    }
+
+    let mut scores = vec![f64::NEG_INFINITY; results.len()];
+    let mut wants_diversity = false;
+    for query in queries {
+        let features = QueryFeatures::from_query(query);
+        wants_diversity |= features.wants_multi_file_diversity;
+        for (best, score) in scores
+            .iter_mut()
+            .zip(score_pool(&features, stage, filters, &results))
+        {
+            *best = best.max(score);
+        }
+    }
+    finish_ranking(results, scores, wants_diversity)
+}
+
+/// Score every pool entry under one query's features: retrieval position
+/// (base rank), additive priors, then pool-relative boosts scaled by the
+/// pool's best combined score so signal strength tracks retrieval confidence.
+fn score_pool(
+    features: &QueryFeatures,
+    stage: RankingStage,
+    filters: &SearchFilters,
+    results: &[SearchResult],
+) -> Vec<f64> {
     let len = results.len() as f64;
+    let mut scores: Vec<f64> = results
+        .iter()
+        .enumerate()
+        .map(|(idx, result)| {
+            let base_rank = 1.0 - (idx as f64 / len);
+            let prior = score_prior(features, result, stage, filters);
+            base_rank + prior
+        })
+        .collect();
+
+    let max_score = scores.iter().copied().fold(0.0_f64, f64::max).max(1e-6);
+    apply_coherence_boost(features, &mut scores, results, max_score);
+    apply_keyword_path_boost(features, &mut scores, results, max_score);
+    apply_content_symbol_boost(features, &mut scores, results, max_score);
+
+    scores
+}
+
+fn finish_ranking(
+    results: Vec<SearchResult>,
+    scores: Vec<f64>,
+    wants_diversity: bool,
+) -> Vec<SearchResult> {
     let mut scored: Vec<(f64, usize, SearchResult)> = results
         .into_iter()
         .enumerate()
-        .map(|(idx, mut result)| {
-            let base_rank = 1.0 - (idx as f64 / len);
-            let same_file_hits = file_relevance
-                .get(&result.file_path)
-                .copied()
-                .unwrap_or_default();
-            let prior = score_prior(&features, &result, stage, filters, same_file_hits);
-            let combined = base_rank + prior;
-            result.score = combined;
-            (combined, idx, result)
+        .zip(scores)
+        .map(|((idx, mut result), score)| {
+            result.score = score;
+            (score, idx, result)
         })
         .collect();
 
@@ -68,7 +127,7 @@ pub(crate) fn apply_query_ranking_with_filters(
     });
 
     let reranked = scored.into_iter().map(|(_, _, result)| result).collect();
-    let reranked = if features.wants_multi_file_diversity {
+    let reranked = if wants_diversity {
         diversify_by_file(reranked)
     } else {
         reranked

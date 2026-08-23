@@ -1059,7 +1059,7 @@ fn short_identifier_queries_expand_bm25_candidate_pool() {
 // ── Integration: NL vs identifier query produces different fusion ──
 
 #[tokio::test]
-async fn nl_query_uses_different_rrf_k_than_identifier() {
+async fn nl_query_uses_same_rrf_k_as_identifier() {
     use crate::embedding::test_helpers::MockProvider;
     use crate::retrieval::query_classifier::{QueryType, classify_query, params_for_query_type};
     use crate::retrieval::reranker::test_helpers::MockReranker;
@@ -1093,7 +1093,7 @@ async fn nl_query_uses_different_rrf_k_than_identifier() {
     .await
     .unwrap();
 
-    // NL query → uses lower k=20.
+    // NL query → uses same k=60 as identifier queries.
     let nl_query = "how is authentication handled";
     let nl_type = classify_query(nl_query);
     assert_eq!(nl_type, QueryType::NaturalLanguage);
@@ -1123,11 +1123,12 @@ async fn nl_query_uses_different_rrf_k_than_identifier() {
     );
     assert!(!nl_results.is_empty(), "NL query should find results");
 
-    // The key assertion: different RRF k was used.
-    assert!(
-        id_params.rrf_k > nl_params.rrf_k,
-        "identifier k ({}) should be greater than NL k ({})",
-        id_params.rrf_k,
-        nl_params.rrf_k
+    // The key assertion: same RRF k is used for both query types.
+    assert_eq!(
+        id_params.rrf_k, nl_params.rrf_k,
+        "identifier k ({}) should equal NL k ({})",
+        id_params.rrf_k, nl_params.rrf_k
     );
+    assert_eq!(id_params.rrf_k, 60.0);
+    assert_eq!(nl_params.rrf_k, 60.0);
 }
