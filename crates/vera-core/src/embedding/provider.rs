@@ -746,6 +746,7 @@ fn context_size_info(error: &EmbeddingError) -> Option<ContextSizeInfo> {
         && !lower.contains("too large to process")
         && !lower.contains("max allowed tokens per submitted batch")
         && !lower.contains("maximum input length")
+        && !lower.contains("maximum context length")
     {
         return None;
     }
@@ -770,9 +771,11 @@ fn context_size_info(error: &EmbeddingError) -> Option<ContextSizeInfo> {
         .get_or_init(|| Regex::new(r"max allowed tokens per submitted batch is (\d+)").unwrap());
     let batch_tokens_re =
         BATCH_TOKENS_RE.get_or_init(|| Regex::new(r"your batch has (\d+) tokens?").unwrap());
-    // OpenAI: `Invalid 'input[3]': maximum input length is 8192 tokens.`
-    let max_input_length_re =
-        MAX_INPUT_LENGTH_RE.get_or_init(|| Regex::new(r"maximum input length is (\d+)").unwrap());
+    // OpenAI emits both phrasings depending on endpoint:
+    //   `Invalid 'input[3]': maximum input length is 8192 tokens.`   (embeddings)
+    //   `This model's maximum context length is 8192 tokens`         (completions-shaped)
+    let max_input_length_re = MAX_INPUT_LENGTH_RE
+        .get_or_init(|| Regex::new(r"maximum (?:input|context) length is (\d+)").unwrap());
 
     let max_tokens = n_ctx_re
         .captures(&lower)
@@ -1363,6 +1366,34 @@ mod tests {
         assert_eq!(info.max_tokens, 8192);
         assert_eq!(info.input_tokens, None);
         assert!(is_context_size_error(&err));
+    }
+
+    #[test]
+    fn context_size_info_parses_maximum_context_length_phrasing() {
+        // Some OpenAI-compatible endpoints phrase the same limit as "maximum
+        // context length". Without this the gate rejected the message, so
+        // truncate-and-retry never engaged and an index build aborted on the
+        // first oversized chunk. 8191 (not 8192) so the assertion cannot pass
+        // on the function's fallback default.
+        let err = EmbeddingError::ApiError {
+            status: 400,
+            message: "This model's maximum context length is 8191 tokens".to_string(),
+        };
+        assert!(is_context_size_error(&err));
+        let info = context_size_info(&err).expect("should recognize max context length error");
+        assert_eq!(info.max_tokens, 8191);
+    }
+
+    #[test]
+    fn context_size_info_ignores_unrelated_errors() {
+        // Negative control: an ordinary 400 must not be classified as a
+        // context-size error, or it would be retried with truncated text.
+        let err = EmbeddingError::ApiError {
+            status: 400,
+            message: "Invalid API key provided".to_string(),
+        };
+        assert!(context_size_info(&err).is_none());
+        assert!(!is_context_size_error(&err));
     }
 
     #[test]
