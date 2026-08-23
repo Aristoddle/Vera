@@ -14,10 +14,12 @@ The Semble benchmark uses 1,251 tasks across 63 repositories. Both tools used th
 
 | Tool | nDCG@10 | R@1 | R@5 | R@10 | MRR | Query p50 | Index time | Index size |
 |------|---------|------|------|-------|-----|-----------|------------|------------|
-| Vera | 0.8447 | 0.6731 | **0.9203** | 0.9514 | 0.8272 | 15.1 ms | 165 s | **3.9 GB** |
+| Vera | 0.8441 | 0.6711 | **0.9203** | 0.9514 | 0.8262 | 9.9 ms | 174 s | **4.7 GB** |
 | Semble 0.5.5, full rerank stack | **0.8514** | **0.6747** | 0.9177 | **0.9656** | **0.8348** | **2.3 ms** | **100 s** | 32 GB |
 
-On the 320-task tuning subset, Vera scored `0.8542` versus Semble at `0.8494` nDCG. On the contamination-check independent set, Vera scored `0.7644` versus Semble at `0.7655`. The aggregate table is the comparison summary; repo-level variation is not a substitute for the full result.
+On the 320-task tuning subset, Vera scored `0.8540` versus Semble at `0.8494` nDCG. On the contamination-check independent set, Vera scored `0.7644` versus Semble at `0.7655`. The aggregate table is the comparison summary; repo-level variation is not a substitute for the full result.
+
+Vector search uses an exact flat SIMD scan over memory-mapped vectors, dual-written alongside sqlite-vec (`VERA_VECTOR_SCAN=vec0` selects the old path). On the largest corpus repo (zig, 336k chunks) the vector stage dropped from ~460 ms to ~21 ms per query; quality is unchanged because the scan is exact. Index size grew because vectors are stored in both backends during the transition.
 
 Embedding alternatives and the dual-set reranker screening are documented in [models.md](models.md).
 
