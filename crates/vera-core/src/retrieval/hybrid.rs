@@ -9,7 +9,8 @@
 //! source result list.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -22,11 +23,59 @@ use crate::retrieval::query_classifier::{QueryType, classify_query, params_for_q
 use crate::retrieval::query_utils::result_key;
 use crate::retrieval::ranking::is_path_weighted_query;
 use crate::retrieval::reranker::{Reranker, rerank_results};
-use crate::retrieval::vector::{VectorSearchError, search_vector_with_stores_timed};
+use crate::retrieval::vector::{
+    VectorSearchError, search_vector_with_cached_stores_timed, search_vector_with_stores_timed,
+};
 use crate::storage::bm25::Bm25Index;
 use crate::storage::metadata::MetadataStore;
 use crate::storage::vector::VectorStore;
 use crate::types::{SearchFilters, SearchResult};
+
+/// Open search stores reused for the active index directory.
+pub(crate) struct SearchStores {
+    pub(crate) bm25: Bm25Index,
+    pub(crate) bm25_metadata: Mutex<MetadataStore>,
+    pub(crate) vector_metadata: Mutex<MetadataStore>,
+    vector_path: PathBuf,
+    vector: Mutex<Option<(usize, Arc<Mutex<VectorStore>>)>>,
+}
+
+impl SearchStores {
+    pub(crate) fn open(index_dir: &Path) -> Result<Self> {
+        let bm25 = Bm25Index::open(&index_dir.join("bm25"))
+            .context("failed to open BM25 index for search")?;
+        let metadata_path = index_dir.join("metadata.db");
+        let bm25_metadata = MetadataStore::open(&metadata_path)
+            .context("failed to open metadata store for search")?;
+        let vector_metadata = MetadataStore::open(&metadata_path)
+            .context("failed to open vector metadata store for search")?;
+        Ok(Self {
+            bm25,
+            bm25_metadata: Mutex::new(bm25_metadata),
+            vector_metadata: Mutex::new(vector_metadata),
+            vector_path: index_dir.join("vectors.db"),
+            vector: Mutex::new(None),
+        })
+    }
+
+    pub(crate) fn vector_store(&self, dim: usize) -> Result<Arc<Mutex<VectorStore>>> {
+        let mut cached = self
+            .vector
+            .lock()
+            .map_err(|_| anyhow::anyhow!("vector store cache lock poisoned"))?;
+        if let Some((cached_dim, store)) = cached.as_ref()
+            && *cached_dim == dim
+        {
+            return Ok(Arc::clone(store));
+        }
+
+        let store = Arc::new(Mutex::new(
+            VectorStore::open(&self.vector_path, dim).context("failed to open vector store")?,
+        ));
+        *cached = Some((dim, Arc::clone(&store)));
+        Ok(store)
+    }
+}
 
 /// Errors specific to hybrid search.
 #[derive(Debug, thiserror::Error)]
@@ -95,37 +144,110 @@ pub async fn search_hybrid(
     stored_dim: usize,
     vector_candidates: usize,
 ) -> Result<(Vec<SearchResult>, HybridTimings), HybridSearchError> {
+    search_hybrid_inner(
+        index_dir,
+        provider,
+        bm25_query,
+        vector_query,
+        filters,
+        limit,
+        rrf_k,
+        stored_dim,
+        vector_candidates,
+        None,
+    )
+    .await
+}
+
+/// Perform hybrid search using stores retained by a reusable search context.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn search_hybrid_with_stores(
+    index_dir: &Path,
+    provider: &impl EmbeddingProvider,
+    bm25_query: &str,
+    vector_query: &str,
+    filters: &SearchFilters,
+    limit: usize,
+    rrf_k: f64,
+    stored_dim: usize,
+    vector_candidates: usize,
+    stores: Arc<SearchStores>,
+) -> Result<(Vec<SearchResult>, HybridTimings), HybridSearchError> {
+    search_hybrid_inner(
+        index_dir,
+        provider,
+        bm25_query,
+        vector_query,
+        filters,
+        limit,
+        rrf_k,
+        stored_dim,
+        vector_candidates,
+        Some(stores),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn search_hybrid_inner(
+    index_dir: &Path,
+    provider: &impl EmbeddingProvider,
+    bm25_query: &str,
+    vector_query: &str,
+    filters: &SearchFilters,
+    limit: usize,
+    rrf_k: f64,
+    stored_dim: usize,
+    vector_candidates: usize,
+    stores: Option<Arc<SearchStores>>,
+) -> Result<(Vec<SearchResult>, HybridTimings), HybridSearchError> {
     let query_type = classify_query(bm25_query);
     let query_params = params_for_query_type(query_type);
     let bm25_candidates = compute_bm25_candidates(bm25_query, limit);
     let mut timings = HybridTimings::default();
 
-    // Spawn BM25 search in a blocking task with its own database connections.
-    // This runs concurrently with vector search (embedding + nearest-neighbor).
+    // Spawn BM25 search in a blocking task. Reusable search contexts retain
+    // the Tantivy reader and SQLite connection; direct callers keep the
+    // original open-per-call behavior.
     let bm25_dir = index_dir.join("bm25");
     let metadata_path = index_dir.join("metadata.db");
     let bm25_query = bm25_query.to_string();
     let bm25_filters = filters.clone();
+    let stores_for_bm25 = stores.clone();
     let bm25_handle = tokio::task::spawn_blocking(move || {
         let start = Instant::now();
-        let result = Bm25Index::open(&bm25_dir)
-            .context("failed to open BM25 index for search")
-            .and_then(|index| {
-                let store = MetadataStore::open(&metadata_path)
-                    .context("failed to open metadata store for BM25 search")?;
-                search_bm25_with_stores_and_filters(
-                    &index,
-                    &store,
-                    &bm25_query,
-                    &bm25_filters,
-                    bm25_candidates,
-                )
-            });
+        let result = match stores_for_bm25 {
+            Some(stores) => stores
+                .bm25_metadata
+                .lock()
+                .map_err(|_| anyhow::anyhow!("metadata store lock poisoned"))
+                .and_then(|store| {
+                    search_bm25_with_stores_and_filters(
+                        &stores.bm25,
+                        &store,
+                        &bm25_query,
+                        &bm25_filters,
+                        bm25_candidates,
+                    )
+                }),
+            None => Bm25Index::open(&bm25_dir)
+                .context("failed to open BM25 index for search")
+                .and_then(|index| {
+                    let store = MetadataStore::open(&metadata_path)
+                        .context("failed to open metadata store for BM25 search")?;
+                    search_bm25_with_stores_and_filters(
+                        &index,
+                        &store,
+                        &bm25_query,
+                        &bm25_filters,
+                        bm25_candidates,
+                    )
+                }),
+        };
         (result, start.elapsed())
     });
 
     // Run vector search concurrently on the async runtime.
-    let vector_metadata_path = index_dir.join("metadata.db");
     // Filters are applied after the kNN fetch, so a selective filter can
     // discard every hit in the default window. Over-fetch when filters are
     // active so filtered chunks beyond the window can still reach fusion.
@@ -135,36 +257,60 @@ pub async fn search_hybrid(
         vector_candidates.saturating_mul(4).max(200)
     };
     let vector_start = Instant::now();
-    let vector_outcome = match VectorStore::open(&index_dir.join("vectors.db"), stored_dim) {
-        Ok(vector_store) => {
-            let vector_store_result =
-                MetadataStore::open(&vector_metadata_path).context("failed to open metadata store");
-            match vector_store_result {
-                Ok(vector_metadata) => {
-                    match search_vector_with_stores_timed(
-                        &vector_store,
-                        &vector_metadata,
-                        provider,
-                        vector_query,
-                        vector_fetch,
-                    )
-                    .await
-                    {
-                        Ok((mut results, embed_elapsed)) => {
-                            if !filters.is_empty() {
-                                results.retain(|result| filters.matches(result));
-                            }
-                            Ok((results, embed_elapsed))
+    let vector_outcome = match stores {
+        Some(stores) => match stores.vector_store(stored_dim) {
+            Ok(vector_store) => {
+                match search_vector_with_cached_stores_timed(
+                    vector_store.as_ref(),
+                    &stores.vector_metadata,
+                    provider,
+                    vector_query,
+                    vector_fetch,
+                )
+                .await
+                {
+                    Ok((mut results, embed_elapsed)) => {
+                        if !filters.is_empty() {
+                            results.retain(|result| filters.matches(result));
                         }
-                        Err(err) => Err(err),
+                        Ok((results, embed_elapsed))
                     }
+                    Err(err) => Err(err),
                 }
-                Err(err) => Err(VectorSearchError::StorageError(err)),
             }
-        }
-        Err(err) => Err(VectorSearchError::StorageError(
-            err.context("failed to open vector store"),
-        )),
+            Err(err) => Err(VectorSearchError::StorageError(err)),
+        },
+        None => match VectorStore::open(&index_dir.join("vectors.db"), stored_dim) {
+            Ok(vector_store) => {
+                let vector_metadata_result = MetadataStore::open(&index_dir.join("metadata.db"))
+                    .context("failed to open metadata store");
+                match vector_metadata_result {
+                    Ok(vector_metadata) => {
+                        match search_vector_with_stores_timed(
+                            &vector_store,
+                            &vector_metadata,
+                            provider,
+                            vector_query,
+                            vector_fetch,
+                        )
+                        .await
+                        {
+                            Ok((mut results, embed_elapsed)) => {
+                                if !filters.is_empty() {
+                                    results.retain(|result| filters.matches(result));
+                                }
+                                Ok((results, embed_elapsed))
+                            }
+                            Err(err) => Err(err),
+                        }
+                    }
+                    Err(err) => Err(VectorSearchError::StorageError(err)),
+                }
+            }
+            Err(err) => Err(VectorSearchError::StorageError(
+                err.context("failed to open vector store"),
+            )),
+        },
     };
     let embed_elapsed = vector_outcome
         .as_ref()
@@ -284,6 +430,43 @@ pub async fn search_hybrid_reranked(
     .await
 }
 
+/// Perform reranked hybrid search using stores retained by a reusable context.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn search_hybrid_reranked_with_stores(
+    index_dir: &Path,
+    provider: &impl EmbeddingProvider,
+    reranker: &impl Reranker,
+    bm25_query: &str,
+    vector_query: &str,
+    filters: &SearchFilters,
+    fetch_limit: usize,
+    result_limit: usize,
+    rrf_k: f64,
+    stored_dim: usize,
+    rerank_candidates: usize,
+    vector_candidates: usize,
+    graph_augmentation_enabled: bool,
+    stores: Arc<SearchStores>,
+) -> Result<(Vec<SearchResult>, HybridTimings), HybridSearchError> {
+    search_hybrid_reranked_inner(
+        index_dir,
+        provider,
+        reranker,
+        bm25_query,
+        vector_query,
+        filters,
+        fetch_limit,
+        result_limit,
+        rrf_k,
+        stored_dim,
+        rerank_candidates,
+        vector_candidates,
+        graph_augmentation_enabled,
+        Some(stores),
+    )
+    .await
+}
+
 /// Perform hybrid search with optional experimental graph augmentation.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn search_hybrid_reranked_with_augmentation(
@@ -301,20 +484,75 @@ pub(crate) async fn search_hybrid_reranked_with_augmentation(
     vector_candidates: usize,
     graph_augmentation_enabled: bool,
 ) -> Result<(Vec<SearchResult>, HybridTimings), HybridSearchError> {
-    let fusion_limit = rerank_candidates.max(fetch_limit);
-
-    let (mut hybrid_results, mut timings) = search_hybrid(
+    search_hybrid_reranked_inner(
         index_dir,
         provider,
+        reranker,
         bm25_query,
         vector_query,
         filters,
-        fusion_limit,
+        fetch_limit,
+        result_limit,
         rrf_k,
         stored_dim,
+        rerank_candidates,
         vector_candidates,
+        graph_augmentation_enabled,
+        None,
     )
-    .await?;
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn search_hybrid_reranked_inner(
+    index_dir: &Path,
+    provider: &impl EmbeddingProvider,
+    reranker: &impl Reranker,
+    bm25_query: &str,
+    vector_query: &str,
+    filters: &SearchFilters,
+    fetch_limit: usize,
+    result_limit: usize,
+    rrf_k: f64,
+    stored_dim: usize,
+    rerank_candidates: usize,
+    vector_candidates: usize,
+    graph_augmentation_enabled: bool,
+    stores: Option<Arc<SearchStores>>,
+) -> Result<(Vec<SearchResult>, HybridTimings), HybridSearchError> {
+    let fusion_limit = rerank_candidates.max(fetch_limit);
+
+    let (mut hybrid_results, mut timings) = match stores {
+        Some(stores) => {
+            search_hybrid_with_stores(
+                index_dir,
+                provider,
+                bm25_query,
+                vector_query,
+                filters,
+                fusion_limit,
+                rrf_k,
+                stored_dim,
+                vector_candidates,
+                stores,
+            )
+            .await?
+        }
+        None => {
+            search_hybrid(
+                index_dir,
+                provider,
+                bm25_query,
+                vector_query,
+                filters,
+                fusion_limit,
+                rrf_k,
+                stored_dim,
+                vector_candidates,
+            )
+            .await?
+        }
+    };
 
     let augmented_count = if graph_augmentation_enabled {
         augment_pool(index_dir, &mut hybrid_results, filters)

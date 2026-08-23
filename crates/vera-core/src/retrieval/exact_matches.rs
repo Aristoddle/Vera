@@ -22,6 +22,7 @@ use crate::retrieval::ranking::{
 use crate::storage::metadata::MetadataStore;
 use crate::types::{Chunk, SearchFilters, SearchResult, SymbolType};
 
+#[cfg(test)]
 pub(crate) fn augment_exact_match_candidates(
     index_dir: &Path,
     query: &str,

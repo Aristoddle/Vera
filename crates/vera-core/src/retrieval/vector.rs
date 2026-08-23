@@ -82,7 +82,69 @@ pub async fn search_vector_with_stores_timed(
         "generated query embedding"
     );
 
-    // 2. Search the vector store for nearest neighbors.
+    let results =
+        search_vector_from_embedding(vector_store, metadata_store, query, limit, &query_embedding)?;
+
+    Ok((results, embed_elapsed))
+}
+
+/// Perform vector search with stores cached behind short-lived mutex guards.
+///
+/// The embedding call happens before either lock is acquired. The locks are
+/// held only across the synchronous sqlite-vec search and metadata hydration,
+/// never across the provider await.
+pub(crate) async fn search_vector_with_cached_stores_timed(
+    vector_store: &std::sync::Mutex<VectorStore>,
+    metadata_store: &std::sync::Mutex<MetadataStore>,
+    provider: &impl EmbeddingProvider,
+    query: &str,
+    limit: usize,
+) -> Result<(Vec<SearchResult>, Duration), VectorSearchError> {
+    if limit == 0 {
+        return Ok((Vec::new(), Duration::ZERO));
+    }
+
+    let stored_dim = vector_store
+        .lock()
+        .map_err(|_| {
+            VectorSearchError::StorageError(anyhow::anyhow!("vector store lock poisoned"))
+        })?
+        .dim();
+    let embed_start = Instant::now();
+    let query_embedding = generate_query_embedding(provider, query, stored_dim).await?;
+    let embed_elapsed = embed_start.elapsed();
+
+    debug!(
+        query = query,
+        dim = query_embedding.len(),
+        "generated query embedding"
+    );
+
+    let vector_store = vector_store.lock().map_err(|_| {
+        VectorSearchError::StorageError(anyhow::anyhow!("vector store lock poisoned"))
+    })?;
+    let metadata_store = metadata_store.lock().map_err(|_| {
+        VectorSearchError::StorageError(anyhow::anyhow!("metadata store lock poisoned"))
+    })?;
+    let results = search_vector_from_embedding(
+        &vector_store,
+        &metadata_store,
+        query,
+        limit,
+        &query_embedding,
+    )?;
+
+    Ok((results, embed_elapsed))
+}
+
+fn search_vector_from_embedding(
+    vector_store: &VectorStore,
+    metadata_store: &MetadataStore,
+    query: &str,
+    limit: usize,
+    query_embedding: &[f32],
+) -> Result<Vec<SearchResult>, VectorSearchError> {
+    // 1. Search the vector store for nearest neighbors.
     let (requested, candidates) = candidate_pool(limit);
     if requested > candidates {
         // Deliberately without the query text: the surrounding `debug!` calls
@@ -97,7 +159,7 @@ pub async fn search_vector_with_stores_timed(
     }
 
     let vector_results = vector_store
-        .search(&query_embedding, candidates)
+        .search(query_embedding, candidates)
         .map_err(|e| VectorSearchError::StorageError(e.context("vector search failed")))?;
 
     debug!(
@@ -106,7 +168,7 @@ pub async fn search_vector_with_stores_timed(
         "vector search returned candidates"
     );
 
-    // 3. Hydrate results from metadata store and convert distances to scores.
+    // 2. Hydrate results from metadata store and convert distances to scores.
     // Fetched in a single batch query instead of one query per candidate
     // (N+1). SQLite does not preserve `IN (...)` row order, so results are
     // re-projected back into the original vector-distance order below.
@@ -145,7 +207,7 @@ pub async fn search_vector_with_stores_timed(
         "vector search complete"
     );
 
-    Ok((results, embed_elapsed))
+    Ok(results)
 }
 
 /// Size the KNN request for a caller-selected pool, bounded by the backend cap.

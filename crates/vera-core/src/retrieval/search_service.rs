@@ -4,28 +4,26 @@
 //! resolve the reranker for the query, compute fetch limits, execute search,
 //! apply filters.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use tokio::sync::OnceCell;
 use tracing::warn;
 
 use crate::config::{InferenceBackend, VeraConfig};
 use crate::embedding::{CachedEmbeddingProvider, DynamicProvider, EmbeddingProvider};
 use crate::retrieval::dynamic_reranker::DynamicReranker;
+use crate::retrieval::exact_matches::augment_exact_match_candidates_with_store;
 pub use crate::retrieval::exact_matches::augment_multi_query_exact_matches;
-use crate::retrieval::exact_matches::{
-    augment_exact_match_candidates, augment_exact_match_candidates_with_store,
-};
 use crate::retrieval::hybrid::{
-    compute_vector_candidates, search_hybrid_reranked_with_augmentation,
+    SearchStores, compute_vector_candidates, search_hybrid_reranked_with_stores,
+    search_hybrid_with_stores,
 };
 use crate::retrieval::query_classifier::{QueryType, classify_query, params_for_query_type};
 use crate::retrieval::ranking::{RankingStage, is_path_weighted_query};
-use crate::retrieval::{apply_filters, search_bm25_with_stores_and_filters, search_hybrid};
-use crate::storage::bm25::Bm25Index;
-use crate::storage::metadata::MetadataStore;
+use crate::retrieval::{apply_filters, search_bm25_with_stores_and_filters};
 use crate::types::{SearchFilters, SearchResult};
 
 /// Timing data for each stage of the search pipeline.
@@ -64,6 +62,7 @@ pub struct SearchContext {
     model_name: Option<String>,
     provider_error: Option<String>,
     backend: InferenceBackend,
+    stores: Mutex<Option<(PathBuf, Arc<SearchStores>)>>,
     /// Cross-encoder session, built on first query that actually reranks.
     ///
     /// `None` inside the cell means "unavailable": either reranking is off in
@@ -101,6 +100,7 @@ impl SearchContext {
             model_name,
             provider_error,
             backend,
+            stores: Mutex::new(None),
             reranker: OnceCell::new(),
             #[cfg(test)]
             reranker_builds: std::sync::atomic::AtomicUsize::new(0),
@@ -115,6 +115,7 @@ impl SearchContext {
             // Unused: with no embedding provider `search` returns on the
             // BM25-only path before any reranker is resolved.
             backend: InferenceBackend::Api,
+            stores: Mutex::new(None),
             reranker: OnceCell::new(),
             #[cfg(test)]
             reranker_builds: std::sync::atomic::AtomicUsize::new(0),
@@ -185,6 +186,22 @@ impl SearchContext {
         self.model_name.as_deref()
     }
 
+    fn search_stores(&self, index_dir: &Path) -> Result<Arc<SearchStores>> {
+        let mut cached = self
+            .stores
+            .lock()
+            .map_err(|_| anyhow::anyhow!("search store cache lock poisoned"))?;
+        if let Some((cached_dir, stores)) = cached.as_ref()
+            && cached_dir == index_dir
+        {
+            return Ok(Arc::clone(stores));
+        }
+
+        let stores = Arc::new(SearchStores::open(index_dir)?);
+        *cached = Some((index_dir.to_path_buf(), Arc::clone(&stores)));
+        Ok(stores)
+    }
+
     pub async fn search(
         &self,
         index_dir: &Path,
@@ -203,6 +220,7 @@ impl SearchContext {
         // True when an intent prefix was actually applied (non-empty intent).
         let has_intent = matches!(vector_query, std::borrow::Cow::Owned(_));
         let fetch_limit = compute_fetch_limit(query, filters, result_limit);
+        let stores = self.search_stores(index_dir)?;
 
         let Some(provider) = self.provider.as_ref() else {
             if let Some(error) = self.provider_error.as_deref() {
@@ -212,65 +230,65 @@ impl SearchContext {
                 );
             }
             return run_bm25_only(
-                index_dir,
                 query,
                 filters,
                 fetch_limit,
                 result_limit,
                 total_start,
+                &stores,
             );
         };
 
         let mut stored_dim = config.embedding.max_stored_dim;
 
         // Check metadata mismatch
-        let metadata_path = index_dir.join("metadata.db");
-        if let Ok(metadata_store) = crate::storage::metadata::MetadataStore::open(&metadata_path) {
-            if let (Some(s_model), Some(s_dim)) = (
+        let index_meta = stores.bm25_metadata.lock().ok().map(|metadata_store| {
+            (
                 metadata_store.get_index_meta("model_name").unwrap_or(None),
                 metadata_store
                     .get_index_meta("embedding_dim")
                     .unwrap_or(None),
-            ) {
-                if let Some(model_name) = self.model_name.as_deref() {
-                    if !crate::config::model_names_match_with_aliases(
-                        &s_model,
-                        model_name,
-                        &config.embedding.model_aliases,
-                    ) {
+            )
+        });
+        if let Some((Some(s_model), Some(s_dim))) = index_meta {
+            if let Some(model_name) = self.model_name.as_deref() {
+                if !crate::config::model_names_match_with_aliases(
+                    &s_model,
+                    model_name,
+                    &config.embedding.model_aliases,
+                ) {
+                    warn!(
+                        "Index model '{}' does not match active model '{}'; using BM25-only search",
+                        s_model, model_name
+                    );
+                    return run_bm25_only(
+                        query,
+                        filters,
+                        fetch_limit,
+                        result_limit,
+                        total_start,
+                        &stores,
+                    );
+                }
+            }
+            if let Ok(dim) = s_dim.parse::<usize>() {
+                if let Some(provider_dim) = provider.expected_dim() {
+                    if provider_dim < dim {
                         warn!(
-                            "Index model '{}' does not match active model '{}'; using BM25-only search",
-                            s_model, model_name
+                            "Index dimension {} exceeds provider dimension {}; using BM25-only search",
+                            dim, provider_dim
                         );
                         return run_bm25_only(
-                            index_dir,
                             query,
                             filters,
                             fetch_limit,
                             result_limit,
                             total_start,
+                            &stores,
                         );
                     }
                 }
-                if let Ok(dim) = s_dim.parse::<usize>() {
-                    if let Some(provider_dim) = provider.expected_dim() {
-                        if provider_dim < dim {
-                            warn!(
-                                "Index dimension {} exceeds provider dimension {}; using BM25-only search",
-                                dim, provider_dim
-                            );
-                            return run_bm25_only(
-                                index_dir,
-                                query,
-                                filters,
-                                fetch_limit,
-                                result_limit,
-                                total_start,
-                            );
-                        }
-                    }
-                    stored_dim = dim;
-                }
+                stored_dim = dim;
             }
         }
 
@@ -299,7 +317,7 @@ impl SearchContext {
         };
 
         let (results, hybrid_timings) = if let Some(reranker) = reranker {
-            search_hybrid_reranked_with_augmentation(
+            search_hybrid_reranked_with_stores(
                 index_dir,
                 provider,
                 reranker,
@@ -313,10 +331,11 @@ impl SearchContext {
                 rerank_candidates,
                 vector_candidates,
                 crate::config::graph_augmentation_enabled(),
+                Arc::clone(&stores),
             )
             .await?
         } else {
-            search_hybrid(
+            search_hybrid_with_stores(
                 index_dir,
                 provider,
                 query,
@@ -326,6 +345,7 @@ impl SearchContext {
                 rrf_k,
                 stored_dim,
                 vector_candidates,
+                Arc::clone(&stores),
             )
             .await?
         };
@@ -333,8 +353,17 @@ impl SearchContext {
         let mut timings = SearchTimings::from(hybrid_timings);
 
         let aug_start = Instant::now();
-        let results =
-            augment_exact_match_candidates(index_dir, query, results, ranking_stage, filters)?;
+        let metadata_store = stores
+            .bm25_metadata
+            .lock()
+            .map_err(|_| anyhow::anyhow!("BM25 metadata store lock poisoned"))?;
+        let results = augment_exact_match_candidates_with_store(
+            &metadata_store,
+            query,
+            results,
+            ranking_stage,
+            filters,
+        )?;
         timings.augmentation = Some(aug_start.elapsed());
 
         timings.total = Some(total_start.elapsed());
@@ -456,20 +485,20 @@ fn should_skip_reranking(query: &str, filters: &SearchFilters) -> bool {
 }
 
 fn run_bm25_only(
-    index_dir: &Path,
     query: &str,
     filters: &SearchFilters,
     fetch_limit: usize,
     result_limit: usize,
     total_start: Instant,
+    stores: &Arc<SearchStores>,
 ) -> Result<(Vec<SearchResult>, SearchTimings)> {
     let bm25_start = Instant::now();
-    let bm25_index =
-        Bm25Index::open(&index_dir.join("bm25")).context("failed to open BM25 index for search")?;
-    let metadata_store = MetadataStore::open(&index_dir.join("metadata.db"))
-        .context("failed to open metadata store for search")?;
+    let metadata_store = stores
+        .bm25_metadata
+        .lock()
+        .map_err(|_| anyhow::anyhow!("BM25 metadata store lock poisoned"))?;
     let results = search_bm25_with_stores_and_filters(
-        &bm25_index,
+        &stores.bm25,
         &metadata_store,
         query,
         filters,
@@ -496,6 +525,7 @@ fn run_bm25_only(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::retrieval::exact_matches::augment_exact_match_candidates;
     use crate::storage::bm25::{Bm25Document, Bm25Index};
     use crate::storage::metadata::MetadataStore;
     use crate::test_env::EnvVarGuard;
