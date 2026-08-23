@@ -176,6 +176,14 @@ fn collect_symbols(
         }
     }
 
+    // Handle Lua function-valued assignments such as `M.setup = function() ... end`.
+    if lang == Language::Lua && matches!(kind, "assignment_statement" | "variable_declaration") {
+        if let Some(sym) = extract_lua_function_binding(&node, source) {
+            symbols.push(sym);
+            return;
+        }
+    }
+
     // Handle Zig variable_declaration -> struct_declaration
     if lang == Language::Zig && kind == "variable_declaration" {
         let mut cursor = node.walk();

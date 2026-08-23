@@ -255,6 +255,61 @@ pub(super) fn extract_js_function_binding(
     Some(RawSymbol::at(node, Some(name), SymbolType::Function))
 }
 
+/// Extract a Lua function-valued assignment as a named function symbol.
+pub(super) fn extract_lua_function_binding(
+    node: &tree_sitter::Node<'_>,
+    source: &[u8],
+) -> Option<RawSymbol> {
+    let assignment = if node.kind() == "variable_declaration" {
+        let mut cursor = node.walk();
+        node.named_children(&mut cursor)
+            .find(|child| child.kind() == "assignment_statement")?
+    } else {
+        *node
+    };
+
+    let mut cursor = assignment.walk();
+    let children: Vec<_> = assignment.named_children(&mut cursor).collect();
+    let [variable_list, expression_list] = children.as_slice() else {
+        return None;
+    };
+    if variable_list.kind() != "variable_list" || expression_list.kind() != "expression_list" {
+        return None;
+    }
+
+    let mut variable_cursor = variable_list.walk();
+    let variables: Vec<_> = variable_list.named_children(&mut variable_cursor).collect();
+    let [variable] = variables.as_slice() else {
+        return None;
+    };
+
+    let mut value_cursor = expression_list.walk();
+    let values: Vec<_> = expression_list.named_children(&mut value_cursor).collect();
+    let [value] = values.as_slice() else {
+        return None;
+    };
+    if value.kind() != "function_definition" {
+        return None;
+    }
+
+    let name = match variable.kind() {
+        "identifier" => variable.utf8_text(source).ok()?.to_string(),
+        "dot_index_expression" => variable
+            .child_by_field_name("field")?
+            .utf8_text(source)
+            .ok()?
+            .to_string(),
+        "method_index_expression" => variable
+            .child_by_field_name("method")?
+            .utf8_text(source)
+            .ok()?
+            .to_string(),
+        _ => return None,
+    };
+
+    Some(RawSymbol::at(node, Some(name), SymbolType::Function))
+}
+
 /// Refine a Go type_spec into the correct SymbolType based on the type child.
 pub(super) fn refine_go_type_spec(node: &tree_sitter::Node<'_>, source: &[u8]) -> SymbolType {
     if let Some(type_child) = node.child_by_field_name("type") {

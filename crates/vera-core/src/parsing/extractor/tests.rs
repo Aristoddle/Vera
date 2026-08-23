@@ -677,6 +677,44 @@ local function bar() end
 }
 
 #[test]
+fn lua_extracts_function_assignments() {
+    let source = "MiniAi.setup = function(config)\n  return 1\nend";
+    let symbols = parse_and_extract(source, Language::Lua);
+
+    assert_eq!(symbols.len(), 1);
+    assert_eq!(symbols[0].name.as_deref(), Some("setup"));
+    assert_eq!(symbols[0].symbol_type, SymbolType::Function);
+    assert_eq!(symbols[0].start_byte, 0);
+    assert_eq!(symbols[0].end_byte, source.len());
+    assert_eq!(symbols[0].start_row, 0);
+    assert_eq!(symbols[0].end_row, 2);
+}
+
+#[test]
+fn lua_ignores_non_function_and_nested_assignments() {
+    let source = r#"
+M.method = function() end
+local helper = function() end
+M.value = 5
+M.items[1] = function() end
+M.table = { callback = function() end }
+"#;
+    let symbols = parse_and_extract(source, Language::Lua);
+
+    assert_eq!(symbols.len(), 2);
+    assert!(
+        symbols
+            .iter()
+            .any(|symbol| symbol.name.as_deref() == Some("method"))
+    );
+    assert!(
+        symbols
+            .iter()
+            .any(|symbol| symbol.name.as_deref() == Some("helper"))
+    );
+}
+
+#[test]
 fn scala_extracts_types_and_functions() {
     let source = r#"
 def main(args: Array[String]): Unit = {}
