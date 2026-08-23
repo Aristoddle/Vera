@@ -20,7 +20,7 @@ Two retrieval paths run in parallel for every query:
 
 **BM25 (keyword matching)** uses a Tantivy index over structured chunk text, including content, symbol names, file paths, and filename/path tokens. It handles exact identifier and config-style lookups. searching for `parse_config` finds that exact function. BM25 alone scores sub-millisecond latency (0.067ms p50).
 
-**Vector search (semantic matching)** embeds the query and compares it against pre-computed chunk embeddings stored in sqlite-vec. This catches conceptual matches. searching "authentication middleware" finds relevant auth code even if those exact words don't appear. Vector search alone achieves 0.66 Recall@10 but only 0.28 MRR@10 (high recall, poor ranking).
+**Vector search (semantic matching)** embeds the query and compares it against pre-computed chunk embeddings. Vera writes every vector to sqlite-vec and to a flat `.vera/vectors.f32` sidecar. The default path memory-maps the sidecar and computes exact Euclidean L2 with SimSIMD; `VERA_VECTOR_SCAN=vec0` selects sqlite-vec for rollback and ablation. Deleted SQLite rowids remain represented by `.vera/vectors.tombs`, so they are skipped without moving later rows. Watch-mode updates write only changed rows at their rowid-derived offsets, while initial builds and recovery atomically publish full sidecar files. The flat file is fsynced before the generation manifest is renamed last; an absent or inconsistent sidecar is rebuilt from `vec_chunks`. This catches conceptual matches. searching "authentication middleware" finds relevant auth code even if those exact words don't appear. Vector search alone achieves 0.66 Recall@10 but only 0.28 MRR@10 (high recall, poor ranking).
 
 Neither path alone is sufficient. BM25 misses semantic matches. Vector search misses exact identifiers and ranks poorly. Combining them covers both.
 
@@ -68,10 +68,10 @@ Large candidate sets are batched automatically to stay within the reranker's req
 
 Everything lives in two places:
 
-- **`.vera/`** in the project root. SQLite metadata (chunks, file hashes, file-level index state), Tantivy BM25 index, and sqlite-vec vector store. One directory per project.
+- **`.vera/`** in the project root. SQLite metadata (chunks, file hashes, file-level index state), Tantivy BM25 index, sqlite-vec vectors, and the flat vector sidecar (`vectors.f32`, `vectors.tombs`, and `vectors.manifest`). One directory per project.
 - **`$XDG_DATA_HOME/vera/models/`** (or `~/.vera/models/` on existing installs): cached local model assets. Downloaded once by `vera setup`.
 
-The index is a single SQLite database file plus a Tantivy directory. No external services, no daemons, no background processes.
+The index is a SQLite database, a Tantivy directory, and the flat vector sidecar files. No external services, no daemons, no background processes.
 
 ## Incremental Updates
 

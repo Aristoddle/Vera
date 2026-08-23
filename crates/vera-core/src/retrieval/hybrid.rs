@@ -11,7 +11,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result};
 use tracing::{debug, info, warn};
@@ -37,7 +37,43 @@ pub(crate) struct SearchStores {
     pub(crate) bm25_metadata: Mutex<MetadataStore>,
     pub(crate) vector_metadata: Mutex<MetadataStore>,
     vector_path: PathBuf,
-    vector: Mutex<Option<(usize, Arc<Mutex<VectorStore>>)>>,
+    vector: Mutex<Option<CachedVectorStore>>,
+}
+
+struct CachedVectorStore {
+    dim: usize,
+    stamp: VectorStoreStamp,
+    store: Arc<Mutex<VectorStore>>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct VectorStoreStamp {
+    db_len: Option<u64>,
+    db_mtime: Option<SystemTime>,
+    manifest_mtime: Option<SystemTime>,
+    manifest_generation: Option<u64>,
+}
+
+fn vector_store_stamp(vector_path: &Path) -> VectorStoreStamp {
+    let db_metadata = std::fs::metadata(vector_path).ok();
+    let manifest_path = vector_path.with_file_name("vectors.manifest");
+    let manifest_mtime = std::fs::metadata(&manifest_path)
+        .and_then(|metadata| metadata.modified())
+        .ok();
+    let manifest_generation = std::fs::read(&manifest_path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .and_then(|manifest| {
+            manifest
+                .get("generation")
+                .and_then(serde_json::Value::as_u64)
+        });
+    VectorStoreStamp {
+        db_len: db_metadata.as_ref().map(std::fs::Metadata::len),
+        db_mtime: db_metadata.and_then(|metadata| metadata.modified().ok()),
+        manifest_mtime,
+        manifest_generation,
+    }
 }
 
 impl SearchStores {
@@ -63,16 +99,23 @@ impl SearchStores {
             .vector
             .lock()
             .map_err(|_| anyhow::anyhow!("vector store cache lock poisoned"))?;
-        if let Some((cached_dim, store)) = cached.as_ref()
-            && *cached_dim == dim
+        let stamp = vector_store_stamp(&self.vector_path);
+        if let Some(cached_store) = cached.as_ref()
+            && cached_store.dim == dim
+            && cached_store.stamp == stamp
         {
-            return Ok(Arc::clone(store));
+            return Ok(Arc::clone(&cached_store.store));
         }
 
         let store = Arc::new(Mutex::new(
             VectorStore::open(&self.vector_path, dim).context("failed to open vector store")?,
         ));
-        *cached = Some((dim, Arc::clone(&store)));
+        let stamp = vector_store_stamp(&self.vector_path);
+        *cached = Some(CachedVectorStore {
+            dim,
+            stamp,
+            store: Arc::clone(&store),
+        });
         Ok(store)
     }
 }

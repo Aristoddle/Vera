@@ -47,7 +47,16 @@ Structural search:
 
 - `metadata.rs`: SQLite: chunk metadata, file paths, content hashes, and persisted file-level index state used for health reporting
 - `bm25.rs`: Tantivy: full-text BM25 index
-- `vector.rs`: sqlite-vec: embedding vectors
+- `vector.rs`: dual sqlite-vec and flat SIMD embedding storage. The default
+  exact scan reads `.vera/vectors.f32` through `memmap2` and uses SimSIMD L2;
+  `VERA_VECTOR_SCAN=vec0` selects sqlite-vec for rollback and ablation. The
+  sidecar uses `.vera/vectors.tombs` for deleted rowids and
+  `.vera/vectors.manifest` as its generation and size commit marker. A missing
+  or inconsistent sidecar is rebuilt by streaming `vec_chunks`. Flat updates
+  preserve SQLite rowids. Watch-mode batches write changed vector rows at their
+  rowid-derived offsets, update the bitmap, fsync the data, and publish the
+  manifest last; initial builds and recovery use atomic full-file publication.
+  True compaction is deferred until a remapping protocol is available.
 
 All stored in `.vera/` at the project root.
 
