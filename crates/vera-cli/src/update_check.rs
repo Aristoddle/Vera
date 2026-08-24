@@ -239,6 +239,15 @@ fn cache_path() -> Option<PathBuf> {
 }
 
 fn check_binary_staleness() {
+    // Fork lineage guard (Aristoddle): a source-built fork version like
+    // `0.12.15-aristoddle.2` must never be compared against upstream's release
+    // feed — different lineage, and semver makes the fork permanently "behind",
+    // so the nudge would fire forever. Worse, the recommended `vera upgrade`
+    // would replace this fork build with upstream's npm package. Fork builds
+    // opt out of the binary staleness nudge entirely.
+    if CURRENT_VERSION.contains("-aristoddle") {
+        return;
+    }
     let status = binary_version_status(false);
     if let Some(latest) = status.latest_version.as_deref() {
         if status.update_available() {
