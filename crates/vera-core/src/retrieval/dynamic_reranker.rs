@@ -102,7 +102,7 @@ fn reranker_source(
 mod tests {
     use super::*;
     use crate::config::{InferenceBackend, OnnxExecutionProvider};
-    use crate::test_env::EnvVarGuard;
+    use crate::test_env::run_env_test;
 
     #[test]
     fn reranker_source_respects_potion_gating_and_api_preference() {
@@ -148,18 +148,23 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn api_reranker_batches_by_the_configured_value_not_the_environment() {
-        // Held across the await and dropped on any unwind, so the credentials
-        // and the batch value never outlive the test.
-        let _env = EnvVarGuard::set(&[
-            ("RERANKER_MODEL_BASE_URL", "http://127.0.0.1:19998/v1"),
-            ("RERANKER_MODEL_ID", "test-model"),
-            ("RERANKER_MODEL_API_KEY", "test-key"),
-            // The value the old second env lookup would have produced.
-            ("VERA_MAX_RERANK_BATCH", "20"),
-        ]);
+    #[test]
+    fn api_reranker_batches_by_the_configured_value_not_the_environment() {
+        run_env_test(
+            "retrieval::dynamic_reranker::tests::api_reranker_batches_by_the_configured_value_not_the_environment_probe",
+            &[
+                ("RERANKER_MODEL_BASE_URL", Some("http://127.0.0.1:19998/v1")),
+                ("RERANKER_MODEL_ID", Some("test-model")),
+                ("RERANKER_MODEL_API_KEY", Some("test-key")),
+                // The value the old second env lookup would have produced.
+                ("VERA_MAX_RERANK_BATCH", Some("20")),
+            ],
+        );
+    }
 
+    #[tokio::test]
+    #[ignore = "driven by api_reranker_batches_by_the_configured_value_not_the_environment"]
+    async fn api_reranker_batches_by_the_configured_value_not_the_environment_probe() {
         let mut config = VeraConfig::default();
         config.retrieval.reranking_enabled = true;
         config.retrieval.max_rerank_batch = 8;

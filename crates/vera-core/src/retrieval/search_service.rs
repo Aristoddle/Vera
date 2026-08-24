@@ -528,24 +528,27 @@ mod tests {
     use crate::retrieval::exact_matches::augment_exact_match_candidates;
     use crate::storage::bm25::{Bm25Document, Bm25Index};
     use crate::storage::metadata::MetadataStore;
-    use crate::test_env::EnvVarGuard;
+    use crate::test_env::run_env_test;
     use crate::types::Language;
     use crate::types::{Chunk, SymbolType};
     use tempfile::tempdir;
 
-    /// Point the API embedding provider at a dead local port. The guard holds
-    /// the environment lock and puts the three variables back on any unwind.
-    fn set_test_embedding_env(model_id: &str) -> EnvVarGuard {
-        EnvVarGuard::set(&[
-            ("EMBEDDING_MODEL_BASE_URL", "http://127.0.0.1:0"),
-            ("EMBEDDING_MODEL_ID", model_id),
-            ("EMBEDDING_MODEL_API_KEY", "dummy-key"),
-        ])
+    #[test]
+    fn test_dimension_mismatch_and_inference() {
+        run_env_test(
+            "retrieval::search_service::tests::test_dimension_mismatch_and_inference_probe",
+            &[
+                ("EMBEDDING_MODEL_BASE_URL", Some("http://127.0.0.1:0")),
+                ("EMBEDDING_MODEL_ID", Some("dummy-api-model")),
+                ("EMBEDDING_MODEL_API_KEY", Some("dummy-key")),
+            ],
+        );
     }
 
     #[test]
-    fn test_dimension_mismatch_and_inference() {
-        let _env_guard = set_test_embedding_env("dummy-api-model");
+    #[ignore = "driven by test_dimension_mismatch_and_inference"]
+    fn test_dimension_mismatch_and_inference_probe() {
+        crate::init_tls();
         let dir = tempdir().unwrap();
         let index_dir = dir.path();
 
@@ -613,7 +616,20 @@ mod tests {
 
     #[test]
     fn model_metadata_mismatch_falls_back_to_bm25() {
-        let _env_guard = set_test_embedding_env("active-api-model");
+        run_env_test(
+            "retrieval::search_service::tests::model_metadata_mismatch_falls_back_to_bm25_probe",
+            &[
+                ("EMBEDDING_MODEL_BASE_URL", Some("http://127.0.0.1:0")),
+                ("EMBEDDING_MODEL_ID", Some("active-api-model")),
+                ("EMBEDDING_MODEL_API_KEY", Some("dummy-key")),
+            ],
+        );
+    }
+
+    #[test]
+    #[ignore = "driven by model_metadata_mismatch_falls_back_to_bm25"]
+    fn model_metadata_mismatch_falls_back_to_bm25_probe() {
+        crate::init_tls();
         let dir = tempdir().unwrap();
         let index_dir = dir.path();
 
@@ -778,17 +794,25 @@ mod tests {
     ///
     /// The result sets are identical either way, so this asserts construction
     /// directly via the build counter rather than any search output.
-    #[tokio::test]
-    async fn reranker_is_built_only_for_queries_that_rerank() {
-        let _env_guard = EnvVarGuard::set(&[
-            ("EMBEDDING_MODEL_BASE_URL", "http://127.0.0.1:0"),
-            ("EMBEDDING_MODEL_ID", "dummy-api-model"),
-            ("EMBEDDING_MODEL_API_KEY", "dummy-key"),
-            ("RERANKER_MODEL_BASE_URL", "http://127.0.0.1:0"),
-            ("RERANKER_MODEL_ID", "dummy-reranker-model"),
-            ("RERANKER_MODEL_API_KEY", "dummy-key"),
-        ]);
+    #[test]
+    fn reranker_is_built_only_for_queries_that_rerank() {
+        run_env_test(
+            "retrieval::search_service::tests::reranker_is_built_only_for_queries_that_rerank_probe",
+            &[
+                ("EMBEDDING_MODEL_BASE_URL", Some("http://127.0.0.1:0")),
+                ("EMBEDDING_MODEL_ID", Some("dummy-api-model")),
+                ("EMBEDDING_MODEL_API_KEY", Some("dummy-key")),
+                ("RERANKER_MODEL_BASE_URL", Some("http://127.0.0.1:0")),
+                ("RERANKER_MODEL_ID", Some("dummy-reranker-model")),
+                ("RERANKER_MODEL_API_KEY", Some("dummy-key")),
+            ],
+        );
+    }
 
+    #[tokio::test]
+    #[ignore = "driven by reranker_is_built_only_for_queries_that_rerank"]
+    async fn reranker_is_built_only_for_queries_that_rerank_probe() {
+        crate::init_tls();
         let mut config = VeraConfig::default();
         config.retrieval.reranking_enabled = true;
         let filters = SearchFilters::default();

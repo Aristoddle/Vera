@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::str::FromStr;
 
+pub(crate) const DEFAULT_MAX_FILE_SIZE_BYTES: u64 = 1_000_000;
+
 /// Top-level configuration for Vera.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct VeraConfig {
@@ -67,7 +69,7 @@ impl Default for IndexingConfig {
                 "__pycache__".to_string(),
                 ".venv".to_string(),
             ],
-            max_file_size_bytes: 1_000_000, // 1MB
+            max_file_size_bytes: DEFAULT_MAX_FILE_SIZE_BYTES, // 1MB
             extra_excludes: Vec::new(),
             no_ignore: false,
             no_default_excludes: false,
@@ -631,7 +633,7 @@ fn parse_model_alias_groups(value: &str) -> Vec<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_env::EnvVarGuard;
+    use crate::test_env::run_env_test;
 
     #[test]
     fn default_config_is_valid() {
@@ -651,20 +653,38 @@ mod tests {
     #[test]
     fn graph_augmentation_env_accepts_only_truthy_values() {
         for value in ["1", "true", "TRUE", "yes", "YeS"] {
-            let _guard = EnvVarGuard::set(&[("VERA_GRAPH_AUGMENT", value)]);
-            assert!(
-                graph_augmentation_enabled(),
-                "{value} should enable the flag"
+            run_env_test(
+                "config::tests::graph_augmentation_truthy_probe",
+                &[("VERA_GRAPH_AUGMENT", Some(value))],
             );
         }
 
         for value in ["0", "false", "no", "", "on"] {
-            let _guard = EnvVarGuard::set(&[("VERA_GRAPH_AUGMENT", value)]);
-            assert!(
-                !graph_augmentation_enabled(),
-                "{value} should disable the flag"
+            run_env_test(
+                "config::tests::graph_augmentation_falsey_probe",
+                &[("VERA_GRAPH_AUGMENT", Some(value))],
             );
         }
+    }
+
+    #[test]
+    #[ignore = "driven by graph_augmentation_env_accepts_only_truthy_values"]
+    fn graph_augmentation_truthy_probe() {
+        let value = std::env::var("VERA_GRAPH_AUGMENT").unwrap();
+        assert!(
+            graph_augmentation_enabled(),
+            "{value} should enable the flag"
+        );
+    }
+
+    #[test]
+    #[ignore = "driven by graph_augmentation_env_accepts_only_truthy_values"]
+    fn graph_augmentation_falsey_probe() {
+        let value = std::env::var("VERA_GRAPH_AUGMENT").unwrap();
+        assert!(
+            !graph_augmentation_enabled(),
+            "{value} should disable the flag"
+        );
     }
 
     #[test]
@@ -693,8 +713,15 @@ mod tests {
 
     #[test]
     fn max_in_flight_environment_value_normalizes_zero_to_one() {
-        let _guard = EnvVarGuard::set(&[("VERA_MAX_IN_FLIGHT_INPUTS", "0")]);
+        run_env_test(
+            "config::tests::max_in_flight_environment_value_normalizes_zero_to_one_probe",
+            &[("VERA_MAX_IN_FLIGHT_INPUTS", Some("0"))],
+        );
+    }
 
+    #[test]
+    #[ignore = "driven by max_in_flight_environment_value_normalizes_zero_to_one"]
+    fn max_in_flight_environment_value_normalizes_zero_to_one_probe() {
         assert_eq!(default_max_in_flight_inputs(), 1);
     }
 
@@ -748,8 +775,18 @@ mod tests {
 
     #[test]
     fn resolve_backend_prefers_saved_backend_env() {
-        let _guard = EnvVarGuard::set(&[("VERA_BACKEND", "onnx-jina-cuda"), ("VERA_LOCAL", "1")]);
+        run_env_test(
+            "config::tests::resolve_backend_prefers_saved_backend_env_probe",
+            &[
+                ("VERA_BACKEND", Some("onnx-jina-cuda")),
+                ("VERA_LOCAL", Some("1")),
+            ],
+        );
+    }
 
+    #[test]
+    #[ignore = "driven by resolve_backend_prefers_saved_backend_env"]
+    fn resolve_backend_prefers_saved_backend_env_probe() {
         assert_eq!(
             resolve_backend(None),
             InferenceBackend::OnnxJina(OnnxExecutionProvider::Cuda)
@@ -758,8 +795,15 @@ mod tests {
 
     #[test]
     fn resolve_backend_falls_back_to_legacy_local_env() {
-        let _guard = EnvVarGuard::apply(&[("VERA_BACKEND", None), ("VERA_LOCAL", Some("1"))]);
+        run_env_test(
+            "config::tests::resolve_backend_falls_back_to_legacy_local_env_probe",
+            &[("VERA_BACKEND", None), ("VERA_LOCAL", Some("1"))],
+        );
+    }
 
+    #[test]
+    #[ignore = "driven by resolve_backend_falls_back_to_legacy_local_env"]
+    fn resolve_backend_falls_back_to_legacy_local_env_probe() {
         assert_eq!(
             resolve_backend(None),
             InferenceBackend::OnnxJina(OnnxExecutionProvider::Cpu)
@@ -821,11 +865,18 @@ mod tests {
 
     #[test]
     fn model_names_match_env_alias_group() {
-        let _guard = EnvVarGuard::set(&[(
-            "VERA_EMBEDDING_MODEL_ALIASES",
-            "text-embedding-3-large,text-embedding-3-large-2;other,other-prod",
-        )]);
+        run_env_test(
+            "config::tests::model_names_match_env_alias_group_probe",
+            &[(
+                "VERA_EMBEDDING_MODEL_ALIASES",
+                Some("text-embedding-3-large,text-embedding-3-large-2;other,other-prod"),
+            )],
+        );
+    }
 
+    #[test]
+    #[ignore = "driven by model_names_match_env_alias_group"]
+    fn model_names_match_env_alias_group_probe() {
         assert!(model_names_match(
             "text-embedding-3-large",
             "text-embedding-3-large-2"

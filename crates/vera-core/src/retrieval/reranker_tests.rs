@@ -1,5 +1,5 @@
 use super::*;
-use crate::test_env::EnvVarGuard;
+use crate::test_env::run_env_test;
 use crate::types::{Language, SymbolType};
 
 /// Helper to create a SearchResult with given parameters.
@@ -51,7 +51,15 @@ fn config_with_timeout() {
 
 #[test]
 fn api_reranker_legacy_constructor_uses_environment_batch_size() {
-    let _env = EnvVarGuard::set(&[("VERA_MAX_RERANK_BATCH", "7")]);
+    run_env_test(
+        "retrieval::reranker::tests::api_reranker_legacy_constructor_uses_environment_batch_size_probe",
+        &[("VERA_MAX_RERANK_BATCH", Some("7"))],
+    );
+}
+
+#[test]
+#[ignore = "driven by api_reranker_legacy_constructor_uses_environment_batch_size"]
+fn api_reranker_legacy_constructor_uses_environment_batch_size_probe() {
     let config = RerankerConfig::new(
         "https://api.example.com/v1".to_string(),
         "model-1".to_string(),
