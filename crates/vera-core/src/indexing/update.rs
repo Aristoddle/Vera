@@ -162,13 +162,19 @@ pub(crate) fn hash_for_indexing_source(
     rel_path: &str,
     language: Language,
     repo_root: &Path,
+    max_file_size_bytes: u64,
 ) -> String {
     if language != Language::Rst {
         return content_hash(content);
     }
 
     let absolute_path = repo_root.join(rel_path);
-    match parsing::sphinx::preprocess_rst(content, &absolute_path, repo_root) {
+    match parsing::sphinx::preprocess_rst_with_limit(
+        content,
+        &absolute_path,
+        repo_root,
+        max_file_size_bytes,
+    ) {
         Ok(preprocessed) => content_hash(&preprocessed),
         Err(err) => {
             warn!(
@@ -398,7 +404,13 @@ where
     for (rel_path, content) in &current_files {
         cancellation.check()?;
         let language = detect_language_for_path(rel_path);
-        let hash = hash_for_indexing_source(content, rel_path, language, &repo_root);
+        let hash = hash_for_indexing_source(
+            content,
+            rel_path,
+            language,
+            &repo_root,
+            config.indexing.max_file_size_bytes,
+        );
         let stored_hash = metadata_store
             .get_file_hash(rel_path)
             .context("failed to get stored hash")?;
@@ -491,10 +503,11 @@ where
                 let (chunks, refs, file_state, parse_error) = if language == Language::Rst {
                     let refs = parsing::parse_and_extract_references(content, language);
                     let absolute_path = repo_root.join(rel_path);
-                    let normalized_source = match parsing::sphinx::preprocess_rst(
+                    let normalized_source = match parsing::sphinx::preprocess_rst_with_limit(
                         content,
                         &absolute_path,
                         &repo_root,
+                        config.indexing.max_file_size_bytes,
                     ) {
                         Ok(preprocessed) => Some(preprocessed),
                         Err(err) => {

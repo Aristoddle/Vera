@@ -433,10 +433,11 @@ fn parse_discovered_files_parallel(
             // come from the raw source, so they can't share a single parse.
             let parsed = if language == Language::Rst {
                 let refs = parsing::parse_and_extract_references(&source, language);
-                let normalized_source = match parsing::sphinx::preprocess_rst(
+                let normalized_source = match parsing::sphinx::preprocess_rst_with_limit(
                     &source,
                     &file.absolute_path,
                     repo_root.as_path(),
+                    config.indexing.max_file_size_bytes,
                 ) {
                     Ok(preprocessed) => Some(preprocessed),
                     Err(err) => {

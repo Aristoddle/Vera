@@ -123,8 +123,13 @@ pub fn detect_staleness(
         .filter(|path| !current_files.contains_key(path.as_str()))
         .count();
 
-    let files_modified =
-        count_modified_files(&current_files, &tracked_files, &metadata_store, &repo_root)?;
+    let files_modified = count_modified_files(
+        &current_files,
+        &tracked_files,
+        &metadata_store,
+        &repo_root,
+        indexing_config.max_file_size_bytes,
+    )?;
 
     Ok(IndexFreshness {
         files_added,
@@ -138,6 +143,7 @@ fn count_modified_files(
     tracked_files: &HashSet<String>,
     metadata_store: &MetadataStore,
     repo_root: &Path,
+    max_file_size_bytes: u64,
 ) -> Result<usize> {
     let tracked_current: Vec<(&String, &PathBuf)> = current_files
         .iter()
@@ -167,7 +173,13 @@ fn count_modified_files(
                 }
             };
             let language = detect_language_for_path(rel_path);
-            let current_hash = hash_for_indexing_source(&content, rel_path, language, repo_root);
+            let current_hash = hash_for_indexing_source(
+                &content,
+                rel_path,
+                language,
+                repo_root,
+                max_file_size_bytes,
+            );
             (*rel_path, Some(current_hash))
         })
         .collect();
@@ -313,8 +325,14 @@ mod tests {
 
         let current_files = HashMap::from([("src/unreadable.rs".to_string(), read_failure_path)]);
         let tracked_files = HashSet::from(["src/unreadable.rs".to_string()]);
-        let files_modified =
-            count_modified_files(&current_files, &tracked_files, &metadata, dir.path()).unwrap();
+        let files_modified = count_modified_files(
+            &current_files,
+            &tracked_files,
+            &metadata,
+            dir.path(),
+            IndexingConfig::default().max_file_size_bytes,
+        )
+        .unwrap();
 
         assert_eq!(files_modified, 1);
     }
