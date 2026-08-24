@@ -1,5 +1,5 @@
 [package]
-name = "vera-core"
+name = "vera2-core"
 description = "Core engine for Vera: parsing, indexing, retrieval, storage, and embedding"
 version.workspace = true
 edition.workspace = true

@@ -1,5 +1,5 @@
 [package]
-name = "vera-mcp"
+name = "vera2-mcp"
 description = "MCP server interface for Vera code indexing and retrieval"
 version.workspace = true
 edition.workspace = true
