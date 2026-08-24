@@ -5,6 +5,8 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+repository.workspace = true
+readme.workspace = true
 
 [dependencies]
 serde = { workspace = true }
@@ -51,14 +53,14 @@ tree-sitter-php = "0.24.2"
 tree-sitter-haskell = "0.23.1"
 tree-sitter-elixir = "0.3.5"
 tree-sitter-dart = "0.1.0"
-tree-sitter-hcl = { git = "https://github.com/tree-sitter-grammars/tree-sitter-hcl", version = "1.2.0" }
+tree-sitter-hcl = { git = "https://github.com/tree-sitter-grammars/tree-sitter-hcl", version = "1.1.0" }
 tree-sitter-html = "0.23.2"
 tree-sitter-css = "0.25.0"
-# SCSS: vendored C source in crates/tree-sitter-scss/ (crates.io 1.0.0 passes GCC flags that break MSVC)
-# Vue: vendored C source in crates/tree-sitter-vue/ (crates.io 0.0.3 needs tree-sitter ~0.20)
+# SCSS: vendored C source in vendor/tree-sitter-scss/ (crates.io 1.0.0 passes GCC flags that break MSVC)
+# Vue: vendored C source in vendor/tree-sitter-vue/ (crates.io 0.0.3 needs tree-sitter ~0.20)
 tree-sitter-graphql = "0.1.0"
 tree-sitter-cmake = "0.7.1"
-# Dockerfile: vendored C source in crates/tree-sitter-dockerfile/ (crates.io 0.2.0 needs tree-sitter ^0.20)
+# Dockerfile: vendored C source in vendor/tree-sitter-dockerfile/ (crates.io 0.2.0 needs tree-sitter ^0.20)
 tree-sitter-xml = "0.7.0"
 # Tier 2A code languages
 tree-sitter-objc = "3.0.2"
@@ -87,7 +89,7 @@ tree-sitter-glsl = "0.2.0"
 tree-sitter-hlsl = "0.2.0"
 # Tier 2B structural/config/frontend languages
 tree-sitter-svelte-next = "0.1.1"
-# Astro: vendored C source in crates/tree-sitter-astro/ (no crates.io package with modern tree-sitter)
+# Astro: vendored C source in vendor/tree-sitter-astro/ (no crates.io package with modern tree-sitter)
 tree-sitter-make = "1.1.1"
 tree-sitter-ini = "1.4.0"
 tree-sitter-nginx = "1.0.1"

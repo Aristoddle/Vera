@@ -1,0 +1,2 @@
+# Preserve upstream-generated grammar bytes; their whitespace is not ours to rewrite.
+crates/vera-core/vendor/** whitespace=-blank-at-eol,-blank-at-eof

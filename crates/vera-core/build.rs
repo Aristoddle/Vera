@@ -1,50 +1,40 @@
 fn main() {
-    let sql_dir = std::path::Path::new("../tree-sitter-sql/src");
-    if sql_dir.exists() {
-        println!("cargo:rerun-if-changed=../tree-sitter-sql/src/parser.c");
-        println!("cargo:rerun-if-changed=../tree-sitter-sql/src/scanner.cc");
-        cc::Build::new()
-            .include(sql_dir)
-            .file(sql_dir.join("parser.c"))
-            .warnings(false)
-            .compile("tree-sitter-sql-parser");
+    let vendor = std::path::Path::new("vendor");
 
-        cc::Build::new()
-            .include(sql_dir)
-            .file(sql_dir.join("scanner.cc"))
-            .cpp(true)
-            .warnings(false)
-            .compile("tree-sitter-sql-scanner");
-    }
+    let sql_dir = vendor.join("tree-sitter-sql");
+    println!("cargo:rerun-if-changed={}", sql_dir.display());
+    cc::Build::new()
+        .include(&sql_dir)
+        .file(sql_dir.join("parser.c"))
+        .warnings(false)
+        .compile("tree-sitter-sql-parser");
 
-    let proto_dir = std::path::Path::new("../tree-sitter-proto/src");
-    if proto_dir.exists() {
-        println!("cargo:rerun-if-changed=../tree-sitter-proto/src/parser.c");
-        cc::Build::new()
-            .include(proto_dir)
-            .file(proto_dir.join("parser.c"))
-            .warnings(false)
-            .compile("tree-sitter-proto");
-    }
+    cc::Build::new()
+        .include(&sql_dir)
+        .file(sql_dir.join("scanner.cc"))
+        .cpp(true)
+        .warnings(false)
+        .compile("tree-sitter-sql-scanner");
 
-    // These grammars are not tracked in git; scripts/bootstrap-vendored-grammars.sh
-    // downloads them. Fail at build-script time instead of at link time.
+    let proto_dir = vendor.join("tree-sitter-proto");
+    println!("cargo:rerun-if-changed={}", proto_dir.display());
+    cc::Build::new()
+        .include(&proto_dir)
+        .file(proto_dir.join("parser.c"))
+        .warnings(false)
+        .compile("tree-sitter-proto");
+
     for name in ["dockerfile", "astro", "scss", "vue"] {
-        let dir = std::path::PathBuf::from(format!("../tree-sitter-{name}/src"));
+        let dir = vendor.join(format!("tree-sitter-{name}"));
         let parser = dir.join("parser.c");
         let scanner = dir.join("scanner.c");
-        assert!(
-            parser.exists() && scanner.exists(),
-            "tree-sitter-{name} grammar not found. Run scripts/bootstrap-vendored-grammars.sh to download it."
-        );
-        println!("cargo:rerun-if-changed={}", parser.display());
+        println!("cargo:rerun-if-changed={}", dir.display());
         cc::Build::new()
             .include(&dir)
             .file(&parser)
             .warnings(false)
             .compile(&format!("tree-sitter-{name}-parser"));
 
-        println!("cargo:rerun-if-changed={}", scanner.display());
         cc::Build::new()
             .include(&dir)
             .file(&scanner)
