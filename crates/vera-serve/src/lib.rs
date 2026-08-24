@@ -20,7 +20,8 @@ use std::time::Duration;
 
 use anyhow::Result;
 use axum::{
-    Router,
+    Json, Router,
+    http::StatusCode,
     routing::{get, post},
 };
 use vera_core::config::{InferenceBackend, VeraConfig};
@@ -29,6 +30,9 @@ use vera_core::retrieval::DynamicReranker;
 
 pub use provider_cache::CacheMode;
 use provider_cache::ModelSlot;
+use types::ApiError;
+
+pub(crate) type AcquireError = (StatusCode, Json<ApiError>);
 
 /// Shared state injected into every handler.
 pub struct AppState {
@@ -41,9 +45,9 @@ pub struct AppState {
     /// Whether a reranker is available (probed at startup).
     pub reranker_available: bool,
     /// The embedding model, cached independently of the reranker.
-    pub(crate) embedding: Arc<ModelSlot<DynamicProvider>>,
+    pub(crate) embedding: Arc<ModelSlot<DynamicProvider, AcquireError>>,
     /// The reranker, cached independently of the embedding model.
-    pub(crate) reranker: Arc<ModelSlot<DynamicReranker>>,
+    pub(crate) reranker: Arc<ModelSlot<DynamicReranker, AcquireError>>,
 }
 
 /// Start the Vera HTTP server.
@@ -80,8 +84,10 @@ pub async fn run_server(
 
     eprintln!("vera serve: embedding model ready ({})", model_name);
 
-    let embedding = Arc::new(ModelSlot::new(cache_mode));
-    let reranker: Arc<ModelSlot<DynamicReranker>> = Arc::new(ModelSlot::new(cache_mode));
+    let embedding: Arc<ModelSlot<DynamicProvider, AcquireError>> =
+        Arc::new(ModelSlot::new(cache_mode));
+    let reranker: Arc<ModelSlot<DynamicReranker, AcquireError>> =
+        Arc::new(ModelSlot::new(cache_mode));
 
     // The probe already paid for a full load, so hand it to the slot rather than
     // dropping it and making the first request load the same model again. Seeded

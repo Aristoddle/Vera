@@ -1,15 +1,14 @@
 //! Residency cache for the models `vera serve` hands to requests.
 //!
 //! Each model gets its own slot with its own lock, so a cold embedding load
-//! never blocks a rerank request. Within a slot the lock is held across the
-//! load deliberately: N concurrent cold requests then build one model instead
-//! of N.
+//! never blocks a rerank request. A slot owns its in-flight load, allowing
+//! concurrent requests to await one build without holding the slot lock.
 
 use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::{Mutex as AsyncMutex, watch};
 
 /// How long a loaded model stays resident.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -48,16 +47,26 @@ struct Resident<T> {
     last_used: Instant,
 }
 
+type LoadState<T, E> = Option<Result<Option<Arc<T>>, E>>;
+
+struct SlotState<T, E> {
+    resident: Option<Resident<T>>,
+    loading: Option<watch::Receiver<LoadState<T, E>>>,
+}
+
 /// One cached model, loaded on first use.
-pub(crate) struct ModelSlot<T> {
-    resident: AsyncMutex<Option<Resident<T>>>,
+pub(crate) struct ModelSlot<T, E = ()> {
+    state: Arc<AsyncMutex<SlotState<T, E>>>,
     mode: CacheMode,
 }
 
-impl<T> ModelSlot<T> {
+impl<T, E> ModelSlot<T, E> {
     pub(crate) fn new(mode: CacheMode) -> Self {
         Self {
-            resident: AsyncMutex::new(None),
+            state: Arc::new(AsyncMutex::new(SlotState {
+                resident: None,
+                loading: None,
+            })),
             mode,
         }
     }
@@ -67,29 +76,51 @@ impl<T> ModelSlot<T> {
     /// A loader that reports the model as unavailable (`Ok(None)`) leaves the
     /// slot empty, so a transient failure is retried by the next request instead
     /// of being cached for the lifetime of the process.
-    pub(crate) async fn get_or_load<F, Fut, E>(&self, load: F) -> Result<Option<Arc<T>>, E>
+    pub(crate) async fn get_or_load<F, Fut>(&self, load: F) -> Result<Option<Arc<T>>, E>
     where
+        T: Send + Sync + 'static,
+        E: Clone + Send + Sync + 'static,
         F: FnOnce() -> Fut,
-        Fut: Future<Output = Result<Option<Arc<T>>, E>>,
+        Fut: Future<Output = Result<Option<Arc<T>>, E>> + Send + 'static,
     {
         if matches!(self.mode, CacheMode::PerRequest) {
             return load().await;
         }
 
-        let mut guard = self.resident.lock().await;
-        if let Some(resident) = guard.as_mut() {
-            resident.last_used = Instant::now();
-            return Ok(Some(Arc::clone(&resident.model)));
+        let (receiver, sender) = {
+            let mut state = self.state.lock().await;
+            if let Some(resident) = state.resident.as_mut() {
+                resident.last_used = Instant::now();
+                return Ok(Some(Arc::clone(&resident.model)));
+            }
+
+            if let Some(receiver) = state.loading.as_ref() {
+                (receiver.clone(), None)
+            } else {
+                let (sender, receiver) = watch::channel(None);
+                state.loading = Some(receiver.clone());
+                (receiver, Some(sender))
+            }
+        };
+
+        if let Some(sender) = sender {
+            let state = Arc::clone(&self.state);
+            let future = load();
+            tokio::spawn(async move {
+                let result = future.await;
+                let mut state = state.lock().await;
+                if let Ok(Some(model)) = result.as_ref() {
+                    state.resident = Some(Resident {
+                        model: Arc::clone(model),
+                        last_used: Instant::now(),
+                    });
+                }
+                let _ = sender.send(Some(result));
+                state.loading = None;
+            });
         }
 
-        let Some(model) = load().await? else {
-            return Ok(None);
-        };
-        *guard = Some(Resident {
-            model: Arc::clone(&model),
-            last_used: Instant::now(),
-        });
-        Ok(Some(model))
+        wait_for_load(receiver).await
     }
 
     /// Put an already-loaded model into the slot.
@@ -102,7 +133,7 @@ impl<T> ModelSlot<T> {
         if matches!(self.mode, CacheMode::PerRequest) {
             return;
         }
-        *self.resident.lock().await = Some(Resident {
+        self.state.lock().await.resident = Some(Resident {
             model,
             last_used: Instant::now(),
         });
@@ -114,8 +145,8 @@ impl<T> ModelSlot<T> {
         let Some(timeout) = self.mode.idle_timeout() else {
             return false;
         };
-        let mut guard = self.resident.lock().await;
-        let Some(resident) = guard.as_mut() else {
+        let mut state = self.state.lock().await;
+        let Some(resident) = state.resident.as_mut() else {
             return false;
         };
         // Evicting a model a request still holds would force a second load in
@@ -130,8 +161,26 @@ impl<T> ModelSlot<T> {
         if resident.last_used.elapsed() < timeout {
             return false;
         }
-        *guard = None;
+        state.resident = None;
         true
+    }
+}
+
+async fn wait_for_load<T, E>(
+    mut receiver: watch::Receiver<LoadState<T, E>>,
+) -> Result<Option<Arc<T>>, E>
+where
+    E: Clone,
+{
+    loop {
+        let result = receiver.borrow().clone();
+        if let Some(result) = result {
+            return result;
+        }
+        receiver
+            .changed()
+            .await
+            .expect("in-flight model load ended without a result");
     }
 }
 
@@ -143,21 +192,29 @@ mod tests {
     /// Stand-in for a model: `Builds` counts how many were constructed, which is
     /// the property under test. The real models need ONNX Runtime and downloaded
     /// assets, so a test built on them would skip silently.
-    struct Builds(AtomicUsize);
+    struct Builds(Arc<AtomicUsize>);
 
     impl Builds {
         fn new() -> Self {
-            Self(AtomicUsize::new(0))
+            Self(Arc::new(AtomicUsize::new(0)))
         }
 
         fn count(&self) -> usize {
             self.0.load(Ordering::SeqCst)
         }
 
-        /// A loader that succeeds, counting each construction.
-        async fn load(&self) -> Result<Option<Arc<usize>>, ()> {
+        fn build(&self) -> Arc<usize> {
             let n = self.0.fetch_add(1, Ordering::SeqCst) + 1;
-            Ok(Some(Arc::new(n)))
+            Arc::new(n)
+        }
+
+        /// A loader that succeeds, counting each construction.
+        fn load(&self) -> impl Future<Output = Result<Option<Arc<usize>>, ()>> + Send + 'static {
+            let builds = Arc::clone(&self.0);
+            async move {
+                let n = builds.fetch_add(1, Ordering::SeqCst) + 1;
+                Ok(Some(Arc::new(n)))
+            }
         }
     }
 
@@ -198,7 +255,7 @@ mod tests {
             let builds = Arc::clone(&builds);
             tasks.push(tokio::spawn(async move {
                 let model = slot
-                    .get_or_load(|| async {
+                    .get_or_load(move || async move {
                         // Widen the window a serialized load has to lose in.
                         tokio::time::sleep(Duration::from_millis(20)).await;
                         builds.load().await
@@ -218,16 +275,20 @@ mod tests {
     #[tokio::test]
     async fn an_unavailable_model_is_not_cached_and_a_later_load_succeeds() {
         let slot: ModelSlot<usize> = ModelSlot::new(CacheMode::Forever);
-        let attempts = AtomicUsize::new(0);
-        let builds = Builds::new();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let builds = Arc::new(Builds::new());
 
-        let load = || async {
-            if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
-                // The shape `create_dynamic_reranker` failures take: swallowed
-                // into "not available" rather than surfaced as an error.
-                return Ok(None);
+        let load = || {
+            let attempts = Arc::clone(&attempts);
+            let builds = Arc::clone(&builds);
+            async move {
+                if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                    // The shape `create_dynamic_reranker` failures take: swallowed
+                    // into "not available" rather than surfaced as an error.
+                    return Ok(None);
+                }
+                builds.load().await
             }
-            builds.load().await
         };
 
         assert!(slot.get_or_load(load).await.unwrap().is_none());
@@ -245,17 +306,21 @@ mod tests {
 
     #[tokio::test]
     async fn a_failed_load_is_not_cached_and_a_later_load_succeeds() {
-        let slot: ModelSlot<usize> = ModelSlot::new(CacheMode::Forever);
-        let attempts = AtomicUsize::new(0);
-        let builds = Builds::new();
+        let slot: ModelSlot<usize, &'static str> = ModelSlot::new(CacheMode::Forever);
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let builds = Arc::new(Builds::new());
 
-        let load = || async {
-            if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
-                // The shape `create_dynamic_provider` failures take on the
-                // embedding path: surfaced as an error, not as "unavailable".
-                return Err("cold start failed");
+        let load = || {
+            let attempts = Arc::clone(&attempts);
+            let builds = Arc::clone(&builds);
+            async move {
+                if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                    // The shape `create_dynamic_provider` failures take on the
+                    // embedding path: surfaced as an error, not as "unavailable".
+                    return Err("cold start failed");
+                }
+                Ok(builds.load().await.unwrap())
             }
-            Ok(builds.load().await.unwrap())
         };
 
         assert_eq!(
@@ -271,6 +336,46 @@ mod tests {
         let again = slot.get_or_load(load).await.unwrap();
         assert_eq!(*again.unwrap(), 1);
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(builds.count(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_dropped_initiator_does_not_discard_a_cold_load() {
+        let slot: Arc<ModelSlot<usize>> = Arc::new(ModelSlot::new(CacheMode::Forever));
+        let builds = Arc::new(Builds::new());
+        let (started, started_rx) = tokio::sync::oneshot::channel();
+        let (release, released) = tokio::sync::oneshot::channel();
+
+        let first = {
+            let slot = Arc::clone(&slot);
+            let builds = Arc::clone(&builds);
+            tokio::spawn(async move {
+                slot.get_or_load(move || async move {
+                    started.send(()).unwrap();
+                    let model = builds.build();
+                    released.await.unwrap();
+                    Ok(Some(model))
+                })
+                .await
+            })
+        };
+
+        started_rx.await.unwrap();
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+
+        let second = {
+            let slot = Arc::clone(&slot);
+            let builds = Arc::clone(&builds);
+            tokio::spawn(async move {
+                slot.get_or_load(move || async move { Ok(Some(builds.build())) })
+                    .await
+            })
+        };
+
+        release.send(()).unwrap();
+        let model = second.await.unwrap().unwrap().unwrap();
+        assert_eq!(*model, 1);
         assert_eq!(builds.count(), 1);
     }
 
@@ -324,7 +429,7 @@ mod tests {
             let reranker = Arc::clone(&reranker);
             tokio::spawn(async move {
                 reranker
-                    .get_or_load(|| async {
+                    .get_or_load(move || async move {
                         entered.send(()).unwrap();
                         let _ = released.await;
                         Ok::<_, ()>(Some(Arc::new(7usize)))

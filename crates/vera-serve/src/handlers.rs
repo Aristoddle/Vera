@@ -14,7 +14,7 @@ use vera_core::embedding::{DynamicProvider, EmbeddingError, EmbeddingProvider};
 use vera_core::retrieval::{DynamicReranker, Reranker, RerankerError};
 
 use crate::{
-    AppState,
+    AcquireError, AppState,
     types::{
         ApiError, EmbeddingObject, EmbeddingsRequest, EmbeddingsResponse, EmbeddingsUsage,
         HealthResponse, RerankDocument, RerankRequest, RerankResponse, RerankResult,
@@ -22,8 +22,6 @@ use crate::{
 };
 
 // ── Provider cache helpers ────────────────────────────────────────────────────
-
-type AcquireError = (StatusCode, Json<ApiError>);
 
 fn embedding_unavailable() -> AcquireError {
     (
@@ -45,16 +43,17 @@ fn reranker_unavailable() -> (StatusCode, Json<ApiError>) {
 /// Acquire the embedding provider from its own cache slot, loading it on first
 /// use unless the cache is disabled.
 async fn acquire_embedding(state: &AppState) -> Result<Arc<DynamicProvider>, AcquireError> {
+    let config = state.config.clone();
+    let backend = state.backend;
     state
         .embedding
-        .get_or_load(|| async {
-            let (embedding, _) =
-                vera_core::embedding::create_dynamic_provider(&state.config, state.backend)
-                    .await
-                    .map_err(|e| {
-                        error!(error = %e, "failed to load embedding model");
-                        embedding_unavailable()
-                    })?;
+        .get_or_load(move || async move {
+            let (embedding, _) = vera_core::embedding::create_dynamic_provider(&config, backend)
+                .await
+                .map_err(|e| {
+                    error!(error = %e, "failed to load embedding model");
+                    embedding_unavailable()
+                })?;
             Ok(Some(Arc::new(embedding)))
         })
         .await?
@@ -69,11 +68,13 @@ async fn acquire_reranker(state: &AppState) -> Result<Option<Arc<DynamicReranker
         return Ok(None);
     }
 
+    let config = state.config.clone();
+    let backend = state.backend;
     state
         .reranker
-        .get_or_load(|| async {
+        .get_or_load(move || async move {
             Ok(
-                vera_core::retrieval::create_dynamic_reranker(&state.config, state.backend)
+                vera_core::retrieval::create_dynamic_reranker(&config, backend)
                     .await
                     .unwrap_or_else(|e| {
                         error!(error = %e, "failed to load reranker");
