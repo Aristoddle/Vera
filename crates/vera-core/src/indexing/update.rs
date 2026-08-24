@@ -372,7 +372,10 @@ where
         .par_iter()
         .map(|file| {
             cancellation.check()?;
-            let content = match discovery::read_source_lossy(&file.absolute_path) {
+            let content = match discovery::read_source_lossy_at(
+                &disc.root_dir,
+                Path::new(&file.relative_path),
+            ) {
                 Ok(content) => Some(content),
                 Err(err) => {
                     warn!(file = %file.relative_path, error = %err, "failed to read file");

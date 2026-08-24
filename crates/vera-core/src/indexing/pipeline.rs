@@ -405,7 +405,10 @@ fn parse_discovered_files_parallel(
                 };
             }
 
-            let source = match crate::discovery::read_source_lossy(&file.absolute_path) {
+            let source = match crate::discovery::read_source_lossy_at(
+                &discovery.root_dir,
+                Path::new(&file.relative_path),
+            ) {
                 Ok(source) => source,
                 Err(err) => {
                     warn!(

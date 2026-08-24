@@ -59,7 +59,8 @@ pub(crate) fn resolve_within(canonical_root: &Path, candidate: &Path) -> Contain
 /// Returns `None` for anything that must not be read. An escape is logged:
 /// a stored path that leaves the project root means the index disagrees with
 /// the repository it sits in, and a silent skip would hide that.
-pub(crate) fn resolve_indexed_path(canonical_root: &Path, relative: &str) -> Option<PathBuf> {
+#[allow(dead_code)]
+fn resolve_indexed_path(canonical_root: &Path, relative: &str) -> Option<PathBuf> {
     let path = Path::new(relative);
     let shape_ok = !relative.is_empty()
         && path

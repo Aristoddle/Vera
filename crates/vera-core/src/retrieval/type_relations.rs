@@ -7,7 +7,7 @@ use anyhow::Result;
 
 use crate::corpus::{ContentClass, classify_content};
 use crate::parsing::signatures;
-use crate::path_containment::{canonical_project_root, resolve_indexed_path};
+use crate::path_containment::canonical_project_root;
 use crate::retrieval::file_scan::{
     allows_class, language_for_path, line_context_snippet, smallest_symbol_chunk_for_line,
     symbol_for_line,
@@ -28,6 +28,7 @@ pub fn search_explicit_implementations(
     let metadata_path = index_dir.join("metadata.db");
     let store = MetadataStore::open(&metadata_path)?;
     let repo_root = canonical_project_root(index_dir)?;
+    let root_dir = crate::discovery::open_root_dir(&repo_root)?;
     let symbol = super::structural::normalize_impl_target(symbol);
     let relations = store.find_type_relations(&symbol)?;
     let mut results = Vec::new();
@@ -43,16 +44,15 @@ pub fn search_explicit_implementations(
             continue;
         }
 
-        let Some(file_abs) = resolve_indexed_path(&repo_root, &relation.file_path) else {
-            continue;
-        };
-        let content = match crate::discovery::read_source_lossy(&file_abs) {
-            Ok(content) => content,
-            Err(e) => {
-                tracing::debug!("skipping {}: {e}", relation.file_path);
-                continue;
-            }
-        };
+        let content =
+            match crate::discovery::read_source_lossy_at(&root_dir, Path::new(&relation.file_path))
+            {
+                Ok(content) => content,
+                Err(e) => {
+                    tracing::debug!("skipping {}: {e}", relation.file_path);
+                    continue;
+                }
+            };
         let class = classify_content(&relation.file_path, language, &content);
         if !allows_class(filters, class) {
             continue;

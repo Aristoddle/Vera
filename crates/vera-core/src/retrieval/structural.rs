@@ -5,12 +5,13 @@ use std::path::Path;
 use std::sync::LazyLock;
 
 use anyhow::{Result, bail};
+use cap_std::fs::Dir;
 use regex::{Captures, Regex};
 use tree_sitter::Parser;
 
 use crate::corpus::{ContentClass, classify_content};
 use crate::parsing::languages;
-use crate::path_containment::{canonical_project_root, resolve_indexed_path};
+use crate::path_containment::canonical_project_root;
 use crate::retrieval::apply_filters;
 use crate::retrieval::file_scan::{
     allows_class, bounded_byte_snippet, language_for_path, smallest_symbol_chunk_for_line,
@@ -58,6 +59,7 @@ pub fn search_structural(
     let metadata_path = index_dir.join("metadata.db");
     let store = MetadataStore::open(&metadata_path)?;
     let repo_root = canonical_project_root(index_dir)?;
+    let root_dir = crate::discovery::open_root_dir(&repo_root)?;
     let filters = structural_filters(filters);
 
     match kind {
@@ -66,15 +68,15 @@ pub fn search_structural(
             search_definitions(&store, symbol, limit, &filters)
         }
         StructuralSearchKind::EnvReads => {
-            search_env_reads(&repo_root, &store, query, limit, &filters)
+            search_env_reads(&root_dir, &store, query, limit, &filters)
         }
         StructuralSearchKind::RouteHandlers => {
             reject_query(kind, query)?;
-            search_route_handlers(&repo_root, &store, limit, &filters)
+            search_route_handlers(&root_dir, &store, limit, &filters)
         }
         StructuralSearchKind::SqlQueries => {
             reject_query(kind, query)?;
-            search_sql_queries(&repo_root, &store, limit, &filters)
+            search_sql_queries(&root_dir, &store, limit, &filters)
         }
         StructuralSearchKind::Implementations => {
             let target = required_query(kind, query)?;
@@ -146,7 +148,7 @@ fn search_definitions(
 }
 
 fn search_env_reads(
-    repo_root: &Path,
+    root_dir: &Dir,
     store: &MetadataStore,
     query: Option<&str>,
     limit: usize,
@@ -154,7 +156,7 @@ fn search_env_reads(
 ) -> Result<Vec<SearchResult>> {
     let target = non_blank(query);
     search_regex_intent(
-        repo_root,
+        root_dir,
         store,
         limit,
         filters,
@@ -189,13 +191,13 @@ fn search_env_reads(
 }
 
 fn search_route_handlers(
-    repo_root: &Path,
+    root_dir: &Dir,
     store: &MetadataStore,
     limit: usize,
     filters: &SearchFilters,
 ) -> Result<Vec<SearchResult>> {
     search_regex_intent(
-        repo_root,
+        root_dir,
         store,
         limit,
         filters,
@@ -217,13 +219,13 @@ fn search_route_handlers(
 }
 
 fn search_sql_queries(
-    repo_root: &Path,
+    root_dir: &Dir,
     store: &MetadataStore,
     limit: usize,
     filters: &SearchFilters,
 ) -> Result<Vec<SearchResult>> {
     search_regex_intent(
-        repo_root,
+        root_dir,
         store,
         limit,
         filters,
@@ -254,7 +256,7 @@ fn search_implementations(
 }
 
 fn search_regex_intent<F>(
-    repo_root: &Path,
+    root_dir: &Dir,
     store: &MetadataStore,
     limit: usize,
     filters: &SearchFilters,
@@ -280,10 +282,7 @@ where
             continue;
         }
 
-        let Some(file_abs) = resolve_indexed_path(repo_root, &file_rel) else {
-            continue;
-        };
-        let content = match crate::discovery::read_source_lossy(&file_abs) {
+        let content = match crate::discovery::read_source_lossy_at(root_dir, Path::new(&file_rel)) {
             Ok(content) => content,
             Err(e) => {
                 tracing::debug!("skipping {}: {e}", file_rel);

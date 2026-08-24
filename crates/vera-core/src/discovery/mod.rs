@@ -14,10 +14,14 @@
 //! - `.ignore` files
 //! - Custom override patterns
 
+use std::fmt;
 use std::path::Component;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use cap_std::ambient_authority;
+use cap_std::fs::Dir;
 use ignore::Match;
 use ignore::WalkBuilder;
 use ignore::gitignore::{Gitignore, GitignoreBuilder, Glob as GitignoreGlob};
@@ -39,7 +43,7 @@ pub struct DiscoveredFile {
 }
 
 /// Result of the file discovery process.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct DiscoveryResult {
     /// Files that passed all filters and are ready to index.
     pub files: Vec<DiscoveredFile>,
@@ -51,6 +55,21 @@ pub struct DiscoveryResult {
     pub large_skipped_paths: Vec<(String, u64)>,
     /// Number of files skipped due to read errors (permissions, etc.).
     pub error_skipped: usize,
+    /// Capability for descriptor-relative reads below the discovered root.
+    pub(crate) root_dir: Arc<Dir>,
+}
+
+impl fmt::Debug for DiscoveryResult {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DiscoveryResult")
+            .field("files", &self.files)
+            .field("binary_skipped", &self.binary_skipped)
+            .field("large_skipped", &self.large_skipped)
+            .field("large_skipped_paths", &self.large_skipped_paths)
+            .field("error_skipped", &self.error_skipped)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -187,12 +206,43 @@ const BINARY_EXTENSIONS: &[&str] = &[
 /// helper is considered text; strict `read_to_string` would skip text files
 /// with stray invalid bytes (mixed encodings, latin-1 notes). Lossy decoding
 /// indexes them instead of silently dropping them from the index.
+///
+/// This compatibility wrapper is for callers that cannot provide a containing
+/// directory capability. Indexed reads use [`read_source_lossy_at`] instead.
 pub fn read_source_lossy(path: &Path) -> std::io::Result<String> {
-    let bytes = std::fs::read(path)?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let file_name = path.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "source path does not name a file",
+        )
+    })?;
+    let dir = Dir::open_ambient_dir(parent, ambient_authority())?;
+    read_source_lossy_at(&dir, Path::new(file_name))
+}
+
+/// Read a source file through an already-open directory capability.
+///
+/// `relative_path` is resolved relative to `root_dir`. The capability follows
+/// symlinks that resolve within the directory tree and rejects paths that would
+/// escape it. The file descriptor used for the read is closed when this call
+/// returns.
+pub fn read_source_lossy_at(root_dir: &Dir, relative_path: &Path) -> std::io::Result<String> {
+    let bytes = root_dir.read(relative_path)?;
     match String::from_utf8(bytes) {
         Ok(text) => Ok(text),
         Err(err) => Ok(String::from_utf8_lossy(err.as_bytes()).into_owned()),
     }
+}
+
+/// Open a directory capability for descriptor-relative source reads.
+pub(crate) fn open_root_dir(root: &Path) -> Result<Arc<Dir>> {
+    Dir::open_ambient_dir(root, ambient_authority())
+        .map(Arc::new)
+        .with_context(|| format!("failed to open source root: {}", root.display()))
 }
 
 /// The directory exclusions discovery applies, reusable without walking a tree.
@@ -258,6 +308,7 @@ pub fn discover_files_with_cancellation(
     let root = root
         .canonicalize()
         .with_context(|| format!("failed to resolve path: {}", root.display()))?;
+    let root_dir = open_root_dir(&root)?;
 
     let strategy = determine_ignore_strategy(&root, config)?;
 
@@ -311,8 +362,13 @@ pub fn discover_files_with_cancellation(
             continue;
         }
 
-        // Get file metadata for size check.
-        let metadata = match std::fs::metadata(path) {
+        let relative_path = match path.strip_prefix(&root) {
+            Ok(rel) => rel.to_string_lossy().to_string(),
+            Err(_) => path.to_string_lossy().to_string(),
+        };
+
+        // Get file metadata through the root capability for size checking.
+        let metadata = match root_dir.metadata(Path::new(&relative_path)) {
             Ok(m) => m,
             Err(err) => {
                 warn!("cannot read metadata for {}: {err}", path.display());
@@ -353,7 +409,7 @@ pub fn discover_files_with_cancellation(
         }
 
         // Skip binary files by content detection (read first 8KB).
-        match is_binary_content(path) {
+        match is_binary_content_at(&root_dir, Path::new(&relative_path)) {
             Ok(true) => {
                 debug!("skipping binary (content): {}", path.display());
                 binary_skipped += 1;
@@ -369,12 +425,6 @@ pub fn discover_files_with_cancellation(
                 continue;
             }
         }
-
-        // Compute repository-relative path.
-        let relative_path = match path.strip_prefix(&root) {
-            Ok(rel) => rel.to_string_lossy().to_string(),
-            Err(_) => path.to_string_lossy().to_string(),
-        };
 
         files.push(DiscoveredFile {
             absolute_path: path.to_path_buf(),
@@ -392,6 +442,7 @@ pub fn discover_files_with_cancellation(
         large_skipped,
         large_skipped_paths,
         error_skipped,
+        root_dir,
     })
 }
 
@@ -1105,6 +1156,19 @@ fn is_binary_content(path: &Path) -> Result<bool> {
     Ok(buf[..n].contains(&0))
 }
 
+fn is_binary_content_at(root_dir: &Dir, relative_path: &Path) -> Result<bool> {
+    use std::io::Read;
+
+    let mut file = root_dir
+        .open(relative_path)
+        .with_context(|| format!("cannot open for binary check: {}", relative_path.display()))?;
+
+    let mut buf = [0u8; 8192];
+    let n = file.read(&mut buf)?;
+
+    Ok(buf[..n].contains(&0))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1206,6 +1270,54 @@ mod tests {
         let good = dir.path().join("ok.rs");
         fs::write(&good, "fn main() {}\n").unwrap();
         assert_eq!(read_source_lossy(&good).unwrap(), "fn main() {}\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn descriptor_read_follows_an_in_tree_symlink() {
+        let dir = TempDir::new().unwrap();
+        fs::create_dir(dir.path().join("src")).unwrap();
+        fs::write(dir.path().join("src/real.rs"), "fn inside() {}\n").unwrap();
+        std::os::unix::fs::symlink("real.rs", dir.path().join("src/alias.rs")).unwrap();
+
+        let root_dir = open_root_dir(dir.path()).unwrap();
+        let content = read_source_lossy_at(&root_dir, Path::new("src/alias.rs")).unwrap();
+
+        assert_eq!(content, "fn inside() {}\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn descriptor_read_rejects_an_escape_planted_after_discovery() {
+        let outside = TempDir::new().unwrap();
+        let canary = outside.path().join("canary.rs");
+        fs::write(&canary, "CANARY_OUTSIDE_ROOT\n").unwrap();
+
+        let dir = TempDir::new().unwrap();
+        fs::create_dir(dir.path().join("src")).unwrap();
+        let source = dir.path().join("src/source.rs");
+        fs::write(&source, "fn inside() {}\n").unwrap();
+
+        let discovery = discover_files(dir.path(), &default_config()).unwrap();
+        assert!(
+            discovery
+                .files
+                .iter()
+                .any(|file| file.relative_path == "src/source.rs")
+        );
+
+        fs::remove_file(&source).unwrap();
+        std::os::unix::fs::symlink(&canary, &source).unwrap();
+
+        let result = read_source_lossy_at(&discovery.root_dir, Path::new("src/source.rs"));
+        assert!(
+            result.is_err(),
+            "an escape planted after discovery was read"
+        );
+        assert_ne!(
+            result.as_deref().unwrap_or_default(),
+            "CANARY_OUTSIDE_ROOT\n"
+        );
     }
 
     #[test]

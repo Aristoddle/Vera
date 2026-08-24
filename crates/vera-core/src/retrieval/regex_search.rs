@@ -11,7 +11,7 @@ use anyhow::Result;
 use regex::RegexBuilder;
 
 use crate::corpus::{ContentClass, classify_content};
-use crate::path_containment::{canonical_project_root, resolve_indexed_path};
+use crate::path_containment::canonical_project_root;
 use crate::retrieval::file_scan::{
     allows_class, bounded_byte_snippet, language_for_path, sort_files_by_scan_priority,
     symbol_for_line,
@@ -45,6 +45,7 @@ pub fn search_regex(
 
     // Resolve the project root (index_dir is .vera/, parent is project root).
     let project_root = canonical_project_root(index_dir)?;
+    let root_dir = crate::discovery::open_root_dir(&project_root)?;
 
     let mut results = Vec::new();
 
@@ -71,10 +72,7 @@ pub fn search_regex(
             None
         };
 
-        let Some(file_abs) = resolve_indexed_path(&project_root, file_rel) else {
-            continue;
-        };
-        let content = match crate::discovery::read_source_lossy(&file_abs) {
+        let content = match crate::discovery::read_source_lossy_at(&root_dir, Path::new(file_rel)) {
             Ok(c) => c,
             Err(_) => continue,
         };

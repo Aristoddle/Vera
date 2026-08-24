@@ -127,6 +127,7 @@ pub fn detect_staleness(
         &current_files,
         &tracked_files,
         &metadata_store,
+        &discovery.root_dir,
         &repo_root,
         indexing_config.max_file_size_bytes,
     )?;
@@ -142,6 +143,7 @@ fn count_modified_files(
     current_files: &HashMap<String, PathBuf>,
     tracked_files: &HashSet<String>,
     metadata_store: &MetadataStore,
+    root_dir: &cap_std::fs::Dir,
     repo_root: &Path,
     max_file_size_bytes: u64,
 ) -> Result<usize> {
@@ -160,18 +162,19 @@ fn count_modified_files(
     // index look current (#74).
     let hashed: Vec<(&String, Option<String>)> = tracked_current
         .par_iter()
-        .map(|(rel_path, absolute_path)| {
-            let content = match crate::discovery::read_source_lossy(absolute_path) {
-                Ok(content) => content,
-                Err(err) => {
-                    warn!(
-                        file = %rel_path,
-                        error = %err,
-                        "failed to read file during freshness scan"
-                    );
-                    return (*rel_path, None);
-                }
-            };
+        .map(|(rel_path, _absolute_path)| {
+            let content =
+                match crate::discovery::read_source_lossy_at(root_dir, Path::new(rel_path)) {
+                    Ok(content) => content,
+                    Err(err) => {
+                        warn!(
+                            file = %rel_path,
+                            error = %err,
+                            "failed to read file during freshness scan"
+                        );
+                        return (*rel_path, None);
+                    }
+                };
             let language = detect_language_for_path(rel_path);
             let current_hash = hash_for_indexing_source(
                 &content,
@@ -329,6 +332,7 @@ mod tests {
             &current_files,
             &tracked_files,
             &metadata,
+            &crate::discovery::open_root_dir(dir.path()).unwrap(),
             dir.path(),
             IndexingConfig::default().max_file_size_bytes,
         )
