@@ -4,6 +4,7 @@
 use crate::config::OnnxExecutionProvider;
 use anyhow::{Context, Result};
 use reqwest::Client;
+use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use tokio::fs;
@@ -40,6 +41,13 @@ pub fn ensure_ort_runtime(lib_path: Option<&std::path::Path>) -> Result<()> {
         Ok(()) => Ok(()),
         Err(msg) => anyhow::bail!("{msg}"),
     }
+}
+
+/// Return whether ONNX Runtime has already been initialized successfully.
+pub(crate) fn ort_runtime_initialized() -> bool {
+    ORT_INIT_RESULT
+        .get()
+        .is_some_and(std::result::Result::is_ok)
 }
 
 /// Returns the pip package name for EPs that require pip-based installation, or None
@@ -330,26 +338,27 @@ pub(super) async fn ensure_ort_library_for_ep_with_cuda_major(
         return Ok(target_path);
     }
 
-    if target_path.exists() {
-        return Ok(target_path);
-    }
-
     let lib_dir = target_path
         .parent()
         .context("failed to determine ONNX Runtime directory")?
         .to_path_buf();
-
     fs::create_dir_all(&lib_dir).await?;
 
     // OpenVINO and ROCm: pip-based install with fallback chain
     #[cfg(target_os = "linux")]
     if pip_package_for_ep(ep).is_some() {
+        if target_path.exists() {
+            return Ok(target_path);
+        }
         return ensure_ort_via_pip_chain(ep, &lib_dir, &target_path).await;
     }
 
     // DirectML: distributed via NuGet, not GitHub release archives.
     #[cfg(target_os = "windows")]
     if matches!(ep, OnnxExecutionProvider::DirectMl) {
+        if target_path.exists() {
+            return Ok(target_path);
+        }
         return ensure_ort_via_nuget_directml(&lib_dir, &target_path).await;
     }
 
@@ -357,12 +366,17 @@ pub(super) async fn ensure_ort_library_for_ep_with_cuda_major(
     let (ext, archive_name, lib_path_in_archive, local_lib_name, ort_version) =
         ort_platform_info_with_cuda_major(ep, detected_cuda_major)?;
     let is_gpu = ep != OnnxExecutionProvider::Cpu;
-
     let archive_filename = if ext == "tgz" {
         format!("{archive_name}.tgz")
     } else {
         format!("{archive_name}.zip")
     };
+    let marker_path = ort_digest_marker_path(&target_path);
+    let expected_digest = expected_ort_archive_sha256(&archive_filename);
+    if target_path.exists() && marker_matches(&marker_path, &target_path, expected_digest).await {
+        return Ok(target_path);
+    }
+
     let url = format!(
         "https://github.com/microsoft/onnxruntime/releases/download/v{ort_version}/{archive_filename}"
     );
@@ -378,7 +392,15 @@ pub(super) async fn ensure_ort_library_for_ep_with_cuda_major(
         .send()
         .await?
         .error_for_status()?;
+    let _ = expected_digest.context("no pinned checksum for ONNX Runtime archive")?;
     let bytes = res.bytes().await?;
+    if let Some(expected) = expected_digest {
+        verify_sha256(
+            bytes.as_ref(),
+            expected,
+            &format!("ONNX Runtime archive {archive_name}"),
+        )?;
+    }
 
     let lib_dir_clone = lib_dir.clone();
     let lib_path_in_archive_clone = lib_path_in_archive.clone();
@@ -410,11 +432,57 @@ pub(super) async fn ensure_ort_library_for_ep_with_cuda_major(
         return Err(e).context("Failed to extract ONNX Runtime from archive");
     }
 
+    if let Some(expected) = expected_digest {
+        let library_digest = sha256_hex(File::open(&target_path)?)?;
+        fs::write(
+            &marker_path,
+            format!("archive={expected}\nlibrary={library_digest}\n"),
+        )
+        .await?;
+    }
+
     eprintln!(
         "ONNX Runtime v{ort_version} installed to {}",
         lib_dir.display()
     );
     Ok(target_path)
+}
+
+fn ort_digest_marker_path(path: &Path) -> PathBuf {
+    path.with_file_name(format!(
+        "{}.sha256",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("ort")
+    ))
+}
+
+async fn marker_matches(path: &Path, target: &Path, expected: Option<&str>) -> bool {
+    let Some(expected) = expected else {
+        return false;
+    };
+    match fs::read_to_string(path).await {
+        Ok(marker) => {
+            let mut archive = None;
+            let mut library = None;
+            for line in marker.lines() {
+                if let Some(value) = line.strip_prefix("archive=") {
+                    archive = Some(value);
+                } else if let Some(value) = line.strip_prefix("library=") {
+                    library = Some(value);
+                }
+            }
+            let Some(library) = library else {
+                return false;
+            };
+            let library_matches = File::open(target)
+                .ok()
+                .and_then(|file| sha256_hex(file).ok())
+                .is_some_and(|actual| actual.eq_ignore_ascii_case(library));
+            archive.is_some_and(|value| value.eq_ignore_ascii_case(expected)) && library_matches
+        }
+        Err(_) => false,
+    }
 }
 
 /// Re-fetch the ONNX Runtime library for the selected execution provider.
@@ -700,12 +768,6 @@ pub fn ensure_provider_dependencies(
     }
     message.push_str("Run `vera doctor --probe` for details.");
     anyhow::bail!("{}", message.trim_end());
-}
-
-pub fn inspect_shared_library_deps(
-    runtime_path: &std::path::Path,
-) -> Result<Option<SharedLibraryDependencyStatus>> {
-    inspect_shared_library_deps_impl(runtime_path, None)
 }
 
 pub fn inspect_provider_dependencies(

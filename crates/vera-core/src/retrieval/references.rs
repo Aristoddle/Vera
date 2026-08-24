@@ -6,6 +6,7 @@ use std::path::Path;
 use anyhow::Result;
 
 use crate::corpus::{ContentClass, classify_content};
+use crate::path_containment::canonical_project_root;
 use crate::retrieval::file_scan::{
     allows_class, language_for_path, line_context_snippet, symbol_for_line,
 };
@@ -25,9 +26,8 @@ pub fn search_callers(
 
     let metadata_path = index_dir.join("metadata.db");
     let store = MetadataStore::open(&metadata_path)?;
-    let repo_root = index_dir
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("Cannot determine project root from index dir"))?;
+    let repo_root = canonical_project_root(index_dir)?;
+    let root_dir = crate::discovery::open_root_dir(&repo_root)?;
     let callers = store.find_callers(symbol)?;
     let mut results = Vec::new();
     let mut seen = HashSet::new();
@@ -42,11 +42,11 @@ pub fn search_callers(
             continue;
         }
 
-        let file_abs = repo_root.join(&caller.file_path);
-        let content = match crate::discovery::read_source_lossy(&file_abs) {
-            Ok(content) => content,
-            Err(_) => continue,
-        };
+        let content =
+            match crate::discovery::read_source_lossy_at(&root_dir, Path::new(&caller.file_path)) {
+                Ok(content) => content,
+                Err(_) => continue,
+            };
         let class = classify_content(&caller.file_path, language, &content);
         if !allows_class(filters, class) {
             continue;

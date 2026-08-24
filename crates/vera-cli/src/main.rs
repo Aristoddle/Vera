@@ -74,7 +74,7 @@ fn main() {
             } else {
                 vera_core::config::resolve_backend(backend.explicit_backend())
             };
-            let config = match helpers::load_runtime_config() {
+            let config = match state::load_runtime_config() {
                 Ok(c) => c,
                 Err(e) => {
                     eprintln!("Error loading config: {e:#}");
@@ -882,6 +882,44 @@ mod tests {
         assert!(matches!(parse(&["vera", "stats"]), Commands::Stats));
     }
 
+    /// `--idle-timeout -1` is the spelling the flag's own help text documents.
+    /// Without `allow_negative_numbers`, clap reads the `-1` as an unknown flag
+    /// and only the `=` form works.
+    #[test]
+    fn cli_parses_a_negative_idle_timeout_in_the_documented_form() {
+        for argv in [
+            vec!["vera", "serve", "--idle-timeout", "-1"],
+            vec!["vera", "serve", "--idle-timeout=-1"],
+        ] {
+            let parsed = Cli::try_parse_from(argv.iter().copied())
+                .unwrap_or_else(|e| panic!("{argv:?} must parse: {e}"));
+            match parsed.command {
+                Commands::Serve { idle_timeout, .. } => assert_eq!(idle_timeout, -1),
+                _ => panic!("{argv:?} did not parse as serve"),
+            }
+        }
+
+        assert!(matches!(
+            parse(&["vera", "serve"]),
+            Commands::Serve {
+                idle_timeout: 300,
+                ..
+            }
+        ));
+        assert!(matches!(
+            parse(&["vera", "serve", "--idle-timeout", "0"]),
+            Commands::Serve {
+                idle_timeout: 0,
+                ..
+            }
+        ));
+
+        // The parser is loosened for negative numbers only: a hyphenated
+        // non-number is still an unknown flag rather than a swallowed value.
+        assert!(Cli::try_parse_from(["vera", "serve", "--idle-timeout", "-abc"]).is_err());
+        assert!(Cli::try_parse_from(["vera", "serve", "--idle-timeout", "--port"]).is_err());
+    }
+
     #[test]
     fn cli_parses_json_flag() {
         let cli = Cli::parse_from(["vera", "--json", "stats"]);
@@ -971,6 +1009,6 @@ mod tests {
 
         let val =
             commands::config::get_config_value(&config, "retrieval.reranking_enabled").unwrap();
-        assert_eq!(val, serde_json::json!(true));
+        assert_eq!(val, serde_json::json!(false));
     }
 }

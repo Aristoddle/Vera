@@ -5,6 +5,10 @@ use super::*;
 use crate::config::OnnxExecutionProvider;
 use std::io::Write;
 use std::net::TcpListener;
+use std::sync::{Arc, Mutex};
+
+// Environment-dependent tests run in child processes via
+// crate::test_env::run_env_test; no set_var/remove_var in test threads.
 
 #[test]
 fn normalize_huggingface_repo_accepts_repo_ids_and_urls() {
@@ -15,6 +19,212 @@ fn normalize_huggingface_repo_accepts_repo_ids_and_urls() {
     assert_eq!(
         normalize_huggingface_repo("https://huggingface.co/Zenabius/CodeRankEmbed-onnx").unwrap(),
         "Zenabius/CodeRankEmbed-onnx"
+    );
+}
+
+#[test]
+fn legacy_model_config_deserializes_without_revision() {
+    let config: LocalEmbeddingModelConfig = serde_json::from_str(
+        r#"{
+            "source": {"source": "hugging-face", "repo": "org/model"},
+            "onnx_file": "model.onnx",
+            "tokenizer_file": "tokenizer.json",
+            "embedding_dim": 3,
+            "pooling": "mean"
+        }"#,
+    )
+    .unwrap();
+
+    assert_eq!(config.revision, None);
+    assert!(!serde_json::to_string(&config).unwrap().contains("revision"));
+}
+
+#[test]
+fn revisions_validate_and_shard_only_non_main_cache_paths() {
+    let mut config = LocalEmbeddingModelConfig::from_huggingface_repo("org/model");
+    let legacy = config.cached_asset_paths().unwrap();
+    config.revision = Some("refs/pr/42".to_string());
+    let pinned = config.cached_asset_paths().unwrap();
+    assert!(
+        legacy
+            .onnx_path
+            .ends_with("models/org/model/onnx/model_quantized.onnx")
+    );
+    assert!(
+        pinned
+            .onnx_path
+            .ends_with("models/org/model/revisions/refs/pr/42/onnx/model_quantized.onnx")
+    );
+
+    config.revision = Some("main".to_string());
+    assert_eq!(
+        config.cached_asset_paths().unwrap().onnx_path,
+        legacy.onnx_path
+    );
+
+    for revision in [
+        "",
+        "../escape",
+        "refs//main",
+        "/absolute",
+        "trailing/",
+        "refs/../main",
+        "v1|pooling=mean",
+        "has?query",
+        "has%percent",
+    ] {
+        assert!(normalize_model_revision(revision).is_err(), "{revision:?}");
+    }
+    assert_eq!(
+        normalize_model_revision(" refs/pr/42 ").unwrap(),
+        "refs/pr/42"
+    );
+}
+
+#[test]
+fn local_reranker_config_defaults_match_jina_assets() {
+    crate::test_env::run_env_test(
+        "local_models::tests::local_reranker_config_defaults_match_jina_assets_probe",
+        &[
+            (LOCAL_RERANKER_REPO_ENV, None),
+            (LOCAL_RERANKER_REVISION_ENV, None),
+            (LOCAL_RERANKER_ONNX_FILE_ENV, None),
+            (LOCAL_RERANKER_TOKENIZER_FILE_ENV, None),
+        ],
+    );
+}
+
+#[test]
+#[ignore = "driven by local_reranker_config_defaults_match_jina_assets"]
+fn local_reranker_config_defaults_match_jina_assets_probe() {
+    let config = LocalRerankerConfig::from_env().unwrap();
+
+    assert_eq!(config.repo, RERANKER_REPO);
+    assert_eq!(config.revision.as_deref(), Some(RERANKER_REVISION));
+    assert_eq!(config.onnx_file, RERANKER_ONNX_FILE);
+    assert_eq!(config.tokenizer_file, RERANKER_TOKENIZER_FILE);
+}
+
+#[test]
+fn local_reranker_config_reads_env_overrides() {
+    crate::test_env::run_env_test(
+        "local_models::tests::local_reranker_config_reads_env_overrides_probe",
+        &[
+            (
+                LOCAL_RERANKER_REPO_ENV,
+                Some("https://huggingface.co/cross-encoder/ettin-reranker-32m-v1"),
+            ),
+            (LOCAL_RERANKER_REVISION_ENV, Some(" b33e5ceb ")),
+            (
+                LOCAL_RERANKER_ONNX_FILE_ENV,
+                Some("onnx/model_qint8_avx2.onnx"),
+            ),
+            (LOCAL_RERANKER_TOKENIZER_FILE_ENV, Some("tokenizer.json")),
+        ],
+    );
+}
+
+#[test]
+#[ignore = "driven by local_reranker_config_reads_env_overrides"]
+fn local_reranker_config_reads_env_overrides_probe() {
+    let config = LocalRerankerConfig::from_env().unwrap();
+
+    assert_eq!(config.repo, "cross-encoder/ettin-reranker-32m-v1");
+    assert_eq!(config.revision.as_deref(), Some("b33e5ceb"));
+    assert_eq!(config.onnx_file, "onnx/model_qint8_avx2.onnx");
+    assert_eq!(config.tokenizer_file, "tokenizer.json");
+}
+
+#[test]
+fn local_reranker_config_revision_shards_cache_paths() {
+    crate::test_env::run_env_test(
+        "local_models::tests::local_reranker_config_revision_shards_cache_paths_probe",
+        &[
+            (LOCAL_RERANKER_REPO_ENV, Some("org/model")),
+            (LOCAL_RERANKER_REVISION_ENV, Some("abc123")),
+            (LOCAL_RERANKER_ONNX_FILE_ENV, Some("onnx/model.onnx")),
+            (LOCAL_RERANKER_TOKENIZER_FILE_ENV, Some("tokenizer.json")),
+        ],
+    );
+}
+
+#[test]
+#[ignore = "driven by local_reranker_config_revision_shards_cache_paths"]
+fn local_reranker_config_revision_shards_cache_paths_probe() {
+    let paths = LocalRerankerConfig::from_env()
+        .unwrap()
+        .cached_asset_paths()
+        .unwrap();
+
+    assert!(
+        paths
+            .onnx_path
+            .ends_with("models/org/model/revisions/abc123/onnx/model.onnx")
+    );
+    assert!(
+        paths
+            .tokenizer_path
+            .ends_with("models/org/model/revisions/abc123/tokenizer.json")
+    );
+}
+
+#[test]
+fn model_identity_differs_for_non_main_revisions_but_not_main() {
+    let base = LocalEmbeddingModelConfig::jina();
+    let mut pinned = base.clone();
+    pinned.revision = Some("abc123".to_string());
+    assert_ne!(base.model_identity(), pinned.model_identity());
+
+    let mut explicit_main = base;
+    explicit_main.revision = Some("main".to_string());
+    assert_eq!(
+        explicit_main.model_identity(),
+        pinned.model_identity().replace("|revision=abc123", "")
+    );
+}
+
+#[test]
+fn directory_models_reject_revisions() {
+    let mut config = LocalEmbeddingModelConfig::from_directory(PathBuf::from("/models/custom"));
+    config.revision = Some("abc123".to_string());
+    assert!(config.cached_asset_paths().is_err());
+}
+
+#[test]
+fn potion_code_identity_carries_the_pinned_revision() {
+    // The staleness guard in `indexing::update` compares the stored model name
+    // against this identity, so the pin has to be part of it: an index frozen
+    // on potion v1 or on the jina ONNX preset must trip the re-index error
+    // rather than answer queries with incompatible vectors.
+    let name = potion_code_model_name();
+    assert_eq!(
+        name,
+        format!("{POTION_CODE_REPO}|revision={POTION_CODE_REVISION}")
+    );
+    assert!(!crate::config::model_names_match_with_aliases(
+        "minishlab/potion-code-16M",
+        &name,
+        &[]
+    ));
+    assert!(!crate::config::model_names_match_with_aliases(
+        &name,
+        "jinaai/jina-embeddings-v5-text-nano-retrieval|pooling=last-token|qp=6:Query:|dp=9:Document:",
+        &[]
+    ));
+}
+
+#[test]
+fn potion_code_assets_live_under_the_revision_shard() {
+    // Same sharded cache layout the revisioned ONNX lanes use, so a potion
+    // re-pin lands beside the old assets instead of overwriting them.
+    let home = Path::new("/tmp/vera-test-home");
+    let dir = model_cache_dir(home, POTION_CODE_REPO, Some(POTION_CODE_REVISION)).unwrap();
+    assert_eq!(
+        dir,
+        home.join("models")
+            .join(POTION_CODE_REPO)
+            .join("revisions")
+            .join(POTION_CODE_REVISION)
     );
 }
 
@@ -434,6 +644,233 @@ async fn successful_onnx_download_replaces_invalid_cached_file() {
     assert_eq!(std::fs::read(&target).unwrap(), [0x08, 0x01]);
 }
 
+#[tokio::test]
+async fn download_uses_pinned_revision_url_and_sharded_cache() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let home = temp_dir.path().join(".vera");
+    let revision = "d59c919d0159aea2c19ed7d04288fcdd048d0f9c";
+    let request_line = Arc::new(Mutex::new(String::new()));
+
+    let listener = match TcpListener::bind("127.0.0.1:0") {
+        Ok(listener) => listener,
+        Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return,
+        Err(err) => panic!("failed to bind test listener: {err}"),
+    };
+    let port = listener.local_addr().unwrap().port();
+    let request_line_for_server = Arc::clone(&request_line);
+    let server = std::thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut request = [0u8; 4096];
+            let bytes_read = std::io::Read::read(&mut stream, &mut request).unwrap_or(0);
+            let line_end = request[..bytes_read]
+                .windows(2)
+                .position(|window| window == b"\r\n")
+                .unwrap_or(bytes_read);
+            *request_line_for_server.lock().unwrap() =
+                String::from_utf8_lossy(&request[..line_end]).into_owned();
+            let response =
+                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n\x08\x01";
+            let _ = stream.write_all(response);
+            let _ = stream.flush();
+            let _ = stream.shutdown(std::net::Shutdown::Write);
+        }
+    });
+
+    let base_url = format!("http://127.0.0.1:{port}");
+    let result = ensure_model_file_impl_with_revision(
+        "org/model",
+        "onnx/model.onnx",
+        LocalModelAssetKind::Onnx,
+        &base_url,
+        Some(&home),
+        Some(revision),
+    )
+    .await
+    .unwrap();
+    server.join().unwrap();
+
+    assert!(request_line.lock().unwrap().starts_with(&format!(
+        "GET /org/model/resolve/{revision}/onnx/model.onnx "
+    )));
+    let expected = home
+        .join("models")
+        .join("org")
+        .join("model")
+        .join("revisions")
+        .join(revision)
+        .join("onnx")
+        .join("model.onnx");
+    assert_eq!(result, expected);
+    assert_eq!(std::fs::read(result).unwrap(), [0x08, 0x01]);
+}
+
+#[tokio::test]
+async fn cached_digest_mismatch_forces_redownload() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let home = temp_dir.path().join(".vera");
+    let revision = "d59c919d0159aea2c19ed7d04288fcdd048d0f9c";
+    let target = home
+        .join("models")
+        .join("org")
+        .join("model")
+        .join("revisions")
+        .join(revision)
+        .join("model.bin");
+    std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+    std::fs::write(&target, b"cached").unwrap();
+    std::fs::write(
+        target.with_file_name("model.bin.sha256"),
+        "fb8da7eb5b1b399e7321179dac9e9f65773d7331e1e30554e3911e4325e1ef19\n",
+    )
+    .unwrap();
+
+    let listener = match TcpListener::bind("127.0.0.1:0") {
+        Ok(listener) => listener,
+        Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return,
+        Err(err) => panic!("failed to bind test listener: {err}"),
+    };
+    let port = listener.local_addr().unwrap().port();
+    let request_line = Arc::new(Mutex::new(String::new()));
+    let request_line_for_server = Arc::clone(&request_line);
+    let server = std::thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut request = [0u8; 4096];
+            let bytes_read = std::io::Read::read(&mut stream, &mut request).unwrap_or(0);
+            let line_end = request[..bytes_read]
+                .windows(2)
+                .position(|window| window == b"\r\n")
+                .unwrap_or(bytes_read);
+            *request_line_for_server.lock().unwrap() =
+                String::from_utf8_lossy(&request[..line_end]).into_owned();
+            let response =
+                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n\x08\x01";
+            let _ = stream.write_all(response);
+            let _ = stream.flush();
+            let _ = stream.shutdown(std::net::Shutdown::Write);
+        }
+    });
+
+    let base_url = format!("http://127.0.0.1:{port}");
+    let result = ensure_model_file_impl_with_revision(
+        "org/model",
+        "model.bin",
+        LocalModelAssetKind::Other,
+        &base_url,
+        Some(&home),
+        Some(revision),
+    )
+    .await
+    .unwrap();
+    server.join().unwrap();
+
+    assert_eq!(result, target);
+    assert_eq!(std::fs::read(&target).unwrap(), [0x08, 0x01]);
+    assert!(
+        request_line
+            .lock()
+            .unwrap()
+            .starts_with("GET /org/model/resolve/")
+    );
+}
+
+#[tokio::test]
+async fn download_without_revision_uses_main_url_and_legacy_cache() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let home = temp_dir.path().join(".vera");
+    let request_line = Arc::new(Mutex::new(String::new()));
+
+    let listener = match TcpListener::bind("127.0.0.1:0") {
+        Ok(listener) => listener,
+        Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return,
+        Err(err) => panic!("failed to bind test listener: {err}"),
+    };
+    let port = listener.local_addr().unwrap().port();
+    let request_line_for_server = Arc::clone(&request_line);
+    let server = std::thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut request = [0u8; 4096];
+            let bytes_read = std::io::Read::read(&mut stream, &mut request).unwrap_or(0);
+            let line_end = request[..bytes_read]
+                .windows(2)
+                .position(|window| window == b"\r\n")
+                .unwrap_or(bytes_read);
+            *request_line_for_server.lock().unwrap() =
+                String::from_utf8_lossy(&request[..line_end]).into_owned();
+            let response =
+                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n\x08\x01";
+            let _ = stream.write_all(response);
+            let _ = stream.flush();
+            let _ = stream.shutdown(std::net::Shutdown::Write);
+        }
+    });
+
+    let base_url = format!("http://127.0.0.1:{port}");
+    let result = ensure_model_file_impl_with_revision(
+        "org/model",
+        "onnx/model.onnx",
+        LocalModelAssetKind::Onnx,
+        &base_url,
+        Some(&home),
+        None,
+    )
+    .await
+    .unwrap();
+    server.join().unwrap();
+
+    assert!(
+        request_line
+            .lock()
+            .unwrap()
+            .starts_with("GET /org/model/resolve/main/onnx/model.onnx ")
+    );
+    let expected = home
+        .join("models")
+        .join("org")
+        .join("model")
+        .join("onnx")
+        .join("model.onnx");
+    assert_eq!(result, expected);
+    assert_eq!(std::fs::read(result).unwrap(), [0x08, 0x01]);
+    assert!(
+        !home
+            .join("models")
+            .join("org")
+            .join("model")
+            .join("revisions")
+            .exists()
+    );
+}
+
+#[test]
+fn local_embedding_config_from_env_trims_revision() {
+    crate::test_env::run_env_test(
+        "local_models::tests::local_embedding_config_from_env_trims_revision_probe",
+        &[(LOCAL_EMBEDDING_REVISION_ENV, Some(" refs/pr/42 "))],
+    );
+}
+
+#[test]
+#[ignore = "driven by local_embedding_config_from_env_trims_revision"]
+fn local_embedding_config_from_env_trims_revision_probe() {
+    let config = LocalEmbeddingModelConfig::from_env().unwrap();
+
+    assert_eq!(config.revision.as_deref(), Some("refs/pr/42"));
+}
+
+#[test]
+fn local_embedding_config_from_env_rejects_invalid_revision() {
+    crate::test_env::run_env_test(
+        "local_models::tests::local_embedding_config_from_env_rejects_invalid_revision_probe",
+        &[(LOCAL_EMBEDDING_REVISION_ENV, Some("../escape"))],
+    );
+}
+
+#[test]
+#[ignore = "driven by local_embedding_config_from_env_rejects_invalid_revision"]
+fn local_embedding_config_from_env_rejects_invalid_revision_probe() {
+    assert!(LocalEmbeddingModelConfig::from_env().is_err());
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn resolve_macos_rpath_loader_path_without_slash() {
@@ -476,5 +913,472 @@ fn resolve_macos_rpath_executable_path_with_slash() {
     assert_eq!(
         resolve_macos_rpath("@executable_path/subdir", inspected),
         expected
+    );
+}
+
+#[test]
+fn pooling_display_and_from_str_round_trip() {
+    // `state.rs` writes pooling to the environment via Display and reads it
+    // back through FromStr, so any spelling those two disagree on silently
+    // fails to reload a saved config.
+    for mode in [
+        LocalEmbeddingPooling::Mean,
+        LocalEmbeddingPooling::Cls,
+        LocalEmbeddingPooling::LastToken,
+    ] {
+        let rendered = mode.to_string();
+        assert_eq!(
+            rendered.parse::<LocalEmbeddingPooling>(),
+            Ok(mode),
+            "Display emitted `{rendered}`, which FromStr does not accept"
+        );
+    }
+}
+
+#[test]
+fn pooling_from_str_accepts_last_token_spellings() {
+    for spelling in [
+        "last-token",
+        "lasttoken",
+        "last_token",
+        "LAST-TOKEN",
+        " last-token ",
+    ] {
+        assert_eq!(
+            spelling.parse::<LocalEmbeddingPooling>(),
+            Ok(LocalEmbeddingPooling::LastToken),
+            "rejected `{spelling}`"
+        );
+    }
+}
+
+#[test]
+fn pooling_from_str_error_lists_every_accepted_mode() {
+    let err = "bogus".parse::<LocalEmbeddingPooling>().unwrap_err();
+    for mode in [
+        LocalEmbeddingPooling::Mean,
+        LocalEmbeddingPooling::Cls,
+        LocalEmbeddingPooling::LastToken,
+    ] {
+        assert!(
+            err.contains(&mode.to_string()),
+            "error `{err}` omits `{mode}`, so the CLI cannot advertise it"
+        );
+    }
+}
+
+#[test]
+fn jina_preset_pools_on_the_last_token() {
+    // jina-embeddings-v5-text-nano-retrieval declares `pooling_mode_lasttoken`
+    // in 1_Pooling/config.json. Mean pooling of its last_hidden_state scores
+    // cos 0.59-0.66 against the graph's own `sentence_embedding` output;
+    // last-token pooling reproduces it exactly.
+    assert_eq!(
+        LocalEmbeddingModelConfig::jina().pooling,
+        LocalEmbeddingPooling::LastToken
+    );
+    assert_eq!(
+        LocalEmbeddingModelConfig::default().pooling,
+        LocalEmbeddingPooling::LastToken
+    );
+    assert_eq!(
+        LocalEmbeddingModelConfig::from_huggingface_repo(EMBEDDING_REPO).pooling,
+        LocalEmbeddingPooling::LastToken
+    );
+}
+
+#[test]
+fn unknown_repo_still_defaults_to_mean_pooling() {
+    // Fixing jina's pooling must not reach through the shared fallback and
+    // repool every custom model.
+    let config = LocalEmbeddingModelConfig::from_huggingface_repo("some-org/some-encoder");
+    assert_eq!(config.pooling, LocalEmbeddingPooling::Mean);
+    assert_eq!(
+        LocalEmbeddingModelConfig::coderankembed().pooling,
+        LocalEmbeddingPooling::Cls
+    );
+}
+
+#[test]
+fn directory_source_still_defaults_to_mean_pooling() {
+    // `--embedding-dir` and VERA_LOCAL_EMBEDDING_DIR point at a model Vera has
+    // no preset for, so they must inherit the generic fallback. Deriving them
+    // from `Default` instead handed every custom directory model jina's
+    // last-token pooling the moment jina's own pooling was fixed.
+    let path = PathBuf::from("/models/some-encoder");
+    let config = LocalEmbeddingModelConfig::from_directory(path.clone());
+
+    assert_eq!(config.pooling, LocalEmbeddingPooling::Mean);
+    assert_eq!(config.source, LocalEmbeddingSource::Directory { path });
+    assert!(
+        config.model_identity().contains("pooling=mean"),
+        "identity `{}` should record mean pooling",
+        config.model_identity()
+    );
+}
+
+#[test]
+fn preset_identity_changes_with_pooling_so_stale_indexes_are_detected() {
+    // Vectors pooled two ways are not comparable. If the preset identity
+    // ignored pooling, upgrading would query mean-pooled rows with last-token
+    // vectors and silently return worse results instead of asking for a
+    // re-index.
+    // Assert the exact preset form. Comparing jina's identity against a
+    // mean-pooled clone proves nothing on its own: changing `pooling` breaks
+    // struct equality with `Self::jina()`, so the clone leaves the preset
+    // branch of `model_identity` and renders through the generic one. The two
+    // strings then differ because of the branch, not because pooling is in the
+    // preset identity, and the assertion still passes with pooling dropped
+    // from that branch entirely.
+    let jina = LocalEmbeddingModelConfig::jina();
+    assert_eq!(
+        jina.model_identity(),
+        format!(
+            "{}|pooling=last-token|qp={}:{JINA_QUERY_PREFIX}|dp={}:{JINA_DOCUMENT_PREFIX}|revision={EMBEDDING_REVISION}",
+            jina.display_name(),
+            JINA_QUERY_PREFIX.len(),
+            JINA_DOCUMENT_PREFIX.len()
+        )
+    );
+    // The repo still has to be recognisable in the stored name.
+    assert!(jina.model_identity().starts_with(&jina.display_name()));
+
+    let mut mean_pooled = jina.clone();
+    mean_pooled.pooling = LocalEmbeddingPooling::Mean;
+    assert_ne!(jina.model_identity(), mean_pooled.model_identity());
+    assert!(mean_pooled.model_identity().contains("pooling=mean"));
+}
+
+#[test]
+fn coderank_preset_identity_records_its_pooling() {
+    // The preset branch of `model_identity` covers CodeRankEmbed as well as
+    // jina, so it carries the same obligation: pooling stays in the identity,
+    // and the repo stays readable in it. Asserting the exact preset form keeps
+    // this from passing on a CodeRankEmbed that quietly fell through to the
+    // generic branch. CodeRankEmbed prefixes queries only, so it is also the
+    // preset that pins how the absent document side is spelled.
+    let coderank = LocalEmbeddingModelConfig::coderankembed();
+    assert_eq!(
+        coderank.model_identity(),
+        format!(
+            "{}|pooling=cls|qp={}:{CODERANK_QUERY_PREFIX}|dp=none|revision={CODERANK_EMBEDDING_REVISION}",
+            coderank.display_name(),
+            CODERANK_QUERY_PREFIX.len()
+        )
+    );
+    assert!(
+        coderank
+            .model_identity()
+            .starts_with(&coderank.display_name())
+    );
+
+    // CodeRankEmbed is CLS-pooled, so mean is the contrasting choice.
+    let mut mean_pooled = coderank.clone();
+    mean_pooled.pooling = LocalEmbeddingPooling::Mean;
+    assert_ne!(coderank.model_identity(), mean_pooled.model_identity());
+    assert!(mean_pooled.model_identity().contains("pooling=mean"));
+}
+
+#[test]
+fn stored_legacy_jina_config_is_repaired_to_last_token() {
+    // What `vera setup` wrote to config.json before the pooling fix.
+    let stored: LocalEmbeddingModelConfig = serde_json::from_str(
+        r#"{
+            "source": {"source": "hugging-face",
+                       "repo": "jinaai/jina-embeddings-v5-text-nano-retrieval"},
+            "onnx_file": "onnx/model_quantized.onnx",
+            "onnx_data_file": "onnx/model_quantized.onnx_data",
+            "tokenizer_file": "tokenizer.json",
+            "embedding_dim": 768,
+            "pooling": "mean",
+            "max_length": 512
+        }"#,
+    )
+    .expect("legacy config should still deserialize");
+    assert_eq!(stored.pooling, LocalEmbeddingPooling::Mean);
+
+    let repaired = stored.repair_stored_defaults();
+    assert_eq!(repaired.pooling, LocalEmbeddingPooling::LastToken);
+    assert_eq!(repaired, LocalEmbeddingModelConfig::jina());
+}
+
+#[test]
+fn legacy_jina_literal_stays_pinned_when_the_constants_move() {
+    // Half one: the literal itself. It describes a config.json an older Vera
+    // already wrote, so editing it changes which installs the migration
+    // reaches.
+    let legacy = LocalEmbeddingModelConfig::legacy_jina_before_pooling_fix();
+    assert_eq!(
+        legacy,
+        LocalEmbeddingModelConfig {
+            source: LocalEmbeddingSource::HuggingFace {
+                repo: "jinaai/jina-embeddings-v5-text-nano-retrieval".to_string(),
+            },
+            revision: None,
+            onnx_file: "onnx/model_quantized.onnx".to_string(),
+            onnx_data_file: Some("onnx/model_quantized.onnx_data".to_string()),
+            tokenizer_file: "tokenizer.json".to_string(),
+            embedding_dim: 768,
+            pooling: LocalEmbeddingPooling::Mean,
+            max_length: 512,
+            query_prefix: None,
+            document_prefix: None,
+        }
+    );
+
+    // Half two: the tripwire. Today's constants still happen to describe that
+    // same file. When one of them moves, this fails and the reader decides.
+    const GUIDANCE: &str = "A live EMBEDDING_* constant no longer matches the pre-fix \
+         config.json that `repair_stored_defaults` migrates. Leave \
+         `legacy_jina_before_pooling_fix` exactly as it is — it is a historical value, not a \
+         preset — and update this assertion to record the divergence. Only edit the frozen \
+         literal if you have confirmed real pre-fix installs carried the new value: making it \
+         follow the constant stops it matching any of them, and every pre-fix install then \
+         stays mean-pooled with no error.";
+    assert_eq!(
+        legacy.source,
+        LocalEmbeddingSource::HuggingFace {
+            repo: EMBEDDING_REPO.to_string(),
+        },
+        "{GUIDANCE}"
+    );
+    assert_eq!(legacy.onnx_file, EMBEDDING_ONNX_FILE, "{GUIDANCE}");
+    assert_eq!(
+        legacy.onnx_data_file.as_deref(),
+        Some(EMBEDDING_ONNX_DATA_FILE),
+        "{GUIDANCE}"
+    );
+    assert_eq!(
+        legacy.tokenizer_file, EMBEDDING_TOKENIZER_FILE,
+        "{GUIDANCE}"
+    );
+    assert_eq!(legacy.embedding_dim, EMBEDDING_DIM, "{GUIDANCE}");
+    assert_eq!(legacy.max_length, EMBEDDING_MAX_LENGTH, "{GUIDANCE}");
+
+    // Half three: the two fields that deliberately do *not* track the preset.
+    // A pre-fix `config.json` predates the retrieval prefixes, so it carries
+    // neither. Copying `JINA_QUERY_PREFIX`/`JINA_DOCUMENT_PREFIX` in here to
+    // "match the preset" would stop the literal matching any file on any real
+    // install, and every pre-fix install would stay mean-pooled with no error.
+    assert_eq!(legacy.query_prefix, None, "{GUIDANCE}");
+    assert_eq!(legacy.document_prefix, None, "{GUIDANCE}");
+}
+
+#[test]
+fn explicit_mean_on_the_default_repo_is_no_longer_the_legacy_default() {
+    // Before the retrieval prefixes, `--embedding-pooling mean` on the default
+    // repo wrote byte-for-byte the config.json an older `vera setup` wrote on
+    // its own, so the migration could not spare this user's choice without
+    // sparing every pre-fix install with it. The prefixes end that collision:
+    // a pre-fix file predates them and carries neither, so an explicit mean
+    // written today is distinguishable and is left alone.
+    let mut explicit_mean = LocalEmbeddingModelConfig::jina();
+    explicit_mean.pooling = LocalEmbeddingPooling::Mean;
+    assert_ne!(
+        explicit_mean,
+        LocalEmbeddingModelConfig::legacy_jina_before_pooling_fix()
+    );
+    assert_eq!(
+        explicit_mean.clone().repair_stored_defaults(),
+        explicit_mean
+    );
+
+    // Pooling aside, that config differs from the historical file in the
+    // prefixes and in nothing else — so the prefixes are what spares it, and
+    // the historical file itself is still migrated.
+    let mut without_prefixes = explicit_mean;
+    without_prefixes.revision = None;
+    without_prefixes.query_prefix = None;
+    without_prefixes.document_prefix = None;
+    assert_eq!(
+        without_prefixes,
+        LocalEmbeddingModelConfig::legacy_jina_before_pooling_fix()
+    );
+    assert_eq!(
+        without_prefixes.repair_stored_defaults(),
+        LocalEmbeddingModelConfig::jina()
+    );
+}
+
+#[test]
+fn repair_leaves_customised_and_unrelated_configs_alone() {
+    // A deliberate non-default choice on the same repo survives; `max_length`
+    // here differs from the historical default on top of the pooling. Pooling
+    // alone survives too, now that the retrieval prefixes separate a config
+    // written today from the pre-fix file — see
+    // `explicit_mean_on_the_default_repo_is_no_longer_the_legacy_default`.
+    let mut customised = LocalEmbeddingModelConfig::jina();
+    customised.pooling = LocalEmbeddingPooling::Mean;
+    customised.max_length = 256;
+    assert_eq!(customised.clone().repair_stored_defaults(), customised);
+
+    // A different repo that happens to be mean-pooled must survive.
+    let other = LocalEmbeddingModelConfig::from_huggingface_repo("some-org/some-encoder");
+    assert_eq!(other.pooling, LocalEmbeddingPooling::Mean);
+    assert_eq!(other.clone().repair_stored_defaults(), other);
+
+    // Repair is idempotent and does not touch the other preset.
+    let jina = LocalEmbeddingModelConfig::jina();
+    assert_eq!(jina.clone().repair_stored_defaults(), jina);
+    let coderank = LocalEmbeddingModelConfig::coderankembed();
+    assert_eq!(coderank.clone().repair_stored_defaults(), coderank);
+}
+
+#[test]
+fn jina_preset_carries_both_retrieval_prefixes() {
+    // config_sentence_transformers.json declares
+    // {"query": "Query: ", "document": "Document: "} and the card requires both
+    // sides for the retrieval variant.
+    let config = LocalEmbeddingModelConfig::jina();
+    assert_eq!(
+        config.query_text("find router code"),
+        "Query: find router code"
+    );
+    assert_eq!(
+        config.document_text("fn route() {}"),
+        "Document: fn route() {}"
+    );
+}
+
+#[test]
+fn document_prefix_is_independent_of_query_prefix() {
+    // CodeRankEmbed is query-prefixed only. A document prefix must not appear
+    // from nowhere, and the query prefix must not leak onto passages.
+    let coderank = LocalEmbeddingModelConfig::coderankembed();
+    assert!(coderank.document_prefix.is_none());
+    assert_eq!(coderank.document_text("fn route() {}"), "fn route() {}");
+    assert_eq!(
+        coderank.query_text("find router code"),
+        "Represent this query for searching relevant code: find router code"
+    );
+
+    // An unprefixed model leaves both sides untouched.
+    let plain = LocalEmbeddingModelConfig::from_huggingface_repo("some-org/some-encoder");
+    assert_eq!(plain.query_text("q"), "q");
+    assert_eq!(plain.document_text("d"), "d");
+}
+
+#[test]
+fn prefixes_are_part_of_the_model_identity() {
+    // Prefixes change the embedded text, so they change the vector space and
+    // must invalidate an index the same way pooling does. Mutating a preset
+    // would only prove that the identity switches to its custom-config form,
+    // so the comparison is between configs that already take that form and
+    // differ in nothing but a prefix.
+    let base = LocalEmbeddingModelConfig::from_huggingface_repo("some-org/some-encoder");
+
+    let mut query_prefixed = base.clone();
+    query_prefixed.query_prefix = Some("Query:".to_string());
+    assert_ne!(base.model_identity(), query_prefixed.model_identity());
+
+    let mut document_prefixed = base.clone();
+    document_prefixed.document_prefix = Some("Document:".to_string());
+    assert_ne!(base.model_identity(), document_prefixed.model_identity());
+
+    // The two sides are recorded separately, so swapping which one is set is
+    // not the same model.
+    assert_ne!(
+        query_prefixed.model_identity(),
+        document_prefixed.model_identity()
+    );
+
+    // The preset form has to name both too, or jina's own identity would not
+    // move when the prefixes were introduced.
+    let jina = LocalEmbeddingModelConfig::jina();
+    assert!(jina.model_identity().contains("qp=6:Query:"));
+    assert!(jina.model_identity().contains("dp=9:Document:"));
+}
+
+#[test]
+fn an_absent_prefix_is_not_the_same_identity_as_a_literal_dash() {
+    // `unwrap_or("-")` spelled both of these `-`, so an index embedded with no
+    // prefix at all passed the staleness check against a config whose prefix is
+    // the literal `-`, and `vera update` appended incompatible vectors to it.
+    let base = LocalEmbeddingModelConfig::from_huggingface_repo("acme/prefix-identity-fixture");
+    assert!(base.query_prefix.is_none());
+    assert!(base.document_prefix.is_none());
+
+    let mut dash_query = base.clone();
+    dash_query.query_prefix = Some("-".to_string());
+    // The two configs really do embed different text, so the identity has to
+    // move with them.
+    assert_ne!(base.query_text("q"), dash_query.query_text("q"));
+    assert_ne!(base.model_identity(), dash_query.model_identity());
+
+    let mut dash_document = base.clone();
+    dash_document.document_prefix = Some("-".to_string());
+    assert_ne!(base.document_text("d"), dash_document.document_text("d"));
+    assert_ne!(base.model_identity(), dash_document.model_identity());
+
+    // And a dash on one side is not a dash on the other.
+    assert_ne!(dash_query.model_identity(), dash_document.model_identity());
+}
+
+#[test]
+fn a_prefix_cannot_forge_an_identity_field_boundary() {
+    // `|qp=` and `|dp=` were ordinary text inside a prefix, so a value carrying
+    // one shifted where the next field started. These two configs prefix
+    // different text on both sides and encoded to a single identity string.
+    let base = LocalEmbeddingModelConfig::from_huggingface_repo("acme/prefix-identity-fixture");
+
+    let mut carried_by_query = base.clone();
+    carried_by_query.query_prefix = Some("alpha|dp=beta|qp=gamma".to_string());
+    carried_by_query.document_prefix = Some("delta".to_string());
+
+    let mut carried_by_document = base.clone();
+    carried_by_document.query_prefix = Some("alpha".to_string());
+    carried_by_document.document_prefix = Some("beta|qp=gamma|dp=delta".to_string());
+
+    assert_ne!(
+        carried_by_query.query_text("q"),
+        carried_by_document.query_text("q")
+    );
+    assert_ne!(
+        carried_by_query.model_identity(),
+        carried_by_document.model_identity()
+    );
+}
+
+#[test]
+fn identity_matches_on_prefixes_that_embed_the_same_text() {
+    // The identity is a staleness guard, not a config diff. Trimming and the
+    // empty-to-absent fold happen before the text is embedded, so configs that
+    // feed the model byte-identical input must agree, or every one of these
+    // spellings would demand its own full re-index for nothing.
+    let base = LocalEmbeddingModelConfig::from_huggingface_repo("acme/prefix-identity-fixture");
+
+    for equivalent_to_absent in ["", "   ", "\t\n"] {
+        let mut blank = base.clone();
+        blank.query_prefix = Some(equivalent_to_absent.to_string());
+        blank.document_prefix = Some(equivalent_to_absent.to_string());
+        assert_eq!(blank.query_text("q"), base.query_text("q"));
+        assert_eq!(blank.document_text("d"), base.document_text("d"));
+        assert_eq!(
+            blank.model_identity(),
+            base.model_identity(),
+            "prefix {equivalent_to_absent:?} embeds exactly what no prefix embeds"
+        );
+    }
+
+    let mut tight = base.clone();
+    tight.query_prefix = Some("Ask:".to_string());
+    let mut padded = base.clone();
+    padded.query_prefix = Some("  Ask:  ".to_string());
+    assert_eq!(tight.query_text("q"), padded.query_text("q"));
+    assert_eq!(tight.model_identity(), padded.model_identity());
+}
+
+#[test]
+fn prefix_joins_with_exactly_one_space_however_it_is_written() {
+    let mut config = LocalEmbeddingModelConfig::jina();
+    for spelling in ["Query:", "Query: ", "  Query:  "] {
+        config.query_prefix = Some(spelling.to_string());
+        assert_eq!(config.query_text("q"), "Query: q", "spelling {spelling:?}");
+    }
+    config.query_prefix = Some("   ".to_string());
+    assert_eq!(
+        config.query_text("q"),
+        "q",
+        "whitespace-only prefix should be ignored"
     );
 }

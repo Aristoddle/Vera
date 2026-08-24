@@ -1,22 +1,29 @@
 //! Tests for incremental update logic.
 
+use std::collections::HashSet;
 use std::fs;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 use tempfile::TempDir;
 
+use crate::CancellationToken;
 use crate::config::VeraConfig;
 use crate::embedding::test_helpers::MockProvider;
 use crate::embedding::{EmbeddingError, EmbeddingProvider};
 use crate::indexing::{
     UpdateOptions, UpdateProgress, index_dir, index_repository, update_repository,
-    update_repository_with_options_and_progress, update_repository_with_progress,
+    update_repository_with_options_and_progress,
+    update_repository_with_options_and_progress_and_cancellation, update_repository_with_progress,
 };
+use crate::parsing::type_relations::{RawTypeRelation, TypeRelationKind};
 use crate::storage::bm25::Bm25Index;
-use crate::storage::metadata::MetadataStore;
+use crate::storage::metadata::{FileIndexState, FileIndexStatus, MetadataStore};
 use crate::storage::vector::VectorStore;
+use crate::types::Language;
 
-use super::content_hash;
+use super::{PreparedFile, collect_prepared_results, content_hash, processed_file_counts};
 
 fn default_config() -> VeraConfig {
     VeraConfig::default()
@@ -50,21 +57,52 @@ async fn indexed_repo(
 
 struct BatchBoundProvider {
     max_batch_size: usize,
-    largest_batch: AtomicUsize,
+    active_inputs: AtomicUsize,
+    peak_inputs: AtomicUsize,
+}
+
+struct FailingProvider;
+
+struct BlockingProvider {
+    started: Arc<tokio::sync::Notify>,
+}
+
+impl EmbeddingProvider for FailingProvider {
+    async fn embed_batch(&self, _texts: &[String]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+        Err(EmbeddingError::ApiError {
+            status: 503,
+            message: "provider unavailable".to_string(),
+        })
+    }
+
+    fn expected_dim(&self) -> Option<usize> {
+        Some(8)
+    }
+}
+
+impl EmbeddingProvider for BlockingProvider {
+    async fn embed_batch(&self, _texts: &[String]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+        self.started.notify_one();
+        std::future::pending().await
+    }
+
+    fn expected_dim(&self) -> Option<usize> {
+        Some(8)
+    }
 }
 
 impl BatchBoundProvider {
     fn new(max_batch_size: usize) -> Self {
         Self {
             max_batch_size,
-            largest_batch: AtomicUsize::new(0),
+            active_inputs: AtomicUsize::new(0),
+            peak_inputs: AtomicUsize::new(0),
         }
     }
 }
 
 impl EmbeddingProvider for BatchBoundProvider {
     async fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
-        self.largest_batch.fetch_max(texts.len(), Ordering::SeqCst);
         if texts.len() > self.max_batch_size {
             return Err(EmbeddingError::ApiError {
                 status: 400,
@@ -76,11 +114,20 @@ impl EmbeddingProvider for BatchBoundProvider {
             });
         }
 
+        let active = self.active_inputs.fetch_add(texts.len(), Ordering::SeqCst) + texts.len();
+        self.peak_inputs.fetch_max(active, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        self.active_inputs.fetch_sub(texts.len(), Ordering::SeqCst);
+
         Ok(vec![vec![0.0; 8]; texts.len()])
     }
 
     fn expected_dim(&self) -> Option<usize> {
         Some(8)
+    }
+
+    fn max_batch_size(&self) -> Option<usize> {
+        Some(self.max_batch_size)
     }
 }
 
@@ -106,6 +153,54 @@ fn content_hash_is_hex_sha256() {
     // SHA-256 hex is 64 characters.
     assert_eq!(h.len(), 64);
     assert!(h.chars().all(|c| c.is_ascii_hexdigit()));
+}
+
+#[test]
+fn processed_file_counts_cover_modified_and_added_files() {
+    assert_eq!(processed_file_counts([true, false]), (1, 1));
+}
+
+#[test]
+fn parallel_results_keep_parse_error_files_in_input_order() {
+    let prepared = |path: &str, status| PreparedFile {
+        path: path.to_string(),
+        hash: format!("hash-{path}"),
+        modified: true,
+        chunks: Vec::new(),
+        references: Vec::new(),
+        type_relations: Vec::new(),
+        state: FileIndexState {
+            file_path: path.to_string(),
+            language: "rust".to_string(),
+            status,
+            tree_has_error: false,
+            tier0_fallback: false,
+            chunk_count: 0,
+        },
+    };
+    let error = crate::indexing::pipeline::FileError {
+        file_path: "broken.rs".to_string(),
+        error: "parse failed".to_string(),
+    };
+
+    let (prepared_files, parse_errors) = collect_prepared_results(vec![
+        (prepared("ok.rs", FileIndexStatus::Indexed), None),
+        (
+            prepared("broken.rs", FileIndexStatus::ParseError),
+            Some(error),
+        ),
+    ]);
+
+    assert_eq!(
+        prepared_files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect::<Vec<_>>(),
+        ["ok.rs", "broken.rs"]
+    );
+    assert_eq!(prepared_files[1].state.status, FileIndexStatus::ParseError);
+    assert_eq!(parse_errors.len(), 1);
+    assert_eq!(parse_errors[0].file_path, "broken.rs");
 }
 
 // ── Update: no changes ──────────────────────────────────────────────
@@ -143,15 +238,17 @@ async fn update_reports_progress_and_respects_max_in_flight_input_bound() {
         .await
         .unwrap();
 
-    for name in ["one.rs", "two.rs", "three.rs"] {
+    for name in [
+        "one.rs", "two.rs", "three.rs", "four.rs", "five.rs", "six.rs",
+    ] {
         fs::write(dir.path().join(name), format!("fn {}() {{}}\n", &name[..3])).unwrap();
     }
 
     let provider = BatchBoundProvider::new(2);
     let mut config = default_config();
-    config.embedding.batch_size = 128;
+    config.embedding.batch_size = 2;
     config.embedding.max_concurrent_requests = 8;
-    config.embedding.max_in_flight_inputs = 2;
+    config.embedding.max_in_flight_inputs = 4;
 
     let events = std::sync::Mutex::new(Vec::new());
     let summary =
@@ -161,9 +258,11 @@ async fn update_reports_progress_and_respects_max_in_flight_input_bound() {
         .await
         .unwrap();
 
-    assert_eq!(summary.files_added, 3);
+    assert_eq!(summary.files_added, 6);
     assert_eq!(summary.files_deferred, 0);
-    assert_eq!(provider.largest_batch.load(Ordering::SeqCst), 2);
+    let peak_inputs = provider.peak_inputs.load(Ordering::SeqCst);
+    assert!(peak_inputs > 2);
+    assert!(peak_inputs <= 4);
 
     let events = events.into_inner().unwrap();
     assert!(matches!(
@@ -173,20 +272,267 @@ async fn update_reports_progress_and_respects_max_in_flight_input_bound() {
     assert!(
         events
             .iter()
-            .any(|event| matches!(event, UpdateProgress::ClassificationDone { added: 3, .. }))
+            .any(|event| matches!(event, UpdateProgress::ClassificationDone { added: 6, .. }))
     );
     assert!(events.iter().any(|event| matches!(
         event,
         UpdateProgress::ParsingDone {
-            file_count: 3,
+            file_count: 6,
             chunk_count
-        } if *chunk_count >= 3
+        } if *chunk_count >= 6
     )));
     assert!(events.iter().any(|event| matches!(
         event,
-        UpdateProgress::EmbeddingProgress { done, total } if done == total && *total >= 3
+        UpdateProgress::EmbeddingProgress { done, total } if done == total && *total >= 6
     )));
     assert!(matches!(events.last(), Some(UpdateProgress::StorageDone)));
+}
+
+#[tokio::test]
+async fn update_keeps_indexed_data_when_a_discovered_file_cannot_be_read() {
+    let (dir, provider, config, _) =
+        indexed_repo(&[("main.rs", "fn preserved_symbol() -> u32 { 42 }\n")]).await;
+    let idx = index_dir(&dir.path().canonicalize().unwrap());
+    let metadata = MetadataStore::open(&idx.join("metadata.db")).unwrap();
+    let hash_before = metadata.get_file_hash("main.rs").unwrap();
+    let chunks_before: Vec<_> = metadata
+        .get_chunks_by_file("main.rs")
+        .unwrap()
+        .into_iter()
+        .map(|chunk| (chunk.id, chunk.content))
+        .collect();
+    let vectors_before = VectorStore::open(&idx.join("vectors.db"), 8)
+        .unwrap()
+        .count()
+        .unwrap();
+    let bm25 = Bm25Index::open(&idx.join("bm25")).unwrap();
+    assert!(!bm25.search("preserved_symbol", 10).unwrap().is_empty());
+
+    let source = dir.path().join("main.rs");
+    let replaced = std::sync::atomic::AtomicBool::new(false);
+    update_repository_with_progress(dir.path(), &provider, &config, "mock-model", |event| {
+        if matches!(event, UpdateProgress::DiscoveryDone { .. })
+            && !replaced.swap(true, Ordering::SeqCst)
+        {
+            fs::remove_file(&source).unwrap();
+            fs::create_dir(&source).unwrap();
+        }
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(metadata.get_file_hash("main.rs").unwrap(), hash_before);
+    let chunks_after: Vec<_> = metadata
+        .get_chunks_by_file("main.rs")
+        .unwrap()
+        .into_iter()
+        .map(|chunk| (chunk.id, chunk.content))
+        .collect();
+    assert_eq!(chunks_after, chunks_before);
+    assert_eq!(
+        VectorStore::open(&idx.join("vectors.db"), 8)
+            .unwrap()
+            .count()
+            .unwrap(),
+        vectors_before
+    );
+    assert!(!bm25.search("preserved_symbol", 10).unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn update_embedding_failure_preserves_existing_parse_data() {
+    let (dir, _provider, config, _) = indexed_repo(&[(
+        "types.ts",
+        "class Loader {}\nclass CachedLoader extends Loader {}\n",
+    )])
+    .await;
+    let idx = index_dir(&dir.path().canonicalize().unwrap());
+    let metadata = MetadataStore::open(&idx.join("metadata.db")).unwrap();
+    let hash_before = metadata.get_file_hash("types.ts").unwrap();
+    assert_eq!(metadata.find_type_relations("Loader").unwrap().len(), 1);
+
+    fs::write(
+        dir.path().join("types.ts"),
+        "class Saver {}\nclass CachedSaver extends Saver {}\n",
+    )
+    .unwrap();
+
+    let error = update_repository(dir.path(), &FailingProvider, &config, "mock-model")
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("embedding generation failed"));
+    assert_eq!(metadata.get_file_hash("types.ts").unwrap(), hash_before);
+    assert_eq!(metadata.find_type_relations("Loader").unwrap().len(), 1);
+    assert!(metadata.find_type_relations("Saver").unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn update_cancellation_stops_embedding_before_publication() {
+    let (dir, _provider, config, _) =
+        indexed_repo(&[("main.rs", "fn preserved_symbol() -> u32 { 42 }\n")]).await;
+    let idx = index_dir(&dir.path().canonicalize().unwrap());
+    let metadata = MetadataStore::open(&idx.join("metadata.db")).unwrap();
+    let hash_before = metadata.get_file_hash("main.rs").unwrap();
+    let chunks_before: Vec<_> = metadata
+        .get_chunks_by_file("main.rs")
+        .unwrap()
+        .into_iter()
+        .map(|chunk| (chunk.id, chunk.content))
+        .collect();
+    fs::write(
+        dir.path().join("main.rs"),
+        "fn replacement_symbol() -> u32 { 7 }\n",
+    )
+    .unwrap();
+
+    let started = Arc::new(tokio::sync::Notify::new());
+    let provider = BlockingProvider {
+        started: Arc::clone(&started),
+    };
+    let cancellation = CancellationToken::new();
+    let operation_cancellation = cancellation.clone();
+    let cancel_after_start = async {
+        started.notified().await;
+        cancellation.cancel();
+    };
+    let options = UpdateOptions::default();
+    let update = update_repository_with_options_and_progress_and_cancellation(
+        dir.path(),
+        &provider,
+        &config,
+        "mock-model",
+        &options,
+        |_| {},
+        &operation_cancellation,
+    );
+
+    let (result, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(update, cancel_after_start)
+    })
+    .await
+    .expect("cancellation must stop the active update embedding request");
+    let error = result.unwrap_err();
+    assert!(format!("{error:#}").contains("cancel"));
+    assert_eq!(metadata.get_file_hash("main.rs").unwrap(), hash_before);
+    let chunks_after: Vec<_> = metadata
+        .get_chunks_by_file("main.rs")
+        .unwrap()
+        .into_iter()
+        .map(|chunk| (chunk.id, chunk.content))
+        .collect();
+    assert_eq!(chunks_after, chunks_before);
+}
+
+#[tokio::test]
+async fn update_cancellation_after_embedding_does_not_publish_changes() {
+    let (dir, provider, config, _) =
+        indexed_repo(&[("main.rs", "fn preserved_symbol() -> u32 { 42 }\n")]).await;
+    let idx = index_dir(&dir.path().canonicalize().unwrap());
+    let metadata = MetadataStore::open(&idx.join("metadata.db")).unwrap();
+    let hash_before = metadata.get_file_hash("main.rs").unwrap();
+    fs::write(
+        dir.path().join("main.rs"),
+        "fn replacement_symbol() -> u32 { 7 }\n",
+    )
+    .unwrap();
+
+    let cancellation = CancellationToken::new();
+    let progress_cancellation = cancellation.clone();
+    let error = update_repository_with_options_and_progress_and_cancellation(
+        dir.path(),
+        &provider,
+        &config,
+        "mock-model",
+        &UpdateOptions::default(),
+        move |event| {
+            if matches!(event, UpdateProgress::EmbeddingDone { .. }) {
+                progress_cancellation.cancel();
+            }
+        },
+        &cancellation,
+    )
+    .await
+    .unwrap_err();
+
+    assert!(error.to_string().contains("cancel"));
+    assert_eq!(metadata.get_file_hash("main.rs").unwrap(), hash_before);
+    let bm25 = Bm25Index::open(&idx.join("bm25")).unwrap();
+    assert!(!bm25.search("preserved_symbol", 10).unwrap().is_empty());
+    assert!(bm25.search("replacement_symbol", 10).unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn update_cleans_partial_added_file_artifacts_before_retry() {
+    let (dir, provider, config, _) = indexed_repo(&[("main.rs", "fn main() {}\n")]).await;
+    let idx = index_dir(&dir.path().canonicalize().unwrap());
+    let metadata = MetadataStore::open(&idx.join("metadata.db")).unwrap();
+    let source = "class Loader {}\nclass CachedLoader extends Loader {}\n";
+    fs::write(dir.path().join("types.ts"), source).unwrap();
+
+    let (partial_chunks, _, _) = crate::parsing::parse_file_with_diagnostics(
+        source,
+        "types.ts",
+        Language::TypeScript,
+        &config.indexing,
+    )
+    .unwrap();
+    metadata.insert_chunks(&partial_chunks).unwrap();
+    let partial_vectors: Vec<_> = partial_chunks
+        .iter()
+        .map(|chunk| (chunk.id.as_str(), vec![0.0; 8]))
+        .collect();
+    let partial_vector_refs: Vec<_> = partial_vectors
+        .iter()
+        .map(|(id, vector)| (*id, vector.as_slice()))
+        .collect();
+    VectorStore::open(&idx.join("vectors.db"), 8)
+        .unwrap()
+        .insert_batch(&partial_vector_refs)
+        .unwrap();
+    let bm25 = Bm25Index::open(&idx.join("bm25")).unwrap();
+    bm25.insert_chunks(&partial_chunks).unwrap();
+
+    let partial_relation = RawTypeRelation {
+        owner: "CachedLoader".to_string(),
+        target: "Loader".to_string(),
+        line: 2,
+        kind: TypeRelationKind::Extends,
+    };
+    metadata
+        .insert_parse_artifacts_batch_borrowed(
+            &[],
+            &[("types.ts", std::slice::from_ref(&partial_relation))],
+        )
+        .unwrap();
+    metadata
+        .insert_file_states(&[FileIndexState {
+            file_path: "types.ts".to_string(),
+            language: "typescript".to_string(),
+            status: FileIndexStatus::Indexed,
+            tree_has_error: false,
+            tier0_fallback: false,
+            chunk_count: 1,
+        }])
+        .unwrap();
+    assert!(metadata.get_file_hash("types.ts").unwrap().is_none());
+
+    let summary = update_repository(dir.path(), &provider, &config, "mock-model")
+        .await
+        .unwrap();
+
+    assert_eq!(summary.files_added, 1);
+    assert_eq!(metadata.find_type_relations("Loader").unwrap().len(), 1);
+    assert!(metadata.get_file_hash("types.ts").unwrap().is_some());
+    let bm25_results = bm25.search("Loader", 100).unwrap();
+    let unique_chunk_ids: HashSet<_> = bm25_results.iter().map(|result| &result.chunk_id).collect();
+    assert_eq!(bm25_results.len(), unique_chunk_ids.len());
+    assert_eq!(
+        VectorStore::open(&idx.join("vectors.db"), 8)
+            .unwrap()
+            .count()
+            .unwrap(),
+        metadata.chunk_count().unwrap()
+    );
 }
 
 #[tokio::test]

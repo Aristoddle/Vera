@@ -70,9 +70,18 @@ pub enum Commands {
 
     /// Start the Vera HTTP API server for remote embedding and reranking.
     #[command(long_about = "Start the Vera HTTP API server.\n\n\
-                      Loads the embedding model and reranker ONCE at startup (using the \
-                      selected backend), then exposes them via HTTP so any unmodified \
-                      vera client can use this host for compute.\n\n\
+                      Loads the embedding model at startup and keeps it (using the \
+                      selected backend), then exposes it via HTTP so any unmodified vera \
+                      client can use this host for compute.\n\n\
+                      The reranker is built at startup too, to check it works, but that \
+                      copy is discarded rather than kept: a server that only answers \
+                      /v1/embeddings would otherwise hold it for nothing. Startup \
+                      therefore pays for both models, and the first /v1/rerank request \
+                      pays to load the reranker again.\n\n\
+                      A loaded model is held in memory and reused across requests. It is \
+                      unloaded after --idle-timeout seconds of inactivity and reloaded on \
+                      the next request that needs it; see that flag for the values that \
+                      keep it loaded indefinitely or rebuild it per request.\n\n\
                       Standard client setup (no client changes needed):\n  \
                       1. Start server:  vera serve --onnx-jina-cuda\n  \
                       2. Configure client:\n  \
@@ -105,10 +114,12 @@ pub enum Commands {
         #[arg(long)]
         api_key: Option<String>,
 
-        /// Seconds of inactivity before the model is unloaded from memory.
-        /// 0 = disable cache (reload per request, same behaviour as vera search).
-        /// -1 = keep loaded indefinitely.
-        #[arg(long, default_value = "0")]
+        /// Seconds of inactivity before a model is unloaded from memory.
+        /// 0 = rebuild the model on every request, and hold one live model per
+        /// concurrent request; only useful to pick up model files replaced under
+        /// a running server. Any negative value, -1 included, keeps models
+        /// loaded indefinitely.
+        #[arg(long, default_value_t = 300, allow_negative_numbers = true)]
         idle_timeout: i64,
 
         #[command(flatten)]
@@ -176,10 +187,10 @@ pub enum Commands {
                       For backend-only changes, use `vera backend`. For skill-only \
                       changes, use `vera agent install`.\n\n\
                       Pass flags to skip the interactive wizard:\n  \
-                      vera setup --potion-code         # CPU-only local mode\n  \
+                      vera setup --potion-code         # Local static embeddings (the default)\n  \
                       vera setup --onnx-jina-cuda      # NVIDIA GPU, skip wizard\n  \
                       vera setup --api                 # API mode from env vars\n  \
-                      vera setup --yes                 # Auto-detect GPU, no prompts\n\n\
+                      vera setup --yes                 # Default Potion Code backend, no prompts\n\n\
                       Examples:\n  \
                       vera setup                       # Full interactive wizard\n  \
                       vera setup --potion-code --index .       # CPU + index, no wizard\n  \
@@ -205,15 +216,15 @@ pub enum Commands {
                       This is the focused backend configuration command. It handles \
                       runtime selection, model downloads, and API credential persistence \
                       without touching agent skills or project indexes.\n\n\
-                      With no flags, shows an interactive backend menu with auto-detected \
-                      GPU as the default.\n\n\
+                      With no flags, shows an interactive backend menu with Potion Code \
+                      as the default.\n\n\
                       Examples:\n  \
                       vera backend                     # Interactive backend selection\n  \
-                      vera backend --potion-code        # CPU-only local mode\n  \
+                      vera backend --potion-code        # Local static embeddings (the default)\n  \
                       vera backend --onnx-jina-cuda    # NVIDIA GPU (skip menu)\n  \
                       vera backend --code-rank-embed   # Switch to CodeRankEmbed model\n  \
                       vera backend --api               # Persist API credentials from env\n  \
-                      vera backend --yes               # Auto-detect GPU, no prompts")]
+                      vera backend --yes               # Default Potion Code backend, no prompts")]
     Backend {
         #[command(flatten)]
         backend: crate::helpers::LocalBackendFlags,
@@ -234,6 +245,9 @@ pub enum Commands {
                       API environment variables, and whether the current repository \
                       has a `.vera/` index. `--probe` adds a deeper read-only local \
                       backend probe and never downloads or repairs missing assets.\n\n\
+                      Exits 1 if any check fails, so `vera doctor && vera index .` \
+                      stops on a broken setup. Warnings do not affect the exit \
+                      code.\n\n\
                       Examples:\n  \
                       vera doctor\n  \
                       vera doctor --probe\n  \
@@ -342,7 +356,7 @@ pub enum Commands {
         /// Structural intent to run.
         #[arg(value_enum)]
         intent: crate::commands::structural::StructuralIntent,
-        /// Optional query term. Required for definitions and impls.
+        /// Query term. Required for definitions and impls, optional for env, rejected by routes and sql.
         query: Option<String>,
         #[command(flatten)]
         filters: crate::helpers::SearchFilterArgs,
@@ -606,7 +620,7 @@ pub enum Commands {
                       retrieval.default_limit        Default result count (default: 5)\n  \
                       retrieval.rrf_k                RRF fusion constant (default: 60)\n  \
                       retrieval.rerank_candidates    Reranker candidate count (default: 50)\n  \
-                      retrieval.reranking_enabled    Enable reranking (default: true)\n  \
+                      retrieval.reranking_enabled    Enable reranking (default: false)\n  \
                       retrieval.max_output_chars     Total output char budget (default: 12000)\n  \
                       embedding.batch_size           Embedding batch size (default: 128)\n  \
                       embedding.max_concurrent_requests  Concurrent API requests (default: 8)\n  \

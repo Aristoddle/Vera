@@ -12,8 +12,18 @@ use crate::types::{
 ///
 /// A match occurs when the result's file path matches and the line ranges
 /// overlap (the result covers at least part of the ground truth range).
+fn path_matches(result_path: &str, gt_path: &str) -> bool {
+    result_path == gt_path
+        || result_path
+            .strip_suffix(gt_path)
+            .is_some_and(|prefix| prefix.ends_with('/'))
+        || gt_path
+            .strip_suffix(result_path)
+            .is_some_and(|prefix| prefix.ends_with('/'))
+}
+
 fn is_match(result: &RetrievalResult, gt: &GroundTruthEntry) -> bool {
-    result.file_path == gt.file_path
+    path_matches(&result.file_path, &gt.file_path)
         && result.line_start <= gt.line_end
         && result.line_end >= gt.line_start
 }
@@ -278,6 +288,14 @@ mod tests {
         let results = vec![make_result("b.rs", 1, 10)];
         let gt = vec![make_gt("a.rs", 1, 10)];
         assert_eq!(recall_at_k(&results, &gt, 1), 0.0);
+    }
+
+    #[test]
+    fn test_path_suffix_matching_respects_boundaries() {
+        assert!(path_matches("a/util.py", "a/util.py"));
+        assert!(path_matches("b/a/util.py", "a/util.py"));
+        assert!(path_matches("a/util.py", "b/a/util.py"));
+        assert!(!path_matches("store.rs", "mystore.rs"));
     }
 
     #[test]

@@ -6,12 +6,14 @@
 //! metadata store. Finds semantically related code even when query terms
 //! don't appear literally in results (e.g., "memory allocation" finds `alloc`).
 
+use std::time::{Duration, Instant};
+
 use anyhow::Result;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::embedding::{EmbeddingError, EmbeddingProvider};
 use crate::storage::metadata::MetadataStore;
-use crate::storage::vector::VectorStore;
+use crate::storage::vector::{MAX_KNN_K, VectorStore};
 use crate::types::SearchResult;
 
 /// Errors specific to vector search.
@@ -46,12 +48,33 @@ pub async fn search_vector_with_stores(
     query: &str,
     limit: usize,
 ) -> Result<Vec<SearchResult>, VectorSearchError> {
+    search_vector_with_stores_timed(vector_store, metadata_store, provider, query, limit)
+        .await
+        .map(|(results, _)| results)
+}
+
+/// Like [`search_vector_with_stores`], but also reports how long the query
+/// embedding took.
+///
+/// The embedding call is nested inside the vector search, so a caller that
+/// reports per-stage timings cannot otherwise separate model cost from storage
+/// cost. The returned duration covers only [`generate_query_embedding`]; it is
+/// [`Duration::ZERO`] when `limit` is 0 and no embedding is generated.
+pub async fn search_vector_with_stores_timed(
+    vector_store: &VectorStore,
+    metadata_store: &MetadataStore,
+    provider: &impl EmbeddingProvider,
+    query: &str,
+    limit: usize,
+) -> Result<(Vec<SearchResult>, Duration), VectorSearchError> {
     if limit == 0 {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), Duration::ZERO));
     }
 
     // 1. Generate query embedding.
+    let embed_start = Instant::now();
     let query_embedding = generate_query_embedding(provider, query, vector_store.dim()).await?;
+    let embed_elapsed = embed_start.elapsed();
 
     debug!(
         query = query,
@@ -59,13 +82,84 @@ pub async fn search_vector_with_stores(
         "generated query embedding"
     );
 
-    // 2. Search the vector store for nearest neighbors.
-    // Fetch extra candidates to account for missing metadata without doubling
-    // large caller-selected candidate pools.
-    let candidates = limit.saturating_add(limit / 2).max(limit + 10);
+    let results =
+        search_vector_from_embedding(vector_store, metadata_store, query, limit, &query_embedding)?;
+
+    Ok((results, embed_elapsed))
+}
+
+/// Perform vector search with stores cached behind short-lived mutex guards.
+///
+/// The embedding call happens before either lock is acquired. The locks are
+/// held only across the synchronous sqlite-vec search and metadata hydration,
+/// never across the provider await.
+pub(crate) async fn search_vector_with_cached_stores_timed(
+    vector_store: &std::sync::Mutex<VectorStore>,
+    metadata_store: &std::sync::Mutex<MetadataStore>,
+    provider: &impl EmbeddingProvider,
+    query: &str,
+    limit: usize,
+) -> Result<(Vec<SearchResult>, Duration), VectorSearchError> {
+    if limit == 0 {
+        return Ok((Vec::new(), Duration::ZERO));
+    }
+
+    let stored_dim = vector_store
+        .lock()
+        .map_err(|_| {
+            VectorSearchError::StorageError(anyhow::anyhow!("vector store lock poisoned"))
+        })?
+        .dim();
+    let embed_start = Instant::now();
+    let query_embedding = generate_query_embedding(provider, query, stored_dim).await?;
+    let embed_elapsed = embed_start.elapsed();
+
+    debug!(
+        query = query,
+        dim = query_embedding.len(),
+        "generated query embedding"
+    );
+
+    let vector_store = vector_store.lock().map_err(|_| {
+        VectorSearchError::StorageError(anyhow::anyhow!("vector store lock poisoned"))
+    })?;
+    let metadata_store = metadata_store.lock().map_err(|_| {
+        VectorSearchError::StorageError(anyhow::anyhow!("metadata store lock poisoned"))
+    })?;
+    let results = search_vector_from_embedding(
+        &vector_store,
+        &metadata_store,
+        query,
+        limit,
+        &query_embedding,
+    )?;
+
+    Ok((results, embed_elapsed))
+}
+
+fn search_vector_from_embedding(
+    vector_store: &VectorStore,
+    metadata_store: &MetadataStore,
+    query: &str,
+    limit: usize,
+    query_embedding: &[f32],
+) -> Result<Vec<SearchResult>, VectorSearchError> {
+    // 1. Search the vector store for nearest neighbors.
+    let (requested, candidates) = candidate_pool(limit);
+    if requested > candidates {
+        // Deliberately without the query text: the surrounding `debug!` calls
+        // carry it, but this one is on by default, and a search query is user
+        // content that should not be raised into default-visible logs.
+        warn!(
+            requested,
+            fetched = candidates,
+            "candidate pool exceeds the sqlite-vec KNN cap; the filter and \
+             metadata over-fetch are inert above it"
+        );
+    }
 
     let vector_results = vector_store
-        .search(&query_embedding, candidates)
+        .search(query_embedding, candidates)
         .map_err(|e| VectorSearchError::StorageError(e.context("vector search failed")))?;
 
     debug!(
@@ -74,18 +168,22 @@ pub async fn search_vector_with_stores(
         "vector search returned candidates"
     );
 
-    // 3. Hydrate results from metadata store and convert distances to scores.
+    // 2. Hydrate results from metadata store and convert distances to scores.
+    // Fetched in a single batch query instead of one query per candidate
+    // (N+1). SQLite does not preserve `IN (...)` row order, so results are
+    // re-projected back into the original vector-distance order below.
+    let ids: Vec<String> = vector_results
+        .iter()
+        .map(|vr| vr.chunk_id.clone())
+        .collect();
+    let mut chunk_by_id = metadata_store.get_chunks_by_ids(&ids).map_err(|e| {
+        VectorSearchError::StorageError(e.context("failed to batch-fetch chunk metadata"))
+    })?;
+
     let mut results = Vec::with_capacity(vector_results.len());
 
     for vr in &vector_results {
-        let chunk = metadata_store.get_chunk(&vr.chunk_id).map_err(|e| {
-            VectorSearchError::StorageError(e.context(format!(
-                "failed to fetch metadata for chunk: {}",
-                vr.chunk_id
-            )))
-        })?;
-
-        let Some(chunk) = chunk else {
+        let Some(chunk) = chunk_by_id.remove(&vr.chunk_id) else {
             debug!(
                 chunk_id = %vr.chunk_id,
                 "chunk metadata not found, skipping"
@@ -110,6 +208,25 @@ pub async fn search_vector_with_stores(
     );
 
     Ok(results)
+}
+
+/// Size the KNN request for a caller-selected pool, bounded by the backend cap.
+///
+/// Returns `(requested, fetched)`. Extra candidates are fetched to absorb chunks
+/// whose metadata has gone missing, without doubling an already-large pool.
+///
+/// The two values differ once the compounded over-fetch runs past
+/// [`MAX_KNN_K`]. Callers stack several multipliers before reaching here (query
+/// type, then a filter over-fetch, then this one), so a natural-language query
+/// with an active filter can ask for more than sqlite-vec will serve. Bounding
+/// it here rather than letting the storage layer clamp keeps the ceiling
+/// visible to the one place that can report it; the same `k` reaches sqlite-vec
+/// either way, so ranking is unchanged.
+fn candidate_pool(limit: usize) -> (usize, usize) {
+    let requested = limit
+        .saturating_add(limit / 2)
+        .max(limit.saturating_add(10));
+    (requested, requested.min(MAX_KNN_K))
 }
 
 /// Generate a query embedding, truncating to match stored dimensionality.
@@ -171,7 +288,27 @@ mod tests {
     use super::*;
     use crate::embedding::test_helpers::MockProvider;
     use crate::types::{Chunk, Language, SymbolType};
-    use anyhow::Context;
+    use std::collections::HashMap;
+
+    /// The pool must never ask sqlite-vec for more than it will serve, and must
+    /// report the shortfall so a degraded pool is diagnosable rather than silent.
+    #[test]
+    fn candidate_pool_is_bounded_by_the_knn_cap() {
+        // Below the cap the metadata over-fetch is untouched.
+        assert_eq!(candidate_pool(10), (20, 20));
+        assert_eq!(candidate_pool(100), (150, 150));
+
+        // At and above it, the request is reported but not made.
+        let (requested, fetched) = candidate_pool(MAX_KNN_K);
+        assert!(
+            requested > MAX_KNN_K,
+            "over-fetch should exceed the cap here"
+        );
+        assert_eq!(fetched, MAX_KNN_K);
+
+        // No caller can push the fetch past the cap, and none can overflow it.
+        assert_eq!(candidate_pool(usize::MAX).1, MAX_KNN_K);
+    }
 
     /// Create sample chunks with semantic variety for testing.
     fn sample_chunks() -> Vec<Chunk> {
@@ -586,6 +723,120 @@ mod tests {
                 .unwrap();
 
         assert!(results.is_empty(), "empty store should return no results");
+    }
+
+    #[tokio::test]
+    async fn batch_chunk_fetch_preserves_vector_distance_order() {
+        // Regression test for the N+1 -> batch fetch change: insert chunks
+        // in an order different from the requested id order, and assert the
+        // search results come back in vector-distance order (the order `vr`
+        // came in), not whatever order SQLite happens to return for
+        // `IN (...)` (unspecified) or insertion order.
+        let dim = 8;
+        let metadata_store = MetadataStore::open_in_memory().unwrap();
+
+        // Inserted in id order, which is also the order `WHERE id IN (...)`
+        // returns rows in (the chunks table keys on id). The mock provider
+        // ranks these contents c, a, b by distance, so the expected result
+        // order differs from both — which is what makes the assertions below
+        // able to fail.
+        let chunks = vec![
+            Chunk {
+                id: "a".to_string(),
+                file_path: "src/a.rs".to_string(),
+                line_start: 1,
+                line_end: 2,
+                content: "fn a() {}".to_string(),
+                language: Language::Rust,
+                symbol_type: Some(SymbolType::Function),
+                symbol_name: Some("a".to_string()),
+            },
+            Chunk {
+                id: "b".to_string(),
+                file_path: "src/b.rs".to_string(),
+                line_start: 1,
+                line_end: 2,
+                content: "fn b() {}".to_string(),
+                language: Language::Rust,
+                symbol_type: Some(SymbolType::Function),
+                symbol_name: Some("b".to_string()),
+            },
+            Chunk {
+                id: "c".to_string(),
+                file_path: "src/c.rs".to_string(),
+                line_start: 1,
+                line_end: 2,
+                content: "fn c() {}".to_string(),
+                language: Language::Rust,
+                symbol_type: Some(SymbolType::Function),
+                symbol_name: Some("c".to_string()),
+            },
+        ];
+        metadata_store.insert_chunks(&chunks).unwrap();
+
+        let vector_store = VectorStore::open_in_memory(dim).unwrap();
+        let provider = MockProvider::new(dim);
+        crate::embedding::test_helpers::embed_and_insert_vectors(&vector_store, &provider, &chunks)
+            .await;
+
+        // Ground truth: the distance order the vector store itself reports.
+        // Every candidate must come back paired with its own distance.
+        let query_embedding = generate_query_embedding(&provider, "fn", dim)
+            .await
+            .unwrap();
+        let vector_results = vector_store.search(&query_embedding, chunks.len()).unwrap();
+        assert_eq!(vector_results.len(), chunks.len());
+
+        let chunk_by_id: HashMap<&str, &Chunk> =
+            chunks.iter().map(|c| (c.id.as_str(), c)).collect();
+        let expected: Vec<(&str, &str, f64)> = vector_results
+            .iter()
+            .map(|vr| {
+                let chunk = chunk_by_id[vr.chunk_id.as_str()];
+                (
+                    chunk.file_path.as_str(),
+                    chunk.content.as_str(),
+                    distance_to_similarity(vr.distance),
+                )
+            })
+            .collect();
+
+        // Guard that the fixture actually discriminates. The chunks are
+        // inserted in id order, so insertion order and the `IN (...)`
+        // primary-key order are the same sequence here; one comparison covers
+        // both. Without this, a fixture whose distance order matched storage
+        // order would satisfy the assertions below without testing anything —
+        // which is exactly what the first version of this test did.
+        let expected_paths: Vec<&str> = expected.iter().map(|(path, _, _)| *path).collect();
+        let storage_order_paths: Vec<&str> = chunks.iter().map(|c| c.file_path.as_str()).collect();
+        assert_ne!(
+            expected_paths, storage_order_paths,
+            "fixture is not discriminating: distance order equals insertion and primary-key order"
+        );
+
+        let results =
+            search_vector_with_stores(&vector_store, &metadata_store, &provider, "fn", 10)
+                .await
+                .unwrap();
+
+        // Assert the pairing, not just that scores descend. Scores descend for
+        // any implementation that emits one result per candidate in candidate
+        // order, because the vector store already returns rows sorted by
+        // distance — so a monotonicity check cannot catch chunks being paired
+        // with the wrong neighbour's distance.
+        assert_eq!(
+            results.len(),
+            expected.len(),
+            "batch fetch dropped candidates"
+        );
+        let actual: Vec<(&str, &str, f64)> = results
+            .iter()
+            .map(|r| (r.file_path.as_str(), r.content.as_str(), r.score))
+            .collect();
+        assert_eq!(
+            actual, expected,
+            "each chunk must come back paired with its own distance, in vector-distance order"
+        );
     }
 
     #[tokio::test]

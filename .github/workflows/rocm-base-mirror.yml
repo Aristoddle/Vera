@@ -1,0 +1,62 @@
+name: Mirror ROCm base
+
+# The ROCm base image's 5.5GB layer arrived corrupted when pulled from Docker
+# Hub on our CI runners ("unexpected commit digest", different wrong digest
+# each run), so Dockerfile.rocm builds FROM a GHCR mirror of it instead. Run
+# this once per base-image bump; it copies registry-to-registry on a
+# GitHub-hosted runner (no Blacksmith network in the path) and verifies the
+# manifest digest matches Docker Hub exactly.
+on:
+  workflow_dispatch:
+    inputs:
+      base_tag:
+        description: 'rocm/dev-ubuntu-24.04 tag to mirror'
+        required: true
+        default: 6.4.4-complete
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install crane
+        run: |
+          curl -sL -o /tmp/crane.tgz https://github.com/google/go-containerregistry/releases/download/v0.20.6/go-containerregistry_Linux_x86_64.tar.gz
+          echo "c1d593d01551f2c9a3df5ca0a0be4385a839bd9b86d4a76e18d7b17d16559127  /tmp/crane.tgz" | sha256sum -c -
+          sudo tar xzf /tmp/crane.tgz -C /usr/local/bin crane
+          crane version
+
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | crane auth login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      # Resolve the source digest first and copy by digest, so the mirror is
+      # exactly the verified manifest even if the upstream tag moves mid-run.
+      # Copy to a staging tag so a failed parity check never leaves a bad
+      # image under the tag Dockerfile.rocm builds FROM; the final tag is
+      # only applied after verification succeeds.
+      - name: Copy ROCm base image to GHCR staging tag
+        env:
+          BASE_TAG: ${{ inputs.base_tag }}
+        run: |
+          SRC=$(crane digest "rocm/dev-ubuntu-24.04:${BASE_TAG}")
+          echo "src=$SRC" >> "$GITHUB_ENV"
+          crane copy "rocm/dev-ubuntu-24.04@${SRC}" "ghcr.io/veratools/vera:rocm-base-${BASE_TAG}-unverified"
+
+      - name: Verify digest parity and promote
+        env:
+          BASE_TAG: ${{ inputs.base_tag }}
+        run: |
+          DST=$(crane digest "ghcr.io/veratools/vera:rocm-base-${BASE_TAG}-unverified")
+          echo "source=$SRC mirror=$DST"
+          test "$SRC" = "$DST"
+          # Promote by digest (registry-side retag, no re-upload) so the final
+          # tag can only ever point at the manifest verified above.
+          crane tag "ghcr.io/veratools/vera@${DST}" "rocm-base-${BASE_TAG}"
+          # The Dockerfile pins FROM by digest so builds always resolve the
+          # manifest verified here, not whatever the mutable tag later holds.
+          echo "Pin this in docker/Dockerfile.rocm:" >> "$GITHUB_STEP_SUMMARY"
+          echo "FROM ghcr.io/veratools/vera:rocm-base-${BASE_TAG}@${DST}" >> "$GITHUB_STEP_SUMMARY"

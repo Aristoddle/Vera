@@ -4,7 +4,7 @@
 //! and the overall evaluation report.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 /// A single benchmark task: a query with ground truth expectations.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -171,17 +171,94 @@ pub struct VersionInfo {
     pub tool_version: String,
     /// Corpus manifest version.
     pub corpus_version: u32,
+    /// Metric semantics used to compute the reported quality scores.
+    #[serde(default = "legacy_metric_contract")]
+    pub metric_contract: String,
+    /// Upstream Semble snapshot when this is a Semble-derived corpus.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semble: Option<SembleSnapshot>,
     /// Repo SHAs used (name -> SHA).
     pub repo_shas: HashMap<String, String>,
     /// Configuration parameters (key -> value).
     #[serde(default)]
     pub config: HashMap<String, String>,
+    /// Resolved model lane configuration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lane: Option<LaneProvenance>,
+    /// Identity of the task slice evaluated by this report.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_set: Option<TaskSetIdentity>,
+    /// Vera source revision used for the run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vera_git_sha: Option<String>,
+    /// Process arguments used to invoke the evaluator.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub command: Vec<String>,
+    /// Relevant environment values after lane overrides, with secrets redacted.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub environment: BTreeMap<String, String>,
+}
+
+/// Resolved configuration for one benchmark lane.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LaneProvenance {
+    pub name: String,
+    pub backend: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_repo: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_dir: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_revision: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub onnx_file: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub onnx_data_file: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokenizer_file: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pooling: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query_prefix: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub document_prefix: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dim: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_length: Option<usize>,
+    pub rerank: bool,
+}
+
+/// Stable identity for the selected task IDs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskSetIdentity {
+    pub count: usize,
+    pub task_ids_sha256: String,
+}
+
+/// Identity of the upstream Semble task snapshot used by a corpus manifest.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SembleSnapshot {
+    pub version: String,
+    pub commit: String,
+    pub task_count: usize,
+    pub tasks_sha256: String,
+}
+
+fn legacy_metric_contract() -> String {
+    "unknown-legacy".to_string()
 }
 
 /// Corpus manifest parsed from corpus.toml.
 #[derive(Debug, Clone, Deserialize)]
 pub struct CorpusManifest {
     pub corpus: CorpusMetadata,
+    #[serde(default)]
+    pub semble: Option<SembleSnapshot>,
     pub repos: Vec<RepoEntry>,
 }
 
@@ -207,4 +284,50 @@ pub struct RepoEntry {
     /// When set, search results are filtered to only include files under this path.
     #[serde(default)]
     pub benchmark_root: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_version_info_defaults_new_provenance_fields() {
+        let json = r#"{
+            "tool_version": "legacy",
+            "corpus_version": 1,
+            "repo_shas": {}
+        }"#;
+
+        let version: VersionInfo = serde_json::from_str(json).unwrap();
+        assert_eq!(version.metric_contract, "unknown-legacy");
+        assert!(version.semble.is_none());
+    }
+
+    #[test]
+    fn version_info_round_trips_semble_provenance() {
+        let version = VersionInfo {
+            tool_version: "test".to_string(),
+            corpus_version: 1,
+            metric_contract: "vera-graded-2-1-task-mean-v1".to_string(),
+            semble: Some(SembleSnapshot {
+                version: "0.5.5".to_string(),
+                commit: "921849164e2632dd4f0e1c1370f82cfe15ed6d6c".to_string(),
+                task_count: 1251,
+                tasks_sha256: "6d8befaa3c19211ef6c3df7d0aa7bb1711670ed32f9b0258c289909cdb5b58de"
+                    .to_string(),
+            }),
+            repo_shas: HashMap::new(),
+            config: HashMap::new(),
+            lane: None,
+            task_set: None,
+            vera_git_sha: None,
+            command: Vec::new(),
+            environment: BTreeMap::new(),
+        };
+
+        let decoded: VersionInfo =
+            serde_json::from_str(&serde_json::to_string(&version).unwrap()).unwrap();
+        assert_eq!(decoded.metric_contract, version.metric_contract);
+        assert_eq!(decoded.semble.unwrap().task_count, 1251);
+    }
 }

@@ -15,8 +15,10 @@ use tracing::{debug, info, warn};
 use crate::CancellationToken;
 use crate::config::VeraConfig;
 use crate::discovery::{self, DiscoveryResult};
-use crate::embedding::{EmbeddingProvider, embed_chunks_concurrent_with_progress};
-use crate::indexing::update::content_hash;
+use crate::embedding::{
+    EmbeddingError, EmbeddingProvider, embed_chunks_concurrent_with_progress_and_cancellation,
+};
+use crate::indexing::update::{content_hash, detect_language_for_path};
 use crate::parsing;
 use crate::parsing::references::RawReference;
 use crate::parsing::type_relations::RawTypeRelation;
@@ -281,16 +283,27 @@ where
     let progress_cb = |done: usize, total: usize| {
         on_progress(IndexProgress::EmbeddingProgress { done, total });
     };
-    let mut embeddings = embed_chunks_concurrent_with_progress(
+    let embedding_result = embed_chunks_concurrent_with_progress_and_cancellation(
         provider,
         &all_chunks,
         batch_size,
         max_concurrent_requests,
         config.indexing.max_chunk_bytes,
+        cancellation.as_async_token(),
         progress_cb,
     )
-    .await
-    .context("embedding generation failed")?;
+    .await;
+    let mut embeddings = match embedding_result {
+        Ok(embeddings) => embeddings,
+        Err(error) => {
+            // A completed provider error outranks a simultaneous cancellation,
+            // mirroring the biased select in the CLI's cancel_task_on_signal.
+            if matches!(error, EmbeddingError::Cancelled) {
+                cancellation.check()?;
+            }
+            return Err(error).context("embedding generation failed");
+        }
+    };
     cancellation.check()?;
 
     // Truncate vectors if max_stored_dim is configured.
@@ -305,6 +318,8 @@ where
     });
 
     // ── 5. Store everything on disk ──────────────────────────────
+    // Publication is synchronous, so cancellation must win before any artifact is replaced.
+    cancellation.check()?;
     let idx_dir = index_dir(&repo_root);
     store_index(
         &idx_dir,
@@ -390,7 +405,10 @@ fn parse_discovered_files_parallel(
                 };
             }
 
-            let source = match crate::discovery::read_source_lossy(&file.absolute_path) {
+            let source = match crate::discovery::read_source_lossy_at(
+                &discovery.root_dir,
+                Path::new(&file.relative_path),
+            ) {
                 Ok(source) => source,
                 Err(err) => {
                     warn!(
@@ -412,28 +430,17 @@ fn parse_discovered_files_parallel(
                 }
             };
 
-            let language = file
-                .absolute_path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .and_then(Language::from_filename)
-                .unwrap_or_else(|| {
-                    let ext = file
-                        .absolute_path
-                        .extension()
-                        .and_then(|e| e.to_str())
-                        .unwrap_or("");
-                    Language::from_extension(ext)
-                });
+            let language = detect_language_for_path(&file.absolute_path);
 
             // RST files need preprocessing before chunking, but refs
             // come from the raw source, so they can't share a single parse.
             let parsed = if language == Language::Rst {
                 let refs = parsing::parse_and_extract_references(&source, language);
-                let normalized_source = match parsing::sphinx::preprocess_rst(
+                let normalized_source = match parsing::sphinx::preprocess_rst_with_limit(
                     &source,
                     &file.absolute_path,
                     repo_root.as_path(),
+                    config.indexing.max_file_size_bytes,
                 ) {
                     Ok(preprocessed) => Some(preprocessed),
                     Err(err) => {
@@ -595,29 +602,15 @@ fn store_index(
         .insert_chunks(chunks)
         .context("failed to insert chunk metadata")?;
 
-    // Store file content hashes for incremental indexing.
-    for (file_path, hash) in file_hashes {
-        metadata_store
-            .set_file_hash(file_path, hash)
-            .context("failed to store file hash")?;
-    }
-
     metadata_store
         .insert_file_states(metadata.file_states)
         .context("failed to store file index states")?;
 
-    // Store call-site references for call graph analysis.
-    for (file_path, refs) in file_refs {
-        metadata_store
-            .insert_references(file_path, refs)
-            .context("failed to store references")?;
-    }
-
-    for (file_path, relations) in file_type_relations {
-        metadata_store
-            .insert_type_relations(file_path, relations)
-            .context("failed to store type relations")?;
-    }
+    // Store call-site references and type relations for call graph analysis,
+    // batched into a single transaction instead of up to two commits per file.
+    metadata_store
+        .insert_parse_artifacts_batch(file_refs, file_type_relations)
+        .context("failed to store references and type relations")?;
 
     metadata_store
         .set_index_meta("model_name", metadata.model_name)
@@ -625,8 +618,6 @@ fn store_index(
     metadata_store
         .set_index_meta("embedding_dim", &dim.to_string())
         .context("failed to store embedding_dim")?;
-    super::freshness::record_index_snapshot(&metadata_store, metadata.indexing_config)
-        .context("failed to store index freshness metadata")?;
 
     debug!(chunks = chunks.len(), "metadata stored");
 
@@ -666,17 +657,34 @@ fn store_index(
 
     debug!(docs = chunks.len(), "BM25 index built");
 
+    // Hashes and the freshness stamp are what certify the index current, so
+    // they are written only once every store has been rebuilt. Both stores are
+    // deleted and repopulated above; committing the hashes first would leave a
+    // crash or a Ctrl-C in that window with a complete metadata store, current
+    // hashes and a missing or half-built vector/BM25 store, which
+    // `detect_staleness` cannot see and `vera update` skips. `metadata_store`
+    // was cleared above, hashes and index metadata included, so a failure
+    // before final publication leaves both absent, every file reads as new and
+    // the next run reprocesses. A failure during the final metadata writes can
+    // happen only after both stores are complete. `update.rs` keeps the same
+    // order.
+    metadata_store
+        .set_file_hashes_batch(file_hashes)
+        .context("failed to store file hashes")?;
+    super::freshness::record_index_snapshot(&metadata_store, metadata.indexing_config)
+        .context("failed to store index freshness metadata")?;
+
     Ok(())
 }
 
-fn count_tree_sitter_error_files(file_states: &[FileIndexState]) -> usize {
+pub(crate) fn count_tree_sitter_error_files(file_states: &[FileIndexState]) -> usize {
     file_states
         .iter()
         .filter(|state| state.status == FileIndexStatus::Indexed && state.tree_has_error)
         .count()
 }
 
-fn count_tier0_fallback_files(file_states: &[FileIndexState]) -> usize {
+pub(crate) fn count_tier0_fallback_files(file_states: &[FileIndexState]) -> usize {
     file_states
         .iter()
         .filter(|state| state.status == FileIndexStatus::Indexed && state.tier0_fallback)

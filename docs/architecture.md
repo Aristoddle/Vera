@@ -9,13 +9,13 @@
 | `vera-mcp` | MCP server (JSON-RPC over stdio) | `server.rs` |
 | `vera-serve` | HTTP inference server (OpenAI/Cohere-compatible) | `lib.rs` |
 | `eval` | Benchmark harness and metrics | `src/main.rs` |
-| `tree-sitter-{sql,proto,vue,dockerfile,astro}` | Vendored C grammars (built via `cc`) | `build.rs` |
+| `tree-sitter-{sql,proto,vue,dockerfile,astro,scss}` | Vendored C grammars (built via `cc`) | `build.rs` |
 
 ## vera-core modules
 
 ### `parsing/`: Language parsing & symbol extraction
 
-Files: `mod.rs` (public API), `languages.rs` (grammar dispatch), `extractor.rs` (AST node → SymbolType), `chunker.rs` (symbol-aware, whole-file, and Tier 0 chunking).
+Files: `mod.rs` (public API), `languages.rs` (grammar dispatch), `extractor/` (AST node → SymbolType), `chunker.rs` (symbol-aware, whole-file, and Tier 0 chunking).
 
 Data flow: file → grammar lookup → tree-sitter parse (+ diagnostics) → node classification → chunk production.
 
@@ -23,8 +23,8 @@ Data flow: file → grammar lookup → tree-sitter parse (+ diagnostics) → nod
 
 `EmbeddingProvider` trait with three implementations:
 - `ApiEmbeddingProvider`: HTTP calls to OpenAI-compatible endpoints
-- `LocalEmbeddingProvider`: ONNX Runtime inference with Jina v5 nano
-- `Model2VecProvider`: Potion Code static embeddings on CPU
+- `LocalEmbeddingProvider`: ONNX Runtime inference for opt-in Jina/custom ONNX models
+- `Model2VecProvider`: the default `potion-code-16M-v2` static embeddings on CPU
 
 `DynamicProvider` dispatches between them at runtime based on `VERA_BACKEND` or backend CLI flags.
 
@@ -34,7 +34,7 @@ Data flow: file → grammar lookup → tree-sitter parse (+ diagnostics) → nod
 2. BM25 (`bm25.rs`) and vector search (`vector.rs`) run in parallel
 3. Results fused via RRF (`hybrid.rs`, k=60). `fuse_rrf_multi` generalizes fusion to N ranked lists.
 4. Query-aware ranking and candidate shaping apply deterministic priors (`ranking.rs`, `search_service.rs`)
-5. Top candidates reranked by cross-encoder (`reranker.rs` or `local_reranker.rs`)
+5. Top candidates optionally reranked by cross-encoder (`reranker.rs` or `local_reranker.rs`)
 6. Final `Vec<SearchResult>` returned
 
 Deep search (`--deep`): `rag_fusion.rs` runs a cheap BM25 pre-filter to collect symbol names and file paths, then passes these as context hints to the LLM (`completion_client.rs`) which decomposes the query into targeted sub-queries (default 2). Sub-queries reuse the active `SearchContext`, and results merge with weighted RRF (original query gets 2x weight). Falls back to iterative symbol-following when no completion endpoint is configured.
@@ -47,7 +47,16 @@ Structural search:
 
 - `metadata.rs`: SQLite: chunk metadata, file paths, content hashes, and persisted file-level index state used for health reporting
 - `bm25.rs`: Tantivy: full-text BM25 index
-- `vector.rs`: sqlite-vec: embedding vectors
+- `vector.rs`: dual sqlite-vec and flat SIMD embedding storage. The default
+  exact scan reads `.vera/vectors.f32` through `memmap2` and uses SimSIMD L2;
+  `VERA_VECTOR_SCAN=vec0` selects sqlite-vec for rollback and ablation. The
+  sidecar uses `.vera/vectors.tombs` for deleted rowids and
+  `.vera/vectors.manifest` as its generation and size commit marker. A missing
+  or inconsistent sidecar is rebuilt by streaming `vec_chunks`. Flat updates
+  preserve SQLite rowids. Watch-mode batches write changed vector rows at their
+  rowid-derived offsets, update the bitmap, fsync the data, and publish the
+  manifest last; initial builds and recovery use atomic full-file publication.
+  True compaction is deferred until a remapping protocol is available.
 
 All stored in `.vera/` at the project root.
 
@@ -59,10 +68,10 @@ All stored in `.vera/` at the project root.
 ### Other modules
 
 - `types.rs`: `Language` enum (60+ variants), `SearchResult`, `CodeChunk`, `SymbolType`
-- `config.rs`: `RetrievalConfig`, `IndexConfig` defaults
-- `local_models.rs`: Manages local embedding presets, custom ONNX embedding configs, and ORT/model assets under the Vera data directory (XDG-compliant)
+- `config.rs`: `RetrievalConfig`, `IndexingConfig` defaults
+- `local_models/`: Manages local embedding presets, custom ONNX embedding configs, and ORT/model assets under the Vera data directory (XDG-compliant)
 - `discovery/`: File discovery with gitignore support, binary/size filtering
-- `git_scope.rs`: Resolves `--changed`, `--since`, and `--base` into exact repository-relative paths
+- `git_scope.rs`: Resolves `--changed`, `--since`, and `--base` into exact paths relative to the indexed directory, which may sit below the git repository root
 - `chunk_text.rs`: Line-boundary text splitting for byte-budget enforcement
 
 ## vera-cli
@@ -79,5 +88,5 @@ All stored in `.vera/` at the project root.
 2. Add extension mapping in `Language::from_extension()`
 3. Add grammar dependency to `vera-core/Cargo.toml`
 4. Wire grammar in `parsing/languages.rs` → `tree_sitter_grammar()`
-5. Add node classifier in `parsing/extractor.rs` → `classify_node()`
+5. Add node classifier in `parsing/extractor/classify.rs` → `classify_node()`
 6. Write tests: extension mapping, grammar loading, symbol extraction

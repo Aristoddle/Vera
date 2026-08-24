@@ -1,14 +1,15 @@
 //! `vera search <query>` — Search the indexed codebase.
 
 use anyhow::bail;
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::path::Path;
 use std::time::{Duration, Instant};
 use vera_core::config::{InferenceBackend, VeraConfig};
 use vera_core::retrieval::search_service::{SearchContext, SearchTimings};
 use vera_core::types::{SearchFilters, SearchResult};
 
-use crate::helpers::{load_runtime_config, output_results, prepare_indexed_search};
+use crate::helpers::{output_results, prepare_indexed_search, should_offer_auto_index};
+use crate::state;
 
 /// Run the `vera search <query>` command.
 #[allow(clippy::too_many_arguments)]
@@ -25,16 +26,39 @@ pub fn run(
     compact: bool,
     backend: InferenceBackend,
 ) -> anyhow::Result<()> {
-    let mut config = load_runtime_config()?;
+    let mut config = state::load_runtime_config()?;
     config.adjust_for_backend(backend);
     let result_limit = limit.unwrap_or(config.retrieval.default_limit);
-    let queries = normalize_queries(queries);
+    let queries = vera_core::retrieval::normalize_queries(queries);
 
     if queries.is_empty() {
         bail!(
             "search query is empty.\n\
              Hint: pass at least one non-empty quoted query."
         );
+    }
+
+    let cwd = std::env::current_dir()
+        .map_err(|e| anyhow::anyhow!("failed to get current directory: {e}"))?;
+    if !vera_core::indexing::index_dir(&cwd).exists()
+        && should_offer_auto_index(
+            json_output,
+            std::io::stdin().is_terminal() && std::io::stderr().is_terminal(),
+        )
+        && cliclack::confirm("No index found. Index the current directory now?")
+            .initial_value(true)
+            .interact()?
+    {
+        crate::commands::index::execute(
+            cwd.to_string_lossy().as_ref(),
+            false,
+            backend,
+            Vec::new(),
+            false,
+            false,
+            false,
+            false,
+        )?;
     }
 
     let (index_dir, filters) =
@@ -120,9 +144,8 @@ impl SearchRunner<'_> {
         intent: Option<&str>,
     ) -> anyhow::Result<(Vec<SearchResult>, SearchTimings)> {
         let overall_start = Instant::now();
-        let per_query_limit = compute_per_query_limit(self.result_limit);
+        let per_query_limit = vera_core::retrieval::multi_query_candidate_limit(self.result_limit);
         let mut timings = SearchTimings::default();
-        let mut weights = Vec::with_capacity(queries.len());
         let mut result_sets = Vec::with_capacity(queries.len());
 
         for query in queries {
@@ -133,50 +156,23 @@ impl SearchRunner<'_> {
             let (results, query_timings) = query_runner.execute_query(query, intent)?;
             merge_timings(&mut timings, &query_timings);
             result_sets.push(results);
-            weights.push(1.0);
         }
 
-        let slices: Vec<&[SearchResult]> = result_sets.iter().map(Vec::as_slice).collect();
-        let fused = vera_core::retrieval::fuse_rrf_multi_weighted(
-            &slices,
-            &weights,
-            self.config.retrieval.rrf_k,
-            self.result_limit,
-        );
-        let fused = vera_core::retrieval::search_service::augment_multi_query_exact_matches(
+        let fused = vera_core::retrieval::fuse_and_augment_multi_query(
             self.index_dir,
             queries,
-            fused,
+            &result_sets,
             self.filters,
+            self.config.retrieval.rrf_k,
+            // Augment before truncating (issue #121): pass the wider candidate
+            // limit so exact/concept matches displace fused entries on score,
+            // not by exhausting a pre-truncated window.
+            vera_core::retrieval::multi_query_candidate_limit(self.result_limit),
             self.result_limit,
         )?;
         timings.total = Some(overall_start.elapsed());
         Ok((fused, timings))
     }
-}
-
-fn normalize_queries(queries: &[String]) -> Vec<String> {
-    let mut normalized = Vec::with_capacity(queries.len());
-    let mut seen = std::collections::HashSet::new();
-
-    for query in queries {
-        let collapsed = query.split_whitespace().collect::<Vec<_>>().join(" ");
-        if collapsed.is_empty() {
-            continue;
-        }
-        if seen.insert(collapsed.to_ascii_lowercase()) {
-            normalized.push(collapsed);
-        }
-    }
-
-    normalized
-}
-
-fn compute_per_query_limit(result_limit: usize) -> usize {
-    result_limit
-        .saturating_mul(2)
-        .max(result_limit.saturating_add(10))
-        .max(20)
 }
 
 fn merge_timings(target: &mut SearchTimings, incoming: &SearchTimings) {
@@ -199,7 +195,7 @@ fn print_timings(timings: &SearchTimings) {
     let mut err = stderr.lock();
     let fmt = |d: Option<Duration>| -> String {
         match d {
-            Some(d) => format!("{}ms", d.as_millis()),
+            Some(d) => format!("{:.1}ms", d.as_micros() as f64 / 1000.0),
             None => "n/a".to_string(),
         }
     };

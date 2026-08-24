@@ -1,23 +1,17 @@
 # Vera CPU Docker image
-# Usage: docker build -f docker/Dockerfile.cpu -t vera:cpu .
+# Packages a prebuilt binary. CI builds it once per release; to build locally
+# (must be a Linux x86_64 build; on macOS/Windows use a Linux container, see docs/docker.md):
+#   ./scripts/bootstrap-vendored-grammars.sh
+#   cargo build --release -p vera-cli && mkdir -p dist && cp target/release/vera dist/
+#   docker build -f docker/Dockerfile.cpu -t vera:cpu .
 
-# --- Build stage ---
-FROM rust:1.94.1-trixie AS builder
-
-WORKDIR /build
-COPY . .
-
-RUN bash scripts/bootstrap-vendored-grammars.sh
-RUN cargo build --release -p vera-cli -p vera-mcp
-
-# --- Runtime stage ---
 FROM debian:trixie-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates curl && \
     rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /build/target/release/vera /usr/local/bin/vera
+COPY dist/vera /usr/local/bin/vera
 
 ENV VERA_LOCAL=1
 

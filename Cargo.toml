@@ -12,7 +12,7 @@ resolver = "2"
 version = "0.4.0"
 edition = "2024"
 license = "MIT"
-rust-version = "1.85"
+rust-version = "1.86"
 
 [workspace.dependencies]
 # Shared dependencies across workspace crates
@@ -30,7 +30,7 @@ tree-sitter = "0.26"
 
 # Storage
 rusqlite = { version = "0.39", features = ["bundled"] }
-tantivy = "0.25"
+tantivy = "0.26"
 
 # CLI
 clap = { version = "4", features = ["derive"] }

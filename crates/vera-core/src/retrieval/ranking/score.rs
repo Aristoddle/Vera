@@ -4,7 +4,8 @@ use crate::chunk_text::file_name;
 use crate::corpus::{ContentClass, classify_content};
 use crate::retrieval::query_classifier::QueryType;
 use crate::retrieval::query_utils::{
-    content_declares_public_symbol, content_starts_with_impl, path_depth, trim_query_token,
+    content_declares_public_symbol, content_starts_with_impl, file_stem, path_depth,
+    trim_query_token,
 };
 use crate::types::{SearchFilters, SearchResult, SymbolType};
 use std::collections::HashMap;
@@ -12,12 +13,83 @@ use std::collections::HashMap;
 use super::query::*;
 use super::*;
 
+// Ranking signal weights and thresholds for deterministic result shaping.
+/// Per-file score-sum coherence, boosting only the file's best chunk.
+pub(super) const COHERENCE_WEIGHT: f64 = 0.4;
+/// Coherence weight for natural-language queries.
+pub(super) const COHERENCE_WEIGHT_NL: f64 = 0.4;
+/// Pool-relative filename and parent-directory keyword boost scale.
+pub(super) const KEYWORD_PATH_WEIGHT: f64 = 1.0;
+/// Minimum coverage ratio required before applying the content boost.
+pub(super) const COVERAGE_MIN_RATIO: f64 = 0.5;
+/// Content coverage boost weight.
+pub(super) const COVERAGE_WEIGHT: f64 = 2.4;
+/// Coverage weight for multi-word identifier queries.
+pub(super) const COVERAGE_WEIGHT_IDENT: f64 = 2.0;
+/// Coverage curve exponent. Values above 1 damp partial coverage while
+/// preserving the full-coverage signal.
+pub(super) const COVERAGE_EXPONENT: f64 = 2.0;
+/// Lower coverage weight for multi-facet queries with explicit conjunctions.
+pub(super) const COVERAGE_WEIGHT_CONJ: f64 = 1.6;
+
+/// Coverage weight for the query: strongest for single-topic NL questions,
+/// gentler when the query is multi-facet (explicit conjunction) or names a
+/// symbol (symbol-definition signals should dominate there), and for
+/// Identifier queries which have symbol-specific signals already.
+fn coverage_weight(features: &QueryFeatures) -> f64 {
+    if features.query_type != QueryType::NaturalLanguage {
+        return COVERAGE_WEIGHT_IDENT;
+    }
+    if features.has_conjunction || !features.embedded_symbols.is_empty() {
+        COVERAGE_WEIGHT_CONJ
+    } else {
+        COVERAGE_WEIGHT
+    }
+}
+
+/// Coverage of query content words in the chunk. Returns the covered
+/// fraction when the signal applies and clears the minimum ratio.
+fn coverage_ratio(features: &QueryFeatures, content: &str) -> Option<f64> {
+    let coverage_keywords: Vec<&String> = features.raw_keywords.iter().collect();
+    if coverage_keywords.len() < 2 {
+        return None;
+    }
+    let content_lower = content.to_ascii_lowercase();
+    let covered = coverage_keywords
+        .iter()
+        .filter(|kw| content_covers_keyword(&content_lower, kw))
+        .count();
+    let ratio = covered as f64 / coverage_keywords.len() as f64;
+    (ratio >= COVERAGE_MIN_RATIO).then_some(ratio)
+}
+
+/// Inflection-tolerant coverage. Queries inflect verbs ("parsing")
+/// while code prose uses other forms ("parses"); stripping a trailing
+/// "ing"/"ed"/"s" (4+ char stem kept) recovers those matches.
+fn content_covers_keyword(content_lower: &str, keyword: &str) -> bool {
+    if content_lower.contains(keyword) {
+        return true;
+    }
+    for suffix in ["ing", "ed", "s"] {
+        if let Some(stem) = keyword.strip_suffix(suffix) {
+            if stem.len() >= 4 && content_lower.contains(stem) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Embedded-symbol content-definition weight for natural-language queries.
+pub(super) const CONTENT_SYMBOL_WEIGHT_EMBEDDED: f64 = 1.5;
+/// Content-definition weight for identifier queries.
+pub(super) const CONTENT_SYMBOL_WEIGHT_IDENT: f64 = 3.0;
+
 pub(super) fn score_prior(
     features: &QueryFeatures,
     result: &SearchResult,
     stage: RankingStage,
     filters: &SearchFilters,
-    same_file_hits: usize,
 ) -> f64 {
     let stage_weight = match stage {
         RankingStage::Initial => 1.0,
@@ -79,6 +151,7 @@ pub(super) fn score_prior(
             // Symbol name matches the query identifier. This is the strongest
             // signal: developers searching "Axios" want the Axios class definition.
             let is_definition_chunk = is_definition_symbol(result.symbol_type);
+            let stem_aligns = file_stem(&result_filename).eq_ignore_ascii_case(identifier);
             let base_symbol_bonus = if features.query_word_count <= 2 {
                 if is_definition_chunk { 1.6 } else { 0.7 }
             } else if is_definition_chunk {
@@ -101,7 +174,7 @@ pub(super) fn score_prior(
                 bonus += stage_weight * 0.28;
             }
             // Extra boost when the file stem also matches (e.g., Axios in Axios.js).
-            if file_stem(&result_filename).eq_ignore_ascii_case(identifier) {
+            if stem_aligns {
                 bonus += stage_weight * 0.45;
             }
         } else if file_stem(&result_filename).eq_ignore_ascii_case(identifier) {
@@ -110,47 +183,6 @@ pub(super) fn score_prior(
             bonus += stage_weight * 0.28;
         } else if identifier_matches_parent_dir(identifier, &file_path) {
             bonus += stage_weight * 0.22;
-        }
-    }
-
-    let stem_overlap = file_stem(&result_filename);
-    if features.query_type == QueryType::NaturalLanguage
-        && !features.keywords.is_empty()
-        && !features.wants_config_paths
-        && allow_filename_semantic_bonus
-    {
-        let normalized_stem = normalize_token(stem_overlap);
-        if features.keywords.contains(&normalized_stem)
-            || features
-                .keywords
-                .iter()
-                .any(|keyword| shares_keyword_stem(&normalized_stem, keyword))
-        {
-            bonus += stage_weight * 0.6;
-        } else {
-            // Proportional stem matching: split the file stem into sub-tokens
-            // and count how many query keywords match. Scale bonus by match ratio.
-            // "BeanDeserializer" → ["bean", "deserializer"], query "bean deserialization"
-            // matches 2/2 → full bonus. Require 4+ char parts to avoid noise
-            // from short stems like "mod", "run".
-            let stem_parts = identifier_stems(stem_overlap);
-            let long_parts: Vec<_> = stem_parts.iter().filter(|p| p.len() >= 4).collect();
-            if long_parts.len() >= 2 {
-                let matched = features
-                    .keywords
-                    .iter()
-                    .filter(|kw| {
-                        kw.len() >= 4
-                            && long_parts
-                                .iter()
-                                .any(|part| *part == kw.as_str() || shares_keyword_stem(part, kw))
-                    })
-                    .count();
-                if matched >= 2 {
-                    let ratio = matched as f64 / features.keywords.len().max(1) as f64;
-                    bonus += stage_weight * 0.6 * ratio.min(1.0);
-                }
-            }
         }
     }
 
@@ -164,10 +196,6 @@ pub(super) fn score_prior(
             if symbol_bonus > 0.0 {
                 bonus += stage_weight * symbol_bonus;
             }
-        }
-        let parent_bonus = parent_dir_keyword_bonus(&file_path, &features.keywords);
-        if parent_bonus > 0.0 {
-            bonus += stage_weight * parent_bonus;
         }
     }
 
@@ -263,63 +291,35 @@ pub(super) fn score_prior(
         bonus += stage_weight * 0.3;
     }
 
-    // Boost chunks whose symbol name matches an embedded CamelCase identifier
-    // in the query. "How does StateManager handle transitions" should boost
-    // chunks with symbol_name "StateManager" or file stem "state_manager".
-    if !features.embedded_symbols.is_empty() {
-        if let Some(symbol_name) = result.symbol_name.as_deref() {
-            let sym_lower = symbol_name.to_ascii_lowercase();
-            let matched = features
-                .embedded_symbols
-                .iter()
-                .any(|es| sym_lower == *es || sym_lower.contains(es.as_str()));
-            if matched {
-                let def_bonus = if is_definition_symbol(result.symbol_type) {
-                    1.0
-                } else {
-                    0.5
-                };
-                bonus += stage_weight * def_bonus;
-            }
+    // Content keyword coverage: multi-concept NL questions are answered by
+    // the chunk that mentions every concept, and BM25's frequency saturation
+    // can bury such a chunk under single-concept keyword-dense noise. Reward
+    // the fraction of distinct query keywords the chunk content covers.
+    // Explicit config-path requests use path intent instead of content
+    // coverage.
+    if !features.wants_config_paths {
+        if let Some(ratio) = coverage_ratio(features, &result.content) {
+            bonus += stage_weight * coverage_weight(features) * ratio.powf(COVERAGE_EXPONENT);
         }
-        // Also check file stem against embedded symbols.
-        let stem_lower = file_stem(&result_filename).to_ascii_lowercase();
-        if stem_lower.len() >= 4 {
-            let stem_matched = features.embedded_symbols.iter().any(|es| {
-                stem_lower == *es
-                    || es.starts_with(&stem_lower)
-                    || stem_lower.starts_with(es.as_str())
-            });
-            if stem_matched {
-                bonus += stage_weight * 0.4;
-            }
-        }
-    }
-
-    if same_file_hits >= 2 && features.query_type == QueryType::NaturalLanguage {
-        let coherence = ((same_file_hits.min(5) - 1) as f64 * 0.15).min(0.60);
-        bonus += stage_weight * coherence;
     }
 
     // --- Noise penalties ---
-    // These are strong enough that noisy content classes rarely outrank source.
-    // Penalties stack: a test file inside tests/ gets penalized twice.
     if !features.wants_test_paths && matches!(role, ContentClass::Test) {
         bonus -= stage_weight * 0.95;
     }
     if matches!(role, ContentClass::Archive) {
-        bonus += if features.wants_archive_paths {
-            stage_weight * 0.18
+        if features.wants_archive_paths {
+            bonus += stage_weight * 0.18;
         } else {
-            -stage_weight * 0.85
-        };
+            bonus -= stage_weight * 0.85;
+        }
     }
     if matches!(role, ContentClass::Runtime) {
-        bonus += if features.wants_runtime_paths {
-            stage_weight * 0.95
+        if features.wants_runtime_paths {
+            bonus += stage_weight * 0.95;
         } else {
-            -stage_weight * 0.72
-        };
+            bonus -= stage_weight * 0.72;
+        }
     } else if features.wants_runtime_paths {
         bonus -= stage_weight * 0.24;
     }
@@ -437,58 +437,6 @@ pub(super) fn requested_versions(tokens: &[String]) -> Vec<String> {
         .collect()
 }
 
-pub(super) fn file_relevance_counts(
-    features: &QueryFeatures,
-    results: &[SearchResult],
-) -> HashMap<String, usize> {
-    let mut counts = HashMap::new();
-    for result in results {
-        if result_matches_query_features(features, result) {
-            *counts.entry(result.file_path.clone()).or_insert(0) += 1;
-        }
-    }
-    counts
-}
-
-pub(super) fn result_matches_query_features(
-    features: &QueryFeatures,
-    result: &SearchResult,
-) -> bool {
-    if let Some(identifier) = features.exact_identifier.as_deref() {
-        if result
-            .symbol_name
-            .as_deref()
-            .is_some_and(|name| name.eq_ignore_ascii_case(identifier))
-            || file_stem(file_name(&result.file_path)).eq_ignore_ascii_case(identifier)
-        {
-            return true;
-        }
-    }
-
-    if features.keywords.is_empty() {
-        return false;
-    }
-
-    let path = result.file_path.to_ascii_lowercase();
-    let content = result.content.to_ascii_lowercase();
-    let symbol_stems = result
-        .symbol_name
-        .as_deref()
-        .map(identifier_stems)
-        .unwrap_or_default();
-    let filename_stems = identifier_stems(file_stem(file_name(&path)));
-    let parent_stems = parent_dir_stems(&path);
-
-    features.keywords.iter().any(|keyword| {
-        content.contains(keyword)
-            || symbol_stems
-                .iter()
-                .chain(filename_stems.iter())
-                .chain(parent_stems.iter())
-                .any(|stem| stem == keyword || shares_keyword_stem(stem, keyword))
-    })
-}
-
 /// Maximum chunks from the same file before saturation decay kicks in.
 pub(super) const FILE_SATURATION_THRESHOLD: usize = 1;
 
@@ -496,6 +444,388 @@ pub(super) const FILE_SATURATION_THRESHOLD: usize = 1;
 /// 0.35 means each successive same-file chunk keeps 35% of its score, pushing
 /// it below results from other files in most cases.
 pub(super) const FILE_SATURATION_DECAY: f64 = 0.35;
+
+/// File coherence: files whose chunks collectively score well are
+/// likely the file the user needs. Sum each file's (clamped) combined scores
+/// and boost only the file's best chunk, proportional to the file's share of
+/// the strongest file. Boosting every chunk (count-based) lets one file flood
+/// the window; boosting only the best surfaces the cluster without the flood.
+pub(super) fn apply_coherence_boost(
+    features: &QueryFeatures,
+    scores: &mut [f64],
+    results: &[SearchResult],
+    max_score: f64,
+) {
+    // Identifier queries benefit from a stronger coherence weight; for
+    // natural-language questions it costs intent ordering.
+    let weight = if features.query_type == QueryType::NaturalLanguage {
+        COHERENCE_WEIGHT_NL
+    } else {
+        COHERENCE_WEIGHT
+    };
+    let updates: Vec<(usize, f64)> = {
+        let mut file_sum: HashMap<&str, f64> = HashMap::new();
+        for (score, result) in scores.iter().zip(results) {
+            *file_sum.entry(result.file_path.as_str()).or_default() += score.max(0.0);
+        }
+        let max_file_sum = file_sum.values().copied().fold(0.0_f64, f64::max).max(1e-6);
+
+        let mut best_chunk: HashMap<&str, usize> = HashMap::new();
+        for (i, (score, result)) in scores.iter().zip(results).enumerate() {
+            best_chunk
+                .entry(result.file_path.as_str())
+                .and_modify(|j| {
+                    if *score > scores[*j] {
+                        *j = i;
+                    }
+                })
+                .or_insert(i);
+        }
+
+        best_chunk
+            .into_iter()
+            .map(|(path, i)| {
+                let boost = weight
+                    * max_score
+                    * (file_sum.get(path).copied().unwrap_or(0.0) / max_file_sum);
+                (i, boost)
+            })
+            .collect()
+    };
+
+    for (i, boost) in updates {
+        scores[i] += boost;
+    }
+}
+
+/// Pool-relative keyword path boost: when query keywords match a file's stem
+/// or its immediate parent directory (exact or prefix, 3+ chars), every chunk
+/// of that file gains `max_score * match_ratio`. Scaling by the pool's best
+/// score keeps the signal proportional to retrieval confidence, and the
+/// match-ratio form rewards files named after the whole query over files
+/// matching a single incidental keyword.
+pub(super) fn apply_keyword_path_boost(
+    features: &QueryFeatures,
+    scores: &mut [f64],
+    results: &[SearchResult],
+    max_score: f64,
+) {
+    // Explicit runtime intent overrides filename keyword inference: a user
+    // asking for the runtime extract does not want the like-named source file
+    // boosted past it. (Other intent flags are not gated: e.g. "compat" is
+    // both a content-class flag and a legitimate path keyword, and the
+    // role gate below already excludes non-source files from the boost.)
+    if features.query_type != QueryType::NaturalLanguage
+        || features.wants_config_paths
+        || features.wants_runtime_paths
+    {
+        return;
+    }
+    if features.keywords.is_empty() {
+        return;
+    }
+    let keywords: Vec<&str> = features
+        .keywords
+        .iter()
+        .map(String::as_str)
+        .filter(|kw| kw.len() > 2)
+        .collect();
+    if keywords.is_empty() {
+        return;
+    }
+
+    let mut bonuses = Vec::with_capacity(results.len());
+    {
+        let mut bonus_cache: HashMap<&str, f64> = HashMap::new();
+        for result in results {
+            let bonus = *bonus_cache
+                .entry(result.file_path.as_str())
+                .or_insert_with(|| {
+                    let role =
+                        classify_content(&result.file_path, result.language, &result.content);
+                    if !matches!(
+                        role,
+                        ContentClass::Source | ContentClass::Config | ContentClass::Unknown
+                    ) {
+                        return 0.0;
+                    }
+                    let ratio = keyword_path_match_ratio(&keywords, &result.file_path);
+                    if ratio >= 0.05 {
+                        KEYWORD_PATH_WEIGHT * max_score * ratio
+                    } else {
+                        0.0
+                    }
+                });
+            bonuses.push(bonus);
+        }
+    }
+    for (score, bonus) in scores.iter_mut().zip(bonuses) {
+        *score += bonus;
+    }
+}
+
+/// Pool-relative content-based symbol definition boost. A chunk whose
+/// text actually defines the queried symbol ("class Session",
+/// "CREATE TABLE sessions") is the definition site regardless of what symbol
+/// metadata extraction produced. Symbol queries scale the boost by
+/// 3.0 * pool max; embedded symbols in NL queries get half strength (the
+/// symbol may be incidental to the question). The file named after the
+/// symbol earns the 1.5x stem-aligned tier.
+pub(super) fn apply_content_symbol_boost(
+    features: &QueryFeatures,
+    scores: &mut [f64],
+    results: &[SearchResult],
+    max_score: f64,
+) {
+    let targets: Vec<(String, f64)> = match features.query_type {
+        QueryType::Identifier => {
+            let Some(name) = features.exact_identifier_case.as_deref() else {
+                return;
+            };
+            // Match the final segment of qualified names ("std::io::Error" ->
+            // "Error"); keep the full form as a fallback name.
+            let short = name
+                .rsplit([':', '\\', '.'])
+                .next()
+                .unwrap_or(name)
+                .to_string();
+            let mut targets = vec![(short, CONTENT_SYMBOL_WEIGHT_IDENT)];
+            if !targets[0].0.eq_ignore_ascii_case(name) {
+                targets.push((name.to_string(), CONTENT_SYMBOL_WEIGHT_IDENT));
+            }
+            targets
+        }
+        QueryType::NaturalLanguage => {
+            if features.embedded_symbols.is_empty() {
+                return;
+            }
+            features
+                .embedded_symbols
+                .iter()
+                .map(|symbol| (symbol.clone(), CONTENT_SYMBOL_WEIGHT_EMBEDDED))
+                .collect()
+        }
+    };
+
+    let identifier_query = features.query_type == QueryType::Identifier;
+    for (score, result) in scores.iter_mut().zip(results) {
+        let mut boost = 0.0_f64;
+        for (name, unit) in &targets {
+            // Backstop only: chunks whose symbol metadata already matches the
+            // identifier are handled by the metadata symbol boost. The content
+            // scan covers extraction gaps (SQL DDL, multi-symbol chunks).
+            if identifier_query
+                && result
+                    .symbol_name
+                    .as_deref()
+                    .is_some_and(|s| s.eq_ignore_ascii_case(name))
+            {
+                continue;
+            }
+            if content_defines_symbol(&result.content, name) {
+                let filename = file_name(&result.file_path).to_ascii_lowercase();
+                let stem = file_stem(&filename);
+                let stem_matched = stem_matches_symbol(stem, name);
+                // Identifier lookups get a stronger stem-aligned tier, while
+                // unrestricted content matching still covers extraction gaps.
+                let tier = if stem_matched { 1.5 } else { 1.0 };
+                boost = boost.max(unit * max_score * tier);
+            }
+        }
+        *score += boost;
+    }
+}
+
+/// Stem-vs-symbol match: exact, underscore-normalised, or plural-adjusted.
+fn stem_matches_symbol(stem: &str, name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    let stem_norm = stem.replace('_', "");
+    stem == name
+        || stem_norm == name
+        || stem.trim_end_matches('s') == name
+        || stem_norm.trim_end_matches('s') == name
+}
+
+/// General definition keywords, case-sensitive. Matching is done on the
+/// original line: code keywords are lowercase in practice, and
+/// case-insensitive matching misfires on prose like "Class" or "Module".
+const DEF_KEYWORDS: &[&str] = &[
+    "abstract class",
+    "data class",
+    "class",
+    "module",
+    "defmodule",
+    "def",
+    "interface",
+    "struct",
+    "enum",
+    "trait",
+    "type",
+    "func",
+    "function",
+    "object",
+    "fn",
+    "fun",
+    "package",
+    "namespace",
+    "protocol",
+    "record",
+    "typedef",
+];
+
+/// SQL DDL definition keywords, matched case-insensitively.
+const SQL_DEF_KEYWORDS: &[&str] = &[
+    "create table",
+    "create view",
+    "create procedure",
+    "create function",
+];
+
+/// Does the chunk content define `symbol`? General keywords match
+/// case-sensitively, SQL DDL case-insensitively (conventionally uppercase).
+fn content_defines_symbol(content: &str, symbol: &str) -> bool {
+    if symbol.len() < 2 {
+        return false;
+    }
+    // Quick reject: the symbol must appear in the chunk at all.
+    let symbol_lower;
+    if !content.contains(symbol) {
+        symbol_lower = symbol.to_ascii_lowercase();
+        if !content.to_ascii_lowercase().contains(&symbol_lower) {
+            return false;
+        }
+    }
+    let symbol_lower = symbol.to_ascii_lowercase();
+    for line in content.lines() {
+        if line_defines_symbol(line, symbol, false, DEF_KEYWORDS) {
+            return true;
+        }
+        if line.to_ascii_lowercase().contains(&symbol_lower)
+            && line_defines_symbol(
+                &line.to_ascii_lowercase(),
+                &symbol_lower,
+                true,
+                SQL_DEF_KEYWORDS,
+            )
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Scan a line for `keyword symbol` definition sites, e.g. "class Session"
+/// or "defmodule Phoenix.Router". Keyword must start the line or follow
+/// whitespace.
+fn line_defines_symbol(
+    line: &str,
+    symbol: &str,
+    case_insensitive: bool,
+    keywords: &[&str],
+) -> bool {
+    let mut start = 0;
+    while start < line.len() {
+        let mut earliest: Option<(usize, &str)> = None;
+        for keyword in keywords {
+            let mut from = start;
+            while let Some(pos) = line[from..].find(keyword) {
+                let abs = from + pos;
+                let left_ok = abs == 0 || line.as_bytes()[abs - 1].is_ascii_whitespace();
+                if left_ok {
+                    earliest = Some(match earliest {
+                        Some((prev, kw)) if prev <= abs => (prev, kw),
+                        _ => (abs, keyword),
+                    });
+                    break;
+                }
+                from = abs + 1;
+            }
+        }
+        let Some((pos, keyword)) = earliest else {
+            return false;
+        };
+        if rest_starts_with_symbol(&line[pos + keyword.len()..], symbol, case_insensitive) {
+            return true;
+        }
+        start = pos + keyword.len();
+    }
+    false
+}
+
+/// Check whether the text after a definition keyword names `symbol`,
+/// skipping namespace qualifiers ("defmodule Phoenix.Router" defines Router).
+/// The symbol must end at a delimiter so "Session" does not match
+/// "SessionStore".
+fn rest_starts_with_symbol(rest: &str, symbol: &str, case_insensitive: bool) -> bool {
+    let mut text = rest.trim_start();
+    loop {
+        let ident_len = text
+            .bytes()
+            .take_while(|b| b.is_ascii_alphanumeric() || *b == b'_')
+            .count();
+        if ident_len == 0 {
+            return false;
+        }
+        let (ident, after) = text.split_at(ident_len);
+        if let Some(stripped) = after.strip_prefix("::") {
+            text = stripped.trim_start();
+            continue;
+        }
+        if let Some(stripped) = after.strip_prefix('.') {
+            if stripped
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            {
+                text = stripped.trim_start();
+                continue;
+            }
+        }
+        let matches = if case_insensitive {
+            ident.eq_ignore_ascii_case(symbol)
+        } else {
+            ident == symbol
+        };
+        return matches
+            && (after.is_empty()
+                || after
+                    .chars()
+                    .next()
+                    .is_some_and(|c| matches!(c, ' ' | '\t' | '<' | '(' | '{' | ':' | '[' | ';')));
+    }
+}
+
+/// Fraction of query keywords that match the file stem's or immediate parent
+/// directory's sub-tokens (exact, or prefix with a 3-char minimum).
+fn keyword_path_match_ratio(keywords: &[&str], file_path: &str) -> f64 {
+    if keywords.is_empty() {
+        return 0.0;
+    }
+    let lowered = file_path.to_ascii_lowercase();
+    let stem = file_stem(file_name(&lowered));
+    let mut parts = identifier_stems(stem);
+    if let Some((dirs, _)) = lowered.rsplit_once('/') {
+        if let Some(parent) = dirs.rsplit('/').next() {
+            parts.extend(identifier_stems(parent));
+        }
+    }
+    if parts.is_empty() {
+        return 0.0;
+    }
+
+    let matched = keywords
+        .iter()
+        .filter(|kw| {
+            parts.iter().any(|part| {
+                part == *kw
+                    || (kw.len() >= 3 && part.starts_with(*kw))
+                    || (part.len() >= 3 && kw.starts_with(part.as_str()))
+            })
+        })
+        .count();
+
+    (matched as f64 / keywords.len() as f64).min(1.0)
+}
 
 pub(super) fn diversify_by_file(results: Vec<SearchResult>) -> Vec<SearchResult> {
     if results.len() <= 1 {
@@ -601,13 +931,6 @@ pub(super) fn path_matches_fragment(path: &str, fragment: &str) -> bool {
     path == fragment || path.ends_with(fragment) || path.contains(fragment)
 }
 
-pub(super) fn file_stem(filename: &str) -> &str {
-    filename
-        .rsplit_once('.')
-        .map(|(stem, _)| stem)
-        .unwrap_or(filename)
-}
-
 /// Check if a file stem shares a 6+ char prefix with an identifier.
 /// Strips namespace prefixes (e.g. "sinatra::showexceptions" → "showexceptions")
 /// so that "format" matches "formatter" but "sinatra" doesn't match "sinatra::ShowExceptions".
@@ -625,30 +948,6 @@ pub(super) fn identifier_matches_parent_dir(identifier: &str, path: &str) -> boo
     parent_dir_stems(path)
         .iter()
         .any(|stem| stem.eq_ignore_ascii_case(identifier))
-}
-
-pub(super) fn parent_dir_keyword_bonus(path: &str, keywords: &[String]) -> f64 {
-    let stems = parent_dir_stems(path);
-    if stems.is_empty() || keywords.is_empty() {
-        return 0.0;
-    }
-
-    let matched = keywords
-        .iter()
-        .filter(|keyword| {
-            stems
-                .iter()
-                .any(|stem| stem == keyword.as_str() || shares_keyword_stem(stem, keyword))
-        })
-        .count();
-
-    if matched == 0 {
-        return 0.0;
-    }
-
-    // Scale bonus by how many query keywords match the directory hierarchy.
-    let ratio = matched as f64 / keywords.len() as f64;
-    0.15 + ratio * 0.35
 }
 
 pub(super) fn parent_dir_stems(path: &str) -> Vec<String> {
@@ -971,7 +1270,8 @@ pub(super) fn content_defines_query_keyword(content: &str, keywords: &[String]) 
     for line in content.lines().take(5) {
         let trimmed = line.trim();
         for prefix in DEFINITION_PREFIXES {
-            if let Some(rest) = trimmed.strip_prefix(prefix) {
+            let rest = trimmed.strip_prefix(*prefix);
+            if let Some(rest) = rest {
                 // Extract the symbol name after the keyword.
                 let symbol: String = rest
                     .chars()

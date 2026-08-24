@@ -263,10 +263,6 @@ fn default_adaptive_batch_scaler_state_version() -> u32 {
 }
 
 impl LocalEmbeddingProvider {
-    pub async fn new_with_ep(ep: OnnxExecutionProvider) -> Result<Self, EmbeddingError> {
-        Self::new_with_ep_and_mem_limit(ep, 0).await
-    }
-
     pub async fn new_with_ep_and_mem_limit(
         ep: OnnxExecutionProvider,
         gpu_mem_limit_mb: u64,
@@ -274,6 +270,7 @@ impl LocalEmbeddingProvider {
         let base_config = LocalEmbeddingModelConfig::from_env().map_err(api_err)?;
         let mut config = base_config.clone();
         config.adjust_for_gpu(ep);
+        let ep = crate::local_models::embedding_execution_provider(ep, &config);
         let mut batch_scaler = if ep == OnnxExecutionProvider::Cpu {
             None
         } else {
@@ -342,6 +339,8 @@ impl LocalEmbeddingProvider {
     }
 
     pub fn probe_provider_registration(ep: OnnxExecutionProvider) -> Result<()> {
+        let config = LocalEmbeddingModelConfig::from_env()?;
+        let ep = crate::local_models::embedding_execution_provider(ep, &config);
         let builder = ort::session::builder::SessionBuilder::new()?
             .with_optimization_level(GraphOptimizationLevel::Level3)?
             .with_intra_threads(1)?;
@@ -352,6 +351,7 @@ impl LocalEmbeddingProvider {
     pub fn probe_session(ep: OnnxExecutionProvider) -> Result<()> {
         let mut config = LocalEmbeddingModelConfig::from_env()?;
         config.adjust_for_gpu(ep);
+        let ep = crate::local_models::embedding_execution_provider(ep, &config);
         let ort_path = crate::local_models::ort_library_path_for_ep(ep)?;
         crate::local_models::ensure_ort_runtime(Some(&ort_path))?;
         let asset_paths = config.cached_asset_paths()?;
@@ -362,6 +362,7 @@ impl LocalEmbeddingProvider {
     pub fn probe_inference(ep: OnnxExecutionProvider) -> Result<()> {
         let mut config = LocalEmbeddingModelConfig::from_env()?;
         config.adjust_for_gpu(ep);
+        let ep = crate::local_models::embedding_execution_provider(ep, &config);
         let ort_path = crate::local_models::ort_library_path_for_ep(ep)?;
         crate::local_models::ensure_ort_runtime(Some(&ort_path))?;
         let asset_paths = config.cached_asset_paths()?;
@@ -500,6 +501,11 @@ impl LocalEmbeddingProvider {
                             }
                         }
                         emb
+                    }
+                    LocalEmbeddingPooling::LastToken => {
+                        let last = last_unpadded_index(&attention_mask, i, max_len);
+                        let start = i * seq_len * dim + last * dim;
+                        data[start..start + dim].to_vec()
                     }
                 };
                 let mut emb = emb;
@@ -795,6 +801,17 @@ fn load_tokenizer(tokenizer_path: std::path::PathBuf, max_length: usize) -> Resu
     Ok(tokenizer)
 }
 
+/// Index of the final unpadded token in row `row` of `attention_mask`.
+///
+/// Scanning for the highest set position rather than counting ones keeps this
+/// correct under both left and right padding. An all-padding row yields 0.
+fn last_unpadded_index(attention_mask: &ndarray::Array2<i64>, row: usize, len: usize) -> usize {
+    (0..len)
+        .rev()
+        .find(|&j| attention_mask[[row, j]] == 1)
+        .unwrap_or(0)
+}
+
 fn normalize_embedding(embedding: &mut [f32]) {
     let norm: f32 = embedding
         .iter()
@@ -879,6 +896,10 @@ fn run_probe_inference(session: &mut Session, tokenizer: &Tokenizer) -> Result<(
 impl EmbeddingProvider for LocalEmbeddingProvider {
     fn expected_dim(&self) -> Option<usize> {
         Some(self.config.embedding_dim)
+    }
+
+    fn prepare_document_text(&self, document: &str) -> String {
+        self.config.document_text(document)
     }
 
     fn prepare_query_text(&self, query: &str) -> String {
@@ -985,6 +1006,43 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    /// Right padding: the model's real final token sits before the pad run.
+    #[test]
+    fn last_unpadded_index_right_padded() {
+        let mask = ndarray::arr2(&[[1i64, 1, 1, 0, 0]]);
+        assert_eq!(last_unpadded_index(&mask, 0, 5), 2);
+    }
+
+    /// Left padding: the real final token is the last column. Counting set
+    /// bits would answer 2 here, which is a pad position.
+    #[test]
+    fn last_unpadded_index_left_padded() {
+        let mask = ndarray::arr2(&[[0i64, 0, 1, 1, 1]]);
+        assert_eq!(last_unpadded_index(&mask, 0, 5), 4);
+    }
+
+    #[test]
+    fn last_unpadded_index_full_row_and_single_token() {
+        assert_eq!(
+            last_unpadded_index(&ndarray::arr2(&[[1i64, 1, 1]]), 0, 3),
+            2
+        );
+        assert_eq!(last_unpadded_index(&ndarray::arr2(&[[1i64]]), 0, 1), 0);
+    }
+
+    #[test]
+    fn last_unpadded_index_is_per_row() {
+        let mask = ndarray::arr2(&[[1i64, 1, 0, 0], [1, 1, 1, 1]]);
+        assert_eq!(last_unpadded_index(&mask, 0, 4), 1);
+        assert_eq!(last_unpadded_index(&mask, 1, 4), 3);
+    }
+
+    #[test]
+    fn last_unpadded_index_all_padding_falls_back_to_zero() {
+        let mask = ndarray::arr2(&[[0i64, 0, 0]]);
+        assert_eq!(last_unpadded_index(&mask, 0, 3), 0);
+    }
+
     #[tokio::test]
     async fn test_local_embedding_provider() {
         // Skip if ONNX Runtime is not installed (requires libonnxruntime.so)
@@ -993,9 +1051,10 @@ mod tests {
             return;
         }
         // Since test downloads ~150MB, this could take a moment.
-        let provider = LocalEmbeddingProvider::new_with_ep(OnnxExecutionProvider::Cpu)
-            .await
-            .unwrap();
+        let provider =
+            LocalEmbeddingProvider::new_with_ep_and_mem_limit(OnnxExecutionProvider::Cpu, 0)
+                .await
+                .unwrap();
         let texts = vec!["Hello world".to_string(), "Another test".to_string()];
         let embeddings = provider.embed_batch(&texts).await.unwrap();
         assert_eq!(embeddings.len(), 2);

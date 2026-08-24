@@ -5,7 +5,9 @@ description: Semantic code search, exact regex search, structural intent search,
 
 # Vera
 
-Semantic code search CLI. Combines BM25 keyword matching with vector similarity and cross-encoder reranking to return the most relevant code for a natural-language query.
+Semantic code search CLI. Combines BM25 keyword matching with vector similarity and optional cross-encoder reranking to return the most relevant code for a natural-language query.
+
+The default embedding model is `minishlab/potion-code-16M-v2`, a static embedding model that runs locally on CPU on any supported machine; no GPU or ONNX Runtime needed. Reranking is opt-in through `retrieval.reranking_enabled` and is off by default.
 
 ## Workflow
 

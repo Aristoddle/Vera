@@ -3,6 +3,8 @@
 //! Stores chunk metadata (file path, line ranges, language, symbol info)
 //! in a SQLite database. Uses WAL mode for concurrent read performance.
 
+use std::collections::HashMap;
+
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -103,6 +105,44 @@ pub struct LanguageHealthStat {
     pub files_with_parse_failures: u64,
 }
 
+/// Case-insensitive lookup queries, held as constants so the query-plan tests
+/// assert against the exact text the production methods run.
+///
+/// An expression index only applies when the index expression matches the
+/// query text. A test that asserted on its own copy of the SQL would keep
+/// passing after the original drifted, and the planner would silently fall
+/// back to a full scan with nothing failing.
+const SQL_CHUNKS_BY_SYMBOL_NAME: &str =
+    "SELECT id, file_path, line_start, line_end, content, language,
+                        symbol_type, symbol_name
+                 FROM chunks
+                 WHERE lower(symbol_name) = lower(?1)
+                 ORDER BY file_path, line_start";
+
+const SQL_FIND_CALLERS: &str = "SELECT file_path, line, caller FROM [references]
+                 WHERE lower(callee) = lower(?1)
+                 ORDER BY file_path, line";
+
+const SQL_FIND_CALLEES: &str = "SELECT file_path, line, callee FROM [references]
+                 WHERE lower(caller) = lower(?1)
+                 ORDER BY file_path, line";
+
+const SQL_FIND_TYPE_RELATIONS: &str = "SELECT file_path, line, owner, target, kind
+                 FROM type_relations
+                 WHERE lower(target) = lower(?1)
+                 ORDER BY file_path, line, owner";
+
+const SQL_FIND_DEAD_SYMBOLS: &str = "SELECT c.symbol_name, c.file_path, c.line_start, c.symbol_type
+                 FROM chunks c
+                 WHERE c.symbol_name IS NOT NULL
+                   AND c.symbol_type IN ('function', 'method')
+                   AND lower(c.symbol_name) NOT IN ('main', 'new', 'default', 'drop', 'clone', 'fmt', 'from', 'into', 'deref', 'init', 'setup', 'teardown')
+                   AND NOT EXISTS (
+                       SELECT 1 FROM [references] r
+                       WHERE lower(r.callee) = lower(c.symbol_name)
+                   )
+                 ORDER BY c.file_path, c.line_start";
+
 /// SQLite-backed metadata store for chunk attributes.
 pub struct MetadataStore {
     conn: Connection,
@@ -153,7 +193,12 @@ impl MetadataStore {
                 CREATE INDEX IF NOT EXISTS idx_chunks_language
                     ON chunks(language);
                 CREATE INDEX IF NOT EXISTS idx_chunks_symbol_name
-                    ON chunks(symbol_name);",
+                    ON chunks(symbol_name);
+                -- `get_chunks_by_symbol_name` matches on `lower(symbol_name)`.
+                -- An index on the bare column cannot serve a predicate over an
+                -- expression, so without this the lookup scans the table.
+                CREATE INDEX IF NOT EXISTS idx_chunks_symbol_name_lower
+                    ON chunks(lower(symbol_name));",
             )
             .context("failed to create chunks table")?;
 
@@ -208,7 +253,14 @@ impl MetadataStore {
                 CREATE INDEX IF NOT EXISTS idx_refs_caller
                     ON [references](caller);
                 CREATE INDEX IF NOT EXISTS idx_refs_file_path
-                    ON [references](file_path);",
+                    ON [references](file_path);
+                -- `find_callers`, `find_callees` and the `NOT EXISTS` subquery
+                -- in `find_dead_symbols` all match on `lower(...)`, which an
+                -- index on the bare column cannot serve.
+                CREATE INDEX IF NOT EXISTS idx_refs_callee_lower
+                    ON [references](lower(callee));
+                CREATE INDEX IF NOT EXISTS idx_refs_caller_lower
+                    ON [references](lower(caller));",
             )
             .context("failed to create references table")?;
 
@@ -226,7 +278,11 @@ impl MetadataStore {
                 CREATE INDEX IF NOT EXISTS idx_type_relations_owner
                     ON type_relations(owner);
                 CREATE INDEX IF NOT EXISTS idx_type_relations_file_path
-                    ON type_relations(file_path);",
+                    ON type_relations(file_path);
+                -- `find_type_relations` matches on `lower(target)`, which an
+                -- index on the bare column cannot serve.
+                CREATE INDEX IF NOT EXISTS idx_type_relations_target_lower
+                    ON type_relations(lower(target));",
             )
             .context("failed to create type_relations table")?;
 
@@ -290,6 +346,42 @@ impl MetadataStore {
         }
     }
 
+    /// Get multiple chunks by id in a single query.
+    ///
+    /// Returns a lookup map keyed by chunk id rather than a `Vec`, because
+    /// SQLite does not preserve any particular row order for `IN (...)`
+    /// queries. Callers that need results in a specific order (e.g.
+    /// vector-distance ranking) must re-project from the map themselves.
+    pub fn get_chunks_by_ids(&self, ids: &[String]) -> Result<HashMap<String, Chunk>> {
+        if ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let placeholders = std::iter::repeat_n("?", ids.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT id, file_path, line_start, line_end, content, language,
+                    symbol_type, symbol_name
+             FROM chunks WHERE id IN ({placeholders})"
+        );
+        let mut stmt = self
+            .conn
+            .prepare(&sql)
+            .context("failed to prepare batch chunk query")?;
+
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(ids.iter()), |row| {
+                Ok(row_to_chunk(row))
+            })
+            .context("failed to query chunks by id batch")?;
+
+        let chunks: Vec<Chunk> = collect_rows(rows)?
+            .into_iter()
+            .collect::<Result<Vec<_>>>()?;
+        Ok(chunks.into_iter().map(|c| (c.id.clone(), c)).collect())
+    }
+
     /// Get all chunks for a given file path.
     pub fn get_chunks_by_file(&self, file_path: &str) -> Result<Vec<Chunk>> {
         let mut stmt = self
@@ -313,13 +405,7 @@ impl MetadataStore {
     pub fn get_chunks_by_symbol_name(&self, symbol_name: &str) -> Result<Vec<Chunk>> {
         let mut stmt = self
             .conn
-            .prepare_cached(
-                "SELECT id, file_path, line_start, line_end, content, language,
-                        symbol_type, symbol_name
-                 FROM chunks
-                 WHERE lower(symbol_name) = lower(?1)
-                 ORDER BY file_path, line_start",
-            )
+            .prepare_cached(SQL_CHUNKS_BY_SYMBOL_NAME)
             .context("failed to prepare symbol chunks query")?;
 
         let rows = stmt
@@ -348,34 +434,6 @@ impl MetadataStore {
         let rows = stmt
             .query_map(params![symbol_name], |row| Ok(row_to_chunk(row)))
             .context("failed to query chunks by symbol name (case-sensitive)")?;
-
-        collect_rows(rows)?.into_iter().collect()
-    }
-
-    /// Get chunks whose symbol names contain the given term (case-insensitive).
-    pub fn get_chunks_by_symbol_name_substring(
-        &self,
-        symbol_name: &str,
-        limit: usize,
-    ) -> Result<Vec<Chunk>> {
-        let mut stmt = self
-            .conn
-            .prepare_cached(
-                "SELECT id, file_path, line_start, line_end, content, language,
-                        symbol_type, symbol_name
-                 FROM chunks
-                 WHERE symbol_name IS NOT NULL
-                   AND instr(lower(symbol_name), lower(?1)) > 0
-                 ORDER BY file_path, line_start
-                 LIMIT ?2",
-            )
-            .context("failed to prepare substring symbol chunks query")?;
-
-        let rows = stmt
-            .query_map(params![symbol_name, limit as i64], |row| {
-                Ok(row_to_chunk(row))
-            })
-            .context("failed to query chunks by symbol name substring")?;
 
         collect_rows(rows)?.into_iter().collect()
     }
@@ -443,11 +501,6 @@ impl MetadataStore {
         Ok(())
     }
 
-    /// Insert or replace a single file state.
-    pub fn upsert_file_state(&self, state: &FileIndexState) -> Result<()> {
-        self.insert_file_states(std::slice::from_ref(state))
-    }
-
     /// Delete file state for a path.
     pub fn delete_file_state(&self, file_path: &str) -> Result<()> {
         self.conn
@@ -486,14 +539,7 @@ impl MetadataStore {
 
     /// Store a file content hash for incremental indexing.
     pub fn set_file_hash(&self, file_path: &str, hash: &str) -> Result<()> {
-        self.conn
-            .execute(
-                "INSERT OR REPLACE INTO file_hashes (file_path, content_hash)
-                 VALUES (?1, ?2)",
-                params![file_path, hash],
-            )
-            .context("failed to set file hash")?;
-        Ok(())
+        self.set_file_hashes_batch_borrowed(&[(file_path, hash)])
     }
 
     /// Get the stored content hash for a file.
@@ -568,64 +614,123 @@ impl MetadataStore {
 
     // ── Reference (call graph) operations ──────────────────────────
 
-    /// Insert a batch of call-site references for a single file.
-    pub fn insert_references(
-        &self,
-        file_path: &str,
-        refs: &[crate::parsing::references::RawReference],
-    ) -> Result<()> {
+    /// Store content hashes for many files in a single transaction.
+    ///
+    /// Equivalent to calling [`Self::set_file_hash`] once per file, but
+    /// issues one commit for the whole batch instead of one per file.
+    pub fn set_file_hashes_batch(&self, hashes: &[(String, String)]) -> Result<()> {
+        if hashes.is_empty() {
+            return Ok(());
+        }
+
+        let borrowed: Vec<(&str, &str)> = hashes
+            .iter()
+            .map(|(file_path, hash)| (file_path.as_str(), hash.as_str()))
+            .collect();
+        self.set_file_hashes_batch_borrowed(&borrowed)
+    }
+
+    pub(crate) fn set_file_hashes_batch_borrowed(&self, hashes: &[(&str, &str)]) -> Result<()> {
+        if hashes.is_empty() {
+            return Ok(());
+        }
+
         let tx = self
             .conn
             .unchecked_transaction()
-            .context("failed to begin reference transaction")?;
+            .context("failed to begin file hash batch transaction")?;
         {
-            let mut stmt = self
-                .conn
+            let mut stmt = tx
+                .prepare_cached(
+                    "INSERT OR REPLACE INTO file_hashes (file_path, content_hash)
+                     VALUES (?1, ?2)",
+                )
+                .context("failed to prepare batch file hash insert")?;
+            for (file_path, hash) in hashes {
+                stmt.execute(params![file_path, hash])
+                    .with_context(|| format!("failed to set file hash: {file_path}"))?;
+            }
+        }
+        tx.commit().context("failed to commit file hash batch")?;
+        Ok(())
+    }
+
+    /// Store call-site references and type relations for many files in a
+    /// single transaction.
+    ///
+    /// Issues one commit for the whole batch instead of up to two per file.
+    pub fn insert_parse_artifacts_batch(
+        &self,
+        file_refs: &[(String, Vec<crate::parsing::references::RawReference>)],
+        file_type_relations: &[(String, Vec<RawTypeRelation>)],
+    ) -> Result<()> {
+        if file_refs.is_empty() && file_type_relations.is_empty() {
+            return Ok(());
+        }
+
+        let borrowed_refs: Vec<(&str, &[crate::parsing::references::RawReference])> = file_refs
+            .iter()
+            .map(|(file_path, refs)| (file_path.as_str(), refs.as_slice()))
+            .collect();
+        let borrowed_relations: Vec<(&str, &[RawTypeRelation])> = file_type_relations
+            .iter()
+            .map(|(file_path, relations)| (file_path.as_str(), relations.as_slice()))
+            .collect();
+        self.insert_parse_artifacts_batch_borrowed(&borrowed_refs, &borrowed_relations)
+    }
+
+    pub(crate) fn insert_parse_artifacts_batch_borrowed(
+        &self,
+        file_refs: &[(&str, &[crate::parsing::references::RawReference])],
+        file_type_relations: &[(&str, &[RawTypeRelation])],
+    ) -> Result<()> {
+        if file_refs.is_empty() && file_type_relations.is_empty() {
+            return Ok(());
+        }
+
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .context("failed to begin parse artifacts batch transaction")?;
+        {
+            let mut ref_stmt = tx
                 .prepare_cached(
                     "INSERT INTO [references] (file_path, line, callee, caller)
                      VALUES (?1, ?2, ?3, ?4)",
                 )
-                .context("failed to prepare reference insert")?;
-            for r in refs {
-                stmt.execute(params![file_path, r.line, r.callee, r.caller])
-                    .context("failed to insert reference")?;
+                .context("failed to prepare batch reference insert")?;
+            for &(file_path, refs) in file_refs {
+                for r in refs {
+                    ref_stmt
+                        .execute(params![file_path, r.line, r.callee, r.caller])
+                        .with_context(|| format!("failed to insert reference for {file_path}"))?;
+                }
             }
-        }
-        tx.commit().context("failed to commit reference inserts")?;
-        Ok(())
-    }
 
-    /// Insert a batch of explicit type relations for a single file.
-    pub fn insert_type_relations(
-        &self,
-        file_path: &str,
-        relations: &[RawTypeRelation],
-    ) -> Result<()> {
-        let tx = self
-            .conn
-            .unchecked_transaction()
-            .context("failed to begin type relation transaction")?;
-        {
-            let mut stmt = self
-                .conn
+            let mut relation_stmt = tx
                 .prepare_cached(
                     "INSERT INTO type_relations (file_path, line, owner, target, kind)
                      VALUES (?1, ?2, ?3, ?4, ?5)",
                 )
-                .context("failed to prepare type relation insert")?;
-            for relation in relations {
-                stmt.execute(params![
-                    file_path,
-                    relation.line,
-                    relation.owner,
-                    relation.target,
-                    relation.kind.as_str(),
-                ])
-                .context("failed to insert type relation")?;
+                .context("failed to prepare batch type relation insert")?;
+            for &(file_path, relations) in file_type_relations {
+                for relation in relations {
+                    relation_stmt
+                        .execute(params![
+                            file_path,
+                            relation.line,
+                            relation.owner,
+                            relation.target,
+                            relation.kind.as_str(),
+                        ])
+                        .with_context(|| {
+                            format!("failed to insert type relation for {file_path}")
+                        })?;
+                }
             }
         }
         tx.commit()
-            .context("failed to commit type relation inserts")?;
+            .context("failed to commit parse artifacts batch")?;
         Ok(())
     }
 
@@ -655,11 +760,7 @@ impl MetadataStore {
     pub fn find_callers(&self, symbol_name: &str) -> Result<Vec<CallerRef>> {
         let mut stmt = self
             .conn
-            .prepare_cached(
-                "SELECT file_path, line, caller FROM [references]
-                 WHERE lower(callee) = lower(?1)
-                 ORDER BY file_path, line",
-            )
+            .prepare_cached(SQL_FIND_CALLERS)
             .context("failed to prepare callers query")?;
         let rows = stmt
             .query_map(params![symbol_name], |row| {
@@ -677,12 +778,7 @@ impl MetadataStore {
     pub fn find_type_relations(&self, symbol_name: &str) -> Result<Vec<TypeRelationRef>> {
         let mut stmt = self
             .conn
-            .prepare_cached(
-                "SELECT file_path, line, owner, target, kind
-                 FROM type_relations
-                 WHERE lower(target) = lower(?1)
-                 ORDER BY file_path, line, owner",
-            )
+            .prepare_cached(SQL_FIND_TYPE_RELATIONS)
             .context("failed to prepare type relation query")?;
         let rows = stmt
             .query_map(params![symbol_name], |row| {
@@ -708,11 +804,7 @@ impl MetadataStore {
     pub fn find_callees(&self, symbol_name: &str) -> Result<Vec<CalleeRef>> {
         let mut stmt = self
             .conn
-            .prepare_cached(
-                "SELECT file_path, line, callee FROM [references]
-                 WHERE lower(caller) = lower(?1)
-                 ORDER BY file_path, line",
-            )
+            .prepare_cached(SQL_FIND_CALLEES)
             .context("failed to prepare callees query")?;
         let rows = stmt
             .query_map(params![symbol_name], |row| {
@@ -733,18 +825,7 @@ impl MetadataStore {
     pub fn find_dead_symbols(&self) -> Result<Vec<DeadSymbol>> {
         let mut stmt = self
             .conn
-            .prepare(
-                "SELECT c.symbol_name, c.file_path, c.line_start, c.symbol_type
-                 FROM chunks c
-                 WHERE c.symbol_name IS NOT NULL
-                   AND c.symbol_type IN ('function', 'method')
-                   AND lower(c.symbol_name) NOT IN ('main', 'new', 'default', 'drop', 'clone', 'fmt', 'from', 'into', 'deref', 'init', 'setup', 'teardown')
-                   AND NOT EXISTS (
-                       SELECT 1 FROM [references] r
-                       WHERE lower(r.callee) = lower(c.symbol_name)
-                   )
-                 ORDER BY c.file_path, c.line_start",
-            )
+            .prepare(SQL_FIND_DEAD_SYMBOLS)
             .context("failed to prepare dead symbols query")?;
         let rows = stmt
             .query_map([], |row| {
@@ -1110,6 +1191,189 @@ mod tests {
         assert_eq!(store.chunk_count().unwrap(), 3);
     }
 
+    /// The index expression has to match the query text exactly. If either
+    /// side is edited without the other, SQLite silently falls back to a full
+    /// scan and nothing fails — so assert on the plan, not just the results.
+    #[test]
+    fn case_insensitive_lookups_use_an_index_rather_than_scanning() {
+        let store = MetadataStore::open_in_memory().unwrap();
+
+        let plan_for = |sql: &str| -> String {
+            let mut stmt = store
+                .conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap();
+            let rows: Vec<String> = stmt
+                .query_map(params!["needle"], |row| row.get::<_, String>(3))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect();
+            rows.join(" | ")
+        };
+
+        for (label, sql, expected_index) in [
+            ("find_callers", SQL_FIND_CALLERS, "idx_refs_callee_lower"),
+            ("find_callees", SQL_FIND_CALLEES, "idx_refs_caller_lower"),
+            (
+                "find_type_relations",
+                SQL_FIND_TYPE_RELATIONS,
+                "idx_type_relations_target_lower",
+            ),
+            (
+                "get_chunks_by_symbol_name",
+                SQL_CHUNKS_BY_SYMBOL_NAME,
+                "idx_chunks_symbol_name_lower",
+            ),
+        ] {
+            let plan = plan_for(sql);
+            assert!(
+                plan.contains(&format!("USING INDEX {expected_index}")),
+                "{label} must use {expected_index}, but the plan was: {plan}"
+            );
+            assert!(
+                plan.split(" | ").all(|detail| {
+                    detail
+                        .split_whitespace()
+                        .next()
+                        .is_none_or(|operation| operation != "SCAN")
+                }),
+                "{label} still scans: {plan}"
+            );
+        }
+    }
+
+    #[test]
+    fn dead_symbol_lookup_seeks_the_reference_index() {
+        // The correlated NOT EXISTS re-runs per candidate chunk, so a scan
+        // here is O(chunks x references) rather than a constant overhead.
+        let store = MetadataStore::open_in_memory().unwrap();
+        let mut stmt = store
+            .conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {SQL_FIND_DEAD_SYMBOLS}"))
+            .unwrap();
+        let plan: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(3))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        let plan = plan.join(" | ");
+        assert!(
+            plan.contains("SEARCH r"),
+            "the reference subquery must seek, not scan: {plan}"
+        );
+    }
+
+    #[test]
+    fn set_file_hashes_batch_persists_every_row_and_replaces_on_repeat() {
+        let store = MetadataStore::open_in_memory().unwrap();
+        store
+            .set_file_hashes_batch(&[
+                ("src/main.rs".to_string(), "hash-a".to_string()),
+                ("src/lib.py".to_string(), "hash-b".to_string()),
+            ])
+            .unwrap();
+        assert_eq!(
+            store.get_file_hash("src/main.rs").unwrap().as_deref(),
+            Some("hash-a")
+        );
+        assert_eq!(
+            store.get_file_hash("src/lib.py").unwrap().as_deref(),
+            Some("hash-b")
+        );
+
+        store
+            .set_file_hashes_batch(&[("src/main.rs".to_string(), "hash-c".to_string())])
+            .unwrap();
+        assert_eq!(
+            store.get_file_hash("src/main.rs").unwrap().as_deref(),
+            Some("hash-c")
+        );
+        // Guards against a partial write taking out rows the batch never
+        // mentioned: re-checking only src/main.rs would miss that.
+        assert_eq!(
+            store.get_file_hash("src/lib.py").unwrap().as_deref(),
+            Some("hash-b")
+        );
+    }
+
+    #[test]
+    fn batch_writes_accept_empty_input() {
+        // The batch methods early-return before opening a transaction. An
+        // update run with nothing to write must not error.
+        let store = MetadataStore::open_in_memory().unwrap();
+        store.set_file_hashes_batch(&[]).unwrap();
+        store.insert_parse_artifacts_batch(&[], &[]).unwrap();
+        assert!(store.get_chunks_by_ids(&[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn insert_parse_artifacts_batch_persists_both_kinds_across_files() {
+        let store = MetadataStore::open_in_memory().unwrap();
+        let refs = vec![
+            (
+                "src/main.rs".to_string(),
+                vec![crate::parsing::references::RawReference {
+                    callee: "helper".to_string(),
+                    caller: Some("main".to_string()),
+                    line: 3,
+                }],
+            ),
+            (
+                "src/lib.py".to_string(),
+                vec![crate::parsing::references::RawReference {
+                    callee: "helper".to_string(),
+                    caller: None,
+                    line: 9,
+                }],
+            ),
+        ];
+        let relations = vec![(
+            "src/main.rs".to_string(),
+            vec![RawTypeRelation {
+                owner: "Config".to_string(),
+                target: "Display".to_string(),
+                line: 12,
+                kind: TypeRelationKind::Conforms,
+            }],
+        )];
+        store
+            .insert_parse_artifacts_batch(&refs, &relations)
+            .unwrap();
+
+        // Both files' references land, not just the first. A count of 2 alone
+        // would also pass if both rows were stored under one file path, so
+        // assert the paths themselves.
+        let mut caller_paths: Vec<String> = store
+            .find_callers("helper")
+            .unwrap()
+            .into_iter()
+            .map(|caller_ref| caller_ref.file_path)
+            .collect();
+        caller_paths.sort();
+        assert_eq!(caller_paths, vec!["src/lib.py", "src/main.rs"]);
+        assert_eq!(store.find_type_relations("Display").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn get_chunks_by_ids_returns_only_requested_rows() {
+        let store = MetadataStore::open_in_memory().unwrap();
+        store.insert_chunks(&sample_chunks()).unwrap();
+
+        let found = store
+            .get_chunks_by_ids(&["src/main.rs:0".to_string(), "src/lib.py:0".to_string()])
+            .unwrap();
+        assert_eq!(found.len(), 2);
+        assert_eq!(found["src/main.rs:0"].symbol_name.as_deref(), Some("main"));
+        assert!(!found.contains_key("src/main.rs:1"));
+
+        // A missing id is skipped rather than erroring, which is what the
+        // caller's "chunk metadata not found" branch relies on.
+        let partial = store
+            .get_chunks_by_ids(&["src/main.rs:0".to_string(), "does/not/exist:9".to_string()])
+            .unwrap();
+        assert_eq!(partial.len(), 1);
+    }
+
     #[test]
     fn get_chunk_by_id() {
         let store = MetadataStore::open_in_memory().unwrap();
@@ -1166,18 +1430,6 @@ mod tests {
             .get_chunks_by_symbol_name_case_sensitive("config")
             .unwrap();
         assert!(lower.is_empty());
-    }
-
-    #[test]
-    fn get_chunks_by_symbol_name_substring() {
-        let store = MetadataStore::open_in_memory().unwrap();
-        store.insert_chunks(&sample_chunks()).unwrap();
-
-        let chunks = store
-            .get_chunks_by_symbol_name_substring("fig", 10)
-            .unwrap();
-        assert_eq!(chunks.len(), 1);
-        assert_eq!(chunks[0].id, "src/main.rs:1");
     }
 
     #[test]
@@ -1250,15 +1502,16 @@ mod tests {
     fn type_relation_operations() {
         let store = MetadataStore::open_in_memory().unwrap();
 
+        let relation = RawTypeRelation {
+            owner: "Repo".to_string(),
+            target: "Loader".to_string(),
+            line: 2,
+            kind: TypeRelationKind::Conforms,
+        };
         store
-            .insert_type_relations(
-                "src/types.ts",
-                &[RawTypeRelation {
-                    owner: "Repo".to_string(),
-                    target: "Loader".to_string(),
-                    line: 2,
-                    kind: TypeRelationKind::Conforms,
-                }],
+            .insert_parse_artifacts_batch_borrowed(
+                &[],
+                &[("src/types.ts", std::slice::from_ref(&relation))],
             )
             .unwrap();
 
@@ -1366,6 +1619,54 @@ mod tests {
         for lang in &all_langs {
             let s = lang.to_string();
             assert_eq!(parse_language(&s), *lang, "Failed roundtrip for {s}");
+
+            // The JSON wire name must be the exact string `--lang` accepts,
+            // not a substring of it: `vera search --json` reports this value
+            // and agents feed it straight back as a filter.
+            let json = serde_json::to_string(lang).unwrap();
+            assert_eq!(
+                json,
+                format!("\"{s}\""),
+                "serde name for {lang:?} diverges from Display"
+            );
+            assert_eq!(
+                serde_json::from_str::<Language>(&json).unwrap(),
+                *lang,
+                "Failed serde roundtrip for {s}"
+            );
+        }
+    }
+
+    #[test]
+    fn symbol_type_serde_name_matches_display() {
+        // SymbolType keeps its derived `rename_all = "snake_case"`; this pins
+        // the agreement so a future variant cannot diverge unnoticed.
+        let all_types = vec![
+            SymbolType::Function,
+            SymbolType::Method,
+            SymbolType::Class,
+            SymbolType::Struct,
+            SymbolType::Enum,
+            SymbolType::Trait,
+            SymbolType::Interface,
+            SymbolType::TypeAlias,
+            SymbolType::Constant,
+            SymbolType::Variable,
+            SymbolType::Module,
+            SymbolType::Block,
+        ];
+        for symbol_type in &all_types {
+            let s = symbol_type.to_string();
+            assert_eq!(
+                serde_json::to_string(symbol_type).unwrap(),
+                format!("\"{s}\""),
+                "serde name for {symbol_type:?} diverges from Display"
+            );
+            assert_eq!(
+                parse_symbol_type(&s),
+                *symbol_type,
+                "Failed roundtrip for {s}"
+            );
         }
     }
 

@@ -3,35 +3,65 @@
 //! Tree-sitter gives us structural parsing (sections, directives, inline nodes),
 //! but it does not resolve Sphinx semantics such as ``.. include::``.
 //! This module performs lightweight source normalization before chunking:
-//! - Recursively inline ``.. include::`` files (with cycle/depth guards)
+//! - Recursively inline ``.. include::`` files (with cycle/depth/size guards)
 //! - Normalize inline role syntax like ``:doc:`...``` into plain text
 
 use std::collections::HashMap;
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use anyhow::{Context, Result};
 use regex::Regex;
 
+use crate::path_containment::{self, Containment};
+
 const MAX_INCLUDE_DEPTH: usize = 16;
+const INCLUDE_OUTPUT_BUDGET_MULTIPLIER: u64 = 4;
 
 /// Preprocess RST text for chunking and embedding.
 pub fn preprocess_rst(source: &str, current_file: &Path, repo_root: &Path) -> Result<String> {
-    let mut stack = vec![current_file.to_path_buf()];
-    let mut include_cache = HashMap::new();
-
-    let expanded = resolve_includes_recursive(
+    preprocess_rst_with_limit(
         source,
         current_file,
         repo_root,
-        &mut stack,
-        &mut include_cache,
-        0,
-    )?;
+        crate::config::DEFAULT_MAX_FILE_SIZE_BYTES,
+    )
+}
+
+/// Preprocess RST text with a configured source and include-size limit.
+///
+/// Expanded output is capped at four times `max_file_size_bytes`. The input
+/// file is already limited to that size by discovery, so this allows normal
+/// include composition while bounding recursive fan-out.
+pub(crate) fn preprocess_rst_with_limit(
+    source: &str,
+    current_file: &Path,
+    repo_root: &Path,
+    max_file_size_bytes: u64,
+) -> Result<String> {
+    let mut stack = vec![current_file.to_path_buf()];
+    let mut expansion_cache = HashMap::new();
+    let mut context = IncludeResolutionContext {
+        repo_root,
+        stack: &mut stack,
+        expansion_cache: &mut expansion_cache,
+        output_budget: include_output_budget(max_file_size_bytes),
+        max_file_size_bytes,
+    };
+
+    let expanded =
+        resolve_includes_recursive(source, current_file, 0, context.output_budget, &mut context)?;
 
     let with_toctree = normalize_toctree_blocks(&expanded);
 
     Ok(normalize_roles(&with_toctree))
+}
+
+fn include_output_budget(max_file_size_bytes: u64) -> usize {
+    max_file_size_bytes
+        .saturating_mul(INCLUDE_OUTPUT_BUDGET_MULTIPLIER)
+        .min(usize::MAX as u64) as usize
 }
 
 fn include_re() -> &'static Regex {
@@ -49,26 +79,49 @@ fn toctree_entry_re() -> &'static Regex {
     TOCTREE_ENTRY_RE.get_or_init(|| Regex::new(r"^(.+?)\s*<([^>]+)>$").unwrap())
 }
 
+struct IncludeResolutionContext<'a> {
+    repo_root: &'a Path,
+    stack: &'a mut Vec<PathBuf>,
+    expansion_cache: &'a mut HashMap<PathBuf, Arc<str>>,
+    output_budget: usize,
+    max_file_size_bytes: u64,
+}
+
 fn resolve_includes_recursive(
     text: &str,
     current_file: &Path,
-    repo_root: &Path,
-    stack: &mut Vec<PathBuf>,
-    include_cache: &mut HashMap<PathBuf, String>,
     depth: usize,
+    output_budget: usize,
+    context: &mut IncludeResolutionContext<'_>,
 ) -> Result<String> {
+    let mut remaining_output_bytes = output_budget;
+
     if depth >= MAX_INCLUDE_DEPTH {
-        return Ok(text.to_string());
+        let mut output = String::new();
+        append_with_budget(&mut output, text, &mut remaining_output_bytes);
+        return Ok(output);
     }
 
-    let mut output = String::with_capacity(text.len());
+    let mut output = String::with_capacity(text.len().min(remaining_output_bytes));
     let mut last_end = 0usize;
 
     for captures in include_re().captures_iter(text) {
+        if remaining_output_bytes == 0 {
+            break;
+        }
+
         let full_match = captures
             .get(0)
             .expect("include regex always has full match");
-        output.push_str(&text[last_end..full_match.start()]);
+        append_with_budget(
+            &mut output,
+            &text[last_end..full_match.start()],
+            &mut remaining_output_bytes,
+        );
+
+        if remaining_output_bytes == 0 {
+            break;
+        }
 
         let raw_ref = captures
             .get(1)
@@ -76,44 +129,77 @@ fn resolve_includes_recursive(
             .as_str();
         let include_ref = strip_wrapping_quotes(raw_ref.trim());
 
-        let replacement = match resolve_include_path(include_ref, current_file, repo_root)? {
+        let replacement = match resolve_include_path(include_ref, current_file, context.repo_root)?
+        {
             Some(include_path) => {
-                if stack.contains(&include_path) {
-                    full_match.as_str().to_string()
+                if context.stack.contains(&include_path) {
+                    None
+                } else if let Some(cached) = context.expansion_cache.get(&include_path) {
+                    Some(Arc::clone(cached))
                 } else {
-                    let include_text = if let Some(cached) = include_cache.get(&include_path) {
-                        cached.clone()
-                    } else {
-                        let bytes = std::fs::read(&include_path).with_context(|| {
-                            format!("failed to read include: {}", include_path.display())
-                        })?;
-                        let decoded = String::from_utf8_lossy(&bytes).to_string();
-                        include_cache.insert(include_path.clone(), decoded.clone());
-                        decoded
-                    };
-
-                    stack.push(include_path.clone());
-                    let resolved = resolve_includes_recursive(
-                        &include_text,
-                        &include_path,
-                        repo_root,
-                        stack,
-                        include_cache,
-                        depth + 1,
-                    )?;
-                    stack.pop();
-                    resolved
+                    match read_include_file(&include_path, context.max_file_size_bytes)? {
+                        Some(include_text) => {
+                            context.stack.push(include_path.clone());
+                            let resolved = resolve_includes_recursive(
+                                &include_text,
+                                &include_path,
+                                depth + 1,
+                                context.output_budget,
+                                context,
+                            )?;
+                            context.stack.pop();
+                            let resolved: Arc<str> = Arc::from(resolved);
+                            context
+                                .expansion_cache
+                                .insert(include_path.clone(), Arc::clone(&resolved));
+                            Some(resolved)
+                        }
+                        None => None,
+                    }
                 }
             }
-            None => full_match.as_str().to_string(),
+            None => None,
         };
 
-        output.push_str(&replacement);
+        append_with_budget(
+            &mut output,
+            replacement.as_deref().unwrap_or(full_match.as_str()),
+            &mut remaining_output_bytes,
+        );
         last_end = full_match.end();
     }
 
-    output.push_str(&text[last_end..]);
+    append_with_budget(&mut output, &text[last_end..], &mut remaining_output_bytes);
     Ok(output)
+}
+
+fn read_include_file(path: &Path, max_file_size_bytes: u64) -> Result<Option<String>> {
+    let file = std::fs::File::open(path)
+        .with_context(|| format!("failed to read include: {}", path.display()))?;
+    let mut bytes = Vec::new();
+    file.take(max_file_size_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("failed to read include: {}", path.display()))?;
+
+    if bytes.len() as u64 > max_file_size_bytes {
+        return Ok(None);
+    }
+
+    Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
+}
+
+fn append_with_budget(output: &mut String, text: &str, remaining: &mut usize) {
+    let byte_count = text.len().min(*remaining);
+    let mut end = byte_count;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    if end == 0 && byte_count > 0 {
+        *remaining = 0;
+        return;
+    }
+    output.push_str(&text[..end]);
+    *remaining -= end;
 }
 
 fn resolve_include_path(
@@ -127,20 +213,16 @@ fn resolve_include_path(
         current_file.parent().unwrap_or(repo_root).join(include_ref)
     };
 
-    let canonical = match candidate.canonicalize() {
-        Ok(path) => path,
-        Err(_) => return Ok(None),
-    };
-
     let canonical_repo_root = repo_root
         .canonicalize()
         .with_context(|| format!("failed to canonicalize repo root: {}", repo_root.display()))?;
 
-    if !canonical.starts_with(&canonical_repo_root) {
-        return Ok(None);
-    }
-
-    Ok(Some(canonical))
+    Ok(
+        match path_containment::resolve_within(&canonical_repo_root, &candidate) {
+            Containment::Inside(path) => Some(path),
+            Containment::Escaped | Containment::Unresolved => None,
+        },
+    )
 }
 
 fn normalize_roles(text: &str) -> String {
@@ -351,7 +433,7 @@ fn strip_wrapping_quotes(input: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use super::preprocess_rst;
+    use super::{preprocess_rst, preprocess_rst_with_limit};
     use std::fs;
 
     #[test]
@@ -385,6 +467,63 @@ mod tests {
         let processed = preprocess_rst(source, &source_path, root).unwrap();
 
         assert!(processed.contains("Common snippet"));
+    }
+
+    #[test]
+    fn preprocess_bounds_dag_fanout_output() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let source_path = root.join("root.rst");
+        let levels = ["a", "b", "c", "d", "e", "f", "g", "h"];
+        for (index, level) in levels.iter().enumerate() {
+            let content = match levels.get(index + 1) {
+                Some(next) => format!(".. include:: {next}.rst\n").repeat(3),
+                None => "leaf content\n".to_string(),
+            };
+            fs::write(root.join(format!("{level}.rst")), content).unwrap();
+        }
+
+        let source = ".. include:: a.rst\n".repeat(3);
+        fs::write(&source_path, &source).unwrap();
+        let processed = preprocess_rst_with_limit(&source, &source_path, root, 64).unwrap();
+
+        assert!(processed.len() <= 256);
+        assert!(processed.contains("leaf content"));
+    }
+
+    #[test]
+    fn preprocess_skips_oversized_include() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let source_path = root.join("root.rst");
+        let include_path = root.join("large.rst");
+        let source = "before\n.. include:: large.rst\nafter\n";
+
+        fs::write(&include_path, "x".repeat(33)).unwrap();
+        let processed = preprocess_rst_with_limit(source, &source_path, root, 32).unwrap();
+
+        assert!(processed.contains("before"));
+        assert!(processed.contains(".. include:: large.rst"));
+        assert!(processed.contains("after"));
+        assert!(!processed.contains(&"x".repeat(33)));
+    }
+
+    #[test]
+    fn preprocess_terminates_on_include_cycle() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let source_path = root.join("root.rst");
+        let child_path = root.join("child.rst");
+
+        fs::write(&child_path, "child\n.. include:: root.rst\n").unwrap();
+        let source = "root\n.. include:: child.rst\n";
+        fs::write(&source_path, source).unwrap();
+        let processed = preprocess_rst_with_limit(source, &source_path, root, 128).unwrap();
+
+        assert!(processed.contains("root"));
+        assert!(processed.contains("child"));
+        assert!(processed.contains(".. include:: root.rst"));
+        assert!(processed.len() < 128 * 4);
     }
 
     #[test]

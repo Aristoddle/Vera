@@ -2,12 +2,11 @@
 
 use anyhow::{Context, bail};
 
-use crate::helpers::load_runtime_config;
 use crate::state;
 
 /// Run the `vera config` command.
 pub fn run(args: &[String], json_output: bool) -> anyhow::Result<()> {
-    let mut config = load_runtime_config()?;
+    let mut config = state::load_runtime_config()?;
 
     match args.first().map(|s| s.as_str()) {
         None | Some("show") => {

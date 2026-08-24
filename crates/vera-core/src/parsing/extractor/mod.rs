@@ -10,10 +10,7 @@ pub(crate) mod classify;
 pub(crate) mod names;
 mod special_forms;
 
-#[cfg(test)]
-mod tests;
-
-use classify::classify_node;
+use classify::{classify_node, container_body_kinds};
 use names::extract_name;
 use special_forms::*;
 
@@ -134,6 +131,14 @@ fn collect_symbols(
         return;
     }
 
+    // Anonymous nodes are punctuation and keywords, never symbols. Several
+    // classification tables use a bare keyword as the node kind of the
+    // construct it introduces (Ruby `class`, Fortran `module`), so walking into
+    // a container would otherwise record its own keyword token a second time.
+    if !node.is_named() {
+        return;
+    }
+
     let kind = node.kind();
 
     // Handle Go type_declaration → recurse into type_spec children
@@ -157,6 +162,25 @@ fn collect_symbols(
                 symbols.push(RawSymbol::at(&node, name, SymbolType::Function));
                 return;
             }
+        }
+    }
+
+    // Handle TS/JS function-valued bindings: the name lives on the declarator,
+    // and a function initializer makes the binding a function, not a variable.
+    if (lang == Language::TypeScript || lang == Language::JavaScript)
+        && matches!(kind, "lexical_declaration" | "variable_declaration")
+    {
+        if let Some(sym) = extract_js_function_binding(&node, source) {
+            symbols.push(sym);
+            return;
+        }
+    }
+
+    // Handle Lua function-valued assignments such as `M.setup = function() ... end`.
+    if lang == Language::Lua && matches!(kind, "assignment_statement" | "variable_declaration") {
+        if let Some(sym) = extract_lua_function_binding(&node, source) {
+            symbols.push(sym);
+            return;
         }
     }
 
@@ -268,9 +292,37 @@ fn collect_symbols(
             }
         }
 
-        // For Rust impl blocks, extract methods inside but also keep the whole block
-        if lang == Language::Rust && kind == "impl_item" {
-            extract_impl_methods(node, source, lang, symbols);
+        // For Rust impl and trait blocks, extract methods inside but also keep
+        // the whole block
+        if lang == Language::Rust && (kind == "impl_item" || kind == "trait_item") {
+            extract_rust_block_methods(node, source, lang, symbols, sym_type);
+            return;
+        }
+
+        // Bash dispatchers commonly put their branches in a case statement;
+        // keep the function and expose each case arm as a named child symbol.
+        if lang == Language::Bash && kind == "function_definition" {
+            extract_bash_case_items(&node, source, symbols);
+            return;
+        }
+
+        // A Rust `mod name { ... }` is a container, not a leaf. Record the
+        // module, then keep walking so the items declared inside it are
+        // extracted as symbols of their own instead of being swallowed by the
+        // module's span. `mod name;` has no body and simply yields nothing more.
+        //
+        // Descend into the `declaration_list` rather than the `mod_item`, the
+        // way `extract_rust_block_methods` does: recursing from the `mod_item`
+        // spends one depth level on the module and a second on its body list,
+        // so three levels of nesting would exhaust the shared budget before
+        // reaching the items inside.
+        if lang == Language::Rust && kind == "mod_item" {
+            let name = extract_name(&node, source);
+            symbols.push(RawSymbol::at(&node, name, sym_type));
+            if let Some(body) = node.child_by_field_name("body") {
+                let mut cursor = body.walk();
+                collect_symbols_cursor(&mut cursor, source, lang, symbols, depth + 1);
+            }
             return;
         }
 
@@ -310,10 +362,11 @@ fn collect_symbols(
             return;
         }
 
-        // For C# namespace, we want to recurse inside.
-        if lang == Language::CSharp
-            && (kind == "namespace_declaration" || kind == "file_scoped_namespace_declaration")
-        {
+        // A container spans its body, so stopping here would swallow every
+        // symbol declared inside it. Record the container under its own
+        // `sym_type`, then keep walking so the items in its body become
+        // symbols of their own.
+        if container_body_kinds(lang).contains(&kind) {
             let name = extract_name(&node, source);
             symbols.push(RawSymbol::at(&node, name, sym_type));
             let mut cursor = node.walk();
@@ -418,3 +471,9 @@ fn collect_symbols(
     let mut cursor = node.walk();
     collect_symbols_cursor(&mut cursor, source, lang, symbols, depth + 1);
 }
+
+#[cfg(test)]
+mod container_tests;
+
+#[cfg(test)]
+mod tests;

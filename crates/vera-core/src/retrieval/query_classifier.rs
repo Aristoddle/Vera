@@ -47,10 +47,10 @@ const IDENTIFIER_PARAMS: QueryParams = QueryParams {
     vector_weight: 1.0,
 };
 
-/// Parameters for NL intent queries: balanced weights with lower RRF k to
-/// amplify vector signal, and fetch more vector candidates.
+/// Parameters for NL intent queries: balanced weights, the shared RRF k, and
+/// a larger vector candidate multiplier for broader semantic recall.
 const NL_PARAMS: QueryParams = QueryParams {
-    rrf_k: 20.0,
+    rrf_k: 60.0,
     vector_candidate_multiplier: 5,
     bm25_weight: 1.0,
     vector_weight: 1.0,
@@ -64,8 +64,11 @@ pub fn classify_query(query: &str) -> QueryType {
         return QueryType::Identifier;
     }
 
+    // Ignore sentence-ending periods while preserving dots inside identifiers and paths.
+    let normalized = trimmed.trim_end_matches('.');
+
     // Multi-word queries with spaces are NL candidates.
-    let words: Vec<&str> = trimmed.split_whitespace().collect();
+    let words: Vec<&str> = normalized.split_whitespace().collect();
 
     if words.len() == 1 {
         // Single token (word or compound identifier) — treat as identifier
@@ -75,7 +78,7 @@ pub fn classify_query(query: &str) -> QueryType {
 
     // Multi-word: check for identifier-like patterns first.
     // If the query contains path separators or scope operators, it's an identifier.
-    if trimmed.contains("::") || trimmed.contains("->") || trimmed.contains('.') {
+    if normalized.contains("::") || normalized.contains("->") || normalized.contains('.') {
         return QueryType::Identifier;
     }
 
@@ -88,7 +91,7 @@ pub fn classify_query(query: &str) -> QueryType {
     }
 
     // Check for NL indicators: question words, common NL patterns.
-    if has_nl_indicators(trimmed, &words) {
+    if has_nl_indicators(normalized, &words) {
         return QueryType::NaturalLanguage;
     }
 
@@ -241,6 +244,22 @@ mod tests {
     }
 
     #[test]
+    fn classify_sentence_ending_period_as_natural_language() {
+        assert_eq!(
+            classify_query("how does auth work."),
+            QueryType::NaturalLanguage
+        );
+    }
+
+    #[test]
+    fn classify_dotted_identifiers_and_paths_as_identifier() {
+        assert_eq!(classify_query("foo.bar"), QueryType::Identifier);
+        assert_eq!(classify_query("src/main.rs"), QueryType::Identifier);
+        assert_eq!(classify_query("module::symbol"), QueryType::Identifier);
+        assert_eq!(classify_query("vera_core::config"), QueryType::Identifier);
+    }
+
+    #[test]
     fn classify_nl_questions_as_natural_language() {
         assert_eq!(
             classify_query("how are errors handled"),
@@ -311,15 +330,16 @@ mod tests {
     // ── params_for_query_type tests ─────────────────────────────────
 
     #[test]
-    fn nl_params_have_lower_rrf_k() {
+    fn nl_params_share_identifier_rrf_k() {
         let nl = params_for_query_type(QueryType::NaturalLanguage);
         let id = params_for_query_type(QueryType::Identifier);
-        assert!(
-            nl.rrf_k < id.rrf_k,
-            "NL should have lower RRF k: {} < {}",
-            nl.rrf_k,
-            id.rrf_k
+        assert_eq!(
+            nl.rrf_k, id.rrf_k,
+            "NL and identifier should share RRF k: {} vs {}",
+            nl.rrf_k, id.rrf_k
         );
+        assert_eq!(nl.rrf_k, 60.0);
+        assert_eq!(id.rrf_k, 60.0);
     }
 
     #[test]

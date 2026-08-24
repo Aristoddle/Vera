@@ -35,27 +35,6 @@ pub struct ParseDiagnostics {
     pub used_tier0_fallback: bool,
 }
 
-/// Parse a source file and produce both chunks and call-site references in a
-/// single pass, avoiding redundant tree-sitter parsing and symbol extraction.
-///
-/// For languages with tree-sitter support, the file is parsed once and the
-/// resulting AST is reused for symbol extraction, chunking, and reference
-/// collection. For other languages, falls back to line-based chunking with
-/// no references.
-///
-/// # Errors
-/// Returns an error if tree-sitter parsing fails for a supported language.
-pub fn parse_file(
-    source: &str,
-    file_path: &str,
-    language: Language,
-    config: &IndexingConfig,
-) -> Result<(Vec<Chunk>, Vec<references::RawReference>)> {
-    let (chunks, refs, _diagnostics) =
-        parse_file_with_diagnostics(source, file_path, language, config)?;
-    Ok((chunks, refs))
-}
-
 /// Parse a source file and return both code chunks and parser diagnostics.
 pub fn parse_file_with_diagnostics(
     source: &str,
@@ -100,7 +79,7 @@ pub fn parse_file_with_diagnostics(
         ));
     }
 
-    let grammar = match languages::tree_sitter_grammar(language) {
+    let grammar = match languages::tree_sitter_grammar_for_path(language, file_path) {
         Some(g) => g,
         None => {
             let chunks = chunker::tier0_line_chunks(source, file_path, language);
@@ -154,7 +133,7 @@ fn uses_indexing_tier0_fallback(language: Language) -> bool {
 
 /// Parse a source file and produce chunks (without references).
 ///
-/// Convenience wrapper around [`parse_file`] for callers that only need chunks.
+/// Convenience wrapper around [`parse_file_with_diagnostics`] for callers that only need chunks.
 pub fn parse_and_chunk(
     source: &str,
     file_path: &str,

@@ -2,6 +2,8 @@
 
 use std::fs;
 use std::path::Path;
+use std::sync::Arc;
+use std::time::Duration;
 
 use tempfile::TempDir;
 
@@ -9,12 +11,55 @@ use super::*;
 use crate::CancellationToken;
 use crate::config::VeraConfig;
 use crate::embedding::test_helpers::MockProvider;
+use crate::embedding::{EmbeddingError, EmbeddingProvider};
 use crate::storage::bm25::Bm25Index;
 use crate::storage::metadata::MetadataStore;
 use crate::storage::vector::VectorStore;
 
 fn default_config() -> VeraConfig {
     VeraConfig::default()
+}
+
+#[derive(Clone)]
+struct BlockingProvider {
+    started: Arc<tokio::sync::Notify>,
+}
+
+impl EmbeddingProvider for BlockingProvider {
+    async fn embed_batch(&self, _texts: &[String]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+        self.started.notify_one();
+        std::future::pending().await
+    }
+
+    fn expected_dim(&self) -> Option<usize> {
+        Some(8)
+    }
+}
+
+/// Cancels the token mid-request and then fails, modelling a provider error
+/// that completes at the same moment cancellation fires.
+struct CancelThenFailProvider;
+
+impl EmbeddingProvider for CancelThenFailProvider {
+    async fn embed_batch(&self, _texts: &[String]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+        Err(EmbeddingError::ApiError {
+            status: 500,
+            message: "provider exploded".to_string(),
+        })
+    }
+
+    async fn embed_batch_cancellable(
+        &self,
+        texts: &[String],
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+        cancel.cancel();
+        self.embed_batch(texts).await
+    }
+
+    fn expected_dim(&self) -> Option<usize> {
+        Some(8)
+    }
 }
 
 #[tokio::test]
@@ -71,6 +116,93 @@ async fn pre_cancelled_index_stops_before_creating_artifacts() {
 
     assert!(error.to_string().contains("operation cancelled"));
     assert!(!index_dir(dir.path()).exists());
+}
+
+#[tokio::test]
+async fn cancellation_stops_an_in_flight_embedding_request() {
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("main.rs"), "fn main() {}\n").unwrap();
+    let started = Arc::new(tokio::sync::Notify::new());
+    let provider = BlockingProvider {
+        started: started.clone(),
+    };
+    let config = default_config();
+    let cancellation = CancellationToken::new();
+    let task_cancellation = cancellation.clone();
+    let path = dir.path().to_path_buf();
+
+    let task = tokio::spawn(async move {
+        super::index_repository_with_progress_and_cancellation(
+            &path,
+            &provider,
+            &config,
+            "mock-model",
+            |_| {},
+            &task_cancellation,
+        )
+        .await
+    });
+    started.notified().await;
+    cancellation.cancel();
+
+    let error = tokio::time::timeout(Duration::from_millis(250), task)
+        .await
+        .expect("cancellation must stop the active embedding request")
+        .unwrap()
+        .unwrap_err();
+    assert!(error.to_string().contains("cancel"));
+    assert!(!dir.path().join(".vera").exists());
+}
+
+#[tokio::test]
+async fn cancellation_after_embedding_does_not_publish_index_artifacts() {
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("main.rs"), "fn main() {}\n").unwrap();
+    let provider = MockProvider::new(8);
+    let config = default_config();
+    let cancellation = CancellationToken::new();
+    let progress_cancellation = cancellation.clone();
+
+    let error = super::index_repository_with_progress_and_cancellation(
+        dir.path(),
+        &provider,
+        &config,
+        "mock-model",
+        move |event| {
+            if matches!(event, IndexProgress::EmbeddingDone { .. }) {
+                progress_cancellation.cancel();
+            }
+        },
+        &cancellation,
+    )
+    .await
+    .unwrap_err();
+
+    assert!(error.to_string().contains("operation cancelled"));
+    assert!(!dir.path().join(".vera").exists());
+}
+
+#[tokio::test]
+async fn provider_error_wins_over_simultaneous_cancellation() {
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("main.rs"), "fn main() {}\n").unwrap();
+    let config = default_config();
+
+    let error = super::index_repository_with_progress_and_cancellation(
+        dir.path(),
+        &CancelThenFailProvider,
+        &config,
+        "mock-model",
+        |_| {},
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap_err();
+
+    assert!(
+        error.to_string().contains("embedding generation failed"),
+        "provider error should win over the simultaneous cancellation: {error}"
+    );
 }
 
 #[tokio::test]
@@ -338,4 +470,99 @@ async fn index_permission_error_continues() {
         use std::os::unix::fs::PermissionsExt;
         let _ = fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o644));
     }
+}
+
+/// Freshness keys, duplicated here because `freshness` keeps them private.
+const INDEXING_CONFIG_META_KEY: &str = "indexing_config";
+const INDEX_REFRESHED_AT_META_KEY: &str = "index_refreshed_at_unix_ms";
+
+fn store_index_into(idx_dir: &Path) -> Result<()> {
+    let indexing_config = crate::config::IndexingConfig::default();
+    store_index(
+        idx_dir,
+        &[],
+        &[],
+        &[("src/lib.rs".to_string(), "hash-a".to_string())],
+        &[],
+        &[],
+        IndexBuildMetadata {
+            file_states: &[],
+            indexing_config: &indexing_config,
+            model_name: "mock-model",
+        },
+    )
+}
+
+/// A failed store rebuild must not leave the index certified current.
+///
+/// Both stores are deleted and repopulated by `store_index`. The failure is
+/// injected by leaving a plain file where the store expects a directory (and a
+/// directory where it expects a file), which makes the reset step fail after
+/// the preceding stores have already been written. This proves the hashes and
+/// the freshness stamp land after both stores; it does not simulate a kill
+/// signal, and `store_index` has no seam for one.
+#[test]
+fn store_index_defers_hashes_and_freshness_until_stores_are_rebuilt() {
+    for poison in ["vector", "bm25"] {
+        let dir = TempDir::new().unwrap();
+        let idx_dir = dir.path().join(".vera");
+        fs::create_dir_all(&idx_dir).unwrap();
+        match poison {
+            // `remove_file` fails on a directory.
+            "vector" => fs::create_dir(idx_dir.join(VECTOR_DB)).unwrap(),
+            // `remove_dir_all` fails on a plain file.
+            _ => fs::write(idx_dir.join(BM25_SUBDIR), "not a directory").unwrap(),
+        }
+
+        let err = store_index_into(&idx_dir).unwrap_err();
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("failed to reset"),
+            "{poison}: unexpected failure: {rendered}"
+        );
+
+        let store = MetadataStore::open(&idx_dir.join(METADATA_DB)).unwrap();
+        assert_eq!(
+            store.get_file_hash("src/lib.rs").unwrap(),
+            None,
+            "{poison}: hashes were committed before the stores were rebuilt"
+        );
+        assert_eq!(
+            store.get_index_meta(INDEX_REFRESHED_AT_META_KEY).unwrap(),
+            None,
+            "{poison}: the index was stamped fresh before the stores were rebuilt"
+        );
+        assert_eq!(
+            store.get_index_meta(INDEXING_CONFIG_META_KEY).unwrap(),
+            None,
+            "{poison}: the freshness snapshot was recorded before the stores were rebuilt"
+        );
+    }
+}
+
+/// The deferred writes still happen when the rebuild succeeds.
+#[test]
+fn store_index_records_hashes_and_freshness_on_success() {
+    let dir = TempDir::new().unwrap();
+    let idx_dir = dir.path().join(".vera");
+
+    store_index_into(&idx_dir).unwrap();
+
+    let store = MetadataStore::open(&idx_dir.join(METADATA_DB)).unwrap();
+    assert_eq!(
+        store.get_file_hash("src/lib.rs").unwrap().as_deref(),
+        Some("hash-a")
+    );
+    assert!(
+        store
+            .get_index_meta(INDEX_REFRESHED_AT_META_KEY)
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        store
+            .get_index_meta(INDEXING_CONFIG_META_KEY)
+            .unwrap()
+            .is_some()
+    );
 }

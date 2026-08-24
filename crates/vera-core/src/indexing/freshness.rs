@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
+use rayon::prelude::*;
 use tracing::warn;
 
 use crate::config::IndexingConfig;
@@ -46,6 +47,19 @@ impl IndexFreshness {
             parts.push(format!("{} deleted", self.files_deleted));
         }
         parts.join(", ")
+    }
+
+    /// The stale-index warning shown to users, or `None` when the index covers
+    /// the tree. Single-sourced here because the CLI prints it on stderr and
+    /// the MCP server attaches it to tool results, and the two must agree.
+    pub fn stale_warning(&self) -> Option<String> {
+        if !self.is_stale() {
+            return None;
+        }
+        Some(format!(
+            "warning: index may be stale: {}. Search and grep only cover indexed files. Run `vera update .` or `vera watch .`.",
+            self.summary()
+        ))
     }
 }
 
@@ -109,24 +123,76 @@ pub fn detect_staleness(
         .filter(|path| !current_files.contains_key(path.as_str()))
         .count();
 
-    let mut files_modified = 0usize;
-    for (rel_path, absolute_path) in current_files
+    let files_modified = count_modified_files(
+        &current_files,
+        &tracked_files,
+        &metadata_store,
+        &discovery.root_dir,
+        &repo_root,
+        indexing_config.max_file_size_bytes,
+    )?;
+
+    Ok(IndexFreshness {
+        files_added,
+        files_modified,
+        files_deleted,
+    })
+}
+
+fn count_modified_files(
+    current_files: &HashMap<String, PathBuf>,
+    tracked_files: &HashSet<String>,
+    metadata_store: &MetadataStore,
+    root_dir: &cap_std::fs::Dir,
+    repo_root: &Path,
+    max_file_size_bytes: u64,
+) -> Result<usize> {
+    let tracked_current: Vec<(&String, &PathBuf)> = current_files
         .iter()
         .filter(|(path, _)| tracked_files.contains(path.as_str()))
-    {
-        let content = match crate::discovery::read_source_lossy(absolute_path) {
-            Ok(content) => content,
-            Err(err) => {
-                warn!(
-                    file = %rel_path,
-                    error = %err,
-                    "failed to read file during freshness scan"
-                );
-                continue;
-            }
+        .collect();
+
+    // Reading and hashing is I/O and CPU bound, so it runs under rayon. The
+    // metadata lookup that follows stays sequential: `MetadataStore` wraps a
+    // single SQLite connection and is not `Sync`, so it cannot be called from
+    // several rayon threads at once.
+    //
+    // `None` means the file could not be read. It is counted as modified
+    // rather than skipped, so an unreadable tracked file cannot make a stale
+    // index look current (#74).
+    let hashed: Vec<(&String, Option<String>)> = tracked_current
+        .par_iter()
+        .map(|(rel_path, _absolute_path)| {
+            let content =
+                match crate::discovery::read_source_lossy_at(root_dir, Path::new(rel_path)) {
+                    Ok(content) => content,
+                    Err(err) => {
+                        warn!(
+                            file = %rel_path,
+                            error = %err,
+                            "failed to read file during freshness scan"
+                        );
+                        return (*rel_path, None);
+                    }
+                };
+            let language = detect_language_for_path(rel_path);
+            let current_hash = hash_for_indexing_source(
+                &content,
+                rel_path,
+                language,
+                repo_root,
+                max_file_size_bytes,
+            );
+            (*rel_path, Some(current_hash))
+        })
+        .collect();
+
+    let mut files_modified = 0usize;
+    for (rel_path, current_hash) in hashed {
+        let Some(current_hash) = current_hash else {
+            files_modified += 1;
+            continue;
         };
-        let language = detect_language_for_path(rel_path);
-        let current_hash = hash_for_indexing_source(&content, rel_path, language, &repo_root);
         let stored_hash = metadata_store
             .get_file_hash(rel_path)
             .with_context(|| format!("failed to read stored hash for {rel_path}"))?;
@@ -135,11 +201,7 @@ pub fn detect_staleness(
         }
     }
 
-    Ok(IndexFreshness {
-        files_added,
-        files_modified,
-        files_deleted,
-    })
+    Ok(files_modified)
 }
 
 fn load_indexing_config(
@@ -182,6 +244,26 @@ mod tests {
             std::fs::create_dir_all(parent).unwrap();
         }
         std::fs::write(path, content).unwrap();
+    }
+
+    #[test]
+    fn stale_warning_names_every_kind_of_drift() {
+        let freshness = IndexFreshness {
+            files_added: 1,
+            files_modified: 2,
+            files_deleted: 3,
+        };
+        assert_eq!(
+            freshness.stale_warning().unwrap(),
+            "warning: index may be stale: 1 added, 2 modified, 3 deleted. \
+             Search and grep only cover indexed files. \
+             Run `vera update .` or `vera watch .`."
+        );
+    }
+
+    #[test]
+    fn fresh_index_has_no_stale_warning() {
+        assert_eq!(IndexFreshness::default().stale_warning(), None);
     }
 
     #[test]
@@ -228,6 +310,35 @@ mod tests {
 
         let freshness = detect_staleness(dir.path(), &IndexingConfig::default()).unwrap();
         assert_eq!(freshness.files_modified, 1);
+    }
+
+    #[test]
+    fn freshness_scan_marks_tracked_read_failures_as_modified() {
+        let dir = tempdir().unwrap();
+        let read_failure_path = dir.path().join("src/unreadable.rs");
+        // Model a tracked file being replaced by a directory after discovery.
+        std::fs::create_dir_all(&read_failure_path).unwrap();
+
+        let index_dir = dir.path().join(".vera");
+        std::fs::create_dir_all(&index_dir).unwrap();
+        let metadata = MetadataStore::open(&index_dir.join("metadata.db")).unwrap();
+        metadata
+            .set_file_hash("src/unreadable.rs", &content_hash("fn indexed() {}\n"))
+            .unwrap();
+
+        let current_files = HashMap::from([("src/unreadable.rs".to_string(), read_failure_path)]);
+        let tracked_files = HashSet::from(["src/unreadable.rs".to_string()]);
+        let files_modified = count_modified_files(
+            &current_files,
+            &tracked_files,
+            &metadata,
+            &crate::discovery::open_root_dir(dir.path()).unwrap(),
+            dir.path(),
+            IndexingConfig::default().max_file_size_bytes,
+        )
+        .unwrap();
+
+        assert_eq!(files_modified, 1);
     }
 
     #[test]

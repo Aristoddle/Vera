@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use crate::helpers::load_runtime_config;
+use crate::state;
 
 /// Run the `vera explain-path <path>` command.
 pub fn run(
@@ -15,7 +15,7 @@ pub fn run(
     let cwd = std::env::current_dir()
         .map_err(|e| anyhow::anyhow!("failed to get current directory: {e}"))?;
 
-    let mut config = load_runtime_config()?;
+    let mut config = state::load_runtime_config()?;
     config.indexing.extra_excludes = exclude;
     config.indexing.no_ignore = no_ignore;
     config.indexing.no_default_excludes = no_default_excludes;

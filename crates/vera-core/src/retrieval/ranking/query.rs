@@ -9,6 +9,13 @@ use crate::types::SymbolType;
 
 use super::*;
 
+/// Stopwords excluded from the raw content-word set.
+const QUERY_STOPWORDS: &[&str] = &[
+    "the", "and", "for", "are", "but", "not", "you", "all", "can", "had", "her", "was", "one",
+    "our", "out", "has", "have", "been", "were", "they", "this", "that", "with", "from", "what",
+    "when", "where", "how", "why", "which", "does",
+];
+
 #[derive(Debug, Clone)]
 pub(super) struct QueryFeatures {
     pub(super) query_word_count: usize,
@@ -17,6 +24,9 @@ pub(super) struct QueryFeatures {
     pub(super) exact_identifier_case: Option<String>,
     pub(super) exact_identifier: Option<String>,
     pub(super) keywords: Vec<String>,
+    /// Raw content words of the query: tokens longer than 2 chars, minus a
+    /// small stopword list. No singularization or curated exclusions.
+    pub(super) raw_keywords: Vec<String>,
     /// CamelCase/snake_case identifiers embedded in NL queries.
     /// E.g., "How does StateManager handle transitions" yields ["StateManager"].
     pub(super) embedded_symbols: Vec<String>,
@@ -34,6 +44,8 @@ pub(super) struct QueryFeatures {
     pub(super) wants_multi_file_diversity: bool,
     pub(super) mentions_implementation: bool,
     pub(super) mentions_definition: bool,
+    /// Query joins facets with an explicit conjunction ("A and B").
+    pub(super) has_conjunction: bool,
 }
 
 impl QueryFeatures {
@@ -97,6 +109,11 @@ impl QueryFeatures {
             .map(|token| normalize_token(token))
             .filter(|token| !token.is_empty())
             .collect();
+        let raw_keywords: Vec<String> = raw_tokens
+            .iter()
+            .map(|token| trim_query_token(token).to_ascii_lowercase())
+            .filter(|word| word.len() > 2 && !QUERY_STOPWORDS.contains(&word.as_str()))
+            .collect();
         let requested_symbol_types = requested_symbol_types(&lower);
 
         // Extract CamelCase/snake_case identifiers embedded in NL queries.
@@ -111,6 +128,7 @@ impl QueryFeatures {
             query_word_count: raw_tokens.len(),
             path_fragment,
             exact_identifier_case,
+            raw_keywords,
             wants_test_paths: mentions_any(&lower, &["test", "tests", "spec", "__tests__"]),
             wants_docs_paths: mentions_any(&lower, &["docs", "documentation", "readme"]),
             wants_example_paths: mentions_any(&lower, &["example", "examples", "demo", "sample"]),
@@ -119,10 +137,13 @@ impl QueryFeatures {
                     &lower,
                     &["configuration", "config", "workspace", "settings"],
                 ),
+            // "runtime" alone is ambiguous: intent queries discuss runtime
+            // *behavior* ("catching runtime panics", "the async runtime")
+            // far more often than runtime artifacts. Only unambiguous
+            // artifact vocabulary triggers the runtime-extract preference.
             wants_runtime_paths: mentions_any(
                 &lower,
                 &[
-                    "runtime",
                     "bundle",
                     "bundles",
                     "minified",
@@ -156,6 +177,10 @@ impl QueryFeatures {
             wants_multi_file_diversity: !is_path_weighted_query(query)
                 && (query_type == QueryType::NaturalLanguage
                     || (exact_identifier.is_some() && raw_tokens.len() <= 2)),
+            has_conjunction: raw_tokens.iter().any(|token| {
+                let t = trim_query_token(token);
+                t.eq_ignore_ascii_case("and") || t.eq_ignore_ascii_case("or")
+            }),
             mentions_implementation: mentions_any(
                 &lower,
                 &[

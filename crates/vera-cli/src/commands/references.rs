@@ -2,7 +2,8 @@
 
 use anyhow::Result;
 
-use crate::helpers::{apply_git_scope, load_runtime_config, output_results, prepare_indexed_repo};
+use crate::helpers::{apply_git_scope, output_results, prepare_indexed_repo};
+use crate::state;
 
 /// Run the `vera references <symbol>` command.
 pub fn run(
@@ -14,7 +15,7 @@ pub fn run(
     raw: bool,
     compact: bool,
 ) -> Result<()> {
-    let config = load_runtime_config()?;
+    let config = state::load_runtime_config()?;
     let result_limit = limit.unwrap_or(20);
     let (cwd, index_dir) = prepare_indexed_repo(&config.indexing)?;
 
@@ -67,7 +68,7 @@ pub fn run(
 
 /// Run the `vera dead-code` command.
 pub fn run_dead_code(json: bool) -> Result<()> {
-    let config = load_runtime_config()?;
+    let config = state::load_runtime_config()?;
     let (cwd, _) = prepare_indexed_repo(&config.indexing)?;
     let results = vera_core::stats::find_dead_symbols(&cwd)?;
 

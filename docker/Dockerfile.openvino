@@ -1,17 +1,14 @@
 # Vera OpenVINO Docker image (Intel GPU/iGPU acceleration)
-# Usage: docker build -f docker/Dockerfile.openvino -t vera:openvino .
+# Packages a prebuilt binary. CI builds it once per release; to build locally
+# (must be a Linux x86_64 build; on macOS/Windows use a Linux container, see docs/docker.md):
+#   ./scripts/bootstrap-vendored-grammars.sh
+#   cargo build --release -p vera-cli && mkdir -p dist && cp target/release/vera dist/
+#   docker build -f docker/Dockerfile.openvino -t vera:openvino .
 
-# --- Build stage ---
-FROM rust:1.94.1-trixie AS builder
-
-WORKDIR /build
-COPY . .
-
-RUN bash scripts/bootstrap-vendored-grammars.sh
-RUN cargo build --release -p vera-cli -p vera-mcp
-
-# --- Runtime stage ---
-FROM debian:trixie-slim
+# Ubuntu 24.04, not debian:trixie-slim like the cpu image: intel-opencl-icd
+# (Intel GPU compute runtime) is not published in Debian trixie at all, but
+# is in Ubuntu noble universe. Noble's glibc 2.39 matches the CI-built binary.
+FROM ubuntu:24.04
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates curl \
@@ -19,7 +16,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ocl-icd-libopencl1 intel-opencl-icd \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /build/target/release/vera /usr/local/bin/vera
+COPY dist/vera /usr/local/bin/vera
 
 ENV VERA_LOCAL=1
 

@@ -19,6 +19,44 @@ const TIER0_OVERLAP: u32 = 10;
 /// Minimum lines for a symbol to be kept as a chunk (skip trivial ones).
 const MIN_SYMBOL_LINES: u32 = 1;
 
+/// Line comment markers per language family. Used to recognise doc comments.
+fn comment_prefixes(language: Language) -> &'static [&'static str] {
+    match language {
+        Language::Python
+        | Language::Ruby
+        | Language::Bash
+        | Language::Yaml
+        | Language::Toml
+        | Language::Perl
+        | Language::R
+        | Language::Julia
+        | Language::Elixir
+        | Language::Dockerfile
+        | Language::Nix
+        | Language::Hcl
+        | Language::Makefile
+        | Language::CMake
+        | Language::PowerShell => &["#"],
+        Language::Lua | Language::Sql | Language::Haskell => &["--"],
+        Language::Html | Language::Vue | Language::Astro | Language::Svelte => &["<!--"],
+        _ => &["//"],
+    }
+}
+
+/// Is this (trimmed) source line part of a comment in `language`? Block
+/// comment interiors ("* ...") and terminators count for C-family languages.
+fn is_comment_line(line: &str, language: Language) -> bool {
+    if comment_prefixes(language)
+        .iter()
+        .any(|prefix| line.starts_with(prefix))
+    {
+        return true;
+    }
+    // C-family block comment interior/end lines.
+    comment_prefixes(language).first() == Some(&"//")
+        && (line.starts_with("/*") || line.starts_with('*') || line.starts_with("*/"))
+}
+
 /// Create chunks from extracted symbols (Tier 1A: symbol-aware chunking).
 ///
 /// Produces one chunk per symbol. Large symbols exceeding `max_chunk_lines`
@@ -40,8 +78,35 @@ pub fn chunks_from_symbols(
     let mut covered_end_row: u32 = 0;
 
     for symbol in symbols {
-        let sym_start = symbol.start_row as u32;
+        let mut sym_start = symbol.start_row as u32;
         let sym_end = symbol.end_row as u32;
+        let has_nested_symbol = language == Language::Bash
+            && symbols.iter().any(|child| {
+                child.start_byte > symbol.start_byte
+                    && child.end_byte <= symbol.end_byte
+                    && child.end_byte > child.start_byte
+            });
+
+        // A documentation comment documents the symbol below it; attaching it
+        // to the symbol chunk keeps the topical prose, the signature, and the
+        // symbol metadata in one retrievable unit instead of stranding the
+        // doc text in a symbol-less gap chunk.
+        let mut attach_start = sym_start;
+        let mut row = sym_start;
+        while row > covered_end_row {
+            let line = lines[(row - 1) as usize].trim_start();
+            if line.is_empty() {
+                break; // blank line: the comment above is not attached
+            }
+            if is_comment_line(line, language) {
+                attach_start = row - 1;
+                row -= 1;
+            } else {
+                break;
+            }
+        }
+        sym_start = attach_start;
+
         let sym_lines = sym_end.saturating_sub(sym_start) + 1;
 
         // Skip trivially small symbols (e.g., single-line forward declarations)
@@ -68,9 +133,10 @@ pub fn chunks_from_symbols(
         }
 
         // Split large symbols into sub-chunks
-        if sym_lines > config.max_chunk_lines {
+        if sym_lines > config.max_chunk_lines && !has_nested_symbol {
             let sub_chunks = split_large_symbol(
                 symbol,
+                sym_start,
                 &lines,
                 file_path,
                 language,
@@ -93,7 +159,12 @@ pub fn chunks_from_symbols(
             chunk_index += 1;
         }
 
-        covered_end_row = sym_end + 1;
+        // Extractors emit a parent (impl, class, namespace) alongside its
+        // children, and symbols are sorted by start byte, so the parent is
+        // seen first. Advancing monotonically stops a child from rewinding
+        // coverage back inside the parent, which would make every span
+        // between children look like an uncovered gap.
+        covered_end_row = covered_end_row.max(sym_end + 1);
     }
 
     // Trailing gap after last symbol
@@ -144,6 +215,7 @@ pub fn whole_file_chunk(source: &str, file_path: &str, language: Language) -> Ve
 /// to the hard `max_lines` limit when no good boundary exists nearby.
 fn split_large_symbol(
     symbol: &RawSymbol,
+    start_row: u32,
     lines: &[&str],
     file_path: &str,
     language: Language,
@@ -151,7 +223,7 @@ fn split_large_symbol(
     chunk_index: &mut u32,
 ) -> Vec<Chunk> {
     let mut chunks = Vec::new();
-    let start = symbol.start_row as u32;
+    let start = start_row;
     let end = symbol.end_row as u32;
     let mut current = start;
     let mut part = 1u32;
@@ -584,6 +656,169 @@ mod tests {
         // First chunk should be the gap (imports)
         assert_eq!(chunks[0].symbol_type, Some(SymbolType::Block));
         assert!(chunks[0].content.contains("use std::io"));
+    }
+
+    #[test]
+    fn nested_children_emit_no_gap_chunks() {
+        // Extractors push the `impl` and each of its methods, sorted by start
+        // byte. The span between two methods and the impl's closing brace are
+        // already inside the parent chunk and must not be emitted again.
+        let source = "impl Token {\n    /// Create a token.\n    fn new() -> Self {\n        Self\n    }\n\n    /// Cancel the token.\n    fn cancel(&self) {}\n}\n";
+        let symbols = vec![
+            RawSymbol {
+                name: Some("Token".to_string()),
+                symbol_type: SymbolType::Block,
+                start_byte: 0,
+                end_byte: source.len(),
+                start_row: 0,
+                end_row: 8,
+            },
+            RawSymbol {
+                name: Some("new".to_string()),
+                symbol_type: SymbolType::Method,
+                start_byte: 40,
+                end_byte: 80,
+                start_row: 2,
+                end_row: 4,
+            },
+            RawSymbol {
+                name: Some("cancel".to_string()),
+                symbol_type: SymbolType::Method,
+                start_byte: 110,
+                end_byte: 130,
+                start_row: 7,
+                end_row: 7,
+            },
+        ];
+        let chunks = chunks_from_symbols(
+            &symbols,
+            source,
+            "token.rs",
+            Language::Rust,
+            &default_config(),
+        );
+
+        let names: Vec<_> = chunks.iter().map(|c| c.symbol_name.clone()).collect();
+        assert_eq!(
+            names,
+            vec![
+                Some("Token".to_string()),
+                Some("new".to_string()),
+                Some("cancel".to_string()),
+            ],
+            "only the parent and its two children should be chunked, got {chunks:?}"
+        );
+        assert!(
+            !chunks.iter().any(|c| c.content.trim() == "}"),
+            "the parent's closing brace must not become its own chunk"
+        );
+    }
+
+    #[test]
+    fn large_bash_dispatcher_keeps_parent_whole_and_emits_case_chunks() {
+        let source = r#"function nvm() {
+  case "$1" in
+    use)
+      echo use
+      ;;
+    deactivate)
+      echo deactivate
+      ;;
+    install)
+      echo install
+      ;;
+    *)
+      echo other
+      ;;
+  esac
+}"#;
+        let grammar = crate::parsing::languages::tree_sitter_grammar(Language::Bash).unwrap();
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&grammar).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let symbols =
+            crate::parsing::extractor::extract_symbols(&tree, source.as_bytes(), Language::Bash);
+        let config = IndexingConfig {
+            max_chunk_lines: 4,
+            ..Default::default()
+        };
+        let chunks = chunks_from_symbols(&symbols, source, "nvm.sh", Language::Bash, &config);
+
+        let names: Vec<_> = chunks
+            .iter()
+            .map(|chunk| chunk.symbol_name.as_deref())
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                Some("nvm"),
+                Some("nvm use"),
+                Some("nvm deactivate"),
+                Some("nvm install"),
+                Some("nvm *"),
+            ]
+        );
+        assert_eq!((chunks[0].line_start, chunks[0].line_end), (1, 16));
+        assert_eq!((chunks[1].line_start, chunks[1].line_end), (3, 5));
+        assert_eq!((chunks[2].line_start, chunks[2].line_end), (6, 8));
+        assert_eq!((chunks[3].line_start, chunks[3].line_end), (9, 11));
+        assert_eq!((chunks[4].line_start, chunks[4].line_end), (12, 14));
+        assert!(chunks[0].content.contains("esac"));
+        assert!(chunks.iter().all(|chunk| {
+            !chunk
+                .symbol_name
+                .as_deref()
+                .unwrap_or_default()
+                .contains("part")
+        }));
+    }
+
+    #[test]
+    fn gap_after_nested_parent_still_captured() {
+        // Monotonic coverage must not swallow real code that follows the
+        // parent, only the spans the parent already covers.
+        let source = "impl Token {\n    fn new() -> Self {\n        Self\n    }\n}\n\nstatic REGISTRY: &str = \"tokens\";\n";
+        let symbols = vec![
+            RawSymbol {
+                name: Some("Token".to_string()),
+                symbol_type: SymbolType::Block,
+                start_byte: 0,
+                end_byte: 60,
+                start_row: 0,
+                end_row: 4,
+            },
+            RawSymbol {
+                name: Some("new".to_string()),
+                symbol_type: SymbolType::Method,
+                start_byte: 17,
+                end_byte: 55,
+                start_row: 1,
+                end_row: 3,
+            },
+        ];
+        let chunks = chunks_from_symbols(
+            &symbols,
+            source,
+            "token.rs",
+            Language::Rust,
+            &default_config(),
+        );
+
+        let names: Vec<_> = chunks.iter().map(|c| c.symbol_name.clone()).collect();
+        assert_eq!(
+            names,
+            vec![Some("Token".to_string()), Some("new".to_string()), None],
+            "the parent and its child must still be chunked before the trailing gap, got {chunks:?}"
+        );
+
+        let trailing = chunks
+            .iter()
+            .find(|c| c.symbol_name.is_none())
+            .expect("trailing top-level code should still produce a gap chunk");
+        assert_eq!(trailing.symbol_type, Some(SymbolType::Block));
+        assert_eq!(trailing.line_start, 6);
+        assert_eq!(trailing.line_end, 7);
+        assert!(trailing.content.contains("static REGISTRY"));
     }
 
     #[test]

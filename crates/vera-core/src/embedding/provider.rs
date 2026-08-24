@@ -11,6 +11,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 use crate::chunk_text;
+use crate::local_models::CODERANK_QUERY_PREFIX;
 use crate::types::Chunk;
 
 // ── Error types ──────────────────────────────────────────────────────
@@ -76,6 +77,12 @@ pub trait EmbeddingProvider: Send + Sync {
     /// Rewrite query text for providers that require asymmetric query prefixes.
     fn prepare_query_text(&self, query: &str) -> String {
         query.to_string()
+    }
+
+    /// Rewrite passage text for providers that require asymmetric document
+    /// prefixes. Applied on the indexing path only.
+    fn prepare_document_text(&self, document: &str) -> String {
+        document.to_string()
     }
 
     /// Return the maximum number of inputs the provider accepts per request.
@@ -193,7 +200,9 @@ fn default_query_prefix_for_model(model_id: &str) -> Option<String> {
     if id.contains("qwen3-embedding") || id.contains("qwen3_embedding") {
         Some("Instruct: Given a code search query, retrieve relevant code snippets that match the query\nQuery: ".into())
     } else if id.contains("coderankembed") {
-        Some("Represent this query for retrieving relevant code: ".into())
+        // `prepare_query_text` concatenates without a separator, so the
+        // trailing space belongs here rather than in the shared constant.
+        Some(format!("{CODERANK_QUERY_PREFIX} "))
     } else if id.contains("e5-") || id.contains("e5_") {
         Some("query: ".into())
     } else if id.contains("bge-") || id.contains("bge_") {
@@ -220,6 +229,7 @@ fn fetch_query_prefix_from_hf(model_id: &str) -> Option<String> {
     );
     debug!(model_id, url = %url, "fetching query prefix from HuggingFace");
 
+    crate::init_tls();
     let body = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(5))
         .build()
@@ -365,15 +375,17 @@ impl OpenAiProvider {
         let status = response.status().as_u16();
 
         if status == 401 || status == 403 {
-            let text = read_response_text(response, "failed to read authentication error response")
-                .await?;
+            let text =
+                read_error_response_text(response, "failed to read authentication error response")
+                    .await?;
             return Err(EmbeddingError::AuthError {
                 message: sanitize_error_message(&text),
             });
         }
 
         if status == 429 {
-            let text = read_response_text(response, "failed to read rate limit response").await?;
+            let text =
+                read_error_response_text(response, "failed to read rate limit response").await?;
             return Err(EmbeddingError::RateLimitError {
                 message: sanitize_error_message(&text),
             });
@@ -381,7 +393,8 @@ impl OpenAiProvider {
 
         if !response.status().is_success() {
             let text =
-                read_response_text(response, "failed to read embedding error response").await?;
+                read_error_response_text(response, "failed to read embedding error response")
+                    .await?;
             // Some providers return 400 with "Unable to process" for transient
             // overload conditions. Treat these as rate limits so they get retried.
             if status == 400 && text.contains("Unable to process") {
@@ -432,14 +445,15 @@ fn response_read_error(error: reqwest::Error, context: &str) -> EmbeddingError {
     }
 }
 
-async fn read_response_text(
+async fn read_error_response_text(
     response: reqwest::Response,
     context: &str,
 ) -> Result<String, EmbeddingError> {
-    response
-        .text()
-        .await
-        .map_err(|error| response_read_error(error, context))
+    match response.text().await {
+        Ok(text) => Ok(text),
+        Err(error) if error.is_timeout() => Err(response_read_error(error, context)),
+        Err(error) => Ok(format!("{context}: {error}")),
+    }
 }
 
 impl EmbeddingProvider for OpenAiProvider {
@@ -649,6 +663,10 @@ impl<P: EmbeddingProvider> EmbeddingProvider for CachedEmbeddingProvider<P> {
 
     fn prepare_query_text(&self, query: &str) -> String {
         self.inner.prepare_query_text(query)
+    }
+
+    fn prepare_document_text(&self, document: &str) -> String {
+        self.inner.prepare_document_text(document)
     }
 
     fn max_batch_size(&self) -> Option<usize> {
@@ -875,14 +893,24 @@ fn shrink_text_for_context_limit(
 async fn embed_batch_resilient<P: EmbeddingProvider>(
     provider: &P,
     items: Vec<EmbeddingBatchItem>,
+    cancel: &CancellationToken,
 ) -> Result<Vec<(usize, String, Vec<f32>)>, EmbeddingError> {
     let mut pending = vec![items];
     let mut completed = Vec::new();
 
     while let Some(batch) = pending.pop() {
+        if cancel.is_cancelled() {
+            return Err(EmbeddingError::Cancelled);
+        }
         let texts: Vec<String> = batch.iter().map(|item| item.text.clone()).collect();
 
-        match provider.embed_batch(&texts).await {
+        let result = tokio::select! {
+            biased;
+            result = provider.embed_batch_cancellable(&texts, cancel) => result,
+            _ = cancel.cancelled() => Err(EmbeddingError::Cancelled),
+        };
+
+        match result {
             Ok(vectors) => {
                 completed.extend(
                     batch
@@ -950,24 +978,30 @@ pub async fn embed_chunks_concurrent<P: EmbeddingProvider>(
     max_concurrent: usize,
     max_chunk_bytes: usize,
 ) -> Result<Vec<(String, Vec<f32>)>, EmbeddingError> {
-    embed_chunks_concurrent_with_progress(
+    embed_chunks_concurrent_with_progress_and_cancellation(
         provider,
         chunks,
         batch_size,
         max_concurrent,
         max_chunk_bytes,
+        &CancellationToken::new(),
         |_, _| {},
     )
     .await
 }
 
-/// Like `embed_chunks_concurrent` but calls `on_progress(done, total)` after each batch.
-pub async fn embed_chunks_concurrent_with_progress<P, F>(
+/// Embed chunks concurrently while allowing the caller to cancel active batches.
+///
+/// The token remains owned by the indexing operation. Cancellation drops every
+/// active provider future and returns [`EmbeddingError::Cancelled`] without
+/// reporting further progress.
+pub(crate) async fn embed_chunks_concurrent_with_progress_and_cancellation<P, F>(
     provider: &P,
     chunks: &[Chunk],
     batch_size: usize,
     max_concurrent: usize,
     max_chunk_bytes: usize,
+    cancel: &CancellationToken,
     on_progress: F,
 ) -> Result<Vec<(String, Vec<f32>)>, EmbeddingError>
 where
@@ -991,6 +1025,8 @@ where
     let mut indexed_chunks: Vec<(usize, &Chunk)> = chunks.iter().enumerate().collect();
     indexed_chunks.sort_by_key(|(_, c)| c.content.len());
 
+    let body_budget = budget_after_prefix(max_chunk_bytes, document_prefix_overhead(provider));
+
     let batch_inputs: Vec<Vec<EmbeddingBatchItem>> = indexed_chunks
         .chunks(batch_size)
         .map(|batch| {
@@ -999,7 +1035,8 @@ where
                 .map(|(orig_idx, chunk)| EmbeddingBatchItem {
                     original_index: *orig_idx,
                     chunk_id: chunk.id.clone(),
-                    text: chunk_to_embedding_text(chunk, max_chunk_bytes),
+                    text: provider
+                        .prepare_document_text(&chunk_to_embedding_text(chunk, body_budget)),
                 })
                 .collect()
         })
@@ -1019,14 +1056,19 @@ where
                 let batch_idx = group_start + i;
                 async move {
                     debug!(batch = batch_idx + 1, total_batches, "embedding batch");
-                    embed_batch_resilient(provider, items.clone()).await
+                    embed_batch_resilient(provider, items.clone(), cancel).await
                 }
             })
             .collect();
 
         let results = futures::future::join_all(futures).await;
         for result in results {
+            // Batch errors (real provider failures or Cancelled) win over a
+            // pending cancellation so the caller sees the actual failure.
             let batch_results = result?;
+            if cancel.is_cancelled() {
+                return Err(EmbeddingError::Cancelled);
+            }
             done_count += batch_results.len();
             all_results.extend(batch_results);
             on_progress(done_count, total);
@@ -1054,6 +1096,33 @@ fn chunk_to_embedding_text(chunk: &Chunk, max_bytes: usize) -> String {
     } else {
         chunk_text::build_embedding_text(chunk)
     }
+}
+
+/// Measure how many bytes `prepare_document_text` adds to a passage.
+///
+/// Read off the provider rather than off the model config, so it stays correct
+/// for any implementation of the hook, including the identity default.
+fn document_prefix_overhead<P: EmbeddingProvider>(provider: &P) -> usize {
+    const PROBE: &str = "x";
+    provider
+        .prepare_document_text(PROBE)
+        .len()
+        .saturating_sub(PROBE.len())
+}
+
+/// Shrink the chunk byte budget so the document prefix fits inside it.
+///
+/// The prefix spends the same context window the budget exists to protect, so
+/// it has to be reserved before truncation rather than added after it.
+///
+/// `0` means "unbounded" to [`chunk_to_embedding_text`], so a prefix at least
+/// as large as the budget floors at 1 instead of saturating to 0, which would
+/// silently switch truncation off entirely.
+fn budget_after_prefix(max_chunk_bytes: usize, prefix_overhead: usize) -> usize {
+    if max_chunk_bytes == 0 {
+        return 0;
+    }
+    max_chunk_bytes.saturating_sub(prefix_overhead).max(1)
 }
 
 // ── Sanitization ─────────────────────────────────────────────────────
@@ -1196,6 +1265,53 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    async fn provider_with_truncated_error_body(
+        status: &'static str,
+    ) -> (OpenAiProvider, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 2048];
+            let _ = stream.read(&mut request).await;
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Length: 32\r\nConnection: close\r\n\r\nshort"
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+            stream.shutdown().await.unwrap();
+        });
+        let config = EmbeddingProviderConfig::new(
+            format!("http://{address}"),
+            "test-model".into(),
+            "test-key".into(),
+        )
+        .with_max_retries(0);
+        (OpenAiProvider::new(config).unwrap(), server)
+    }
+
+    /// Cancels the token mid-request but still returns vectors, modelling an
+    /// embedding response that completes at the same moment cancellation fires.
+    struct CancelThenSucceedProvider;
+
+    impl EmbeddingProvider for CancelThenSucceedProvider {
+        async fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+            Ok(vec![vec![0.0; 8]; texts.len()])
+        }
+
+        async fn embed_batch_cancellable(
+            &self,
+            texts: &[String],
+            cancel: &CancellationToken,
+        ) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+            cancel.cancel();
+            self.embed_batch(texts).await
+        }
+
+        fn expected_dim(&self) -> Option<usize> {
+            Some(8)
+        }
+    }
+
     struct CancellationAwareProvider;
 
     impl EmbeddingProvider for CancellationAwareProvider {
@@ -1263,8 +1379,53 @@ mod tests {
     #[test]
     fn auto_detect_coderankembed_prefix() {
         let prefix = default_query_prefix_for_model("krlvi/CodeRankEmbed");
-        assert!(prefix.is_some());
-        assert!(prefix.unwrap().contains("Represent this query"));
+        // Exact: the published prompt in the model's
+        // `config_sentence_transformers.json`, trailing space included.
+        assert_eq!(
+            prefix.as_deref(),
+            Some("Represent this query for searching relevant code: ")
+        );
+    }
+
+    /// The local ONNX path and the API path must embed the same query
+    /// identically. They apply the prefix differently (`query_text` trims the
+    /// *prefix* and rejoins it with one space, `prepare_query_text`
+    /// concatenates a prefix that already carries its own trailing space), so
+    /// this pins the resulting text rather than the constant.
+    ///
+    /// Neither path touches the query itself, so an un-normalized query has to
+    /// survive verbatim and identically on both sides; that case is covered
+    /// here so a one-sided `trim()` cannot be added without failing.
+    #[test]
+    fn coderankembed_query_text_matches_across_local_and_api_paths() {
+        let cases = [
+            (
+                "find router code",
+                "Represent this query for searching relevant code: find router code",
+            ),
+            (
+                "  find router code  ",
+                "Represent this query for searching relevant code:   find router code  ",
+            ),
+        ];
+
+        for (query, expected) in cases {
+            let local =
+                crate::local_models::LocalEmbeddingModelConfig::coderankembed().query_text(query);
+
+            let mut config = EmbeddingProviderConfig::new(
+                "http://x".into(),
+                "krlvi/CodeRankEmbed".into(),
+                "k".into(),
+            );
+            config.query_prefix = default_query_prefix_for_model(&config.model_id);
+            let api = OpenAiProvider::new(config)
+                .unwrap()
+                .prepare_query_text(query);
+
+            assert_eq!(local, api, "paths diverged on {query:?}");
+            assert_eq!(local, expected, "unexpected prefixed text for {query:?}");
+        }
     }
 
     #[test]
@@ -1471,5 +1632,217 @@ mod tests {
         assert!(matches!(error, EmbeddingError::TimeoutError { .. }));
         assert_eq!(request_count.load(Ordering::SeqCst), 1);
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn truncated_auth_body_preserves_authentication_classification() {
+        let (provider, server) = provider_with_truncated_error_body("401 Unauthorized").await;
+        let texts = ["input".to_string()];
+        let body = EmbeddingRequest {
+            model: &provider.config.model_id,
+            input: &texts,
+        };
+
+        let error = provider
+            .send_request(&provider.endpoint_url(), &body)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, EmbeddingError::AuthError { .. }));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn truncated_rate_limit_body_preserves_rate_limit_classification() {
+        let (provider, server) = provider_with_truncated_error_body("429 Too Many Requests").await;
+        let texts = ["input".to_string()];
+        let body = EmbeddingRequest {
+            model: &provider.config.model_id,
+            input: &texts,
+        };
+
+        let error = provider
+            .send_request(&provider.endpoint_url(), &body)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, EmbeddingError::RateLimitError { .. }));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_completed_batch_suppresses_further_progress() {
+        let chunks = vec![crate::types::Chunk {
+            id: "chunk-0".to_string(),
+            file_path: "src/main.rs".to_string(),
+            line_start: 1,
+            line_end: 1,
+            content: "fn main() {}".to_string(),
+            language: crate::types::Language::Rust,
+            symbol_type: None,
+            symbol_name: None,
+        }];
+        let progress_events = AtomicUsize::new(0);
+
+        let result = embed_chunks_concurrent_with_progress_and_cancellation(
+            &CancelThenSucceedProvider,
+            &chunks,
+            1,
+            1,
+            0,
+            &CancellationToken::new(),
+            |_, _| {
+                progress_events.fetch_add(1, Ordering::SeqCst);
+            },
+        )
+        .await;
+
+        assert!(matches!(result, Err(EmbeddingError::Cancelled)));
+        assert_eq!(progress_events.load(Ordering::SeqCst), 0);
+    }
+
+    /// Records the texts it is asked to embed and prefixes passages, so the
+    /// test can prove the indexing funnel actually calls the document hook
+    /// rather than merely defining it.
+    struct RecordingProvider {
+        seen: Mutex<Vec<String>>,
+    }
+
+    impl EmbeddingProvider for RecordingProvider {
+        async fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+            self.seen.lock().unwrap().extend(texts.iter().cloned());
+            Ok(texts.iter().map(|_| vec![0.0]).collect())
+        }
+
+        fn expected_dim(&self) -> Option<usize> {
+            Some(1)
+        }
+
+        fn prepare_document_text(&self, document: &str) -> String {
+            format!("Document: {document}")
+        }
+
+        fn prepare_query_text(&self, query: &str) -> String {
+            format!("Query: {query}")
+        }
+    }
+
+    #[tokio::test]
+    async fn indexing_applies_the_document_prefix_and_not_the_query_prefix() {
+        let chunks = vec![crate::types::Chunk {
+            id: "chunk-0".to_string(),
+            file_path: "src/main.rs".to_string(),
+            line_start: 1,
+            line_end: 1,
+            content: "fn main() {}".to_string(),
+            language: crate::types::Language::Rust,
+            symbol_type: None,
+            symbol_name: None,
+        }];
+        let provider = RecordingProvider {
+            seen: Mutex::new(Vec::new()),
+        };
+
+        embed_chunks_concurrent_with_progress_and_cancellation(
+            &provider,
+            &chunks,
+            1,
+            1,
+            0,
+            &CancellationToken::new(),
+            |_, _| {},
+        )
+        .await
+        .expect("embedding should succeed");
+
+        let seen = provider.seen.lock().unwrap();
+        assert_eq!(seen.len(), 1, "expected exactly one embedded passage");
+        assert!(
+            seen[0].starts_with("Document: "),
+            "indexing path did not apply the document prefix: {:?}",
+            seen[0]
+        );
+        assert!(
+            !seen[0].contains("Query: "),
+            "indexed passage was given the query prefix: {:?}",
+            seen[0]
+        );
+        assert!(
+            seen[0].contains("fn main() {}"),
+            "prefix replaced the chunk body instead of prefixing it: {:?}",
+            seen[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn the_document_prefix_fits_inside_the_chunk_byte_budget() {
+        const BUDGET: usize = 200;
+        let chunks = vec![crate::types::Chunk {
+            id: "chunk-0".to_string(),
+            file_path: "src/main.rs".to_string(),
+            line_start: 1,
+            line_end: 200,
+            // Far past the budget, so the bounded builder is the thing that
+            // decides the length. Short lines keep the line-boundary cut from
+            // landing well inside the budget and hiding the overshoot.
+            content: "ab\n".repeat(400),
+            language: crate::types::Language::Rust,
+            symbol_type: None,
+            symbol_name: None,
+        }];
+        let provider = RecordingProvider {
+            seen: Mutex::new(Vec::new()),
+        };
+
+        embed_chunks_concurrent_with_progress_and_cancellation(
+            &provider,
+            &chunks,
+            1,
+            1,
+            BUDGET,
+            &CancellationToken::new(),
+            |_, _| {},
+        )
+        .await
+        .expect("embedding should succeed");
+
+        let seen = provider.seen.lock().unwrap();
+        assert_eq!(seen.len(), 1, "expected exactly one embedded passage");
+        assert!(
+            seen[0].starts_with("Document: "),
+            "the passage lost its document prefix: {:?}",
+            seen[0]
+        );
+        assert!(
+            seen[0].contains("Code:\nab\nab"),
+            "the reservation ate the chunk body: {:?}",
+            seen[0]
+        );
+        assert!(
+            seen[0].len() <= BUDGET,
+            "prefixed passage is {} bytes against a {BUDGET}-byte budget",
+            seen[0].len()
+        );
+    }
+
+    #[test]
+    fn a_prefix_larger_than_the_budget_still_leaves_a_budget() {
+        // 0 means "unbounded" to chunk_to_embedding_text, so saturating to it
+        // would turn an over-long prefix into no truncation at all.
+        assert_eq!(budget_after_prefix(8, 10), 1);
+        assert_eq!(budget_after_prefix(8, 8), 1);
+        assert_eq!(budget_after_prefix(200, 10), 190);
+        // An unbounded budget stays unbounded.
+        assert_eq!(budget_after_prefix(0, 10), 0);
+    }
+
+    #[test]
+    fn the_prefix_overhead_is_measured_from_the_provider() {
+        let provider = RecordingProvider {
+            seen: Mutex::new(Vec::new()),
+        };
+        assert_eq!(document_prefix_overhead(&provider), "Document: ".len());
+        // A provider that takes the identity default reserves nothing.
+        assert_eq!(document_prefix_overhead(&CancelThenSucceedProvider), 0);
     }
 }

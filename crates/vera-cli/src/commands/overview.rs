@@ -1,6 +1,7 @@
 //! `vera overview` — Show architecture overview of the indexed project.
 
-use crate::helpers::{load_runtime_config, warn_if_index_stale};
+use crate::helpers::warn_if_index_stale;
+use crate::state;
 use vera_core::stats::{self, ProjectOverview};
 
 /// Run the `vera overview` command.
@@ -10,7 +11,7 @@ pub fn run(
 ) -> anyhow::Result<()> {
     let cwd = std::env::current_dir()
         .map_err(|e| anyhow::anyhow!("failed to get current directory: {e}"))?;
-    let config = load_runtime_config()?;
+    let config = state::load_runtime_config()?;
 
     let exact_paths = if let Some(scope) = git_scope.as_ref() {
         Some(vera_core::git_scope::resolve_scope(&cwd, scope)?)

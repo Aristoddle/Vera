@@ -207,6 +207,186 @@ pub(super) fn get_elixir_do_block<'a>(
         .find(|child| child.kind() == "do_block")
 }
 
+/// Extract function-valued `const`, `let`, and `var` bindings as named function
+/// symbols.
+///
+/// The name sits on the `variable_declarator`, not on the declaration itself,
+/// so the generic name lookup finds nothing and the symbol is stored unnamed.
+/// That is what makes function-valued bindings such as React components and
+/// utilities unreachable from `structural definitions`.
+///
+/// `let` and `var` bindings are covered too: the reported symptom was about
+/// `const` because that is the dominant style, but the missing name is a
+/// property of the declarator, not of the keyword, so scoping this to `const`
+/// would leave the same bug in place for the other two.
+///
+/// Returns `None` for anything else, including multi-declarator statements,
+/// destructuring patterns and bindings to plain values, so those keep their
+/// existing chunk shape.
+///
+/// The symbol spans the declaration node, which is what every other declaration
+/// kind in this extractor does. `export` is part of the enclosing
+/// `export_statement`, so it sits outside that span exactly as it already does
+/// for `export`-ed functions, classes and interfaces. Chunk content is expanded
+/// to whole lines afterwards, so a single-line `export const f = ...` still reads
+/// with its `export`, while a declaration split across lines does not.
+pub(super) fn extract_js_function_binding(
+    node: &tree_sitter::Node<'_>,
+    source: &[u8],
+) -> Option<RawSymbol> {
+    let mut cursor = node.walk();
+    let mut declarators = node
+        .children(&mut cursor)
+        .filter(|child| child.kind() == "variable_declarator");
+    let declarator = declarators.next()?;
+    if declarators.next().is_some() {
+        return None;
+    }
+
+    let value = declarator.child_by_field_name("value")?;
+    if !matches!(
+        value.kind(),
+        "arrow_function" | "function_expression" | "generator_function"
+    ) {
+        return None;
+    }
+
+    let name = extract_name(&declarator, source)?;
+    Some(RawSymbol::at(node, Some(name), SymbolType::Function))
+}
+
+/// Extract a Lua function-valued assignment as a named function symbol.
+pub(super) fn extract_lua_function_binding(
+    node: &tree_sitter::Node<'_>,
+    source: &[u8],
+) -> Option<RawSymbol> {
+    let assignment = if node.kind() == "variable_declaration" {
+        let mut cursor = node.walk();
+        node.named_children(&mut cursor)
+            .find(|child| child.kind() == "assignment_statement")?
+    } else {
+        *node
+    };
+
+    let mut cursor = assignment.walk();
+    let children: Vec<_> = assignment.named_children(&mut cursor).collect();
+    let [variable_list, expression_list] = children.as_slice() else {
+        return None;
+    };
+    if variable_list.kind() != "variable_list" || expression_list.kind() != "expression_list" {
+        return None;
+    }
+
+    let mut variable_cursor = variable_list.walk();
+    let variables: Vec<_> = variable_list.named_children(&mut variable_cursor).collect();
+    let [variable] = variables.as_slice() else {
+        return None;
+    };
+
+    let mut value_cursor = expression_list.walk();
+    let values: Vec<_> = expression_list.named_children(&mut value_cursor).collect();
+    let [value] = values.as_slice() else {
+        return None;
+    };
+    if value.kind() != "function_definition" {
+        return None;
+    }
+
+    let name = match variable.kind() {
+        "identifier" => variable.utf8_text(source).ok()?.to_string(),
+        "dot_index_expression" => variable
+            .child_by_field_name("field")?
+            .utf8_text(source)
+            .ok()?
+            .to_string(),
+        "method_index_expression" => variable
+            .child_by_field_name("method")?
+            .utf8_text(source)
+            .ok()?
+            .to_string(),
+        _ => return None,
+    };
+
+    Some(RawSymbol::at(node, Some(name), SymbolType::Function))
+}
+
+/// Extract Bash `case` arms inside a function as named function symbols.
+///
+/// Bash dispatchers commonly put most of their useful behavior in a large
+/// `case` statement. Keeping each arm as a child symbol gives those branches
+/// their own names and spans while the enclosing function remains indexable.
+pub(super) fn extract_bash_case_items(
+    function_node: &tree_sitter::Node<'_>,
+    source: &[u8],
+    symbols: &mut Vec<RawSymbol>,
+) {
+    let function_name = extract_name(function_node, source);
+    symbols.push(RawSymbol::at(
+        function_node,
+        function_name.clone(),
+        SymbolType::Function,
+    ));
+
+    fn visit(
+        node: tree_sitter::Node<'_>,
+        source: &[u8],
+        function_name: Option<&str>,
+        symbols: &mut Vec<RawSymbol>,
+    ) {
+        if node.kind() == "case_statement" {
+            let mut cursor = node.walk();
+            for item in node
+                .named_children(&mut cursor)
+                .filter(|child| child.kind() == "case_item")
+            {
+                let mut value_cursor = item.walk();
+                let Some(pattern) = item
+                    .children_by_field_name("value", &mut value_cursor)
+                    .next()
+                    .and_then(|value| value.utf8_text(source).ok())
+                    .and_then(bash_case_pattern_name)
+                else {
+                    continue;
+                };
+
+                let name = function_name
+                    .map(|parent| format!("{parent} {pattern}"))
+                    .unwrap_or(pattern);
+                symbols.push(RawSymbol::at(&item, Some(name), SymbolType::Function));
+            }
+        }
+
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            // The generic extractor treats a function definition as a leaf;
+            // do not attribute a nested function's case arms to its parent.
+            if child.kind() != "function_definition" {
+                visit(child, source, function_name, symbols);
+            }
+        }
+    }
+
+    let mut cursor = function_node.walk();
+    for child in function_node.named_children(&mut cursor) {
+        visit(child, source, function_name.as_deref(), symbols);
+    }
+}
+
+/// Convert the first Bash case pattern into a readable symbol-name fragment.
+fn bash_case_pattern_name(text: &str) -> Option<String> {
+    let text = text.trim();
+    if text.len() >= 2
+        && matches!(
+            (text.as_bytes().first(), text.as_bytes().last()),
+            (Some(b'\''), Some(b'\'')) | (Some(b'"'), Some(b'"'))
+        )
+    {
+        let text = &text[1..text.len() - 1];
+        return (!text.is_empty()).then(|| text.to_string());
+    }
+    (!text.is_empty()).then(|| text.to_string())
+}
+
 /// Refine a Go type_spec into the correct SymbolType based on the type child.
 pub(super) fn refine_go_type_spec(node: &tree_sitter::Node<'_>, source: &[u8]) -> SymbolType {
     if let Some(type_child) = node.child_by_field_name("type") {
@@ -227,19 +407,21 @@ pub(super) fn refine_go_type_spec(node: &tree_sitter::Node<'_>, source: &[u8]) -
     }
 }
 
-/// Extract individual methods from a Rust `impl` block as separate symbols.
-pub(super) fn extract_impl_methods(
-    impl_node: tree_sitter::Node<'_>,
+/// Extract individual methods from a Rust `impl` or `trait` block as separate
+/// symbols, keeping the block itself indexable as `container_type`.
+pub(super) fn extract_rust_block_methods(
+    block_node: tree_sitter::Node<'_>,
     source: &[u8],
     lang: Language,
     symbols: &mut Vec<RawSymbol>,
+    container_type: SymbolType,
 ) {
-    let name = extract_name(&impl_node, source);
-    symbols.push(RawSymbol::at(&impl_node, name, SymbolType::Block));
+    let name = extract_name(&block_node, source);
+    symbols.push(RawSymbol::at(&block_node, name, container_type));
 
-    let mut cursor = impl_node.walk();
+    let mut cursor = block_node.walk();
 
-    for child in impl_node.children(&mut cursor) {
+    for child in block_node.children(&mut cursor) {
         if child.kind() == "declaration_list" {
             let mut inner_cursor = child.walk();
             for item in child.children(&mut inner_cursor) {

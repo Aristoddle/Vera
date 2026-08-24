@@ -7,6 +7,12 @@ version = 1
 description = "Semble benchmark corpus for cross-tool evaluation"
 clone_root = ".bench/semble-repos"
 
+[semble]
+version = "0.5.5"
+commit = "921849164e2632dd4f0e1c1370f82cfe15ed6d6c"
+task_count = 1251
+tasks_sha256 = "6d8befaa3c19211ef6c3df7d0aa7bb1711670ed32f9b0258c289909cdb5b58de"
+
 [[repos]]
 name = "aiohttp"
 url = "https://github.com/aio-libs/aiohttp.git"

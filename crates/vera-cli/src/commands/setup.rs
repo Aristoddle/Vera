@@ -27,11 +27,20 @@ pub(crate) struct SetupReport {
 }
 
 /// Remedy shown when a non-interactive invocation cannot prompt.
-const NON_INTERACTIVE_HINT: &str = "Hint: pass a backend flag (for example `--onnx-jina-coreml`, \
-     `--onnx-jina-cuda`, or `--potion-code`), `--yes` to auto-detect one, or `--api` with \
+const NON_INTERACTIVE_HINT: &str = "Hint: pass `--yes` for the default Potion Code backend, a GPU flag \
+     (for example `--onnx-jina-cuda` or `--onnx-jina-coreml`), or `--api` with \
      EMBEDDING_MODEL_BASE_URL, EMBEDDING_MODEL_ID, and EMBEDDING_MODEL_API_KEY set.";
 
-/// `backend`: Some(local backend) for local, None + api=true for API, None + api=false defaults to auto-detect.
+/// The backend `vera setup` and `vera backend` pick when no flag is given.
+///
+/// Potion Code runs on any CPU with a ~50 MB download and no ONNX runtime, so
+/// it is the default on every machine. GPU ONNX backends stay available
+/// through flags and the interactive menu's auto-detect entry.
+pub(crate) fn default_setup_backend() -> InferenceBackend {
+    InferenceBackend::PotionCode
+}
+
+/// `backend`: Some(local backend) for local, None + api=true for API, None + api=false uses the default.
 /// `allow_wizard`: bare interactive invocations run the full wizard only for
 /// `vera setup`; `vera backend` always stays in the backend-only flow.
 pub fn run(
@@ -60,17 +69,19 @@ pub fn run(
         return run_wizard();
     }
 
-    // Resolve: explicit backend flag wins, then --api, then auto-detect.
+    // Resolve: explicit backend flag wins, then --api, then the default.
     let effective_backend = if api {
         InferenceBackend::Api
     } else if let Some(b) = backend {
         b
     } else if json_output || yes {
-        let detected = detect_gpu();
         if !json_output {
-            eprintln!("Auto-detected backend: {detected}. Use a backend flag to override.");
+            eprintln!(
+                "Using default backend: {}. Use a backend flag (e.g. `--onnx-jina-cuda`) to override.",
+                default_setup_backend()
+            );
         }
-        detected
+        default_setup_backend()
     } else if !interactive {
         bail!(
             "no backend selected and no terminal is available for prompts.\n{NON_INTERACTIVE_HINT}"
@@ -125,6 +136,7 @@ pub fn run(
         json_output,
         "Vera setup complete.",
         api_setup,
+        true,
     )
 }
 
@@ -163,7 +175,7 @@ fn run_wizard() -> anyhow::Result<()> {
     // Step 3: Optional indexing
     cliclack::log::step("Step 3: Index a project")?;
     let index_now: bool = cliclack::confirm("Index a project now?")
-        .initial_value(false)
+        .initial_value(true)
         .interact()?;
     if index_now {
         let path: String = cliclack::input("Project path")
@@ -199,6 +211,24 @@ pub(crate) fn configure_backend(
         json_output,
         success_header,
         None,
+        true,
+    )
+}
+
+pub(crate) fn repair_backend(
+    effective_backend: InferenceBackend,
+    local_embedding_model: Option<LocalEmbeddingModelConfig>,
+    json_output: bool,
+    success_header: &str,
+) -> anyhow::Result<()> {
+    configure_backend_with_api_setup(
+        effective_backend,
+        local_embedding_model,
+        None,
+        json_output,
+        success_header,
+        None,
+        false,
     )
 }
 
@@ -209,6 +239,7 @@ fn configure_backend_with_api_setup(
     json_output: bool,
     success_header: &str,
     api_setup: Option<(ApiSetupInput, Option<ApiSetupInput>)>,
+    persist_state: bool,
 ) -> anyhow::Result<()> {
     let use_local = effective_backend.is_local();
     let mut models_prefetched = 0usize;
@@ -232,9 +263,11 @@ fn configure_backend_with_api_setup(
                 )
                 .is_ok(),
             );
-            state::save_backend(effective_backend)?;
-            state::save_local_embedding_model(&local_embedding_model)?;
-            state::clear_reranker_setup()?;
+            if persist_state {
+                state::save_backend(effective_backend)?;
+                state::save_local_embedding_model(&local_embedding_model)?;
+                state::clear_reranker_setup()?;
+            }
             state::apply_saved_env_force()?;
             local_embedding_summary = Some(local_embedding_model.display_name());
         }
@@ -244,11 +277,12 @@ fn configure_backend_with_api_setup(
             rt.block_on(vera_core::local_models::ensure_potion_code_assets())?;
             models_prefetched = vera_core::local_models::inspect_potion_code_model_files()?.len();
             onnx_runtime_ready = None;
-            state::save_backend(effective_backend)?;
-            state::clear_reranker_setup()?;
+            if persist_state {
+                state::save_backend(effective_backend)?;
+                state::clear_reranker_setup()?;
+            }
             state::apply_saved_env_force()?;
-            local_embedding_summary =
-                Some(vera_core::local_models::potion_code_model_name().to_string());
+            local_embedding_summary = Some(vera_core::local_models::potion_code_model_name());
         }
         InferenceBackend::Api => {
             let (embedding, reranker) = match api_setup {
@@ -266,13 +300,15 @@ fn configure_backend_with_api_setup(
                     )?,
                 ),
             };
-            state::save_api_setup(&embedding, reranker.as_ref())?;
+            if persist_state {
+                state::save_api_setup(&embedding, reranker.as_ref())?;
+            }
             state::apply_saved_env_force()?;
             onnx_runtime_ready = None;
         }
     }
 
-    if state::load_saved_config()?.install_method.is_none() {
+    if persist_state && state::load_saved_config()?.install_method.is_none() {
         if let Some(install_method) = crate::update_check::resolve_install_method().install_method {
             state::save_install_method(Some(&install_method))?;
         }
@@ -343,8 +379,8 @@ fn should_prompt_api_config(
     effective_backend == InferenceBackend::Api && !json_output && !yes
 }
 
-/// Probe the system for a usable GPU and return the best local backend.
-/// Falls back to Potion Code on CPU if nothing is detected.
+/// Probe the system for a usable GPU for the interactive menu's auto-detect
+/// entry. Falls back to Potion Code on CPU if nothing is detected.
 fn detect_gpu() -> InferenceBackend {
     // NVIDIA: check for nvidia-smi or vendor ID (0x10de) in sysfs
     let has_nvidia = std::process::Command::new("nvidia-smi")
@@ -406,7 +442,7 @@ fn detect_gpu() -> InferenceBackend {
     InferenceBackend::PotionCode
 }
 
-/// Show an interactive backend selection menu. Auto-detect is the default.
+/// Show an interactive backend selection menu. Potion Code is the default.
 fn prompt_backend() -> anyhow::Result<InferenceBackend> {
     cliclack::intro("vera backend")?;
     let backend = prompt_backend_select()?;
@@ -429,19 +465,19 @@ fn prompt_backend_select() -> anyhow::Result<InferenceBackend> {
 
     let backend: InferenceBackend = cliclack::select("Select a backend")
         .item(
+            InferenceBackend::PotionCode,
+            "Potion Code CPU",
+            "static embeddings, works everywhere (default)",
+        )
+        .item(
             detected,
             format!("Auto-detect ({detected_hint})"),
-            "recommended",
+            "GPU ONNX backend",
         )
         .item(
             InferenceBackend::Api,
             "API mode",
             "remote OpenAI-compatible endpoints",
-        )
-        .item(
-            InferenceBackend::PotionCode,
-            "Potion Code CPU",
-            "CPU-only machines",
         )
         .item(
             InferenceBackend::OnnxJina(OnnxExecutionProvider::Cuda),
@@ -516,9 +552,15 @@ fn resolve_local_embedding_model(
     if let Some(max_length) = flags.embedding_max_length {
         model.max_length = max_length;
     }
+    // An empty value is kept rather than collapsed to `None`: it is the only
+    // way to turn a preset's prefix off, and `None` would be restored from the
+    // preset on the next run. Everything downstream treats an empty prefix as
+    // no prefix.
+    if let Some(document_prefix) = flags.embedding_document_prefix.as_ref() {
+        model.document_prefix = Some(document_prefix.trim().to_string());
+    }
     if let Some(query_prefix) = flags.embedding_query_prefix.as_ref() {
-        model.query_prefix =
-            Some(query_prefix.trim().to_string()).filter(|value| !value.is_empty());
+        model.query_prefix = Some(query_prefix.trim().to_string());
     }
 
     Ok(model)
@@ -756,6 +798,13 @@ mod tests {
     use super::*;
 
     #[test]
+    fn setup_with_no_flags_defaults_to_potion_code() {
+        // Potion Code runs on any CPU with no ONNX runtime, so it is the
+        // default on every machine; GPU ONNX backends stay opt-in via flags.
+        assert_eq!(default_setup_backend(), InferenceBackend::PotionCode);
+    }
+
+    #[test]
     fn explicit_interactive_api_setup_prompts_for_config() {
         assert!(should_prompt_api_config(
             InferenceBackend::Api,
@@ -781,5 +830,33 @@ mod tests {
             false,
             false
         ));
+    }
+
+    /// `--embedding-query-prefix ""` is the only way to turn a preset's prefix
+    /// off. Collapsing it to `None` made `config.json` omit the key entirely,
+    /// and the preset put jina's prefix back on the very next run.
+    #[test]
+    fn an_explicitly_emptied_prefix_flag_is_not_collapsed_to_absent() {
+        let flags = LocalEmbeddingModelFlags {
+            embedding_query_prefix: Some(String::new()),
+            embedding_document_prefix: Some("   ".to_string()),
+            ..LocalEmbeddingModelFlags::default()
+        };
+
+        let model = resolve_local_embedding_model(&flags).unwrap();
+
+        assert_eq!(
+            model.query_prefix.as_deref(),
+            Some(""),
+            "the flag defaulted back to jina's preset query prefix"
+        );
+        assert_eq!(
+            model.document_prefix.as_deref(),
+            Some(""),
+            "the flag defaulted back to jina's preset document prefix"
+        );
+        // Kept, but still nothing: an empty prefix embeds the text unchanged.
+        assert_eq!(model.query_text("find main"), "find main");
+        assert_eq!(model.document_text("fn main() {}"), "fn main() {}");
     }
 }
