@@ -37,7 +37,9 @@ pub struct IndexingConfig {
     pub no_default_excludes: bool,
     /// Maximum chunk size in bytes for embedding. Chunks exceeding this are
     /// split at line boundaries. 0 disables byte-based splitting.
-    /// Default: 24576 (24KB, ~6K-7K tokens, safe for any embedding model).
+    /// Default: 24576 (24KB, ~6K-7K tokens). Local embedders see only the
+    /// first 512 tokens of a chunk; the size is a retrieval-quality choice
+    /// (measured on the Semble suite, see issue #67), not a model limit.
     #[serde(default = "default_max_chunk_bytes")]
     pub max_chunk_bytes: usize,
 }
