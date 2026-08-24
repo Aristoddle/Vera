@@ -270,6 +270,7 @@ impl LocalEmbeddingProvider {
         let base_config = LocalEmbeddingModelConfig::from_env().map_err(api_err)?;
         let mut config = base_config.clone();
         config.adjust_for_gpu(ep);
+        let ep = crate::local_models::embedding_execution_provider(ep, &config);
         let mut batch_scaler = if ep == OnnxExecutionProvider::Cpu {
             None
         } else {
@@ -338,6 +339,8 @@ impl LocalEmbeddingProvider {
     }
 
     pub fn probe_provider_registration(ep: OnnxExecutionProvider) -> Result<()> {
+        let config = LocalEmbeddingModelConfig::from_env()?;
+        let ep = crate::local_models::embedding_execution_provider(ep, &config);
         let builder = ort::session::builder::SessionBuilder::new()?
             .with_optimization_level(GraphOptimizationLevel::Level3)?
             .with_intra_threads(1)?;
@@ -348,6 +351,7 @@ impl LocalEmbeddingProvider {
     pub fn probe_session(ep: OnnxExecutionProvider) -> Result<()> {
         let mut config = LocalEmbeddingModelConfig::from_env()?;
         config.adjust_for_gpu(ep);
+        let ep = crate::local_models::embedding_execution_provider(ep, &config);
         let ort_path = crate::local_models::ort_library_path_for_ep(ep)?;
         crate::local_models::ensure_ort_runtime(Some(&ort_path))?;
         let asset_paths = config.cached_asset_paths()?;
@@ -358,6 +362,7 @@ impl LocalEmbeddingProvider {
     pub fn probe_inference(ep: OnnxExecutionProvider) -> Result<()> {
         let mut config = LocalEmbeddingModelConfig::from_env()?;
         config.adjust_for_gpu(ep);
+        let ep = crate::local_models::embedding_execution_provider(ep, &config);
         let ort_path = crate::local_models::ort_library_path_for_ep(ep)?;
         crate::local_models::ensure_ort_runtime(Some(&ort_path))?;
         let asset_paths = config.cached_asset_paths()?;

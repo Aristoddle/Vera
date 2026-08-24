@@ -1,12 +1,15 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::fmt;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::sync::atomic::AtomicU64;
 
 pub(super) const HUB_URL: &str = "https://huggingface.co";
 pub(super) const EMBEDDING_REPO: &str = "jinaai/jina-embeddings-v5-text-nano-retrieval";
+pub(super) const EMBEDDING_REVISION: &str = "ac5d898c8d382b17167c33e5c8af644a3519b47d";
 pub(super) const EMBEDDING_ONNX_FILE: &str = "onnx/model_quantized.onnx";
 pub(super) const EMBEDDING_ONNX_DATA_FILE: &str = "onnx/model_quantized.onnx_data";
 /// FP16 model for GPU backends (quantized INT8 ops lack CUDA kernels,
@@ -26,6 +29,7 @@ pub(super) const JINA_QUERY_PREFIX: &str = "Query:";
 pub(super) const JINA_DOCUMENT_PREFIX: &str = "Document:";
 
 pub(super) const CODERANK_EMBEDDING_REPO: &str = "Zenabius/CodeRankEmbed-onnx";
+pub(super) const CODERANK_EMBEDDING_REVISION: &str = "e6a6893986a9aaf09a6aa177f42ebc73bb623cca";
 pub(super) const CODERANK_QUERY_PREFIX: &str = "Represent this query for searching relevant code:";
 
 pub const POTION_CODE_REPO: &str = "minishlab/potion-code-16M-v2";
@@ -52,6 +56,7 @@ pub const LOCAL_EMBEDDING_DOCUMENT_PREFIX_ENV: &str = "VERA_LOCAL_EMBEDDING_DOCU
 pub const LEGACY_EMBEDDING_QUERY_PREFIX_ENV: &str = "VERA_EMBEDDING_QUERY_PREFIX";
 
 pub(super) const RERANKER_REPO: &str = "jinaai/jina-reranker-v2-base-multilingual";
+pub(super) const RERANKER_REVISION: &str = "9cfeff2df7d40d1b78e75e5e9cebec92a99813c9";
 /// No prebuilt reranker ONNX export runs on the CoreML GPU: the quantized
 /// export contains DynamicQuantizeLinear/MatMulInteger ops the CoreML EP cannot
 /// execute, and the fp16 export stores every tensor as float16 which the CoreML
@@ -86,6 +91,19 @@ pub fn reranker_execution_provider(
     }
 }
 
+/// CodeRankEmbed's CoreML graph has a dynamic output dimension that CoreML
+/// accepts during session construction but rejects during inference.
+pub fn embedding_execution_provider(
+    ep: crate::config::OnnxExecutionProvider,
+    model: &LocalEmbeddingModelConfig,
+) -> crate::config::OnnxExecutionProvider {
+    if ep == crate::config::OnnxExecutionProvider::CoreMl && model.is_coderankembed_preset() {
+        crate::config::OnnxExecutionProvider::Cpu
+    } else {
+        ep
+    }
+}
+
 /// ONNX Runtime version to auto-download. Using 1.24.4 for CUDA 13 support.
 /// The `ort` crate (rc.11) uses `load-dynamic` so any ABI-compatible ORT works.
 pub(super) const ORT_VERSION: &str = "1.24.4";
@@ -101,6 +119,112 @@ pub(super) const ORT_VERSION_MACOS_X86: &str = "1.23.2";
 
 pub(super) static ORT_INIT_RESULT: OnceLock<std::result::Result<(), String>> = OnceLock::new();
 pub(super) static MODEL_DOWNLOAD_ATTEMPT: AtomicU64 = AtomicU64::new(0);
+
+pub(super) fn sha256_hex(reader: impl Read) -> Result<String> {
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    let mut reader = reader;
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
+pub(super) fn verify_sha256(reader: impl Read, expected: &str, label: &str) -> Result<()> {
+    let actual = sha256_hex(reader)?;
+    if !actual.eq_ignore_ascii_case(expected) {
+        anyhow::bail!("{label} SHA-256 mismatch: expected {expected}, got {actual}");
+    }
+    Ok(())
+}
+
+pub(super) fn expected_model_sha256(
+    repo: &str,
+    revision: Option<&str>,
+    file: &str,
+) -> Option<&'static str> {
+    let revision = revision?;
+    match (repo, revision, file) {
+        (EMBEDDING_REPO, EMBEDDING_REVISION, EMBEDDING_ONNX_FILE) => {
+            Some("ac93a7417c216e5076e37da2b3599f7ef16513934098a477680440c09f735a08")
+        }
+        (EMBEDDING_REPO, EMBEDDING_REVISION, EMBEDDING_ONNX_DATA_FILE) => {
+            Some("ee7870eb143a7353be08b33f79992a51de3e32b41f684ccd82953a710c2f2f9c")
+        }
+        (EMBEDDING_REPO, EMBEDDING_REVISION, EMBEDDING_ONNX_GPU_FILE) => {
+            Some("028918f8c20e4f858dfcdf41e950f24194862c25422fd2d0299286855b446f06")
+        }
+        (EMBEDDING_REPO, EMBEDDING_REVISION, EMBEDDING_ONNX_GPU_DATA_FILE) => {
+            Some("1564cc224352ff170df0d861bfa4f50f3a8c7f9f88b253420fff286d0ebc3b51")
+        }
+        (EMBEDDING_REPO, EMBEDDING_REVISION, EMBEDDING_TOKENIZER_FILE) => {
+            Some("98d4a1d32152d6cedf85b5e88f3b205106dca1fe72aaab34e0ac13c238421069")
+        }
+        (CODERANK_EMBEDDING_REPO, CODERANK_EMBEDDING_REVISION, "onnx/model_quantized.onnx") => {
+            Some("732d85552abc1c7f3d8d755a7cbb2df1563d8acafb0d42192971ce078409d06c")
+        }
+        (CODERANK_EMBEDDING_REPO, CODERANK_EMBEDDING_REVISION, "tokenizer.json") => {
+            Some("91f1def9b9391fdabe028cd3f3fcc4efd34e5d1f08c3bf2de513ebb5911a1854")
+        }
+        (RERANKER_REPO, RERANKER_REVISION, RERANKER_ONNX_FILE) => {
+            Some("c5220cf8fe023f8aa0ed2a3eb787d4451a7f17cf53f6b787e35718dd4b8815c3")
+        }
+        (RERANKER_REPO, RERANKER_REVISION, RERANKER_TOKENIZER_FILE) => {
+            Some("3a56def25aa40facc030ea8b0b87f3688e4b3c39eb8b45d5702b3a1300fe2a20")
+        }
+        (POTION_CODE_REPO, POTION_CODE_REVISION, POTION_CODE_MODEL_FILE) => {
+            Some("75cf7a6c2171b230ad19b1e7d8e0b1aee86da5a02af8e7cacedd9921d227623c")
+        }
+        (POTION_CODE_REPO, POTION_CODE_REVISION, POTION_CODE_TOKENIZER_FILE) => {
+            Some("107bbdcbad4bff1d299b7a4c3a2fb17c52890688b7dd0e4c9deab79d3c4f3d45")
+        }
+        (POTION_CODE_REPO, POTION_CODE_REVISION, POTION_CODE_CONFIG_FILE) => {
+            Some("148e5691a6fcc553437156859701fba017a1ba5d340b170f17e0f3668fb861a7")
+        }
+        _ => None,
+    }
+}
+
+pub(super) fn expected_ort_archive_sha256(archive_filename: &str) -> Option<&'static str> {
+    match archive_filename {
+        "onnxruntime-linux-aarch64-1.24.4.tgz" => {
+            Some("866109a9248d057671a039b9d725be4bd86888e3754140e6701ec621be9d4d7e")
+        }
+        "onnxruntime-linux-x64-1.24.4.tgz" => {
+            Some("3a211fbea252c1e66290658f1b735b772056149f28321e71c308942cdb54b747")
+        }
+        "onnxruntime-linux-x64-gpu-1.24.4.tgz" => {
+            Some("c5f804ff5d239b436fa59e9f2fb288a39f7eb9552f6a636c8b71e792e91a8808")
+        }
+        "onnxruntime-linux-x64-gpu_cuda13-1.24.4.tgz" => {
+            Some("fdc6eb18317b4eaeda8b3b86595e5da7e853f72bac67ccac9b04ffc20c9f7fe0")
+        }
+        "onnxruntime-osx-arm64-1.24.4.tgz" => {
+            Some("93787795f47e1eee369182e43ed51b9e5da0878ab0346aecf4258979b8bba989")
+        }
+        "onnxruntime-osx-x86_64-1.23.2.tgz" => {
+            Some("d10359e16347b57d9959f7e80a225a5b4a66ed7d7e007274a15cae86836485a6")
+        }
+        "onnxruntime-win-x64-1.24.4.zip" => {
+            Some("d2319fddfb6ea4db99ccc4b60c85c517bcd855721f5daa6a06d40d7cb2ee2357")
+        }
+        "onnxruntime-win-x64-gpu-1.24.4.zip" => {
+            Some("ef3337a0b8184eb8beec310f7c83bd50376b3eefc43aab84ac8e452f6987df0a")
+        }
+        "onnxruntime-win-x64-gpu_cuda13-1.24.4.zip" => {
+            Some("971be8cf984950672934a3173669590a8ece10b44746883420da8066ba836707")
+        }
+        _ => None,
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -179,6 +303,7 @@ impl Default for LocalEmbeddingModelConfig {
 impl LocalEmbeddingModelConfig {
     fn preset(
         repo: &str,
+        revision: Option<&str>,
         onnx_data_file: Option<&str>,
         pooling: LocalEmbeddingPooling,
         query_prefix: Option<&str>,
@@ -188,7 +313,7 @@ impl LocalEmbeddingModelConfig {
             source: LocalEmbeddingSource::HuggingFace {
                 repo: repo.to_string(),
             },
-            revision: None,
+            revision: revision.map(str::to_string),
             onnx_file: EMBEDDING_ONNX_FILE.to_string(),
             onnx_data_file: onnx_data_file.map(str::to_string),
             tokenizer_file: EMBEDDING_TOKENIZER_FILE.to_string(),
@@ -207,6 +332,7 @@ impl LocalEmbeddingModelConfig {
     pub fn jina() -> Self {
         Self::preset(
             EMBEDDING_REPO,
+            Some(EMBEDDING_REVISION),
             Some(EMBEDDING_ONNX_DATA_FILE),
             LocalEmbeddingPooling::LastToken,
             Some(JINA_QUERY_PREFIX),
@@ -217,6 +343,7 @@ impl LocalEmbeddingModelConfig {
     pub fn coderankembed() -> Self {
         Self::preset(
             CODERANK_EMBEDDING_REPO,
+            Some(CODERANK_EMBEDDING_REVISION),
             None,
             LocalEmbeddingPooling::Cls,
             Some(CODERANK_QUERY_PREFIX),
@@ -324,6 +451,14 @@ impl LocalEmbeddingModelConfig {
         }
     }
 
+    fn is_coderankembed_preset(&self) -> bool {
+        let mut config = self.clone();
+        config.revision = None;
+        let mut preset = Self::coderankembed();
+        preset.revision = None;
+        config == preset
+    }
+
     pub fn from_env() -> Result<Self> {
         let repo = env_override(LOCAL_EMBEDDING_REPO_ENV);
         let dir = env_override(LOCAL_EMBEDDING_DIR_ENV);
@@ -359,8 +494,8 @@ impl LocalEmbeddingModelConfig {
         // mean-pooled rows with last-token vectors.
         let mut identity_config = self.clone();
         identity_config.revision = None;
-        let identity = if identity_config == Self::jina()
-            || identity_config == Self::coderankembed()
+        let identity = if identity_config.is_jina_preset()
+            || identity_config.is_coderankembed_preset()
         {
             format!(
                 "{}|pooling={}|qp={}|dp={}",
@@ -399,6 +534,14 @@ impl LocalEmbeddingModelConfig {
             }
             _ => identity,
         }
+    }
+
+    fn is_jina_preset(&self) -> bool {
+        let mut config = self.clone();
+        config.revision = None;
+        let mut preset = Self::jina();
+        preset.revision = None;
+        config == preset
     }
 
     /// The canonical form of a configured prefix: trimmed, and absent once
@@ -492,6 +635,7 @@ impl LocalEmbeddingModelConfig {
     fn generic_defaults() -> Self {
         Self::preset(
             EMBEDDING_REPO,
+            None,
             Some(EMBEDDING_ONNX_DATA_FILE),
             LocalEmbeddingPooling::Mean,
             None,
@@ -549,7 +693,7 @@ impl Default for LocalRerankerConfig {
     fn default() -> Self {
         Self {
             repo: RERANKER_REPO.to_string(),
-            revision: None,
+            revision: Some(RERANKER_REVISION.to_string()),
             onnx_file: RERANKER_ONNX_FILE.to_string(),
             tokenizer_file: RERANKER_TOKENIZER_FILE.to_string(),
         }
@@ -559,12 +703,16 @@ impl Default for LocalRerankerConfig {
 impl LocalRerankerConfig {
     pub fn from_env() -> Result<Self> {
         let defaults = Self::default();
+        let repo = env_override(LOCAL_RERANKER_REPO_ENV)
+            .map(|repo| normalize_huggingface_repo(&repo))
+            .transpose()?
+            .unwrap_or_else(|| defaults.repo.clone());
+        let default_revision = (repo == RERANKER_REPO)
+            .then_some(defaults.revision)
+            .flatten();
         Ok(Self {
-            repo: env_override(LOCAL_RERANKER_REPO_ENV)
-                .map(|repo| normalize_huggingface_repo(&repo))
-                .transpose()?
-                .unwrap_or(defaults.repo),
-            revision: revision_from_env(LOCAL_RERANKER_REVISION_ENV, defaults.revision)?,
+            repo,
+            revision: revision_from_env(LOCAL_RERANKER_REVISION_ENV, default_revision)?,
             onnx_file: env_override(LOCAL_RERANKER_ONNX_FILE_ENV).unwrap_or(defaults.onnx_file),
             tokenizer_file: env_override(LOCAL_RERANKER_TOKENIZER_FILE_ENV)
                 .unwrap_or(defaults.tokenizer_file),
@@ -876,6 +1024,25 @@ mod finding_tests {
         ] {
             assert_eq!(reranker_execution_provider(ep), ep);
         }
+    }
+
+    #[test]
+    fn coderank_embedding_runs_on_cpu_under_coreml_only() {
+        let coderank = LocalEmbeddingModelConfig::coderankembed();
+        assert_eq!(
+            embedding_execution_provider(OnnxExecutionProvider::CoreMl, &coderank),
+            OnnxExecutionProvider::Cpu
+        );
+        assert_eq!(
+            embedding_execution_provider(OnnxExecutionProvider::Cuda, &coderank),
+            OnnxExecutionProvider::Cuda
+        );
+
+        let jina = LocalEmbeddingModelConfig::jina();
+        assert_eq!(
+            embedding_execution_provider(OnnxExecutionProvider::CoreMl, &jina),
+            OnnxExecutionProvider::CoreMl
+        );
     }
 
     #[test]

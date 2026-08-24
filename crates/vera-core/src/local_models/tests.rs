@@ -7,91 +7,8 @@ use std::io::Write;
 use std::net::TcpListener;
 use std::sync::{Arc, Mutex};
 
-static LOCAL_EMBEDDING_ENV_LOCK: Mutex<()> = Mutex::new(());
-
-struct RevisionEnvGuard {
-    previous: Option<std::ffi::OsString>,
-    _lock: std::sync::MutexGuard<'static, ()>,
-}
-
-impl RevisionEnvGuard {
-    fn set(value: &str) -> Self {
-        let lock = LOCAL_EMBEDDING_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let previous = std::env::var_os(LOCAL_EMBEDDING_REVISION_ENV);
-        unsafe {
-            std::env::set_var(LOCAL_EMBEDDING_REVISION_ENV, value);
-        }
-        Self {
-            previous,
-            _lock: lock,
-        }
-    }
-}
-
-impl Drop for RevisionEnvGuard {
-    fn drop(&mut self) {
-        unsafe {
-            match &self.previous {
-                Some(value) => std::env::set_var(LOCAL_EMBEDDING_REVISION_ENV, value),
-                None => std::env::remove_var(LOCAL_EMBEDDING_REVISION_ENV),
-            }
-        }
-    }
-}
-
-struct RerankerEnvGuard {
-    previous: Vec<(&'static str, Option<std::ffi::OsString>)>,
-    _lock: std::sync::MutexGuard<'static, ()>,
-}
-
-impl RerankerEnvGuard {
-    fn clear() -> Self {
-        Self::set([
-            (LOCAL_RERANKER_REPO_ENV, None),
-            (LOCAL_RERANKER_REVISION_ENV, None),
-            (LOCAL_RERANKER_ONNX_FILE_ENV, None),
-            (LOCAL_RERANKER_TOKENIZER_FILE_ENV, None),
-        ])
-    }
-
-    fn set<const N: usize>(values: [(&'static str, Option<&str>); N]) -> Self {
-        let lock = LOCAL_EMBEDDING_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let previous = values
-            .into_iter()
-            .map(|(key, value)| {
-                let previous = std::env::var_os(key);
-                unsafe {
-                    match value {
-                        Some(value) => std::env::set_var(key, value),
-                        None => std::env::remove_var(key),
-                    }
-                }
-                (key, previous)
-            })
-            .collect();
-        Self {
-            previous,
-            _lock: lock,
-        }
-    }
-}
-
-impl Drop for RerankerEnvGuard {
-    fn drop(&mut self) {
-        unsafe {
-            for (key, value) in &self.previous {
-                match value {
-                    Some(value) => std::env::set_var(key, value),
-                    None => std::env::remove_var(key),
-                }
-            }
-        }
-    }
-}
+// Environment-dependent tests run in child processes via
+// crate::test_env::run_env_test; no set_var/remove_var in test threads.
 
 #[test]
 fn normalize_huggingface_repo_accepts_repo_ids_and_urls() {
@@ -166,29 +83,50 @@ fn revisions_validate_and_shard_only_non_main_cache_paths() {
 
 #[test]
 fn local_reranker_config_defaults_match_jina_assets() {
-    let _env = RerankerEnvGuard::clear();
+    crate::test_env::run_env_test(
+        "local_models::tests::local_reranker_config_defaults_match_jina_assets_probe",
+        &[
+            (LOCAL_RERANKER_REPO_ENV, None),
+            (LOCAL_RERANKER_REVISION_ENV, None),
+            (LOCAL_RERANKER_ONNX_FILE_ENV, None),
+            (LOCAL_RERANKER_TOKENIZER_FILE_ENV, None),
+        ],
+    );
+}
+
+#[test]
+#[ignore = "driven by local_reranker_config_defaults_match_jina_assets"]
+fn local_reranker_config_defaults_match_jina_assets_probe() {
     let config = LocalRerankerConfig::from_env().unwrap();
 
     assert_eq!(config.repo, RERANKER_REPO);
-    assert_eq!(config.revision, None);
+    assert_eq!(config.revision.as_deref(), Some(RERANKER_REVISION));
     assert_eq!(config.onnx_file, RERANKER_ONNX_FILE);
     assert_eq!(config.tokenizer_file, RERANKER_TOKENIZER_FILE);
 }
 
 #[test]
 fn local_reranker_config_reads_env_overrides() {
-    let _env = RerankerEnvGuard::set([
-        (
-            LOCAL_RERANKER_REPO_ENV,
-            Some("https://huggingface.co/cross-encoder/ettin-reranker-32m-v1"),
-        ),
-        (LOCAL_RERANKER_REVISION_ENV, Some(" b33e5ceb ")),
-        (
-            LOCAL_RERANKER_ONNX_FILE_ENV,
-            Some("onnx/model_qint8_avx2.onnx"),
-        ),
-        (LOCAL_RERANKER_TOKENIZER_FILE_ENV, Some("tokenizer.json")),
-    ]);
+    crate::test_env::run_env_test(
+        "local_models::tests::local_reranker_config_reads_env_overrides_probe",
+        &[
+            (
+                LOCAL_RERANKER_REPO_ENV,
+                Some("https://huggingface.co/cross-encoder/ettin-reranker-32m-v1"),
+            ),
+            (LOCAL_RERANKER_REVISION_ENV, Some(" b33e5ceb ")),
+            (
+                LOCAL_RERANKER_ONNX_FILE_ENV,
+                Some("onnx/model_qint8_avx2.onnx"),
+            ),
+            (LOCAL_RERANKER_TOKENIZER_FILE_ENV, Some("tokenizer.json")),
+        ],
+    );
+}
+
+#[test]
+#[ignore = "driven by local_reranker_config_reads_env_overrides"]
+fn local_reranker_config_reads_env_overrides_probe() {
     let config = LocalRerankerConfig::from_env().unwrap();
 
     assert_eq!(config.repo, "cross-encoder/ettin-reranker-32m-v1");
@@ -199,12 +137,20 @@ fn local_reranker_config_reads_env_overrides() {
 
 #[test]
 fn local_reranker_config_revision_shards_cache_paths() {
-    let _env = RerankerEnvGuard::set([
-        (LOCAL_RERANKER_REPO_ENV, Some("org/model")),
-        (LOCAL_RERANKER_REVISION_ENV, Some("abc123")),
-        (LOCAL_RERANKER_ONNX_FILE_ENV, Some("onnx/model.onnx")),
-        (LOCAL_RERANKER_TOKENIZER_FILE_ENV, Some("tokenizer.json")),
-    ]);
+    crate::test_env::run_env_test(
+        "local_models::tests::local_reranker_config_revision_shards_cache_paths_probe",
+        &[
+            (LOCAL_RERANKER_REPO_ENV, Some("org/model")),
+            (LOCAL_RERANKER_REVISION_ENV, Some("abc123")),
+            (LOCAL_RERANKER_ONNX_FILE_ENV, Some("onnx/model.onnx")),
+            (LOCAL_RERANKER_TOKENIZER_FILE_ENV, Some("tokenizer.json")),
+        ],
+    );
+}
+
+#[test]
+#[ignore = "driven by local_reranker_config_revision_shards_cache_paths"]
+fn local_reranker_config_revision_shards_cache_paths_probe() {
     let paths = LocalRerankerConfig::from_env()
         .unwrap()
         .cached_asset_paths()
@@ -759,6 +705,75 @@ async fn download_uses_pinned_revision_url_and_sharded_cache() {
 }
 
 #[tokio::test]
+async fn cached_digest_mismatch_forces_redownload() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let home = temp_dir.path().join(".vera");
+    let revision = "d59c919d0159aea2c19ed7d04288fcdd048d0f9c";
+    let target = home
+        .join("models")
+        .join("org")
+        .join("model")
+        .join("revisions")
+        .join(revision)
+        .join("model.bin");
+    std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+    std::fs::write(&target, b"cached").unwrap();
+    std::fs::write(
+        target.with_file_name("model.bin.sha256"),
+        "fb8da7eb5b1b399e7321179dac9e9f65773d7331e1e30554e3911e4325e1ef19\n",
+    )
+    .unwrap();
+
+    let listener = match TcpListener::bind("127.0.0.1:0") {
+        Ok(listener) => listener,
+        Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return,
+        Err(err) => panic!("failed to bind test listener: {err}"),
+    };
+    let port = listener.local_addr().unwrap().port();
+    let request_line = Arc::new(Mutex::new(String::new()));
+    let request_line_for_server = Arc::clone(&request_line);
+    let server = std::thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut request = [0u8; 4096];
+            let bytes_read = std::io::Read::read(&mut stream, &mut request).unwrap_or(0);
+            let line_end = request[..bytes_read]
+                .windows(2)
+                .position(|window| window == b"\r\n")
+                .unwrap_or(bytes_read);
+            *request_line_for_server.lock().unwrap() =
+                String::from_utf8_lossy(&request[..line_end]).into_owned();
+            let response =
+                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n\x08\x01";
+            let _ = stream.write_all(response);
+            let _ = stream.flush();
+            let _ = stream.shutdown(std::net::Shutdown::Write);
+        }
+    });
+
+    let base_url = format!("http://127.0.0.1:{port}");
+    let result = ensure_model_file_impl_with_revision(
+        "org/model",
+        "model.bin",
+        LocalModelAssetKind::Other,
+        &base_url,
+        Some(&home),
+        Some(revision),
+    )
+    .await
+    .unwrap();
+    server.join().unwrap();
+
+    assert_eq!(result, target);
+    assert_eq!(std::fs::read(&target).unwrap(), [0x08, 0x01]);
+    assert!(
+        request_line
+            .lock()
+            .unwrap()
+            .starts_with("GET /org/model/resolve/")
+    );
+}
+
+#[tokio::test]
 async fn download_without_revision_uses_main_url_and_legacy_cache() {
     let temp_dir = tempfile::tempdir().unwrap();
     let home = temp_dir.path().join(".vera");
@@ -828,7 +843,15 @@ async fn download_without_revision_uses_main_url_and_legacy_cache() {
 
 #[test]
 fn local_embedding_config_from_env_trims_revision() {
-    let _env = RevisionEnvGuard::set(" refs/pr/42 ");
+    crate::test_env::run_env_test(
+        "local_models::tests::local_embedding_config_from_env_trims_revision_probe",
+        &[(LOCAL_EMBEDDING_REVISION_ENV, Some(" refs/pr/42 "))],
+    );
+}
+
+#[test]
+#[ignore = "driven by local_embedding_config_from_env_trims_revision"]
+fn local_embedding_config_from_env_trims_revision_probe() {
     let config = LocalEmbeddingModelConfig::from_env().unwrap();
 
     assert_eq!(config.revision.as_deref(), Some("refs/pr/42"));
@@ -836,8 +859,15 @@ fn local_embedding_config_from_env_trims_revision() {
 
 #[test]
 fn local_embedding_config_from_env_rejects_invalid_revision() {
-    let _env = RevisionEnvGuard::set("../escape");
+    crate::test_env::run_env_test(
+        "local_models::tests::local_embedding_config_from_env_rejects_invalid_revision_probe",
+        &[(LOCAL_EMBEDDING_REVISION_ENV, Some("../escape"))],
+    );
+}
 
+#[test]
+#[ignore = "driven by local_embedding_config_from_env_rejects_invalid_revision"]
+fn local_embedding_config_from_env_rejects_invalid_revision_probe() {
     assert!(LocalEmbeddingModelConfig::from_env().is_err());
 }
 
@@ -1004,7 +1034,7 @@ fn preset_identity_changes_with_pooling_so_stale_indexes_are_detected() {
     assert_eq!(
         jina.model_identity(),
         format!(
-            "{}|pooling=last-token|qp={}:{JINA_QUERY_PREFIX}|dp={}:{JINA_DOCUMENT_PREFIX}",
+            "{}|pooling=last-token|qp={}:{JINA_QUERY_PREFIX}|dp={}:{JINA_DOCUMENT_PREFIX}|revision={EMBEDDING_REVISION}",
             jina.display_name(),
             JINA_QUERY_PREFIX.len(),
             JINA_DOCUMENT_PREFIX.len()
@@ -1031,7 +1061,7 @@ fn coderank_preset_identity_records_its_pooling() {
     assert_eq!(
         coderank.model_identity(),
         format!(
-            "{}|pooling=cls|qp={}:{CODERANK_QUERY_PREFIX}|dp=none",
+            "{}|pooling=cls|qp={}:{CODERANK_QUERY_PREFIX}|dp=none|revision={CODERANK_EMBEDDING_REVISION}",
             coderank.display_name(),
             CODERANK_QUERY_PREFIX.len()
         )
@@ -1157,6 +1187,7 @@ fn explicit_mean_on_the_default_repo_is_no_longer_the_legacy_default() {
     // prefixes and in nothing else — so the prefixes are what spares it, and
     // the historical file itself is still migrated.
     let mut without_prefixes = explicit_mean;
+    without_prefixes.revision = None;
     without_prefixes.query_prefix = None;
     without_prefixes.document_prefix = None;
     assert_eq!(

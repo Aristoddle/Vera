@@ -700,8 +700,40 @@ mod tests {
     }
 
     #[test]
-    fn a_stored_config_without_a_revision_clears_a_stale_one() {
+    fn a_stored_legacy_jina_config_is_pinned_over_a_stale_revision() {
         let _guard = with_stored_config(LEGACY_JINA_CONFIG);
+        set_process_env(
+            vera_core::local_models::LOCAL_EMBEDDING_REVISION_ENV,
+            "stale-revision",
+        );
+
+        apply_saved_env_force().unwrap();
+
+        // The legacy jina config is repaired in memory to the current jina
+        // preset, which carries a pinned revision. Forcing it over the
+        // environment has to overwrite a stale inherited revision with the
+        // pin, or the pin would silently swap the model bytes under an
+        // unchanged config.
+        assert_eq!(
+            std::env::var(vera_core::local_models::LOCAL_EMBEDDING_REVISION_ENV).unwrap(),
+            "ac5d898c8d382b17167c33e5c8af644a3519b47d"
+        );
+        let model = vera_core::local_models::LocalEmbeddingModelConfig::from_env().unwrap();
+        assert_eq!(
+            model.revision.as_deref(),
+            Some("ac5d898c8d382b17167c33e5c8af644a3519b47d")
+        );
+    }
+
+    #[test]
+    fn a_stored_config_without_a_revision_clears_a_stale_one() {
+        // An unknown repo: repair_stored_defaults does not fire, and known
+        // repos always resolve to their pin, so the unpinned case only exists
+        // for custom models.
+        let _guard = with_stored_config(&LEGACY_JINA_CONFIG.replace(
+            "jinaai/jina-embeddings-v5-text-nano-retrieval",
+            "org/custom-model",
+        ));
         set_process_env(
             vera_core::local_models::LOCAL_EMBEDDING_REVISION_ENV,
             "stale-revision",
