@@ -112,43 +112,76 @@ fn search_bm25_with_stores_inner(
     );
 
     let mut results = Vec::with_capacity(limit.min(bm25_results.len()));
-    let hydration_page_size = limit.saturating_mul(4).clamp(256, BM25_HYDRATION_PAGE_MAX);
 
-    for page in bm25_results.chunks(hydration_page_size) {
-        let ids: Vec<String> = page
-            .iter()
-            .map(|bm25_result| bm25_result.chunk_id.clone())
-            .collect();
-        let chunks_by_id = metadata_store.get_chunks_by_ids(&ids).with_context(|| {
-            format!("failed to fetch metadata for {} BM25 candidates", ids.len())
-        })?;
+    // The first `limit` candidates hydrate one row at a time through the
+    // cached single-row statement: when every candidate passes (the common
+    // case, especially unfiltered) this is the cheapest possible path and
+    // fetches nothing that goes unused. If the head falls short (filter
+    // rejection or missing metadata), the remaining pool hydrates in paged
+    // batches, amortizing SQLite round trips over the long rejection tail.
+    let (head, tail) = bm25_results.split_at(limit.min(bm25_results.len()));
+    for bm25_result in head {
+        let Some(chunk) = metadata_store
+            .get_chunk(&bm25_result.chunk_id)
+            .with_context(|| {
+                format!(
+                    "failed to fetch metadata for chunk: {}",
+                    bm25_result.chunk_id
+                )
+            })?
+        else {
+            debug!(
+                chunk_id = %bm25_result.chunk_id,
+                "chunk metadata not found, skipping"
+            );
+            continue;
+        };
+        let result = chunk.into_search_result(f64::from(bm25_result.score));
+        if filters.is_some_and(|filters| !filters.matches(&result)) {
+            continue;
+        }
+        results.push(result);
+    }
 
-        for bm25_result in page {
-            let Some(chunk) = chunks_by_id.get(&bm25_result.chunk_id) else {
-                debug!(
-                    chunk_id = %bm25_result.chunk_id,
-                    "chunk metadata not found, skipping"
-                );
-                continue;
-            };
+    if results.len() < limit && !tail.is_empty() {
+        let hydration_page_size = limit.saturating_mul(4).clamp(256, BM25_HYDRATION_PAGE_MAX);
 
-            let result = chunk
-                .clone()
-                .into_search_result(f64::from(bm25_result.score));
+        for page in tail.chunks(hydration_page_size) {
+            let ids: Vec<String> = page
+                .iter()
+                .map(|bm25_result| bm25_result.chunk_id.clone())
+                .collect();
+            let mut chunks_by_id = metadata_store.get_chunks_by_ids(&ids).with_context(|| {
+                format!("failed to fetch metadata for {} BM25 candidates", ids.len())
+            })?;
 
-            if filters.is_some_and(|filters| !filters.matches(&result)) {
-                continue;
+            for bm25_result in page {
+                // `remove` moves the chunk out of the page map: every id is
+                // visited once, so no clone is needed.
+                let Some(chunk) = chunks_by_id.remove(&bm25_result.chunk_id) else {
+                    debug!(
+                        chunk_id = %bm25_result.chunk_id,
+                        "chunk metadata not found, skipping"
+                    );
+                    continue;
+                };
+
+                let result = chunk.into_search_result(f64::from(bm25_result.score));
+
+                if filters.is_some_and(|filters| !filters.matches(&result)) {
+                    continue;
+                }
+
+                results.push(result);
+
+                if results.len() >= limit {
+                    break;
+                }
             }
-
-            results.push(result);
 
             if results.len() >= limit {
                 break;
             }
-        }
-
-        if results.len() >= limit {
-            break;
         }
     }
 
