@@ -1132,3 +1132,60 @@ async fn nl_query_uses_same_rrf_k_as_identifier() {
     assert_eq!(id_params.rrf_k, 60.0);
     assert_eq!(nl_params.rrf_k, 60.0);
 }
+
+// ── Indexed file list cache tests ───────────────────────────────
+
+#[cfg(test)]
+mod indexed_files_cache_tests {
+    use super::super::SearchStores;
+    use crate::storage::metadata::MetadataStore;
+    use crate::types::{Chunk, Language, SymbolType};
+    use std::sync::Arc;
+
+    fn chunk(file_path: &str) -> Chunk {
+        Chunk {
+            id: format!("{file_path}:1"),
+            file_path: file_path.to_string(),
+            line_start: 1,
+            line_end: 3,
+            content: "fn f() {}".to_string(),
+            language: Language::Rust,
+            symbol_type: Some(SymbolType::Function),
+            symbol_name: Some("f".to_string()),
+        }
+    }
+
+    #[test]
+    fn indexed_files_cache_refreshes_after_metadata_update() {
+        let dir = tempfile::tempdir().unwrap();
+        let index_dir = dir.path();
+        let metadata_path = index_dir.join("metadata.db");
+        MetadataStore::open(&metadata_path)
+            .unwrap()
+            .insert_chunks(&[chunk("src/a.rs")])
+            .unwrap();
+
+        let stores = SearchStores::open(index_dir).unwrap();
+
+        let first = stores.indexed_files().unwrap();
+        assert_eq!(first.as_slice(), &["src/a.rs".to_string()]);
+
+        // Unchanged database: the cache serves the same allocation.
+        let second = stores.indexed_files().unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+
+        // A writer on another connection adds a file, as watch mode would.
+        MetadataStore::open(&metadata_path)
+            .unwrap()
+            .insert_chunks(&[chunk("src/b.rs")])
+            .unwrap();
+
+        let third = stores.indexed_files().unwrap();
+        assert_eq!(
+            third.as_slice(),
+            &["src/a.rs".to_string(), "src/b.rs".to_string()],
+            "cache must refresh after the metadata database changes"
+        );
+        assert!(!Arc::ptr_eq(&first, &third));
+    }
+}

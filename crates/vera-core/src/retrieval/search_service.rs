@@ -375,12 +375,14 @@ impl SearchContext {
         let mut timings = SearchTimings::from(hybrid_timings);
 
         let aug_start = Instant::now();
+        let indexed_files = stores.indexed_files()?;
         let metadata_store = stores
             .bm25_metadata
             .lock()
             .map_err(|_| anyhow::anyhow!("BM25 metadata store lock poisoned"))?;
         let results = augment_exact_match_candidates_with_store(
             &metadata_store,
+            &indexed_files,
             query,
             results,
             ranking_stage,
@@ -528,8 +530,10 @@ fn run_bm25_only(
     )?;
     let bm25_elapsed = bm25_start.elapsed();
     let aug_start = Instant::now();
+    let indexed_files = stores.indexed_files()?;
     let results = augment_exact_match_candidates_with_store(
         &metadata_store,
+        &indexed_files,
         query,
         results,
         RankingStage::Initial,

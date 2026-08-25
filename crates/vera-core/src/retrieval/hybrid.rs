@@ -38,6 +38,47 @@ pub(crate) struct SearchStores {
     pub(crate) vector_metadata: Mutex<MetadataStore>,
     vector_path: PathBuf,
     vector: Mutex<Option<CachedVectorStore>>,
+    metadata_path: PathBuf,
+    indexed_files: Mutex<Option<CachedIndexedFiles>>,
+}
+
+struct CachedIndexedFiles {
+    stamp: MetadataDbStamp,
+    files: Arc<Vec<String>>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct MetadataDbStamp {
+    db_len: Option<u64>,
+    db_mtime: Option<SystemTime>,
+    wal_len: Option<u64>,
+    wal_mtime: Option<SystemTime>,
+}
+
+fn metadata_db_stamp(db_path: &Path) -> MetadataDbStamp {
+    // WAL-mode commits append to the -wal file without touching the main
+    // database file until a checkpoint, so both files must contribute.
+    let wal_path = db_path.with_file_name(format!(
+        "{}-wal",
+        db_path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    ));
+    let stats = |path: &Path| {
+        std::fs::metadata(path)
+            .ok()
+            .map(|metadata| (metadata.len(), metadata.modified().ok()))
+    };
+    let (db_len, db_mtime) = stats(db_path).map_or((None, None), |(len, mtime)| (Some(len), mtime));
+    let (wal_len, wal_mtime) =
+        stats(&wal_path).map_or((None, None), |(len, mtime)| (Some(len), mtime));
+    MetadataDbStamp {
+        db_len,
+        db_mtime,
+        wal_len,
+        wal_mtime,
+    }
 }
 
 struct CachedVectorStore {
@@ -91,7 +132,48 @@ impl SearchStores {
             vector_metadata: Mutex::new(vector_metadata),
             vector_path: index_dir.join("vectors.db"),
             vector: Mutex::new(None),
+            metadata_path,
+            indexed_files: Mutex::new(None),
         })
+    }
+
+    /// Indexed file list, cached against the metadata database stamp.
+    ///
+    /// `MetadataStore::indexed_files()` runs a DISTINCT scan over every chunk
+    /// row, which costs tens of milliseconds on large indexes. Searches repeat
+    /// it per query through exact-match augmentation, so the list is cached
+    /// and refreshed only when metadata.db (or its WAL) changes on disk.
+    ///
+    /// Reads the stamp before querying so a concurrent commit invalidates the
+    /// entry instead of certifying a stale list. A fresh connection is used on
+    /// misses so this never interacts with the `bm25_metadata` lock.
+    pub(crate) fn indexed_files(&self) -> Result<Arc<Vec<String>>> {
+        let stamp = metadata_db_stamp(&self.metadata_path);
+        {
+            let cached = self
+                .indexed_files
+                .lock()
+                .map_err(|_| anyhow::anyhow!("indexed files cache lock poisoned"))?;
+            if let Some(cached) = cached.as_ref()
+                && cached.stamp == stamp
+            {
+                return Ok(Arc::clone(&cached.files));
+            }
+        }
+        let files = Arc::new(
+            MetadataStore::open(&self.metadata_path)
+                .context("failed to open metadata store for file list")?
+                .indexed_files()?,
+        );
+        let mut cached = self
+            .indexed_files
+            .lock()
+            .map_err(|_| anyhow::anyhow!("indexed files cache lock poisoned"))?;
+        *cached = Some(CachedIndexedFiles {
+            stamp,
+            files: Arc::clone(&files),
+        });
+        Ok(files)
     }
 
     pub(crate) fn vector_store(&self, dim: usize) -> Result<Arc<Mutex<VectorStore>>> {

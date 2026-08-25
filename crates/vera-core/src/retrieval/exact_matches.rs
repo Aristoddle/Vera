@@ -36,7 +36,12 @@ pub(crate) fn augment_exact_match_candidates(
             query, results, stage, filters,
         ));
     };
-    augment_exact_match_candidates_with_store(&store, query, results, stage, filters)
+    let Ok(files) = store.indexed_files() else {
+        return Ok(apply_query_ranking_with_filters(
+            query, results, stage, filters,
+        ));
+    };
+    augment_exact_match_candidates_with_store(&store, &files, query, results, stage, filters)
 }
 
 /// Maximum definition chunks one concept-matched file may contribute.
@@ -44,17 +49,18 @@ const CONCEPT_CHUNKS_PER_FILE: usize = 4;
 
 pub(crate) fn augment_exact_match_candidates_with_store(
     store: &MetadataStore,
+    indexed_files: &[String],
     query: &str,
     results: Vec<SearchResult>,
     stage: RankingStage,
     filters: &SearchFilters,
 ) -> Result<Vec<SearchResult>> {
-    let supplemental = collect_exact_match_candidates(store, query, 0)?;
+    let supplemental = collect_exact_match_candidates(store, indexed_files, query, 0)?;
 
     // Concept matches only fire when no exact filename or identifier matched.
     // They join the pool tail so ranking signals can decide their position.
     let concept = if supplemental.is_empty() {
-        collect_concept_matched_files(store, query)?
+        collect_concept_matched_files(store, indexed_files, query)?
             .into_iter()
             .map(|chunk| chunk.into_search_result(0.0))
             .collect()
@@ -93,14 +99,15 @@ pub fn augment_multi_query_exact_matches(
     let Ok(store) = crate::storage::metadata::MetadataStore::open(&metadata_path) else {
         return Ok(apply_filters(results, filters, result_limit));
     };
+    let indexed_files = store.indexed_files()?;
 
     let mut per_query: Vec<std::vec::IntoIter<SearchResult>> = Vec::with_capacity(queries.len());
     let mut concept_candidates = Vec::new();
     for (query_index, query) in queries.iter().enumerate() {
-        let exact = collect_exact_match_candidates(&store, query, query_index)?;
+        let exact = collect_exact_match_candidates(&store, &indexed_files, query, query_index)?;
         if exact.is_empty() {
             concept_candidates.extend(
-                collect_concept_matched_files(&store, query)?
+                collect_concept_matched_files(&store, &indexed_files, query)?
                     .into_iter()
                     .map(|chunk| chunk.into_search_result(0.0)),
             );
@@ -157,6 +164,7 @@ pub(crate) struct ExactMatchOrder {
 
 pub(crate) fn collect_exact_match_candidates(
     store: &crate::storage::metadata::MetadataStore,
+    indexed_files: &[String],
     query: &str,
     query_index: usize,
 ) -> Result<Vec<SearchResult>> {
@@ -167,10 +175,10 @@ pub(crate) fn collect_exact_match_candidates(
     if let Some(filename) = extract_exact_filename(query)
         .filter(|_| is_path_weighted_query(query) || query.split_whitespace().count() == 1)
     {
-        let mut matching_files: Vec<String> = store
-            .indexed_files()?
-            .into_iter()
+        let mut matching_files: Vec<String> = indexed_files
+            .iter()
             .filter(|path| file_name(path).eq_ignore_ascii_case(&filename))
+            .cloned()
             .collect();
         matching_files.sort_by(|a, b| path_depth(a).cmp(&path_depth(b)).then(a.cmp(b)));
 
@@ -209,7 +217,8 @@ pub(crate) fn collect_exact_match_candidates(
         // This catches definitions that weren't found by symbol name lookup,
         // e.g. when the file is sessions.py and the query is "Session".
         let seen_files: HashSet<String> = chunks.iter().map(|c| c.file_path.clone()).collect();
-        let stem_chunks = collect_stem_matched_definitions(store, &identifier, &seen_files)?;
+        let stem_chunks =
+            collect_stem_matched_definitions(store, indexed_files, &identifier, &seen_files)?;
         chunks.extend(stem_chunks);
 
         for chunk in chunks {
@@ -246,14 +255,14 @@ pub(crate) fn collect_exact_match_candidates(
 /// definition-type symbols to avoid pulling in noisy mentions.
 pub(crate) fn collect_stem_matched_definitions(
     store: &crate::storage::metadata::MetadataStore,
+    indexed_files: &[String],
     identifier: &str,
     already_seen: &HashSet<String>,
 ) -> Result<Vec<crate::types::Chunk>> {
     let identifier_lower = identifier.to_ascii_lowercase();
     let mut results = Vec::new();
 
-    let all_files = store.indexed_files()?;
-    for file_path in &all_files {
+    for file_path in indexed_files {
         if already_seen.contains(file_path.as_str()) {
             continue;
         }
@@ -289,6 +298,7 @@ pub(crate) fn collect_stem_matched_definitions(
 /// chunks to avoid noise. Limited to short queries to avoid false positives.
 pub(crate) fn collect_concept_matched_files(
     store: &crate::storage::metadata::MetadataStore,
+    indexed_files: &[String],
     query: &str,
 ) -> Result<Vec<crate::types::Chunk>> {
     let keywords: Vec<String> = query
@@ -304,10 +314,9 @@ pub(crate) fn collect_concept_matched_files(
         return Ok(Vec::new());
     }
 
-    let all_files = store.indexed_files()?;
     let mut matched_files = Vec::new();
 
-    for file_path in &all_files {
+    for file_path in indexed_files {
         let fname = file_name(file_path).to_ascii_lowercase();
         let stem = file_stem(&fname);
         if stem.len() < 4 {
@@ -592,7 +601,8 @@ mod tests {
         chunk.file_path = "src/other.rs".to_string();
         store.insert_chunks(&[chunk]).unwrap();
 
-        let results = collect_exact_match_candidates(&store, "Session", 0).unwrap();
+        let files = store.indexed_files().unwrap();
+        let results = collect_exact_match_candidates(&store, &files, "Session", 0).unwrap();
 
         assert!(results.is_empty());
     }
