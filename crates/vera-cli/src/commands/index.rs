@@ -132,15 +132,16 @@ pub fn execute(
     let on_progress = move |event: IndexProgress| match event {
         IndexProgress::DiscoveryDone { file_count } => {
             spinner_ref.stop(format!("Discovered {file_count} files"));
+            spinner_ref.start("Parsing files...");
         }
         IndexProgress::ParsingDone { chunk_count } => {
             spinner_ref.start(format!("Parsed into {chunk_count} chunks"));
             spinner_ref.stop(format!("Parsed into {chunk_count} chunks"));
         }
         IndexProgress::EmbeddingProgress { done, total } => {
+            embed_bar_ref.set_length(total as u64);
             if !embed_started_ref.load(std::sync::atomic::Ordering::Relaxed) {
                 embed_started_ref.store(true, std::sync::atomic::Ordering::Relaxed);
-                embed_bar_ref.set_length(total as u64);
                 embed_bar_ref.start("Generating embeddings...");
             }
             embed_bar_ref.set_position(done as u64);

@@ -2,7 +2,7 @@
 
 use std::fs;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tempfile::TempDir;
@@ -60,6 +60,204 @@ impl EmbeddingProvider for CancelThenFailProvider {
     fn expected_dim(&self) -> Option<usize> {
         Some(8)
     }
+}
+
+#[derive(Clone)]
+struct RecordingProvider {
+    calls: Arc<Mutex<Vec<usize>>>,
+    fail_on_call: Option<usize>,
+    dim: usize,
+}
+
+impl RecordingProvider {
+    fn new(dim: usize) -> Self {
+        Self {
+            calls: Arc::new(Mutex::new(Vec::new())),
+            fail_on_call: None,
+            dim,
+        }
+    }
+
+    fn failing_on_call(dim: usize, call: usize) -> Self {
+        Self {
+            calls: Arc::new(Mutex::new(Vec::new())),
+            fail_on_call: Some(call),
+            dim,
+        }
+    }
+
+    fn call_lengths(&self) -> Vec<usize> {
+        self.calls.lock().unwrap().clone()
+    }
+}
+
+impl EmbeddingProvider for RecordingProvider {
+    async fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+        let call = {
+            let mut calls = self.calls.lock().unwrap();
+            calls.push(texts.len());
+            calls.len()
+        };
+        if self.fail_on_call == Some(call) {
+            return Err(EmbeddingError::ApiError {
+                status: 503,
+                message: "recording provider failed".to_string(),
+            });
+        }
+        Ok(texts.iter().map(|_| vec![0.5; self.dim]).collect())
+    }
+
+    fn expected_dim(&self) -> Option<usize> {
+        Some(self.dim)
+    }
+}
+
+fn write_window_corpus(dir: &Path, file_count: usize) {
+    for index in 0..file_count {
+        fs::write(
+            dir.join(format!("file_{index:02}.rs")),
+            format!("fn item_{index}() {{}}\n"),
+        )
+        .unwrap();
+    }
+}
+
+fn index_fingerprint(idx_dir: &Path) -> Vec<(String, String)> {
+    let store = MetadataStore::open(&idx_dir.join(METADATA_DB)).unwrap();
+    let mut fingerprint = Vec::new();
+    for file_path in store.indexed_files().unwrap() {
+        let hash = store.get_file_hash(&file_path).unwrap().unwrap();
+        for chunk in store.get_chunks_by_file(&file_path).unwrap() {
+            fingerprint.push((chunk.id, hash.clone()));
+        }
+    }
+    fingerprint
+}
+
+#[tokio::test]
+async fn full_index_embeds_bounded_windows_and_preserves_order() {
+    let windowed_dir = TempDir::new().unwrap();
+    let single_window_dir = TempDir::new().unwrap();
+    write_window_corpus(windowed_dir.path(), 9);
+    write_window_corpus(single_window_dir.path(), 9);
+
+    let config = default_config();
+    let windowed_provider = RecordingProvider::new(8);
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let events_ref = events.clone();
+    let windowed_summary = index_repository_with_progress_and_cancellation_with_window_target(
+        windowed_dir.path(),
+        &windowed_provider,
+        &config,
+        "mock-model",
+        move |event| events_ref.lock().unwrap().push(event),
+        &CancellationToken::new(),
+        2,
+    )
+    .await
+    .unwrap();
+
+    let single_window_provider = RecordingProvider::new(8);
+    index_repository_with_progress_and_cancellation_with_window_target(
+        single_window_dir.path(),
+        &single_window_provider,
+        &config,
+        "mock-model",
+        |_| {},
+        &CancellationToken::new(),
+        1000,
+    )
+    .await
+    .unwrap();
+
+    let windowed_calls = windowed_provider.call_lengths();
+    assert!(windowed_calls.len() >= 3, "expected at least three windows");
+    assert!(windowed_calls.iter().all(|size| *size <= 2));
+    assert_eq!(
+        index_fingerprint(&index_dir(windowed_dir.path())),
+        index_fingerprint(&index_dir(single_window_dir.path()))
+    );
+
+    let events = events.lock().unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, IndexProgress::ParsingDone { .. }))
+            .count(),
+        1
+    );
+    let parsing_done = events
+        .iter()
+        .find_map(|event| match event {
+            IndexProgress::ParsingDone { chunk_count } => Some(*chunk_count),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(parsing_done, windowed_summary.chunks_created);
+
+    let mut previous_done = 0;
+    let mut previous_total = 0;
+    for event in events.iter() {
+        if let IndexProgress::EmbeddingProgress { done, total } = event {
+            assert!(*done >= previous_done);
+            assert!(*total >= previous_total);
+            previous_done = *done;
+            previous_total = *total;
+        }
+    }
+    assert_eq!(previous_done, windowed_summary.embeddings_generated);
+    assert_eq!(previous_total, windowed_summary.chunks_created);
+}
+
+#[tokio::test]
+async fn failed_window_keeps_live_index_and_cleans_staging() {
+    let dir = TempDir::new().unwrap();
+    write_window_corpus(dir.path(), 6);
+    let idx_dir = index_dir(dir.path());
+    fs::create_dir_all(&idx_dir).unwrap();
+    fs::write(idx_dir.join("sentinel"), "previous index").unwrap();
+
+    let provider = RecordingProvider::failing_on_call(8, 2);
+    let error = index_repository_with_progress_and_cancellation_with_window_target(
+        dir.path(),
+        &provider,
+        &default_config(),
+        "mock-model",
+        |_| {},
+        &CancellationToken::new(),
+        2,
+    )
+    .await
+    .unwrap_err();
+
+    assert!(error.to_string().contains("embedding generation failed"));
+    assert_eq!(
+        fs::read_to_string(idx_dir.join("sentinel")).unwrap(),
+        "previous index"
+    );
+    assert!(!sibling_index_dir(&idx_dir, "build").exists());
+    assert!(!sibling_index_dir(&idx_dir, "old").exists());
+}
+
+#[test]
+fn stale_staging_and_old_index_are_recovered_on_startup() {
+    let dir = TempDir::new().unwrap();
+    let idx_dir = index_dir(dir.path());
+    let old_dir = sibling_index_dir(&idx_dir, "old");
+    let build_dir = sibling_index_dir(&idx_dir, "build");
+    fs::create_dir_all(&old_dir).unwrap();
+    fs::create_dir_all(&build_dir).unwrap();
+    fs::write(old_dir.join("sentinel"), "previous index").unwrap();
+    fs::write(build_dir.join("stale"), "discard me").unwrap();
+
+    recover_index_directories(&idx_dir).unwrap();
+
+    assert_eq!(
+        fs::read_to_string(idx_dir.join("sentinel")).unwrap(),
+        "previous index"
+    );
+    assert!(!old_dir.exists());
+    assert!(!build_dir.exists());
 }
 
 #[tokio::test]
@@ -476,84 +674,25 @@ async fn index_permission_error_continues() {
 const INDEXING_CONFIG_META_KEY: &str = "indexing_config";
 const INDEX_REFRESHED_AT_META_KEY: &str = "index_refreshed_at_unix_ms";
 
-fn store_index_into(idx_dir: &Path) -> Result<()> {
-    let indexing_config = crate::config::IndexingConfig::default();
-    store_index(
-        idx_dir,
-        &[],
-        &[],
-        &[("src/lib.rs".to_string(), "hash-a".to_string())],
-        &[],
-        &[],
-        IndexBuildMetadata {
-            file_states: &[],
-            indexing_config: &indexing_config,
-            model_name: "mock-model",
-            document_prefix: "",
-        },
-    )
-}
+/// A completed windowed build publishes hashes and the freshness stamp, the
+/// markers `detect_staleness` relies on to treat the index as current.
+#[tokio::test]
+async fn successful_index_publishes_hashes_and_freshness() {
+    let dir = TempDir::new().unwrap();
+    write_window_corpus(dir.path(), 3);
 
-/// A failed store rebuild must not leave the index certified current.
-///
-/// Both stores are deleted and repopulated by `store_index`. The failure is
-/// injected by leaving a plain file where the store expects a directory (and a
-/// directory where it expects a file), which makes the reset step fail after
-/// the preceding stores have already been written. This proves the hashes and
-/// the freshness stamp land after both stores; it does not simulate a kill
-/// signal, and `store_index` has no seam for one.
-#[test]
-fn store_index_defers_hashes_and_freshness_until_stores_are_rebuilt() {
-    for poison in ["vector", "bm25"] {
-        let dir = TempDir::new().unwrap();
-        let idx_dir = dir.path().join(".vera");
-        fs::create_dir_all(&idx_dir).unwrap();
-        match poison {
-            // `remove_file` fails on a directory.
-            "vector" => fs::create_dir(idx_dir.join(VECTOR_DB)).unwrap(),
-            // `remove_dir_all` fails on a plain file.
-            _ => fs::write(idx_dir.join(BM25_SUBDIR), "not a directory").unwrap(),
-        }
+    let provider = MockProvider::new(8);
+    index_repository(dir.path(), &provider, &default_config(), "mock-model")
+        .await
+        .unwrap();
 
-        let err = store_index_into(&idx_dir).unwrap_err();
-        let rendered = format!("{err:#}");
+    let store = MetadataStore::open(&index_dir(dir.path()).join(METADATA_DB)).unwrap();
+    for file_path in store.indexed_files().unwrap() {
         assert!(
-            rendered.contains("failed to reset"),
-            "{poison}: unexpected failure: {rendered}"
-        );
-
-        let store = MetadataStore::open(&idx_dir.join(METADATA_DB)).unwrap();
-        assert_eq!(
-            store.get_file_hash("src/lib.rs").unwrap(),
-            None,
-            "{poison}: hashes were committed before the stores were rebuilt"
-        );
-        assert_eq!(
-            store.get_index_meta(INDEX_REFRESHED_AT_META_KEY).unwrap(),
-            None,
-            "{poison}: the index was stamped fresh before the stores were rebuilt"
-        );
-        assert_eq!(
-            store.get_index_meta(INDEXING_CONFIG_META_KEY).unwrap(),
-            None,
-            "{poison}: the freshness snapshot was recorded before the stores were rebuilt"
+            store.get_file_hash(&file_path).unwrap().is_some(),
+            "{file_path}: hash missing after a successful build"
         );
     }
-}
-
-/// The deferred writes still happen when the rebuild succeeds.
-#[test]
-fn store_index_records_hashes_and_freshness_on_success() {
-    let dir = TempDir::new().unwrap();
-    let idx_dir = dir.path().join(".vera");
-
-    store_index_into(&idx_dir).unwrap();
-
-    let store = MetadataStore::open(&idx_dir.join(METADATA_DB)).unwrap();
-    assert_eq!(
-        store.get_file_hash("src/lib.rs").unwrap().as_deref(),
-        Some("hash-a")
-    );
     assert!(
         store
             .get_index_meta(INDEX_REFRESHED_AT_META_KEY)

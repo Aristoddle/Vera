@@ -852,6 +852,15 @@ fn build_overrides(root: &Path, config: &IndexingConfig) -> Result<Override> {
         }
         overrides.add("!.veraignore")?;
     }
+    // Index build staging dirs are internal artifacts, not configuration:
+    // they must stay excluded even when default excludes are switched off,
+    // or a crashed/concurrent build's leftovers would be indexed as source.
+    let index_name = crate::indexing::pipeline::INDEX_DIR_NAME;
+    for suffix in ["build", "old"] {
+        overrides
+            .add(&format!("!{index_name}.{suffix}/"))
+            .context("failed to exclude index staging directory")?;
+    }
     for pattern in &config.extra_excludes {
         overrides
             .add(&format!("!{pattern}"))
@@ -911,6 +920,28 @@ fn explain_override_match(
                 "default excludes",
                 ".veraignore",
                 "the .veraignore file itself is never indexed",
+            )));
+        }
+    }
+
+    // Internal build artifacts, excluded in `build_overrides` regardless of
+    // `no_default_excludes`; mirror that here so explain-path agrees.
+    let index_name = crate::indexing::pipeline::INDEX_DIR_NAME;
+    for suffix in ["build", "old"] {
+        let pattern = format!("{index_name}.{suffix}");
+        let mut builder = OverrideBuilder::new(root);
+        builder
+            .add(&format!("!{pattern}/"))
+            .context("failed to build staging override")?;
+        let matcher = builder
+            .build()
+            .context("failed to build staging override matcher")?;
+        if override_matches_path_or_any_parents(&matcher, relative) {
+            return Ok(Some(simple_explanation(
+                PathReason::DefaultExclude,
+                "index staging",
+                &pattern,
+                "index build staging directories are never indexed",
             )));
         }
     }
@@ -1797,6 +1828,37 @@ mod tests {
             names.iter().any(|n| n.starts_with("node_modules")),
             "no_default_excludes should allow node_modules"
         );
+    }
+
+    #[test]
+    fn index_staging_dirs_stay_excluded_even_without_default_excludes() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("main.rs"), "fn main() {}").unwrap();
+        for staging in [".vera.build", ".vera.old"] {
+            let staging_dir = dir.path().join(staging);
+            fs::create_dir_all(&staging_dir).unwrap();
+            fs::write(staging_dir.join("meta.json"), "{}").unwrap();
+        }
+
+        let mut config = default_config();
+        config.no_default_excludes = true;
+
+        let result = discover_files(dir.path(), &config).unwrap();
+        let names: Vec<&str> = result
+            .files
+            .iter()
+            .map(|f| f.relative_path.as_str())
+            .collect();
+        assert!(names.contains(&"main.rs"));
+        assert!(
+            !names.iter().any(|n| n.starts_with(".vera")),
+            "index staging directories are internal artifacts: {names:?}"
+        );
+
+        let root = dir.path().canonicalize().unwrap();
+        let matcher = ExclusionMatcher::new(&root, &config).unwrap();
+        assert!(matcher.is_excluded(&root.join(".vera.build/meta.json")));
+        assert!(matcher.is_excluded(&root.join(".vera.old/meta.json")));
     }
 
     #[test]

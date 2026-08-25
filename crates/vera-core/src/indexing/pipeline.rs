@@ -4,7 +4,7 @@
 //! into a single `index_repository` entry point. Produces an [`IndexSummary`]
 //! describing the work performed.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -83,7 +83,7 @@ pub enum IndexProgress {
 // ── Index directory layout ───────────────────────────────────────────
 
 /// Default index directory name (placed inside the indexed repo).
-const INDEX_DIR_NAME: &str = ".vera";
+pub(crate) const INDEX_DIR_NAME: &str = ".vera";
 
 /// Subdirectory for BM25 (Tantivy) index files.
 const BM25_SUBDIR: &str = "bm25";
@@ -92,9 +92,30 @@ const BM25_SUBDIR: &str = "bm25";
 const METADATA_DB: &str = "metadata.db";
 const VECTOR_DB: &str = "vectors.db";
 
+/// Maximum number of parsed chunks held by the full-index pipeline at once.
+///
+/// The actual bound is approximate when a parse group or a single file
+/// produces more chunks than the target. With the default embedding byte
+/// limit, this bounds live chunk text to roughly `target * max_chunk_bytes`.
+const WINDOW_CHUNK_TARGET: usize = 2048;
+
+/// Keep each rayon parse group bounded while a window is being assembled.
+const MAX_PARSE_FILE_GROUP: usize = 64;
+
 /// Resolve the index directory for a given repository root.
 pub fn index_dir(repo_root: &Path) -> std::path::PathBuf {
     repo_root.join(INDEX_DIR_NAME)
+}
+
+/// True when `path` lives inside the live index directory or one of the
+/// staging siblings (`.vera.build`, `.vera.old`) a build swaps in and out.
+/// Watchers and file discovery must treat all three as internal artifacts:
+/// reacting to staging writes re-triggers watchers, and indexing them
+/// duplicates index content as source.
+pub fn path_in_index_artifacts(idx_dir: &Path, path: &Path) -> bool {
+    path.starts_with(idx_dir)
+        || path.starts_with(sibling_index_dir(idx_dir, "build"))
+        || path.starts_with(sibling_index_dir(idx_dir, "old"))
 }
 
 // ── Pipeline entry point ─────────────────────────────────────────────
@@ -186,8 +207,36 @@ where
     P: EmbeddingProvider,
     F: Fn(IndexProgress) + Send + Sync,
 {
+    index_repository_with_progress_and_cancellation_with_window_target(
+        repo_path,
+        provider,
+        config,
+        model_name,
+        on_progress,
+        cancellation,
+        WINDOW_CHUNK_TARGET,
+    )
+    .await
+}
+
+/// Test seam for running the full-index pipeline with a smaller chunk window.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn index_repository_with_progress_and_cancellation_with_window_target<P, F>(
+    repo_path: &Path,
+    provider: &P,
+    config: &VeraConfig,
+    model_name: &str,
+    on_progress: F,
+    cancellation: &CancellationToken,
+    window_chunk_target: usize,
+) -> Result<IndexSummary>
+where
+    P: EmbeddingProvider,
+    F: Fn(IndexProgress) + Send + Sync,
+{
     let start = Instant::now();
     cancellation.check()?;
+    let window_chunk_target = window_chunk_target.max(1);
 
     // ── 1. Validate path ─────────────────────────────────────────
     if !repo_path.exists() {
@@ -202,6 +251,9 @@ where
         .with_context(|| format!("failed to resolve path: {}", repo_path.display()))?;
 
     info!(path = %repo_root.display(), "starting indexing");
+
+    let idx_dir = index_dir(&repo_root);
+    recover_index_directories(&idx_dir).context("failed to recover index directories")?;
 
     // ── 2. Discover files ────────────────────────────────────────
     let discovery =
@@ -235,20 +287,196 @@ where
         file_count: discovery.files.len(),
     });
 
-    // ── 3. Parse and chunk each file (parallelized with rayon) ──
-    let (all_chunks, parse_errors, file_hashes, all_refs, all_type_relations, file_states) =
-        parse_discovered_files_parallel(&discovery, &repo_root, config, cancellation)?;
+    // Build into a sibling directory. The guard removes it on every error or
+    // cancellation, leaving the previous live index untouched until swap.
+    let mut staging = StagingIndex::new(&idx_dir).context("failed to create staging index")?;
+    let metadata_store = MetadataStore::open(&staging.build_dir.join(METADATA_DB))
+        .context("failed to open staging metadata store")?;
+    metadata_store
+        .set_index_meta("model_name", model_name)
+        .context("failed to store model_name")?;
+    let document_prefix = provider.document_prefix_identity();
+    metadata_store
+        .set_index_meta("document_prefix", &document_prefix)
+        .context("failed to store document_prefix")?;
 
-    info!(
-        chunks = all_chunks.len(),
-        parse_errors = parse_errors.len(),
-        "parsing complete"
-    );
-    on_progress(IndexProgress::ParsingDone {
-        chunk_count: all_chunks.len(),
-    });
+    let bm25_index = Bm25Index::open(&staging.build_dir.join(BM25_SUBDIR))
+        .context("failed to open staging BM25 index")?;
+    let mut vector_store = None;
+    let mut stored_dim = None;
 
-    if all_chunks.is_empty() {
+    // ── 3. Parse, embed, and store bounded windows ───────────────
+    let (batch_size, max_concurrent_requests) = config.embedding.bounded_parallelism();
+    if batch_size != config.embedding.batch_size
+        || max_concurrent_requests != config.embedding.max_concurrent_requests
+    {
+        info!(
+            configured_batch_size = config.embedding.batch_size,
+            configured_concurrency = config.embedding.max_concurrent_requests,
+            max_in_flight_inputs = config.embedding.max_in_flight_inputs,
+            batch_size,
+            max_concurrent_requests,
+            "clamped embedding parallelism to the in-flight input bound"
+        );
+    }
+
+    let parse_group_size = window_chunk_target.min(MAX_PARSE_FILE_GROUP);
+    let mut next_file_index = 0;
+    let mut parsed_chunk_count = 0;
+    let mut embedded_count = 0;
+    let mut parse_errors = Vec::new();
+    let mut file_hashes = Vec::new();
+    let mut file_states = Vec::new();
+
+    while next_file_index < discovery.files.len() {
+        cancellation.check()?;
+
+        let window_start = next_file_index;
+        let mut window_chunks = Vec::new();
+        let mut window_parse_errors = Vec::new();
+        let mut window_file_hashes = Vec::new();
+        let mut window_refs = Vec::new();
+        let mut window_type_relations = Vec::new();
+        let mut window_file_states = Vec::new();
+
+        while next_file_index < discovery.files.len()
+            && (next_file_index == window_start || window_chunks.len() < window_chunk_target)
+        {
+            let group_end = (next_file_index + parse_group_size).min(discovery.files.len());
+            let (
+                chunks,
+                group_parse_errors,
+                group_file_hashes,
+                group_refs,
+                group_type_relations,
+                group_file_states,
+            ) = parse_discovered_files_parallel(
+                &discovery,
+                &discovery.files[next_file_index..group_end],
+                &repo_root,
+                config,
+                cancellation,
+            )?;
+            next_file_index = group_end;
+            parsed_chunk_count += chunks.len();
+            window_chunks.extend(chunks);
+            window_parse_errors.extend(group_parse_errors);
+            window_file_hashes.extend(group_file_hashes);
+            window_refs.extend(group_refs);
+            window_type_relations.extend(group_type_relations);
+            window_file_states.extend(group_file_states);
+        }
+
+        let is_final_window = next_file_index == discovery.files.len();
+        if is_final_window {
+            info!(
+                chunks = parsed_chunk_count,
+                parse_errors = window_parse_errors.len() + parse_errors.len(),
+                "parsing complete"
+            );
+            on_progress(IndexProgress::ParsingDone {
+                chunk_count: parsed_chunk_count,
+            });
+        }
+
+        parse_errors.extend(window_parse_errors);
+        file_hashes.extend(window_file_hashes);
+        file_states.extend(window_file_states.iter().cloned());
+
+        cancellation.check()?;
+        if !window_chunks.is_empty() {
+            let embedded_before_window = embedded_count;
+            let parsed_through_window = parsed_chunk_count;
+            let window_batch_size = batch_size.min(window_chunk_target);
+            let progress_cb = |done: usize, _total: usize| {
+                on_progress(IndexProgress::EmbeddingProgress {
+                    done: embedded_before_window + done,
+                    total: parsed_through_window,
+                });
+            };
+            let embedding_result = embed_chunks_concurrent_with_progress_and_cancellation(
+                provider,
+                &window_chunks,
+                window_batch_size,
+                max_concurrent_requests,
+                config.indexing.max_chunk_bytes,
+                cancellation.as_async_token(),
+                progress_cb,
+            )
+            .await;
+            let mut embeddings = match embedding_result {
+                Ok(embeddings) => embeddings,
+                Err(error) => {
+                    // A completed provider error outranks a simultaneous cancellation,
+                    // mirroring the biased select in the CLI's cancel_task_on_signal.
+                    if matches!(error, EmbeddingError::Cancelled) {
+                        cancellation.check()?;
+                    }
+                    return Err(error).context("embedding generation failed");
+                }
+            };
+            cancellation.check()?;
+
+            let window_dim =
+                super::truncate_embeddings(&mut embeddings, config.embedding.max_stored_dim);
+            if !embeddings.is_empty() {
+                if let Some(existing_dim) = stored_dim {
+                    anyhow::ensure!(
+                        existing_dim == window_dim,
+                        "embedding dimension changed between windows: expected {}, got {}",
+                        existing_dim,
+                        window_dim
+                    );
+                } else {
+                    let store = VectorStore::open(&staging.build_dir.join(VECTOR_DB), window_dim)
+                        .context("failed to open staging vector store")?;
+                    metadata_store
+                        .set_index_meta("embedding_dim", &window_dim.to_string())
+                        .context("failed to store embedding_dim")?;
+                    vector_store = Some(store);
+                    stored_dim = Some(window_dim);
+                }
+            }
+            embedded_count += embeddings.len();
+
+            cancellation.check()?;
+            metadata_store
+                .insert_chunks(&window_chunks)
+                .context("failed to insert chunk metadata")?;
+            metadata_store
+                .insert_file_states(&window_file_states)
+                .context("failed to store file index states")?;
+            metadata_store
+                .insert_parse_artifacts_batch(&window_refs, &window_type_relations)
+                .context("failed to store references and type relations")?;
+
+            if let Some(vector_store) = vector_store.as_ref() {
+                let batch: Vec<(&str, &[f32])> = embeddings
+                    .iter()
+                    .map(|(id, vector)| (id.as_str(), vector.as_slice()))
+                    .collect();
+                vector_store
+                    .insert_batch(&batch)
+                    .context("failed to insert vectors")?;
+            }
+            bm25_index
+                .insert_chunks(&window_chunks)
+                .context("failed to insert BM25 documents")?;
+        } else {
+            // Parse-error-only windows still need their file state and parse
+            // artifacts persisted if a later window contains chunks.
+            metadata_store
+                .insert_file_states(&window_file_states)
+                .context("failed to store file index states")?;
+            metadata_store
+                .insert_parse_artifacts_batch(&window_refs, &window_type_relations)
+                .context("failed to store references and type relations")?;
+        }
+
+        cancellation.check()?;
+    }
+
+    if parsed_chunk_count == 0 {
         return Ok(IndexSummary {
             files_parsed: discovery.files.len() - parse_errors.len(),
             chunks_created: 0,
@@ -264,89 +492,32 @@ where
         });
     }
 
-    // ── 4. Generate embeddings (concurrent batches) ──────────────
-    cancellation.check()?;
-    let (batch_size, max_concurrent_requests) = config.embedding.bounded_parallelism();
-    if batch_size != config.embedding.batch_size
-        || max_concurrent_requests != config.embedding.max_concurrent_requests
-    {
-        info!(
-            configured_batch_size = config.embedding.batch_size,
-            configured_concurrency = config.embedding.max_concurrent_requests,
-            max_in_flight_inputs = config.embedding.max_in_flight_inputs,
-            batch_size,
-            max_concurrent_requests,
-            "clamped embedding parallelism to the in-flight input bound"
-        );
-    }
-
-    let progress_cb = |done: usize, total: usize| {
-        on_progress(IndexProgress::EmbeddingProgress { done, total });
-    };
-    let embedding_result = embed_chunks_concurrent_with_progress_and_cancellation(
-        provider,
-        &all_chunks,
-        batch_size,
-        max_concurrent_requests,
-        config.indexing.max_chunk_bytes,
-        cancellation.as_async_token(),
-        progress_cb,
-    )
-    .await;
-    let mut embeddings = match embedding_result {
-        Ok(embeddings) => embeddings,
-        Err(error) => {
-            // A completed provider error outranks a simultaneous cancellation,
-            // mirroring the biased select in the CLI's cancel_task_on_signal.
-            if matches!(error, EmbeddingError::Cancelled) {
-                cancellation.check()?;
-            }
-            return Err(error).context("embedding generation failed");
-        }
-    };
-    cancellation.check()?;
-
-    // Truncate vectors if max_stored_dim is configured.
-    let stored_dim = super::truncate_embeddings(&mut embeddings, config.embedding.max_stored_dim);
-
-    info!(
-        embeddings = embeddings.len(),
-        stored_dim, "embeddings generated"
-    );
     on_progress(IndexProgress::EmbeddingDone {
-        count: embeddings.len(),
+        count: embedded_count,
     });
 
-    // ── 5. Store everything on disk ──────────────────────────────
+    // A provider returning no vectors is not expected, but preserve the old
+    // empty-vector dimensionality fallback for a non-empty parsed corpus.
+    if stored_dim.is_none() {
+        let fallback_dim = 4096;
+        let store = VectorStore::open(&staging.build_dir.join(VECTOR_DB), fallback_dim)
+            .context("failed to open staging vector store")?;
+        metadata_store
+            .set_index_meta("embedding_dim", &fallback_dim.to_string())
+            .context("failed to store embedding_dim")?;
+        vector_store = Some(store);
+    }
+
     // Publication is synchronous, so cancellation must win before any artifact is replaced.
     cancellation.check()?;
-    let idx_dir = index_dir(&repo_root);
-    let document_prefix = provider.document_prefix_identity();
-    store_index(
-        &idx_dir,
-        &all_chunks,
-        &embeddings,
-        &file_hashes,
-        &all_refs,
-        &all_type_relations,
-        IndexBuildMetadata {
-            file_states: &file_states,
-            indexing_config: &config.indexing,
-            model_name,
-            document_prefix: &document_prefix,
-        },
-    )
-    .context("failed to write index artifacts")?;
-
-    info!(index_dir = %idx_dir.display(), "index artifacts written");
-    on_progress(IndexProgress::StorageDone);
+    publish_index_certification(&metadata_store, &file_hashes, &config.indexing)
+        .context("failed to publish index freshness metadata")?;
 
     let files_parsed = discovery.files.len() - parse_errors.len();
-
-    Ok(IndexSummary {
+    let summary = IndexSummary {
         files_parsed,
-        chunks_created: all_chunks.len(),
-        embeddings_generated: embeddings.len(),
+        chunks_created: parsed_chunk_count,
+        embeddings_generated: embedded_count,
         binary_skipped: discovery.binary_skipped,
         large_skipped: discovery.large_skipped,
         large_skipped_paths: discovery.large_skipped_paths,
@@ -355,7 +526,19 @@ where
         files_using_tier0_fallback: count_tier0_fallback_files(&file_states),
         parse_errors,
         elapsed_secs: start.elapsed().as_secs_f64(),
-    })
+    };
+
+    drop(vector_store);
+    drop(bm25_index);
+    drop(metadata_store);
+    swap_staging_index(&idx_dir, &staging.build_dir, &staging.old_dir)
+        .context("failed to publish staged index")?;
+    staging.committed = true;
+
+    info!(index_dir = %idx_dir.display(), "index artifacts written");
+    on_progress(IndexProgress::StorageDone);
+
+    Ok(summary)
 }
 
 // ── Internal helpers ─────────────────────────────────────────────────
@@ -369,6 +552,7 @@ where
 #[allow(clippy::type_complexity)]
 fn parse_discovered_files_parallel(
     discovery: &DiscoveryResult,
+    files: &[discovery::DiscoveredFile],
     repo_root: &Path,
     config: &VeraConfig,
     cancellation: &CancellationToken,
@@ -392,8 +576,7 @@ fn parse_discovered_files_parallel(
         file_state: Option<FileIndexState>,
     }
 
-    let results: Vec<ParsedFileResult> = discovery
-        .files
+    let results: Vec<ParsedFileResult> = files
         .par_iter()
         .map(|file| {
             if cancellation.is_cancelled() {
@@ -573,117 +756,121 @@ fn parse_discovered_files_parallel(
     ))
 }
 
-/// Write chunks, embeddings, BM25 index, file hashes, and references to disk.
-struct IndexBuildMetadata<'a> {
-    file_states: &'a [FileIndexState],
-    indexing_config: &'a crate::config::IndexingConfig,
-    model_name: &'a str,
-    document_prefix: &'a str,
+struct StagingIndex {
+    build_dir: PathBuf,
+    old_dir: PathBuf,
+    committed: bool,
 }
 
-fn store_index(
-    idx_dir: &Path,
-    chunks: &[Chunk],
-    embeddings: &[(String, Vec<f32>)],
+impl StagingIndex {
+    fn new(idx_dir: &Path) -> Result<Self> {
+        let build_dir = sibling_index_dir(idx_dir, "build");
+        let old_dir = sibling_index_dir(idx_dir, "old");
+        if build_dir.exists() {
+            std::fs::remove_dir_all(&build_dir).with_context(|| {
+                format!(
+                    "failed to remove stale staging dir: {}",
+                    build_dir.display()
+                )
+            })?;
+        }
+        std::fs::create_dir_all(&build_dir)
+            .with_context(|| format!("failed to create staging dir: {}", build_dir.display()))?;
+        Ok(Self {
+            build_dir,
+            old_dir,
+            committed: false,
+        })
+    }
+}
+
+impl Drop for StagingIndex {
+    fn drop(&mut self) {
+        if !self.committed {
+            let _ = std::fs::remove_dir_all(&self.build_dir);
+        }
+    }
+}
+
+fn sibling_index_dir(idx_dir: &Path, suffix: &str) -> PathBuf {
+    let name = idx_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(INDEX_DIR_NAME);
+    idx_dir
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(format!("{name}.{suffix}"))
+}
+
+fn recover_index_directories(idx_dir: &Path) -> Result<()> {
+    let build_dir = sibling_index_dir(idx_dir, "build");
+    let old_dir = sibling_index_dir(idx_dir, "old");
+    if !idx_dir.exists() && old_dir.exists() {
+        std::fs::rename(&old_dir, idx_dir).with_context(|| {
+            format!(
+                "failed to restore previous index from {}",
+                old_dir.display()
+            )
+        })?;
+    }
+    if build_dir.exists() {
+        std::fs::remove_dir_all(&build_dir).with_context(|| {
+            format!(
+                "failed to remove stale staging dir: {}",
+                build_dir.display()
+            )
+        })?;
+    }
+    if old_dir.exists() {
+        std::fs::remove_dir_all(&old_dir)
+            .with_context(|| format!("failed to remove stale old index: {}", old_dir.display()))?;
+    }
+    Ok(())
+}
+
+fn swap_staging_index(idx_dir: &Path, build_dir: &Path, old_dir: &Path) -> Result<()> {
+    if old_dir.exists() {
+        std::fs::remove_dir_all(old_dir)
+            .with_context(|| format!("failed to remove old index: {}", old_dir.display()))?;
+    }
+    if idx_dir.exists() {
+        std::fs::rename(idx_dir, old_dir).with_context(|| {
+            format!(
+                "failed to move live index to temporary path: {}",
+                old_dir.display()
+            )
+        })?;
+    }
+    if let Err(error) = std::fs::rename(build_dir, idx_dir) {
+        if old_dir.exists() && !idx_dir.exists() {
+            let _ = std::fs::rename(old_dir, idx_dir);
+        }
+        return Err(error)
+            .with_context(|| format!("failed to publish staging index as {}", idx_dir.display()));
+    }
+    if old_dir.exists() {
+        std::fs::remove_dir_all(old_dir)
+            .with_context(|| format!("failed to remove old index: {}", old_dir.display()))?;
+    }
+    Ok(())
+}
+
+fn publish_index_certification(
+    metadata_store: &MetadataStore,
     file_hashes: &[(String, String)],
-    file_refs: &[(String, Vec<RawReference>)],
-    file_type_relations: &[(String, Vec<RawTypeRelation>)],
-    metadata: IndexBuildMetadata<'_>,
+    indexing_config: &crate::config::IndexingConfig,
 ) -> Result<()> {
-    // Ensure index directory exists.
-    std::fs::create_dir_all(idx_dir)
-        .with_context(|| format!("failed to create index dir: {}", idx_dir.display()))?;
-
-    // Determine vector dimensionality from the first embedding.
-    let dim = embeddings.first().map(|(_, v)| v.len()).unwrap_or(4096);
-
-    // ── Metadata store ───────────────────────────────────────────
-    let metadata_path = idx_dir.join(METADATA_DB);
-    let metadata_store =
-        MetadataStore::open(&metadata_path).context("failed to open metadata store")?;
-    // Clear previous data (fresh index).
-    metadata_store
-        .clear()
-        .context("failed to clear metadata store")?;
-    metadata_store
-        .insert_chunks(chunks)
-        .context("failed to insert chunk metadata")?;
-
-    metadata_store
-        .insert_file_states(metadata.file_states)
-        .context("failed to store file index states")?;
-
-    // Store call-site references and type relations for call graph analysis,
-    // batched into a single transaction instead of up to two commits per file.
-    metadata_store
-        .insert_parse_artifacts_batch(file_refs, file_type_relations)
-        .context("failed to store references and type relations")?;
-
-    metadata_store
-        .set_index_meta("model_name", metadata.model_name)
-        .context("failed to store model_name")?;
-    metadata_store
-        .set_index_meta("document_prefix", metadata.document_prefix)
-        .context("failed to store document_prefix")?;
-    metadata_store
-        .set_index_meta("embedding_dim", &dim.to_string())
-        .context("failed to store embedding_dim")?;
-
-    debug!(chunks = chunks.len(), "metadata stored");
-
-    // ── Vector store ─────────────────────────────────────────────
-    let vector_path = idx_dir.join(VECTOR_DB);
-    if vector_path.exists() {
-        std::fs::remove_file(&vector_path)
-            .with_context(|| format!("failed to reset vector db: {}", vector_path.display()))?;
-    }
-    let vector_store =
-        VectorStore::open(&vector_path, dim).context("failed to open vector store")?;
-    vector_store
-        .clear()
-        .context("failed to clear vector store")?;
-
-    let batch: Vec<(&str, &[f32])> = embeddings
-        .iter()
-        .map(|(id, vec)| (id.as_str(), vec.as_slice()))
-        .collect();
-    vector_store
-        .insert_batch(&batch)
-        .context("failed to insert vectors")?;
-
-    debug!(vectors = embeddings.len(), "vectors stored");
-
-    // ── BM25 index ───────────────────────────────────────────────
-    let bm25_dir = idx_dir.join(BM25_SUBDIR);
-    if bm25_dir.exists() {
-        std::fs::remove_dir_all(&bm25_dir)
-            .with_context(|| format!("failed to reset BM25 dir: {}", bm25_dir.display()))?;
-    }
-    let bm25_index = Bm25Index::open(&bm25_dir).context("failed to open BM25 index")?;
-
-    bm25_index
-        .insert_chunks(chunks)
-        .context("failed to insert BM25 documents")?;
-
-    debug!(docs = chunks.len(), "BM25 index built");
-
-    // Hashes and the freshness stamp are what certify the index current, so
-    // they are written only once every store has been rebuilt. Both stores are
-    // deleted and repopulated above; committing the hashes first would leave a
-    // crash or a Ctrl-C in that window with a complete metadata store, current
-    // hashes and a missing or half-built vector/BM25 store, which
-    // `detect_staleness` cannot see and `vera update` skips. `metadata_store`
-    // was cleared above, hashes and index metadata included, so a failure
-    // before final publication leaves both absent, every file reads as new and
-    // the next run reprocesses. A failure during the final metadata writes can
-    // happen only after both stores are complete. `update.rs` keeps the same
-    // order.
+    // Hashes and the freshness stamp certify the index current, so they are
+    // written only after every staged metadata, vector, and BM25 insert has
+    // completed. A failure before this publication leaves the staging build
+    // uncertified and the previous live index untouched. The swap happens
+    // only after these writes succeed.
     metadata_store
         .set_file_hashes_batch(file_hashes)
         .context("failed to store file hashes")?;
-    super::freshness::record_index_snapshot(&metadata_store, metadata.indexing_config)
+    super::freshness::record_index_snapshot(metadata_store, indexing_config)
         .context("failed to store index freshness metadata")?;
-
     Ok(())
 }
 

@@ -229,7 +229,8 @@ fn start_watching_with_runtime(
     // The index directory is filtered on its own, never through `exclusions`:
     // an update cycle writes into it, so a watcher that reacts to those writes
     // re-triggers itself. `no_default_excludes`, or a stored `default_excludes`
-    // without `.vera`, would switch that guard off.
+    // without `.vera`, would switch that guard off. The same applies to the
+    // `.vera.build`/`.vera.old` staging siblings a full index swaps through.
     let index_dir = idx_dir.clone();
 
     let update_state = Arc::new(Mutex::new(UpdateState::default()));
@@ -268,13 +269,14 @@ fn start_watching_with_runtime(
             };
             let tracked_paths = load_tracked_paths(&index_dir, &repo_clone);
 
-            // Ignore the index directory always, plus the directories indexing
-            // would not walk anyway (target, node_modules, ...). A build
-            // churning target/ used to start a full update cycle per debounce
-            // window.
+            // Ignore the index directory always (including the `.vera.build`
+            // and `.vera.old` staging siblings a full index swaps in and
+            // out), plus the directories indexing would not walk anyway
+            // (target, node_modules, ...). A build churning target/ used to
+            // start a full update cycle per debounce window.
             let has_relevant_changes = events.iter().any(|e| {
                 e.kind == DebouncedEventKind::Any
-                    && !e.path.starts_with(&index_dir)
+                    && !vera_core::indexing::pipeline::path_in_index_artifacts(&index_dir, &e.path)
                     && is_relevant_change(&e.path, &exclusions, &tracked_paths)
             });
 
@@ -880,6 +882,50 @@ mod tests {
             updates.load(Ordering::SeqCst),
             1,
             "writes into the index directory must never trigger an update cycle"
+        );
+    }
+
+    /// A full index build swaps staging siblings (`.vera.build`, `.vera.old`)
+    /// next to the live index. Those writes are index-internal too: `Path::
+    /// starts_with` on the live dir does not cover them, so the guard must.
+    #[test]
+    fn staging_dir_writes_never_trigger_updates() {
+        let repo = repo_fixture();
+        let builds = Arc::new(AtomicUsize::new(0));
+        let updates = Arc::new(AtomicUsize::new(0));
+
+        let _handle = start_watching_with(
+            repo.path(),
+            false,
+            TEST_DEBOUNCE,
+            &IndexingConfig::default(),
+            counting_builder(Arc::clone(&builds), Arc::clone(&updates)),
+        )
+        .expect("watcher starts");
+
+        std::fs::write(repo.path().join("src/real.rs"), "fn real() {}").expect("write");
+        assert!(
+            wait_until(Duration::from_secs(10), || updates.load(Ordering::SeqCst)
+                == 1),
+            "an indexable change must trigger exactly one update cycle"
+        );
+
+        for staging in [".vera.build", ".vera.old"] {
+            std::fs::create_dir_all(repo.path().join(staging)).expect("staging dir");
+            for i in 0..3 {
+                std::fs::write(
+                    repo.path().join(format!("{staging}/chunk{i}.json")),
+                    format!("staging write {i}"),
+                )
+                .expect("write");
+            }
+        }
+        std::thread::sleep(TEST_DEBOUNCE * 6);
+
+        assert_eq!(
+            updates.load(Ordering::SeqCst),
+            1,
+            "writes into index staging directories must never trigger an update cycle"
         );
     }
 
