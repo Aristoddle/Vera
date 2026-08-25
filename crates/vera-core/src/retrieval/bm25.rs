@@ -644,36 +644,20 @@ mod tests {
         .take(limit)
         .collect();
 
-        let actual_signature: Vec<_> = filtered
-            .iter()
-            .map(|result| {
-                (
-                    result.file_path.as_str(),
-                    result.line_start,
-                    result.line_end,
-                    result.content.as_str(),
-                    result.language,
-                    result.score,
-                    result.symbol_name.as_deref(),
-                    result.symbol_type,
-                )
-            })
-            .collect();
-        let expected_signature: Vec<_> = expected
-            .iter()
-            .map(|result| {
-                (
-                    result.file_path.as_str(),
-                    result.line_start,
-                    result.line_end,
-                    result.content.as_str(),
-                    result.language,
-                    result.score,
-                    result.symbol_name.as_deref(),
-                    result.symbol_type,
-                )
-            })
-            .collect();
+        let result_signature = |result: &SearchResult| {
+            (
+                result.file_path.clone(),
+                result.line_start,
+                result.line_end,
+                result.content.clone(),
+                result.language,
+                result.score,
+                result.symbol_name.clone(),
+                result.symbol_type,
+            )
+        };
+        let actual_signature: Vec<_> = filtered.iter().map(result_signature).collect();
+        let expected_signature: Vec<_> = expected.iter().map(result_signature).collect();
 
         assert_eq!(filtered.len(), limit);
         assert_eq!(actual_signature, expected_signature);

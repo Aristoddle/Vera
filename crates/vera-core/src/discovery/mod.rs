@@ -856,7 +856,7 @@ fn build_overrides(root: &Path, config: &IndexingConfig) -> Result<Override> {
     // they must stay excluded even when default excludes are switched off,
     // or a crashed/concurrent build's leftovers would be indexed as source.
     let index_name = crate::indexing::pipeline::INDEX_DIR_NAME;
-    for suffix in ["build", "old"] {
+    for suffix in crate::indexing::pipeline::INDEX_STAGING_SUFFIXES {
         overrides
             .add(&format!("!{index_name}.{suffix}/"))
             .context("failed to exclude index staging directory")?;
@@ -927,7 +927,7 @@ fn explain_override_match(
     // Internal build artifacts, excluded in `build_overrides` regardless of
     // `no_default_excludes`; mirror that here so explain-path agrees.
     let index_name = crate::indexing::pipeline::INDEX_DIR_NAME;
-    for suffix in ["build", "old"] {
+    for suffix in crate::indexing::pipeline::INDEX_STAGING_SUFFIXES {
         let pattern = format!("{index_name}.{suffix}");
         let mut builder = OverrideBuilder::new(root);
         builder

@@ -85,6 +85,10 @@ pub enum IndexProgress {
 /// Default index directory name (placed inside the indexed repo).
 pub(crate) const INDEX_DIR_NAME: &str = ".vera";
 
+const INDEX_BUILD_SUFFIX: &str = "build";
+const INDEX_OLD_SUFFIX: &str = "old";
+pub(crate) const INDEX_STAGING_SUFFIXES: [&str; 2] = [INDEX_BUILD_SUFFIX, INDEX_OLD_SUFFIX];
+
 /// Subdirectory for BM25 (Tantivy) index files.
 const BM25_SUBDIR: &str = "bm25";
 
@@ -114,8 +118,9 @@ pub fn index_dir(repo_root: &Path) -> std::path::PathBuf {
 /// duplicates index content as source.
 pub fn path_in_index_artifacts(idx_dir: &Path, path: &Path) -> bool {
     path.starts_with(idx_dir)
-        || path.starts_with(sibling_index_dir(idx_dir, "build"))
-        || path.starts_with(sibling_index_dir(idx_dir, "old"))
+        || INDEX_STAGING_SUFFIXES
+            .iter()
+            .any(|suffix| path.starts_with(sibling_index_dir(idx_dir, suffix)))
 }
 
 // ── Pipeline entry point ─────────────────────────────────────────────
@@ -764,8 +769,8 @@ struct StagingIndex {
 
 impl StagingIndex {
     fn new(idx_dir: &Path) -> Result<Self> {
-        let build_dir = sibling_index_dir(idx_dir, "build");
-        let old_dir = sibling_index_dir(idx_dir, "old");
+        let build_dir = sibling_index_dir(idx_dir, INDEX_BUILD_SUFFIX);
+        let old_dir = sibling_index_dir(idx_dir, INDEX_OLD_SUFFIX);
         if build_dir.exists() {
             std::fs::remove_dir_all(&build_dir).with_context(|| {
                 format!(
@@ -804,8 +809,8 @@ fn sibling_index_dir(idx_dir: &Path, suffix: &str) -> PathBuf {
 }
 
 fn recover_index_directories(idx_dir: &Path) -> Result<()> {
-    let build_dir = sibling_index_dir(idx_dir, "build");
-    let old_dir = sibling_index_dir(idx_dir, "old");
+    let build_dir = sibling_index_dir(idx_dir, INDEX_BUILD_SUFFIX);
+    let old_dir = sibling_index_dir(idx_dir, INDEX_OLD_SUFFIX);
     if !idx_dir.exists() && old_dir.exists() {
         std::fs::rename(&old_dir, idx_dir).with_context(|| {
             format!(
