@@ -7,8 +7,11 @@
 
 use std::collections::HashSet;
 
+use tree_sitter::Parser;
+
 use crate::types::{Chunk, Language, SymbolType};
 
+use super::languages::tree_sitter_grammar_for_path;
 use super::signatures;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -94,6 +97,15 @@ fn extract_chunk_relations(chunk: &Chunk) -> Vec<RawTypeRelation> {
                 return Vec::new();
             };
             ruby_relations(chunk, &header, &owner)
+        }
+        Language::Python => {
+            if chunk.symbol_type != Some(SymbolType::Class) {
+                return Vec::new();
+            }
+            let Some(owner) = relation_owner(chunk) else {
+                return Vec::new();
+            };
+            python_relations(chunk, &owner)
         }
         Language::CSharp | Language::Kotlin | Language::Swift | Language::Cpp | Language::Dart => {
             // A colon only denotes inheritance on type declarations. On
@@ -352,6 +364,55 @@ fn ruby_relations(chunk: &Chunk, header: &str, owner: &str) -> Vec<RawTypeRelati
         vec![header[idx + " < ".len()..].to_string()],
         TypeRelationKind::Extends,
     )
+}
+
+fn python_relations(chunk: &Chunk, owner: &str) -> Vec<RawTypeRelation> {
+    let Some(grammar) = tree_sitter_grammar_for_path(Language::Python, &chunk.file_path) else {
+        return Vec::new();
+    };
+
+    let mut parser = Parser::new();
+    if parser.set_language(&grammar).is_err() {
+        return Vec::new();
+    }
+    let Some(tree) = parser.parse(&chunk.content, None) else {
+        return Vec::new();
+    };
+    let Some(class_definition) = find_python_class_definition(tree.root_node()) else {
+        return Vec::new();
+    };
+    let Some(superclasses) = class_definition.child_by_field_name("superclasses") else {
+        return Vec::new();
+    };
+
+    let mut cursor = superclasses.walk();
+    let targets = superclasses
+        .named_children(&mut cursor)
+        .filter(|base| base.kind() != "keyword_argument")
+        .filter_map(|base| base.utf8_text(chunk.content.as_bytes()).ok())
+        .filter_map(python_superclass_name)
+        .collect();
+
+    build_relations(chunk.line_start, owner, targets, TypeRelationKind::Extends)
+}
+
+fn find_python_class_definition(node: tree_sitter::Node<'_>) -> Option<tree_sitter::Node<'_>> {
+    if node.kind() == "class_definition" {
+        return Some(node);
+    }
+
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if let Some(class_definition) = find_python_class_definition(child) {
+            return Some(class_definition);
+        }
+    }
+    None
+}
+
+fn python_superclass_name(text: &str) -> Option<String> {
+    let base = text.split_once('[').map_or(text, |(base, _)| base);
+    simple_name(base)
 }
 
 fn haskell_relations(chunk: &Chunk, owner: &str) -> Vec<RawTypeRelation> {
@@ -866,5 +927,54 @@ mod tests {
         assert_eq!(relations.len(), 1);
         assert_eq!(relations[0].owner, "HugeClass");
         assert_eq!(relations[0].target, "Base");
+    }
+
+    #[test]
+    fn python_class_inheritance_relations() {
+        let chunk = class_chunk(
+            Language::Python,
+            "User",
+            "class User(AdminBase):\n    pass\n",
+        );
+
+        let relations = extract_type_relations(&[chunk]);
+
+        assert_eq!(relations.len(), 1);
+        assert_eq!(relations[0].owner, "User");
+        assert_eq!(relations[0].target, "AdminBase");
+        assert_eq!(relations[0].kind, TypeRelationKind::Extends);
+    }
+
+    #[test]
+    fn python_multiple_inheritance_relations() {
+        let chunk = class_chunk(
+            Language::Python,
+            "User",
+            "class User(AdminBase, Protocol):\n    pass\n",
+        );
+
+        let relations = extract_type_relations(&[chunk]);
+
+        assert_eq!(relations.len(), 2);
+        assert!(relations.iter().all(|relation| {
+            relation.owner == "User" && relation.kind == TypeRelationKind::Extends
+        }));
+        assert!(
+            relations
+                .iter()
+                .any(|relation| relation.target == "AdminBase")
+        );
+        assert!(
+            relations
+                .iter()
+                .any(|relation| relation.target == "Protocol")
+        );
+    }
+
+    #[test]
+    fn python_plain_class_has_no_relations() {
+        let chunk = class_chunk(Language::Python, "User", "class User:\n    pass\n");
+
+        assert!(extract_type_relations(&[chunk]).is_empty());
     }
 }

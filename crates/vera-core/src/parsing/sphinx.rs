@@ -42,8 +42,11 @@ pub(crate) fn preprocess_rst_with_limit(
 ) -> Result<String> {
     let mut stack = vec![current_file.to_path_buf()];
     let mut expansion_cache = HashMap::new();
+    let canonical_repo_root = repo_root
+        .canonicalize()
+        .with_context(|| format!("failed to canonicalize repo root: {}", repo_root.display()))?;
     let mut context = IncludeResolutionContext {
-        repo_root,
+        canonical_repo_root: &canonical_repo_root,
         stack: &mut stack,
         expansion_cache: &mut expansion_cache,
         output_budget: include_output_budget(max_file_size_bytes),
@@ -80,7 +83,7 @@ fn toctree_entry_re() -> &'static Regex {
 }
 
 struct IncludeResolutionContext<'a> {
-    repo_root: &'a Path,
+    canonical_repo_root: &'a Path,
     stack: &'a mut Vec<PathBuf>,
     expansion_cache: &'a mut HashMap<PathBuf, Arc<str>>,
     output_budget: usize,
@@ -129,37 +132,37 @@ fn resolve_includes_recursive(
             .as_str();
         let include_ref = strip_wrapping_quotes(raw_ref.trim());
 
-        let replacement = match resolve_include_path(include_ref, current_file, context.repo_root)?
-        {
-            Some(include_path) => {
-                if context.stack.contains(&include_path) {
-                    None
-                } else if let Some(cached) = context.expansion_cache.get(&include_path) {
-                    Some(Arc::clone(cached))
-                } else {
-                    match read_include_file(&include_path, context.max_file_size_bytes)? {
-                        Some(include_text) => {
-                            context.stack.push(include_path.clone());
-                            let resolved = resolve_includes_recursive(
-                                &include_text,
-                                &include_path,
-                                depth + 1,
-                                context.output_budget,
-                                context,
-                            )?;
-                            context.stack.pop();
-                            let resolved: Arc<str> = Arc::from(resolved);
-                            context
-                                .expansion_cache
-                                .insert(include_path.clone(), Arc::clone(&resolved));
-                            Some(resolved)
+        let replacement =
+            match resolve_include_path(include_ref, current_file, context.canonical_repo_root)? {
+                Some(include_path) => {
+                    if context.stack.contains(&include_path) {
+                        None
+                    } else if let Some(cached) = context.expansion_cache.get(&include_path) {
+                        Some(Arc::clone(cached))
+                    } else {
+                        match read_include_file(&include_path, context.max_file_size_bytes)? {
+                            Some(include_text) => {
+                                context.stack.push(include_path.clone());
+                                let resolved = resolve_includes_recursive(
+                                    &include_text,
+                                    &include_path,
+                                    depth + 1,
+                                    context.output_budget,
+                                    context,
+                                )?;
+                                context.stack.pop();
+                                let resolved: Arc<str> = Arc::from(resolved);
+                                context
+                                    .expansion_cache
+                                    .insert(include_path.clone(), Arc::clone(&resolved));
+                                Some(resolved)
+                            }
+                            None => None,
                         }
-                        None => None,
                     }
                 }
-            }
-            None => None,
-        };
+                None => None,
+            };
 
         append_with_budget(
             &mut output,
@@ -205,20 +208,19 @@ fn append_with_budget(output: &mut String, text: &str, remaining: &mut usize) {
 fn resolve_include_path(
     include_ref: &str,
     current_file: &Path,
-    repo_root: &Path,
+    canonical_repo_root: &Path,
 ) -> Result<Option<PathBuf>> {
     let candidate = if include_ref.starts_with('/') {
-        repo_root.join(include_ref.trim_start_matches('/'))
+        canonical_repo_root.join(include_ref.trim_start_matches('/'))
     } else {
-        current_file.parent().unwrap_or(repo_root).join(include_ref)
+        current_file
+            .parent()
+            .unwrap_or(canonical_repo_root)
+            .join(include_ref)
     };
 
-    let canonical_repo_root = repo_root
-        .canonicalize()
-        .with_context(|| format!("failed to canonicalize repo root: {}", repo_root.display()))?;
-
     Ok(
-        match path_containment::resolve_within(&canonical_repo_root, &candidate) {
+        match path_containment::resolve_within(canonical_repo_root, &candidate) {
             Containment::Inside(path) => Some(path),
             Containment::Escaped | Containment::Unresolved => None,
         },

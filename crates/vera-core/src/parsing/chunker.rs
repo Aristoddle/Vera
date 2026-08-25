@@ -16,8 +16,6 @@ use super::extractor::RawSymbol;
 const TIER0_WINDOW_SIZE: u32 = 50;
 /// Default overlap for Tier 0 sliding-window (lines).
 const TIER0_OVERLAP: u32 = 10;
-/// Minimum lines for a symbol to be kept as a chunk (skip trivial ones).
-const MIN_SYMBOL_LINES: u32 = 1;
 
 /// Line comment markers per language family. Used to recognise doc comments.
 fn comment_prefixes(language: Language) -> &'static [&'static str] {
@@ -108,11 +106,6 @@ pub fn chunks_from_symbols(
         sym_start = attach_start;
 
         let sym_lines = sym_end.saturating_sub(sym_start) + 1;
-
-        // Skip trivially small symbols (e.g., single-line forward declarations)
-        if sym_lines < MIN_SYMBOL_LINES {
-            continue;
-        }
 
         // Capture gap before this symbol (imports, blank lines, etc.)
         if sym_start > covered_end_row {
@@ -285,6 +278,46 @@ fn find_split_boundary(lines: &[&str], start: u32, ideal_end: u32, max_lines: u3
     ideal_end
 }
 
+/// A Markdown fenced code block marker and its minimum closing length.
+#[derive(Clone, Copy)]
+struct MarkdownFence {
+    marker: char,
+    length: usize,
+}
+
+fn markdown_fence(line: &str) -> Option<MarkdownFence> {
+    let indentation = line.bytes().take_while(|byte| *byte == b' ').count();
+    if indentation > 3 {
+        return None;
+    }
+
+    let rest = &line[indentation..];
+    let marker = rest.chars().next()?;
+    if marker != '`' && marker != '~' {
+        return None;
+    }
+
+    let length = rest
+        .chars()
+        .take_while(|character| *character == marker)
+        .count();
+    (length >= 3).then_some(MarkdownFence { marker, length })
+}
+
+fn markdown_fence_closes(line: &str, fence: MarkdownFence) -> bool {
+    let indentation = line.bytes().take_while(|byte| *byte == b' ').count();
+    if indentation > 3 {
+        return false;
+    }
+
+    let rest = &line[indentation..];
+    let marker_count = rest
+        .chars()
+        .take_while(|character| *character == fence.marker)
+        .count();
+    marker_count >= fence.length && rest.chars().skip(marker_count).all(char::is_whitespace)
+}
+
 /// Split a markdown file into section-based chunks.
 ///
 /// Each heading (# through ######) starts a new chunk. Content before the
@@ -303,8 +336,21 @@ pub fn markdown_section_chunks(source: &str, file_path: &str) -> Vec<Chunk> {
     // Track current section
     let mut section_start: usize = 0;
     let mut section_name: Option<String> = None;
+    let mut fence: Option<MarkdownFence> = None;
 
     for (i, line) in lines.iter().enumerate() {
+        if let Some(active_fence) = fence {
+            if markdown_fence_closes(line, active_fence) {
+                fence = None;
+            }
+            continue;
+        }
+
+        if let Some(opening_fence) = markdown_fence(line) {
+            fence = Some(opening_fence);
+            continue;
+        }
+
         let trimmed = line.trim_start();
         if trimmed.starts_with('#') {
             // Extract heading text (strip leading #s and whitespace)
@@ -979,5 +1025,47 @@ mod tests {
         assert_eq!(chunks[0].symbol_name.as_deref(), Some("Cargo.toml"));
         assert_eq!(chunks[0].line_start, 1);
         assert_eq!(chunks[0].line_end, 2);
+    }
+
+    #[test]
+    fn markdown_fenced_comments_do_not_start_sections() {
+        let source =
+            "# Real Title\n\n```python\n# this is a comment\nx = 1\n```\n## Next Title\ntext\n";
+
+        let chunks = markdown_section_chunks(source, "README.md");
+
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].symbol_name.as_deref(), Some("Real Title"));
+        assert!(chunks[0].content.contains("# this is a comment"));
+        assert_eq!(chunks[1].symbol_name.as_deref(), Some("Next Title"));
+    }
+
+    #[test]
+    fn markdown_fences_support_tildes_and_commonmark_indentation() {
+        let source = "# Title\n\n   ~~~yaml\n   # not a heading\n   ~~~\n## Next\n";
+
+        let chunks = markdown_section_chunks(source, "README.md");
+
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].symbol_name.as_deref(), Some("Title"));
+        assert!(
+            !chunks[0]
+                .symbol_name
+                .as_deref()
+                .unwrap()
+                .contains("not a heading")
+        );
+        assert_eq!(chunks[1].symbol_name.as_deref(), Some("Next"));
+    }
+
+    #[test]
+    fn markdown_unclosed_fence_keeps_following_hashes_in_section() {
+        let source = "# Title\n\n~~~python\n# comment\n## not a heading\n";
+
+        let chunks = markdown_section_chunks(source, "README.md");
+
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].symbol_name.as_deref(), Some("Title"));
+        assert!(chunks[0].content.contains("## not a heading"));
     }
 }
