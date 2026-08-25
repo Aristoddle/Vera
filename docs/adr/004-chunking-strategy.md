@@ -48,4 +48,4 @@ Three strategies compared using the same embedding model (Qwen3-8B) and retrieva
 - Requires a tree-sitter grammar per language (mitigated by sliding-window fallback)
 - Slightly lower Recall@10 than sliding-window (0.61 vs 0.66). compensated by BM25 hybrid retrieval
 - Cross-file discovery doesn't improve. needs graph-level metadata, not better chunking
-- Large symbols (>150 lines) get split into sub-chunks to keep embedding quality stable
+- Large symbols beyond the configured chunk limit (default 200 lines) get split into sub-chunks to keep embedding quality stable

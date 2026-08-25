@@ -32,7 +32,7 @@ Data flow: file → grammar lookup → tree-sitter parse (+ diagnostics) → nod
 
 1. Query enters `search_service.rs`
 2. BM25 (`bm25.rs`) and vector search (`vector.rs`) run in parallel
-3. Results fused via RRF (`hybrid.rs`, k=60). `fuse_rrf_multi` generalizes fusion to N ranked lists.
+3. Results fused via RRF (`hybrid.rs`, k=60). `fuse_rrf_multi_weighted` generalizes fusion to N ranked lists.
 4. Query-aware ranking and candidate shaping apply deterministic priors (`ranking.rs`, `search_service.rs`)
 5. Top candidates optionally reranked by cross-encoder (`reranker.rs` or `local_reranker.rs`)
 6. Final `Vec<SearchResult>` returned
@@ -62,7 +62,7 @@ All stored in `.vera/` at the project root.
 
 ### `indexing/`: Index build & update
 
-- `pipeline.rs`: Full build: discover → parse → chunk → embed → store, including persisted parse diagnostics
+- `pipeline.rs`: Full build: discover → parse → chunk → embed → store in bounded windows, with staged publication through `.vera.build` and `.vera.old` recovery, including persisted parse diagnostics
 - `update.rs`: Incremental: hash-based change detection, re-process only modified files, and refresh file-level index state
 
 ### Other modules
@@ -76,7 +76,7 @@ All stored in `.vera/` at the project root.
 
 ## vera-cli
 
-`main.rs` parses args via clap. `commands/` contains the CLI subcommand implementations and helpers: `agent`, `config`, `doctor`, `explain_path`, `grep`, `index`, `mcp`, `overview`, `references` (also used by `dead-code`), `repair`, `search`, `serve`, `setup`, `stats`, `structural`, `uninstall`, `update`, `upgrade`, and `watch`.
+`main.rs` parses args via clap. `commands/` contains the CLI subcommand implementations and helpers: `agent`, `backend`, `config`, `doctor`, `explain_path`, `grep`, `index`, `mcp`, `overview`, `references` (also used by `dead-code`), `repair`, `search`, `serve`, `setup`, `stats`, `structural`, `uninstall`, `update`, `upgrade`, and `watch`.
 
 ## vera-mcp
 

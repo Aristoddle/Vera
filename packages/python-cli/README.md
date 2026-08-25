@@ -4,7 +4,7 @@ Code search for AI agents. Vera indexes your codebase using tree-sitter parsing 
 
 This package downloads and wraps the native Vera binary for your platform. On musl-based Linux (Alpine, NixOS), the correct static binary is selected automatically. Set `VERA_TARGET` to override target detection (e.g., `VERA_TARGET=x86_64-unknown-linux-musl uvx vera-ai install`).
 
-The default local embedding model is `minishlab/potion-code-16M-v2`. It runs locally on CPU on any supported machine; no GPU or ONNX Runtime needed. In the 2026-08-23 Semble comparison, Vera scored `0.8447` nDCG@10 versus Semble 0.5.5 at `0.8514`, using the same embeddings, harness, graded relevance, and suffix-corrected path matching. Full details live in the main repo docs.
+The default local embedding model is `minishlab/potion-code-16M-v2`. It runs locally on CPU on any supported machine; no GPU or ONNX Runtime needed. In the 2026-08-23 Semble comparison, Vera scored `0.8441` nDCG@10 versus Semble 0.5.5 at `0.8514`, using the same embeddings, harness, graded relevance, and suffix-corrected path matching. Full details live in the main repo docs.
 
 ## Install
 

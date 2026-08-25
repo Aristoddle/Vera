@@ -196,7 +196,7 @@ From `v0.4.0` to `v0.7.0`, Vera improved by:
 - `+0.4079` MRR@10
 - `+0.3791` nDCG@10
 
-The raw per-version JSONs were pruned from the tree; they remain in git history. See [`v0.7.0` accuracy improvements](./releases/v0.7.0-accuracy-improvements.md) for the per-version breakdown.
+The raw per-version JSONs were pruned from the tree; they remain in git history.
 
 ### Historical Performance Snapshot
 
@@ -372,6 +372,5 @@ From the same older benchmark set:
 
 ## Related Docs
 
-- [`v0.7.0` accuracy improvements](./releases/v0.7.0-accuracy-improvements.md)
-- [Indexing performance note](../benchmarks/indexing-performance.md)
-- [Reproduction guide](../benchmarks/reports/reproduction-guide.md)
+- [Query-aware retrieval ADR](./adr/005-query-aware-retrieval.md)
+- [Model selection and screening](./models.md)

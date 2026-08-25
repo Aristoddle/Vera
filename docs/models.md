@@ -45,7 +45,7 @@ In the 2026-08-23 dual-set screening, every tested cross-encoder scored below th
 
 | Reranking option | nDCG@10 |
 | --- | ---: |
-| No reranker | 0.8542 / 0.7644 |
+| No reranker | 0.8540 / 0.7644 |
 | `jina-reranker-v2-base-multilingual` | 0.8473 / 0.7557 |
 | `mxbai-rerank-xsmall-v1` | 0.8497 / 0.7564 |
 | `gte-reranker-modernbert-base` | 0.8472 / 0.7525 |
@@ -186,7 +186,7 @@ On macOS Apple Silicon, CoreML auto-detects unified memory by reading `sysctl hw
 ## Notes
 
 - Custom ONNX options only affect opt-in Jina ONNX local embeddings. API mode and the default Potion Code model are unchanged.
-- Query prefixes only apply to ONNX local embedding queries, not API embeddings. Document prefixes apply to indexed passages, and only on the local ONNX path.
+- Query and document prefixes apply to both API mode and local ONNX embeddings. API mode reads `EMBEDDING_QUERY_PREFIX` and `EMBEDDING_DOCUMENT_PREFIX`, with model-ID auto-detection when they are unset. Local ONNX uses the corresponding `--embedding-query-prefix` and `--embedding-document-prefix` setup flags.
 - The stored embedding model identity covers every `--embedding-*` setting, not just the model name, so changing pooling or either prefix also requires a re-index.
 - If you switch local embedding models without configured aliases, re-index the repo so the stored vectors match the active model.
 - If your network blocks CLI downloads, use [manual-install.md](manual-install.md).

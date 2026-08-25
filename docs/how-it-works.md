@@ -18,9 +18,9 @@ During parsing, Vera also records file-level diagnostics such as tree-sitter err
 
 Two retrieval paths run in parallel for every query:
 
-**BM25 (keyword matching)** uses a Tantivy index over structured chunk text, including content, symbol names, file paths, and filename/path tokens. It handles exact identifier and config-style lookups. searching for `parse_config` finds that exact function. BM25 alone scores sub-millisecond latency (0.067ms p50).
+**BM25 (keyword matching)** uses a Tantivy index over structured chunk text, including content, symbol names, file paths, and filename/path tokens. It handles exact identifier and config-style lookups. searching for `parse_config` finds that exact function.
 
-**Vector search (semantic matching)** embeds the query and compares it against pre-computed chunk embeddings. Vera writes every vector to sqlite-vec and to a flat `.vera/vectors.f32` sidecar. The default path memory-maps the sidecar and computes exact Euclidean L2 with SimSIMD; `VERA_VECTOR_SCAN=vec0` selects sqlite-vec for rollback and ablation. Deleted SQLite rowids remain represented by `.vera/vectors.tombs`, so they are skipped without moving later rows. Watch-mode updates write only changed rows at their rowid-derived offsets, while initial builds and recovery atomically publish full sidecar files. The flat file is fsynced before the generation manifest is renamed last; an absent or inconsistent sidecar is rebuilt from `vec_chunks`. This catches conceptual matches. searching "authentication middleware" finds relevant auth code even if those exact words don't appear. Vector search alone achieves 0.66 Recall@10 but only 0.28 MRR@10 (high recall, poor ranking).
+**Vector search (semantic matching)** embeds the query and compares it against pre-computed chunk embeddings. Vera writes every vector to sqlite-vec and to a flat `.vera/vectors.f32` sidecar. The default path memory-maps the sidecar and computes exact Euclidean L2 with SimSIMD; `VERA_VECTOR_SCAN=vec0` selects sqlite-vec for rollback and ablation. Deleted SQLite rowids remain represented by `.vera/vectors.tombs`, so they are skipped without moving later rows. Watch-mode updates write only changed rows at their rowid-derived offsets, while initial builds and recovery atomically publish full sidecar files. The flat file is fsynced before the generation manifest is renamed last; an absent or inconsistent sidecar is rebuilt from `vec_chunks`. This catches conceptual matches. searching "authentication middleware" finds relevant auth code even if those exact words don't appear.
 
 Neither path alone is sufficient. BM25 misses semantic matches. Vector search misses exact identifiers and ranks poorly. Combining them covers both.
 
@@ -60,7 +60,7 @@ Reranking is opt-in through `retrieval.reranking_enabled` and is off by default.
 
 The default no-reranker path ends with the deterministic ranking stage. The 2026-08-23 dual-set cross-encoder screening scored every tested reranker below that heuristic baseline. See [models.md](models.md#reranking) for the scores and the recommended local override.
 
-With Jina ONNX local models, the reranker runs on-device via ONNX Runtime. Potion Code uses deterministic ranking heuristics instead of the ONNX reranker. With API mode, reranking calls your configured endpoint. Obvious filename and path-dominant queries can skip reranking when lexical evidence is already decisive.
+With Jina ONNX local models, the reranker runs on-device via ONNX Runtime. With Potion Code embeddings, enabling reranking uses the local CPU reranker unless an API reranker is configured; when reranking is off, deterministic ranking is the final stage. With API mode, reranking calls your configured endpoint. Obvious filename and path-dominant queries can skip reranking when lexical evidence is already decisive.
 
 Large candidate sets are batched automatically to stay within the reranker's request limits. Oversized documents are truncated at newline boundaries before scoring. See [features.md](features.md#cross-encoder-reranking) for configuration details.
 
@@ -82,7 +82,7 @@ The index is a SQLite database, a Tantivy directory, and the flat vector sidecar
 ```
 Query
   ├─→ BM25 search (Tantivy)        ──→ ranked candidates
-  └─→ Vector search (sqlite-vec)    ──→ ranked candidates
+  └─→ Vector search (flat SIMD; sqlite-vec fallback) ──→ ranked candidates
                                           │
                                     RRF fusion
                                           │

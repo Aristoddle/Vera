@@ -29,9 +29,9 @@ Code search that combines BM25 keyword matching, vector similarity, and optional
 
 </div>
 
-## v1.0
+## What's New
 
-Vera 1.0 is the feature-complete milestone: the search pipeline, code-intelligence commands, agent integrations, and local inference backends are all in place, hardened by a wave of community PRs and user-reported fixes. Highlights include measured search-quality gains on the full 1,251-task Semble suite, an agent-level benchmark showing fewer input tokens at equal answer quality, structural search intents, git-scoped queries, the `vera serve` HTTP server, and local-mode hardening. See [What's new in v1.0](docs/whats-new-v1.md) for details.
+See [What's New](docs/whats-new.md) for release highlights from v1.0 onward, including search-quality measurements, local model changes, agent workflows, performance work, and reliability fixes.
 
 ## Quick Start
 
