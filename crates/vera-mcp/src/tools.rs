@@ -9,6 +9,7 @@
 //! - `find_references` — exact callers or callees from the persisted call graph
 //! - `explain_path` — explain why a path is or is not indexed
 
+use std::collections::{HashMap, hash_map::Entry};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use serde_json::Value;
@@ -17,10 +18,15 @@ use vera_core::presentation::{CompactResult, truncate_to_budget};
 use crate::protocol::{ToolCallResult, ToolDefinition};
 use crate::watcher::WatchHandle;
 
-/// Global watcher handle. Kept alive for the lifetime of the MCP server process.
-static WATCHER: Mutex<Option<WatchHandle>> = Mutex::new(None);
+/// Watcher handles keyed by canonical repository path. Each handle is kept
+/// alive for the lifetime of the MCP server process.
+static WATCHERS: OnceLock<Mutex<HashMap<std::path::PathBuf, WatchHandle>>> = OnceLock::new();
 static SEARCH_CONTEXT: Mutex<Option<CachedSearchContext>> = Mutex::new(None);
 static SEARCH_RUNTIME: OnceLock<Result<tokio::runtime::Runtime, String>> = OnceLock::new();
+
+fn watchers() -> &'static Mutex<HashMap<std::path::PathBuf, WatchHandle>> {
+    WATCHERS.get_or_init(|| Mutex::new(HashMap::new()))
+}
 
 struct CachedSearchContext {
     key: String,
@@ -690,10 +696,13 @@ fn ensure_index_and_watcher(cwd: &std::path::Path) -> Result<std::path::PathBuf,
         .map_err(|e| ToolCallResult::error(format!("Auto-indexing failed: {e}")))?;
     }
 
-    let mut guard = WATCHER.lock().unwrap_or_else(|e| e.into_inner());
-    if guard.is_none() {
+    let watcher_path = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+    let mut guard = watchers().lock().unwrap_or_else(|e| e.into_inner());
+    if let Entry::Vacant(entry) = guard.entry(watcher_path) {
         match crate::watcher::start_watching(cwd) {
-            Ok(handle) => *guard = Some(handle),
+            Ok(handle) => {
+                entry.insert(handle);
+            }
             Err(e) => tracing::warn!("failed to start file watcher: {e}"),
         }
     }
@@ -739,7 +748,7 @@ fn cached_search_context(
     config: &vera_core::config::VeraConfig,
     backend: vera_core::config::InferenceBackend,
 ) -> Result<Arc<vera_core::retrieval::search_service::SearchContext>, ToolCallResult> {
-    let key = search_context_key(config, backend);
+    let key = search_context_key(config, backend)?;
     let mut guard = SEARCH_CONTEXT.lock().unwrap_or_else(|e| e.into_inner());
 
     if let Some(cached) = guard.as_ref().filter(|cached| cached.key == key) {
@@ -761,9 +770,11 @@ fn cached_search_context(
 fn search_context_key(
     config: &vera_core::config::VeraConfig,
     backend: vera_core::config::InferenceBackend,
-) -> String {
-    let config_json = serde_json::to_string(config).unwrap_or_default();
-    format!("{backend}|{config_json}")
+) -> Result<String, ToolCallResult> {
+    let config_json = serde_json::to_string(config).map_err(|error| {
+        ToolCallResult::error(format!("Failed to serialize search configuration: {error}"))
+    })?;
+    Ok(format!("{backend}|{config_json}"))
 }
 
 /// Resolve an optional path argument to a validated directory path.
@@ -1234,6 +1245,25 @@ mod tests {
         let second = cached_search_context(&rt, &config, backend).unwrap();
 
         assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[test]
+    fn search_context_key_does_not_collapse_non_finite_config() {
+        // serde_json renders non-finite floats as `null` instead of failing,
+        // so the key must still distinguish such a config from the default.
+        let mut config = vera_core::config::VeraConfig::default();
+        config.retrieval.rrf_k = f64::NAN;
+
+        let key = search_context_key(&config, vera_core::config::InferenceBackend::Api)
+            .expect("VeraConfig is always serializable");
+        let default_key = search_context_key(
+            &vera_core::config::VeraConfig::default(),
+            vera_core::config::InferenceBackend::Api,
+        )
+        .expect("VeraConfig is always serializable");
+
+        assert!(!key.is_empty());
+        assert_ne!(key, default_key);
     }
 
     #[test]

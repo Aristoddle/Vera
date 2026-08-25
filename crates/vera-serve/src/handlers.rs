@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use axum::{
     Json,
-    extract::State,
+    extract::{FromRequest, Request, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
 };
@@ -88,17 +88,19 @@ async fn acquire_reranker(state: &AppState) -> Result<Option<Arc<DynamicReranker
 
 // ── Auth ──────────────────────────────────────────────────────────────────────
 
+const MAX_EMBEDDINGS_BODY_SIZE: usize = 2 * 1024 * 1024;
+
 /// Constant-time byte comparison (prevents timing-oracle prefix attacks).
 fn constant_time_eq(a: &str, b: &str) -> bool {
     let a = a.as_bytes();
     let b = b.as_bytes();
-    if a.len() != b.len() {
-        return false;
+    let mut difference = a.len() ^ b.len();
+    for index in 0..a.len().max(b.len()) {
+        difference |= usize::from(
+            a.get(index).copied().unwrap_or_default() ^ b.get(index).copied().unwrap_or_default(),
+        );
     }
-    a.iter()
-        .zip(b.iter())
-        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
-        == 0
+    difference == 0
 }
 
 fn check_auth(state: &AppState, headers: &HeaderMap) -> Option<(StatusCode, Json<ApiError>)> {
@@ -126,11 +128,20 @@ fn check_auth(state: &AppState, headers: &HeaderMap) -> Option<(StatusCode, Json
 pub async fn embeddings(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Json(req): Json<EmbeddingsRequest>,
+    mut request: Request,
 ) -> impl IntoResponse {
     if let Some(err) = check_auth(&state, &headers) {
         return err.into_response();
     }
+
+    // Apply the limit before Json buffers the body. This keeps the endpoint's
+    // resource bound explicit even if Axum's global default changes.
+    axum::extract::DefaultBodyLimit::max(MAX_EMBEDDINGS_BODY_SIZE).apply(&mut request);
+    let Json(req) = match Json::<EmbeddingsRequest>::from_request(request, &state).await {
+        Ok(request) => request,
+        Err(rejection) => return rejection.into_response(),
+    };
+
     if req.input.is_empty() {
         return (
             StatusCode::BAD_REQUEST,
@@ -273,4 +284,30 @@ pub async fn health(State(state): State<Arc<AppState>>, headers: HeaderMap) -> i
         backend: format!("{}", state.backend),
     })
     .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn constant_time_eq_checks_length_without_an_early_return() {
+        assert!(constant_time_eq("same", "same"));
+        assert!(!constant_time_eq("same", "different"));
+        assert!(!constant_time_eq("same", "sam"));
+    }
+
+    #[tokio::test]
+    async fn embeddings_json_extraction_rejects_oversized_body() {
+        let body = format!(r#"{{"input":"{}"}}"#, "x".repeat(MAX_EMBEDDINGS_BODY_SIZE));
+        let mut request = Request::builder()
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(body))
+            .expect("request");
+        axum::extract::DefaultBodyLimit::max(MAX_EMBEDDINGS_BODY_SIZE).apply(&mut request);
+
+        let result = Json::<EmbeddingsRequest>::from_request(request, &()).await;
+
+        assert!(result.is_err());
+    }
 }

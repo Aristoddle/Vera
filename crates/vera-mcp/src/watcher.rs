@@ -6,7 +6,6 @@
 
 use std::collections::HashSet;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -20,6 +19,37 @@ use vera_core::storage::metadata::MetadataStore;
 
 /// Debounce interval: wait this long after the last file change before updating.
 const DEBOUNCE_SECS: u64 = 2;
+const MAX_UPDATE_PASSES: usize = 8;
+
+#[derive(Default)]
+struct UpdateState {
+    updating: bool,
+    pending: bool,
+}
+
+type UpdateStateHandle = Arc<Mutex<UpdateState>>;
+
+/// Mark an event as pending, or claim the right to start an update if none is
+/// currently running.
+fn begin_update(state: &Mutex<UpdateState>) -> bool {
+    let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
+    if state.updating {
+        state.pending = true;
+        false
+    } else {
+        state.updating = true;
+        state.pending = false;
+        true
+    }
+}
+
+#[cfg(test)]
+fn mark_update_pending(state: &Mutex<UpdateState>) {
+    let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
+    if state.updating {
+        state.pending = true;
+    }
+}
 
 /// Runs one incremental update. Built once per watcher and reused across cycles,
 /// so the tokio runtime and the embedding model are paid for once rather than
@@ -197,8 +227,8 @@ fn start_watching_with_runtime(
     // without `.vera`, would switch that guard off.
     let index_dir = idx_dir.clone();
 
-    let updating = Arc::new(AtomicBool::new(false));
-    let updating_clone = updating.clone();
+    let update_state = Arc::new(Mutex::new(UpdateState::default()));
+    let update_state_clone = Arc::clone(&update_state);
     let repo_clone = repo_path.clone();
     let engine = Arc::new(SharedEngine {
         build,
@@ -247,11 +277,9 @@ fn start_watching_with_runtime(
                 return;
             }
 
-            // Skip if already updating.
-            if updating_clone
-                .compare_exchange(false, true, Ordering::SeqCst, Ordering::Relaxed)
-                .is_err()
-            {
+            // Coalesce events that arrive while an update is running. The
+            // completion path consumes this flag and performs a trailing pass.
+            if !begin_update(&update_state_clone) {
                 debug!("Skipping auto-update: previous update still running");
                 if progress_logs {
                     eprintln!(
@@ -266,11 +294,11 @@ fn start_watching_with_runtime(
             }
 
             let repo = repo_clone.clone();
-            let flag = updating_clone.clone();
+            let state = Arc::clone(&update_state_clone);
             let engine = Arc::clone(&engine);
 
             std::thread::spawn(move || {
-                run_incremental_update(&engine, &repo, &runtime, &flag, progress_logs);
+                run_incremental_update(&engine, &repo, &runtime, &state, progress_logs);
             });
         },
     )
@@ -301,17 +329,22 @@ fn resolve_watch_runtime() -> Result<WatchRuntime, anyhow::Error> {
         InferenceBackend::Api => std::env::var("EMBEDDING_MODEL_BASE_URL").unwrap_or_default(),
         _ => String::new(),
     };
-    let query_prefix = match backend {
-        InferenceBackend::Api => std::env::var("EMBEDDING_QUERY_PREFIX").unwrap_or_default(),
-        InferenceBackend::OnnxJina(_) => {
+    let prefix_env = |key: &str| std::env::var(key).unwrap_or_default();
+    let (query_prefix, document_prefix) = match backend {
+        InferenceBackend::Api => (
+            prefix_env("EMBEDDING_QUERY_PREFIX"),
+            prefix_env("EMBEDDING_DOCUMENT_PREFIX"),
+        ),
+        InferenceBackend::OnnxJina(_) => (
             std::env::var(vera_core::local_models::LOCAL_EMBEDDING_QUERY_PREFIX_ENV)
                 .or_else(|_| std::env::var("VERA_EMBEDDING_QUERY_PREFIX"))
-                .unwrap_or_default()
-        }
-        InferenceBackend::PotionCode => String::new(),
+                .unwrap_or_default(),
+            String::new(),
+        ),
+        InferenceBackend::PotionCode => (String::new(), String::new()),
     };
     let provider_identity = format!(
-        "{backend}|endpoint={endpoint}|model={model_name}|query_prefix={query_prefix}|timeout={}|retries={}|gpu_mem_limit={}|low_vram={}",
+        "{backend}|endpoint={endpoint}|model={model_name}|query_prefix={query_prefix}|document_prefix={document_prefix}|timeout={}|retries={}|gpu_mem_limit={}|low_vram={}",
         config.embedding.timeout_secs,
         config.embedding.max_retries,
         config.embedding.gpu_mem_limit_mb,
@@ -362,59 +395,160 @@ fn watch_failure_message(repo_path: &Path, error: &notify::Error) -> String {
     format!("Failed to watch directory: {error}")
 }
 
-/// Run an incremental update, resetting the flag when done.
+/// Run an update and any coalesced trailing passes, with a bound so a noisy
+/// filesystem cannot keep one worker alive forever.
 fn run_incremental_update(
     engine: &SharedEngine,
     repo_path: &Path,
     runtime: &WatchRuntime,
-    updating: &AtomicBool,
+    state: &UpdateStateHandle,
     progress_logs: bool,
 ) {
-    debug!(path = %repo_path.display(), "Auto-update triggered by file changes");
+    for pass in 0..MAX_UPDATE_PASSES {
+        debug!(path = %repo_path.display(), pass = pass + 1, "Auto-update triggered by file changes");
 
-    let result = engine
-        .get(runtime)
-        .and_then(|engine| engine.update(repo_path, &runtime.config));
+        let result = engine
+            .get(runtime)
+            .and_then(|engine| engine.update(repo_path, &runtime.config));
 
-    match result {
-        Ok(summary) => {
-            let changed = summary.files_modified + summary.files_added + summary.files_deleted;
-            if changed > 0 {
-                info!(
-                    modified = summary.files_modified,
-                    added = summary.files_added,
-                    deleted = summary.files_deleted,
-                    "Auto-update complete"
-                );
-                if progress_logs {
-                    eprintln!(
-                        "[watch] update complete: {} modified, {} added, {} deleted",
-                        summary.files_modified, summary.files_added, summary.files_deleted
+        match result {
+            Ok(summary) => {
+                let changed = summary.files_modified + summary.files_added + summary.files_deleted;
+                if changed > 0 {
+                    info!(
+                        modified = summary.files_modified,
+                        added = summary.files_added,
+                        deleted = summary.files_deleted,
+                        "Auto-update complete"
                     );
+                    if progress_logs {
+                        eprintln!(
+                            "[watch] update complete: {} modified, {} added, {} deleted",
+                            summary.files_modified, summary.files_added, summary.files_deleted
+                        );
+                    }
+                } else {
+                    debug!("Auto-update: no changes detected");
+                    if progress_logs {
+                        eprintln!("[watch] no indexable changes detected");
+                    }
                 }
-            } else {
-                debug!("Auto-update: no changes detected");
+            }
+            Err(e) => {
+                warn!(error = %e, "Auto-update failed");
                 if progress_logs {
-                    eprintln!("[watch] no indexable changes detected");
+                    eprintln!("[watch] update failed: {e}");
                 }
             }
         }
-        Err(e) => {
-            warn!(error = %e, "Auto-update failed");
-            if progress_logs {
-                eprintln!("[watch] update failed: {e}");
-            }
+
+        let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
+        if !state.pending {
+            state.updating = false;
+            return;
         }
+        if pass + 1 == MAX_UPDATE_PASSES {
+            warn!(
+                path = %repo_path.display(),
+                limit = MAX_UPDATE_PASSES,
+                "Auto-update reached trailing pass limit; waiting for another file event"
+            );
+            state.updating = false;
+            state.pending = false;
+            return;
+        }
+        state.pending = false;
     }
 
-    updating.store(false, Ordering::SeqCst);
+    let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
+    state.updating = false;
+}
+
+#[cfg(test)]
+fn test_runtime() -> WatchRuntime {
+    WatchRuntime {
+        config: VeraConfig::default(),
+        backend: InferenceBackend::Api,
+        provider_identity: "test".to_string(),
+    }
+}
+
+#[cfg(test)]
+fn test_summary() -> UpdateSummary {
+    UpdateSummary {
+        files_modified: 0,
+        files_added: 0,
+        files_deleted: 0,
+        files_unchanged: 0,
+        files_with_tree_sitter_errors: 0,
+        files_using_tier0_fallback: 0,
+        parse_errors: Vec::new(),
+        files_deferred: 0,
+        total_chunks: 0,
+        elapsed_secs: 0.0,
+    }
+}
+
+#[cfg(test)]
+struct BlockingEngine {
+    updates: Arc<std::sync::atomic::AtomicUsize>,
+    first_started: Arc<std::sync::Barrier>,
+    release: Arc<std::sync::Barrier>,
+}
+
+#[cfg(test)]
+impl IncrementalUpdate for BlockingEngine {
+    fn update(
+        &self,
+        _repo_path: &Path,
+        _config: &VeraConfig,
+    ) -> Result<UpdateSummary, anyhow::Error> {
+        let update_number = self
+            .updates
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        if update_number == 1 {
+            self.first_started.wait();
+            self.release.wait();
+        }
+        Ok(test_summary())
+    }
+}
+
+#[cfg(test)]
+struct ContinuousEngine {
+    updates: Arc<std::sync::atomic::AtomicUsize>,
+    state: UpdateStateHandle,
+}
+
+#[cfg(test)]
+impl IncrementalUpdate for ContinuousEngine {
+    fn update(
+        &self,
+        _repo_path: &Path,
+        _config: &VeraConfig,
+    ) -> Result<UpdateSummary, anyhow::Error> {
+        self.updates
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        mark_update_pending(&self.state);
+        Ok(test_summary())
+    }
+}
+
+#[cfg(test)]
+fn shared_test_engine(engine: Engine) -> SharedEngine {
+    let build: EngineBuilder = Arc::new(move |_| Ok(Arc::clone(&engine)));
+    SharedEngine {
+        build,
+        cached: Mutex::new(None),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::future::Future;
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use vera_core::config::VeraConfig;
     use vera_core::embedding::{EmbeddingError, EmbeddingProvider};
@@ -525,6 +659,70 @@ mod tests {
             std::thread::sleep(Duration::from_millis(25));
         }
         predicate()
+    }
+
+    #[test]
+    fn event_during_update_triggers_one_trailing_pass() {
+        let updates = Arc::new(AtomicUsize::new(0));
+        let first_started = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        let engine: Engine = Arc::new(BlockingEngine {
+            updates: Arc::clone(&updates),
+            first_started: Arc::clone(&first_started),
+            release: Arc::clone(&release),
+        });
+        let shared = shared_test_engine(engine);
+        let state = Arc::new(Mutex::new(UpdateState::default()));
+        assert!(begin_update(&state));
+        let runtime = test_runtime();
+        let worker_state = Arc::clone(&state);
+        let worker = std::thread::spawn(move || {
+            run_incremental_update(
+                &shared,
+                Path::new("/tmp/test-repo"),
+                &runtime,
+                &worker_state,
+                false,
+            );
+        });
+
+        first_started.wait();
+        assert!(
+            !begin_update(&state),
+            "the mid-update event must be coalesced"
+        );
+        release.wait();
+        worker.join().expect("update worker");
+
+        assert_eq!(updates.load(Ordering::SeqCst), 2);
+        let state = state.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(!state.updating);
+        assert!(!state.pending);
+    }
+
+    #[test]
+    fn continuous_events_stop_at_the_trailing_pass_limit() {
+        let updates = Arc::new(AtomicUsize::new(0));
+        let state = Arc::new(Mutex::new(UpdateState::default()));
+        let engine: Engine = Arc::new(ContinuousEngine {
+            updates: Arc::clone(&updates),
+            state: Arc::clone(&state),
+        });
+        let shared = shared_test_engine(engine);
+        assert!(begin_update(&state));
+
+        run_incremental_update(
+            &shared,
+            Path::new("/tmp/test-repo"),
+            &test_runtime(),
+            &state,
+            false,
+        );
+
+        assert_eq!(updates.load(Ordering::SeqCst), MAX_UPDATE_PASSES);
+        let state = state.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(!state.updating);
+        assert!(!state.pending);
     }
 
     #[test]
