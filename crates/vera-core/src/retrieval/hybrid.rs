@@ -8,7 +8,7 @@
 //! (typically 60) and `rank_i` is the 1-based rank of the item in each
 //! source result list.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
@@ -628,17 +628,7 @@ async fn search_hybrid_reranked_inner(
                 reranked = reranked.len(),
                 "reranking complete"
             );
-            let mut score_ceiling = reranked.last().map(|result| result.score);
-            for mut result in hybrid_results.into_iter().skip(rerank_limit) {
-                // RRF and reranker scores have different scales. Keep the untouched tail below
-                // the reranked prefix so the public score order still matches the result order.
-                if let Some(ceiling) = score_ceiling {
-                    result.score = result.score.min(ceiling);
-                }
-                score_ceiling = Some(result.score);
-                reranked.push(result);
-            }
-            reranked.truncate(fetch_limit);
+            reranked = merge_reranked_results(reranked, hybrid_results, rerank_limit, fetch_limit);
             Ok((reranked, timings))
         }
         Err(rerank_err) => {
@@ -655,6 +645,42 @@ async fn search_hybrid_reranked_inner(
             Ok((results, timings))
         }
     }
+}
+
+fn merge_reranked_results(
+    mut reranked: Vec<SearchResult>,
+    hybrid_results: Vec<SearchResult>,
+    rerank_limit: usize,
+    fetch_limit: usize,
+) -> Vec<SearchResult> {
+    let rerank_prefix_len = rerank_limit.min(hybrid_results.len());
+    let mut present = reranked.iter().map(result_key).collect::<HashSet<_>>();
+    let mut score_ceiling = reranked.last().map(|result| result.score);
+
+    let mut append_unscored = |mut result: SearchResult| {
+        if !present.insert(result_key(&result)) {
+            return;
+        }
+        // RRF and reranker scores have different scales. Keep unscored candidates below the
+        // reranked prefix so the public score order still matches the result order.
+        if let Some(ceiling) = score_ceiling {
+            result.score = result.score.min(ceiling);
+        }
+        score_ceiling = Some(result.score);
+        reranked.push(result);
+    };
+
+    // A short reranker response can omit candidates from the prefix. Append those first,
+    // preserving their original hybrid order, before the normal untouched tail.
+    for result in hybrid_results.iter().take(rerank_prefix_len) {
+        append_unscored(result.clone());
+    }
+    for result in hybrid_results.into_iter().skip(rerank_prefix_len) {
+        append_unscored(result);
+    }
+
+    reranked.truncate(fetch_limit);
+    reranked
 }
 
 /// Perform hybrid search using pre-opened stores (useful for testing).
@@ -773,3 +799,55 @@ fn charge_vector_span(
 #[cfg(test)]
 #[path = "hybrid_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod shortfall_tests {
+    use super::*;
+    use crate::types::Language;
+
+    fn result(index: usize) -> SearchResult {
+        SearchResult {
+            file_path: format!("candidate-{index}.rs"),
+            line_start: 1,
+            line_end: 1,
+            content: format!("candidate {index}"),
+            language: Language::Rust,
+            score: 1.0 - index as f64 / 100.0,
+            symbol_name: None,
+            symbol_type: None,
+        }
+    }
+
+    #[test]
+    fn reranker_shortfall_appends_missing_candidates_in_hybrid_order() {
+        let hybrid_results: Vec<_> = (0..20).map(result).collect();
+        let scored_indices = (0..7).chain(13..20);
+        let reranked = scored_indices
+            .enumerate()
+            .map(|(rank, index)| {
+                let mut result = hybrid_results[index].clone();
+                result.score = 100.0 - rank as f64;
+                result
+            })
+            .collect();
+
+        let merged = merge_reranked_results(reranked, hybrid_results, 20, 20);
+
+        assert_eq!(merged.len(), 20);
+        let missing_tail: Vec<_> = merged[14..]
+            .iter()
+            .map(|result| result.content.as_str())
+            .collect();
+        assert_eq!(
+            missing_tail,
+            vec![
+                "candidate 7",
+                "candidate 8",
+                "candidate 9",
+                "candidate 10",
+                "candidate 11",
+                "candidate 12",
+            ]
+        );
+    }
+}

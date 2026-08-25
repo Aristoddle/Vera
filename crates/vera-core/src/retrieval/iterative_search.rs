@@ -51,21 +51,7 @@ pub async fn execute_iterative_search_with_context(
     }
 
     // Extract symbol names from initial results for follow-up queries.
-    let follow_up_symbols: Vec<String> = initial_results
-        .iter()
-        .filter_map(|r| r.symbol_name.clone())
-        .filter(|name| {
-            let lower = name.to_ascii_lowercase();
-            // Skip generic names that would produce noisy results.
-            !matches!(
-                lower.as_str(),
-                "main" | "new" | "default" | "test" | "init" | "run" | "setup"
-            )
-        })
-        .collect::<HashSet<_>>()
-        .into_iter()
-        .take(5)
-        .collect();
+    let follow_up_symbols = select_follow_up_symbols(&initial_results);
 
     for symbol in &follow_up_symbols {
         let (hop_results, _) = context
@@ -89,4 +75,70 @@ pub async fn execute_iterative_search_with_context(
 
     merged.truncate(result_limit);
     Ok((merged, timings))
+}
+
+fn select_follow_up_symbols(initial_results: &[SearchResult]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut symbols = Vec::new();
+
+    for result in initial_results {
+        let Some(name) = result.symbol_name.as_deref() else {
+            continue;
+        };
+        let lower = name.to_ascii_lowercase();
+        // Skip generic names that would produce noisy results.
+        if matches!(
+            lower.as_str(),
+            "main" | "new" | "default" | "test" | "init" | "run" | "setup"
+        ) {
+            continue;
+        }
+        if seen.insert(name.to_string()) {
+            symbols.push(name.to_string());
+            if symbols.len() == 5 {
+                break;
+            }
+        }
+    }
+
+    symbols
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::Language;
+
+    fn result_with_symbol(symbol_name: &str) -> SearchResult {
+        SearchResult {
+            file_path: format!("{symbol_name}.rs"),
+            line_start: 1,
+            line_end: 1,
+            content: String::new(),
+            language: Language::Rust,
+            score: 1.0,
+            symbol_name: Some(symbol_name.to_string()),
+            symbol_type: None,
+        }
+    }
+
+    #[test]
+    fn follow_up_symbol_selection_is_deterministic_and_ranked() {
+        let results = [
+            result_with_symbol("first"),
+            result_with_symbol("second"),
+            result_with_symbol("first"),
+            result_with_symbol("main"),
+            result_with_symbol("third"),
+            result_with_symbol("fourth"),
+            result_with_symbol("fifth"),
+            result_with_symbol("sixth"),
+        ];
+
+        let first = select_follow_up_symbols(&results);
+        let second = select_follow_up_symbols(&results);
+
+        assert_eq!(first, second);
+        assert_eq!(first, vec!["first", "second", "third", "fourth", "fifth"]);
+    }
 }

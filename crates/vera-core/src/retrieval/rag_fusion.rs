@@ -35,35 +35,34 @@ pub async fn execute_deep_search_with_context(
     filters: &SearchFilters,
     result_limit: usize,
 ) -> Result<(Vec<SearchResult>, SearchTimings)> {
-    let completion_client = match CompletionClient::from_env_if_configured() {
-        Ok(Some(client)) => client,
-        Ok(None) => {
-            return super::iterative_search::execute_iterative_search_with_context(
-                context,
-                index_dir,
-                query,
-                intent,
-                config,
-                filters,
-                result_limit,
-                1,
-            )
-            .await;
+    let completion_client = match tokio::task::spawn_blocking(
+        CompletionClient::from_env_if_configured,
+    )
+    .await
+    {
+        Ok(Ok(client)) => client,
+        Ok(Err(e)) => {
+            warn!(error = %e, "completion client init failed, falling back to iterative search");
+            None
         }
         Err(e) => {
-            warn!(error = %e, "completion client init failed, falling back to iterative search");
-            return super::iterative_search::execute_iterative_search_with_context(
-                context,
-                index_dir,
-                query,
-                intent,
-                config,
-                filters,
-                result_limit,
-                1,
-            )
-            .await;
+            warn!(error = %e, "completion client init task failed, falling back to iterative search");
+            None
         }
+    };
+
+    let Some(completion_client) = completion_client else {
+        return super::iterative_search::execute_iterative_search_with_context(
+            context,
+            index_dir,
+            query,
+            intent,
+            config,
+            filters,
+            result_limit,
+            1,
+        )
+        .await;
     };
 
     execute_rag_fusion_with_context(
@@ -94,15 +93,28 @@ async fn execute_rag_fusion_with_context(
 
     // BM25 pre-filter: run a cheap keyword search to gather codebase context
     // (symbol names and file paths) that helps the LLM generate better rewrites.
-    let context_hints = bm25_context_hints(index_dir, query);
+    let context_hints = {
+        let index_dir = index_dir.to_path_buf();
+        let query = query.to_string();
+        tokio::task::spawn_blocking(move || bm25_context_hints(&index_dir, &query))
+            .await
+            .map_err(|e| anyhow!("BM25 context hint task failed: {e}"))?
+    };
     debug!(
         hints = context_hints.len(),
         "BM25 pre-filter produced context hints for query expansion"
     );
 
-    let expanded = completion_client
-        .expand_query_with_context(query, &context_hints)
-        .map_err(|e| anyhow!("failed to generate deep-search query candidates: {e}"))?;
+    let expanded = {
+        let completion_client = completion_client.clone();
+        let query = query.to_string();
+        tokio::task::spawn_blocking(move || {
+            completion_client.expand_query_with_context(&query, &context_hints)
+        })
+        .await
+        .map_err(|e| anyhow!("completion query expansion task failed: {e}"))?
+        .map_err(|e| anyhow!("failed to generate deep-search query candidates: {e}"))?
+    };
 
     let queries = dedupe_queries_with_original(query, expanded);
     if queries.len() <= 1 {

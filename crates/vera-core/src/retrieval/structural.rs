@@ -20,6 +20,14 @@ use crate::retrieval::file_scan::{
 use crate::storage::metadata::MetadataStore;
 use crate::types::{Chunk, Language, SearchFilters, SearchResult, SearchScope};
 
+#[cfg(test)]
+use std::cell::Cell;
+
+#[cfg(test)]
+thread_local! {
+    static SYNTAX_FILTER_CREATIONS: Cell<usize> = const { Cell::new(0) };
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StructuralSearchKind {
@@ -161,7 +169,7 @@ fn search_env_reads(
         limit,
         filters,
         true,
-        |_, language, content, _| {
+        |_, language, content| {
             let Some(patterns) = patterns_for_language(&ENV_PATTERNS, language) else {
                 return Ok(Vec::new());
             };
@@ -202,7 +210,7 @@ fn search_route_handlers(
         limit,
         filters,
         true,
-        |_, language, content, _| {
+        |_, language, content| {
             let Some(patterns) = patterns_for_language(&ROUTE_PATTERNS, language) else {
                 return Ok(Vec::new());
             };
@@ -230,7 +238,7 @@ fn search_sql_queries(
         limit,
         filters,
         true,
-        |_, language, content, _| {
+        |_, language, content| {
             let Some(patterns) = patterns_for_language(&SQL_PATTERNS, language) else {
                 return Ok(Vec::new());
             };
@@ -264,7 +272,7 @@ fn search_regex_intent<F>(
     mut collect: F,
 ) -> Result<Vec<SearchResult>>
 where
-    F: FnMut(&str, Language, &str, &[Chunk]) -> Result<Vec<StructuralMatch>>,
+    F: FnMut(&str, Language, &str) -> Result<Vec<StructuralMatch>>,
 {
     let mut files = store.indexed_files()?;
     sort_files_by_scan_priority(&mut files, filters);
@@ -299,9 +307,14 @@ where
             continue;
         }
 
+        let candidates = collect(&file_rel, language, &content)?;
+        if candidates.is_empty() {
+            continue;
+        }
+
         let chunks = store.get_chunks_by_file(&file_rel)?;
         let syntax_filter = SyntaxFilter::new(language, &file_rel, &content);
-        for candidate in collect(&file_rel, language, &content, &chunks)? {
+        for candidate in candidates {
             if results.len() >= limit {
                 break;
             }
@@ -395,6 +408,9 @@ struct SyntaxFilter(Option<tree_sitter::Tree>);
 
 impl SyntaxFilter {
     fn new(language: Language, file_path: &str, content: &str) -> Self {
+        #[cfg(test)]
+        SYNTAX_FILTER_CREATIONS.with(|count| count.set(count.get() + 1));
+
         let tree =
             languages::tree_sitter_grammar_for_path(language, file_path).and_then(|grammar| {
                 let mut parser = Parser::new();
@@ -1024,5 +1040,25 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn unmatched_intent_skips_syntax_filter_parsing() {
+        let dir = index_repo(&[("src/app.ts", "const value = 1;\n")]).await;
+        let index_dir = crate::indexing::index_dir(dir.path());
+        let before = SYNTAX_FILTER_CREATIONS.with(|count| count.get());
+
+        let results = search_structural(
+            &index_dir,
+            StructuralSearchKind::EnvReads,
+            Some("MISSING_ENV_NAME"),
+            10,
+            &SearchFilters::default(),
+        )
+        .unwrap();
+
+        let after = SYNTAX_FILTER_CREATIONS.with(|count| count.get());
+        assert!(results.is_empty());
+        assert_eq!(after, before, "unmatched files must not be parsed");
     }
 }

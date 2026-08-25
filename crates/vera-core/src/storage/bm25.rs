@@ -349,13 +349,33 @@ fn build_schema() -> Bm25Schema {
 }
 
 fn sanitize_query(query_text: &str) -> String {
-    query_text
+    let sanitized = query_text
         .chars()
         .map(|c| match c {
             ':' | '(' | ')' | '[' | ']' | '{' | '}' | '^' | '~' | '!' | '\'' | '"' | '`' => ' ',
             _ => c,
         })
-        .collect()
+        .collect::<String>();
+
+    sanitized
+        .split_whitespace()
+        .map(|token| {
+            // Tantivy treats a leading `-`/`+` as must-not/must and `*`/`?`
+            // as wildcards. Strip them only at token edges so hyphenated
+            // identifiers like `e-mail` survive as single terms.
+            let token = token.trim_start_matches(['-', '+']);
+            let token = token.trim_end_matches(['*', '?']);
+            match token {
+                "AND" => "and",
+                "OR" => "or",
+                "NOT" => "not",
+                "IN" => "in",
+                _ => token,
+            }
+        })
+        .filter(|token| !token.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn looks_path_weighted(query_text: &str) -> bool {
@@ -661,5 +681,58 @@ mod tests {
             sanitize_query("how pandoc's app module orchestrates"),
             "how pandoc s app module orchestrates"
         );
+    }
+
+    #[test]
+    fn sanitize_query_neutralizes_tantivy_operators() {
+        assert_eq!(
+            sanitize_query("NOT NULL -required +must wildcard? * AND OR IN"),
+            "not NULL required must wildcard and or in"
+        );
+    }
+
+    #[test]
+    fn sanitize_query_preserves_hyphenated_identifiers() {
+        assert_eq!(
+            sanitize_query("e-mail client read-line"),
+            "e-mail client read-line"
+        );
+    }
+
+    #[test]
+    fn operator_queries_match_plain_terms() {
+        let index = Bm25Index::open_in_memory().unwrap();
+        index
+            .insert_batch(&[
+                Bm25Document {
+                    chunk_id: "null:0",
+                    file_path: "null.sql",
+                    content: "NOT NULL constraint",
+                    symbol_name: None,
+                    language: "sql",
+                },
+                Bm25Document {
+                    chunk_id: "null:1",
+                    file_path: "other.sql",
+                    content: "NULL value validation",
+                    symbol_name: None,
+                    language: "sql",
+                },
+            ])
+            .unwrap();
+
+        let ids = |query| {
+            index
+                .search(query, 10)
+                .unwrap()
+                .into_iter()
+                .map(|result| result.chunk_id)
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(ids("NOT NULL"), ids("not null"));
+        assert_eq!(ids("-null"), ids("null"));
+        assert_eq!(ids("+null"), ids("null"));
+        assert_eq!(ids("* null?"), ids("null"));
     }
 }

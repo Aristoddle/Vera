@@ -9,6 +9,7 @@
 //! Graceful degradation: if the reranker API is unavailable (timeout, 5xx,
 //! connection error), the pipeline returns unreranked results with a warning.
 
+use std::collections::HashSet;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -481,10 +482,18 @@ pub async fn rerank_results(
     );
 
     // Reorder results by reranker scores.
+    let mut seen_indices = HashSet::new();
     let mut reranked: Vec<SearchResult> = scores
         .iter()
         .filter_map(|score| {
             if score.index < candidates.len() {
+                if !seen_indices.insert(score.index) {
+                    warn!(
+                        index = score.index,
+                        "reranker returned duplicate index, skipping"
+                    );
+                    return None;
+                }
                 let mut result = candidates[score.index].clone();
                 result.score = score.relevance_score;
                 Some(result)
@@ -498,6 +507,14 @@ pub async fn rerank_results(
             }
         })
         .collect();
+
+    if reranked.len() < candidates.len() {
+        warn!(
+            candidates = candidates.len(),
+            scored = reranked.len(),
+            "reranker returned fewer scores than candidates"
+        );
+    }
 
     // Ensure results are sorted by score descending (should already be from the API).
     reranked.sort_by(|a, b| {
@@ -781,6 +798,57 @@ mod cancellation_tests {
         assert!(matches!(result, Err(RerankerError::Cancelled)));
         assert_eq!(request_count.load(Ordering::SeqCst), 1);
         server.abort();
+    }
+}
+
+#[cfg(test)]
+mod shortfall_tests {
+    use super::*;
+    use crate::types::Language;
+
+    fn result(index: usize) -> SearchResult {
+        SearchResult {
+            file_path: format!("candidate-{index}.rs"),
+            line_start: 1,
+            line_end: 1,
+            content: format!("candidate {index}"),
+            language: Language::Rust,
+            score: 1.0,
+            symbol_name: None,
+            symbol_type: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn duplicate_reranker_indices_are_skipped() {
+        struct DuplicateReranker;
+
+        impl Reranker for DuplicateReranker {
+            async fn rerank(
+                &self,
+                _query: &str,
+                _documents: &[String],
+            ) -> Result<Vec<RerankScore>, RerankerError> {
+                Ok(vec![
+                    RerankScore {
+                        index: 0,
+                        relevance_score: 1.0,
+                    },
+                    RerankScore {
+                        index: 0,
+                        relevance_score: 0.5,
+                    },
+                ])
+            }
+        }
+
+        let results = [result(0), result(1)];
+        let reranked = rerank_results(&DuplicateReranker, "query", &results, 2)
+            .await
+            .unwrap();
+
+        assert_eq!(reranked.len(), 1);
+        assert_eq!(reranked[0].content, "candidate 0");
     }
 }
 
