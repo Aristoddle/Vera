@@ -208,21 +208,34 @@ fn failed_check_names(checks: &[DoctorCheck]) -> Vec<&'static str> {
 }
 
 fn check_env_group(name: &'static str, keys: &[&'static str]) -> DoctorCheck {
-    let present = keys
+    // Non-UTF-8 values fail at request time just like unset ones.
+    let values = keys
         .iter()
-        .filter(|key| std::env::var_os(key).is_some())
+        .map(|key| std::env::var_os(key).and_then(|value| value.into_string().ok()))
+        .collect::<Vec<_>>();
+    check_env_values(name, keys.len(), &values)
+}
+
+/// A value counts as present only when it is usable: unset, non-UTF-8, and
+/// empty/whitespace-only values (a common shellrc leftover after revoking a
+/// key) all fail the same way at request time (#147).
+fn check_env_values(name: &'static str, total: usize, values: &[Option<String>]) -> DoctorCheck {
+    let present = values
+        .iter()
+        .flatten()
+        .filter(|value| !value.trim().is_empty())
         .count();
 
     let status = match present {
         0 => CheckStatus::Warn,
-        n if n == keys.len() => CheckStatus::Ok,
+        n if n == total => CheckStatus::Ok,
         _ => CheckStatus::Fail,
     };
 
     DoctorCheck {
         name,
         status,
-        detail: format!("{present}/{} variables present", keys.len()),
+        detail: format!("{present}/{total} variables present"),
     }
 }
 
@@ -706,5 +719,33 @@ mod tests {
             "a warning must not fail the run: version-check, config-file, \
              saved-backend and current-index all warn on a healthy machine"
         );
+    }
+
+    /// #147 regression: empty and whitespace-only API env values are shellrc
+    /// leftovers that no consumer accepts, so they must score as absent.
+    #[test]
+    fn blank_env_values_score_as_absent() {
+        let values = vec![
+            Some("https://api.example.com".to_string()),
+            Some("  \t ".to_string()),
+            Some(String::new()),
+        ];
+        let check = check_env_values("embedding-api", 3, &values);
+        assert!(matches!(check.status, CheckStatus::Fail));
+        assert_eq!(check.detail, "1/3 variables present");
+    }
+
+    #[test]
+    fn complete_env_group_scores_ok_and_missing_group_warns() {
+        let complete = vec![Some("a".to_string()), Some("b".to_string())];
+        assert!(matches!(
+            check_env_values("embedding-api", 2, &complete).status,
+            CheckStatus::Ok
+        ));
+
+        let absent = vec![None, None];
+        let check = check_env_values("reranker-api", 2, &absent);
+        assert!(matches!(check.status, CheckStatus::Warn));
+        assert_eq!(check.detail, "0/2 variables present");
     }
 }

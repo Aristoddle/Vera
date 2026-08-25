@@ -301,10 +301,9 @@ fn write_private_file(path: &Path, contents: &[u8]) -> Result<()> {
             .with_context(|| format!("failed to set permissions on {}", tmp_path.display()))?;
     }
 
-    if path.exists() {
-        fs::remove_file(path)
-            .with_context(|| format!("failed to replace existing {}", path.display()))?;
-    }
+    // Rename over the destination instead of removing it first: the rename is
+    // atomic, so a crash mid-write leaves either the old file or the new one,
+    // never a window where the config file does not exist at all.
     fs::rename(&tmp_path, path).with_context(|| {
         format!(
             "failed to move {} into place as {}",
@@ -859,5 +858,33 @@ mod tests {
         assert!(provenance.install_method.is_none());
         assert!(provenance.version.is_none());
         assert!(provenance.binary_path.is_none());
+    }
+
+    /// Overwriting an existing file must go through a plain rename: the old
+    /// content stays readable until the new content replaces it atomically,
+    /// and no temp file survives either way.
+    #[test]
+    fn write_private_file_replaces_an_existing_file_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+
+        write_private_file(&path, b"first").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"first\n");
+
+        write_private_file(&path, b"second").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"second\n");
+
+        let residue: Vec<String> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(residue, vec!["config.json".to_string()]);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "the rewritten file must stay private");
+        }
     }
 }

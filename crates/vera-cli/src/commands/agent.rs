@@ -2,7 +2,7 @@
 
 use std::collections::BTreeSet;
 use std::fs;
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
@@ -1529,6 +1529,10 @@ fn choose_new_agent_config_path(cwd: &Path, preferred_name: &str) -> anyhow::Res
 }
 
 /// After skill install, offer to add a Vera snippet to the project's agent config file.
+///
+/// The silent `refresh_existing_vera_snippets` pass always runs; the prompts
+/// only run when stdin is a terminal (#153), so scripted installs succeed
+/// instead of dying in `cliclack` with "not connected" after installing.
 fn offer_agents_md_snippet(selected_clients: &[AgentClient]) -> anyhow::Result<()> {
     let cwd = std::env::current_dir().context("failed to resolve current directory")?;
     let existing = find_agent_configs(&cwd);
@@ -1538,7 +1542,10 @@ fn offer_agents_md_snippet(selected_clients: &[AgentClient]) -> anyhow::Result<(
         cliclack::log::success(format!("Updated Vera snippet in {name}"))?;
     }
 
-    if existing.iter().any(|config| config.mentions_vera) {
+    if !should_offer_snippet_prompt(
+        existing.iter().any(|config| config.mentions_vera),
+        std::io::stdin().is_terminal(),
+    ) {
         return Ok(());
     }
 
@@ -1587,10 +1594,28 @@ fn offer_agents_md_snippet(selected_clients: &[AgentClient]) -> anyhow::Result<(
     Ok(())
 }
 
+/// Whether to prompt about creating a Vera usage snippet: only when no existing
+/// config already mentions Vera and stdin is a terminal. Prompts read from
+/// stdin, so a non-interactive run (CI, package scripts, `< /dev/null`) must
+/// skip them instead of failing after the skills are already installed.
+fn should_offer_snippet_prompt(existing_mentions_vera: bool, stdin_is_terminal: bool) -> bool {
+    !existing_mentions_vera && stdin_is_terminal
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    /// #153 regression: a scripted install must not reach the interactive
+    /// snippet prompts.
+    #[test]
+    fn snippet_prompt_needs_a_terminal_and_an_uncovered_config() {
+        assert!(should_offer_snippet_prompt(false, true));
+        assert!(!should_offer_snippet_prompt(false, false));
+        assert!(!should_offer_snippet_prompt(true, true));
+        assert!(!should_offer_snippet_prompt(true, false));
+    }
 
     #[test]
     fn resolve_locations_expands_scope_all() {

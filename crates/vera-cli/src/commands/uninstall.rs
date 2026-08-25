@@ -74,16 +74,12 @@ fn run_at(
     let mut removed = Vec::new();
 
     // 1. Remove agent skill files (all clients, all scopes).
-    let skill_removal = match agent::remove_all_skills(cwd, home) {
-        Ok(removal) => removal,
-        Err(e) => {
-            tracing::warn!("failed to resolve agent skill locations: {e:#}");
-            agent::SkillRemoval::default()
-        }
-    };
-    // Uninstall continues past a skill that cannot be deleted, so the failure is
-    // only visible if it is reported here. stderr keeps it out of the JSON
-    // document on stdout.
+    let skill_removal = fold_skill_removal(agent::remove_all_skills(cwd, home));
+    let complete = skill_removal.failures.is_empty();
+    // Uninstall continues past a failure so the rest of the cleanup still runs,
+    // but it must not end in success: the failures are reported on stderr here,
+    // echoed into the exit code at the bottom of this function, and reflected
+    // as `"complete": false` in the JSON document.
     for error in &skill_removal.failures {
         writeln!(stderr, "  {error:#}")?;
     }
@@ -141,20 +137,49 @@ fn run_at(
             "{}",
             serde_json::json!({
                 "uninstalled": true,
+                "complete": complete,
                 "removed": removed,
                 "skills": removed_skills,
             })
         )?;
     } else {
         writeln!(stderr)?;
-        writeln!(stderr, "Vera has been uninstalled.")?;
+        if complete {
+            writeln!(stderr, "Vera has been uninstalled.")?;
+        } else {
+            writeln!(
+                stderr,
+                "Vera was partially uninstalled; some skills could not be removed."
+            )?;
+        }
         writeln!(
             stderr,
             "Per-project indexes (.vera/ in each project) were not removed."
         )?;
     }
 
+    // Mirror `agent::do_remove`: report everything first, then let the first
+    // failure fail the command so automation cannot read exit 0 while skill
+    // directories survive on disk.
+    if let Some(first) = skill_removal.failures.into_iter().next() {
+        return Err(first.context("uninstall did not complete"));
+    }
     Ok(())
+}
+
+fn fold_skill_removal(removal: Result<agent::SkillRemoval>) -> agent::SkillRemoval {
+    match removal {
+        Ok(removal) => removal,
+        Err(e) => {
+            tracing::warn!("failed to resolve agent skill locations: {e:#}");
+            // A location that cannot be resolved is still an unfinished
+            // uninstall: keep it as a failure instead of letting the run
+            // report a complete removal.
+            let mut removal = agent::SkillRemoval::default();
+            removal.failures.push(e);
+            removal
+        }
+    }
 }
 
 #[cfg(test)]
@@ -210,8 +235,35 @@ mod tests {
             &mut stdout,
             &mut stderr,
         )
-        .unwrap();
+        .unwrap_or_else(|e| panic!("a clean uninstall must succeed, got: {e:#}"));
         (
+            String::from_utf8(stdout).unwrap(),
+            String::from_utf8(stderr).unwrap(),
+        )
+    }
+
+    /// A run whose skill removal fails partway: captures what was printed even
+    /// though the command reports failure.
+    #[cfg(unix)]
+    fn uninstall_with_failing_skill(
+        roots: &Roots,
+        json_output: bool,
+    ) -> (Option<String>, String, String) {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let error = run_at(
+            &roots.home,
+            &roots.vera_home,
+            &roots.cwd,
+            Some(roots.user_bin_dir.as_path()),
+            json_output,
+            &mut stdout,
+            &mut stderr,
+        )
+        .err()
+        .map(|e| e.to_string());
+        (
+            error,
             String::from_utf8(stdout).unwrap(),
             String::from_utf8(stderr).unwrap(),
         )
@@ -292,7 +344,10 @@ mod tests {
         let claude = install_claude_global_skill(&roots.home);
         let locked = install_unremovable_gemini_global_skill(&roots.home);
 
-        let (stdout, _) = uninstall(&roots, true);
+        // #149 regression: a partial removal is a failed uninstall. The JSON
+        // document still reaches stdout, but `complete` must be false and the
+        // process error must be set.
+        let (error, stdout, _) = uninstall_with_failing_skill(&roots, true);
         let claude_was_deleted = !claude.exists();
         allow_cleanup(&locked);
 
@@ -300,7 +355,14 @@ mod tests {
             claude_was_deleted,
             "fixture does not discriminate: the earlier skill was never deleted"
         );
+        assert!(
+            error
+                .as_deref()
+                .is_some_and(|e| e.contains("uninstall did not complete")),
+            "partial removal must fail the command: {error:?}"
+        );
         let document: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+        assert_eq!(document["complete"], serde_json::json!(false), "{stdout}");
         assert_eq!(
             document["skills"],
             serde_json::json!([claude.display().to_string()]),
@@ -313,6 +375,17 @@ mod tests {
         );
     }
 
+    #[test]
+    fn uninstall_json_marks_a_clean_removal_complete() {
+        let roots = roots();
+        install_claude_global_skill(&roots.home);
+
+        let (stdout, _) = uninstall(&roots, true);
+
+        let document: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+        assert_eq!(document["complete"], serde_json::json!(true));
+    }
+
     #[cfg(unix)]
     #[test]
     fn uninstall_human_output_names_skills_removed_before_a_later_removal_failed() {
@@ -320,7 +393,7 @@ mod tests {
         let claude = install_claude_global_skill(&roots.home);
         let locked = install_unremovable_gemini_global_skill(&roots.home);
 
-        let (stdout, stderr) = uninstall(&roots, false);
+        let (error, stdout, stderr) = uninstall_with_failing_skill(&roots, false);
         let claude_was_deleted = !claude.exists();
         allow_cleanup(&locked);
 
@@ -328,6 +401,7 @@ mod tests {
             claude_was_deleted,
             "fixture does not discriminate: the earlier skill was never deleted"
         );
+        assert!(error.is_some(), "partial removal must fail the command");
         assert!(stdout.contains(&claude.display().to_string()), "{stdout}");
         assert!(
             !stdout.contains("No Vera skill installations found."),
@@ -337,6 +411,15 @@ mod tests {
         assert!(
             stderr.contains("failed to remove installed skill at"),
             "the failure was never reported: {stderr}"
+        );
+        // #149: the success line must not contradict the reported failures.
+        assert!(
+            !stderr.contains("Vera has been uninstalled."),
+            "claimed a complete uninstall despite the failure: {stderr}"
+        );
+        assert!(
+            stderr.contains("Vera was partially uninstalled"),
+            "the partial outcome was never stated: {stderr}"
         );
     }
 
@@ -348,9 +431,10 @@ mod tests {
         let roots = roots();
         let locked = install_unremovable_gemini_global_skill(&roots.home);
 
-        let (stdout, stderr) = uninstall(&roots, false);
+        let (error, stdout, stderr) = uninstall_with_failing_skill(&roots, false);
         allow_cleanup(&locked);
 
+        assert!(error.is_some(), "partial removal must fail the command");
         assert!(
             !stdout.contains("No Vera skill installations found."),
             "{stdout}"
@@ -381,10 +465,11 @@ mod tests {
         let roots = roots();
         let locked = install_uninspectable_claude_global_skill(&roots.home);
 
-        let (stdout, stderr) = uninstall(&roots, false);
+        let (error, stdout, stderr) = uninstall_with_failing_skill(&roots, false);
         allow_cleanup(&locked);
         let skill_survived = locked.join("SKILL.md").exists();
 
+        assert!(error.is_some(), "partial removal must fail the command");
         assert!(
             skill_survived,
             "fixture does not discriminate: the skill was deleted after all"
@@ -397,6 +482,23 @@ mod tests {
         assert!(
             stderr.contains("failed to check for an installed skill at"),
             "the inspection failure was never reported: {stderr}"
+        );
+    }
+
+    /// A location that cannot even be resolved (for example an unreadable
+    /// project directory) must count as an unfinished uninstall, not vanish
+    /// into a default that reports `complete: true`.
+    #[test]
+    fn a_failed_location_resolution_is_kept_as_a_failure() {
+        let removal = fold_skill_removal(Err(anyhow::anyhow!("cannot list agent locations")));
+
+        assert_eq!(removal.failures.len(), 1);
+        assert!(
+            removal.failures[0]
+                .to_string()
+                .contains("cannot list agent locations"),
+            "the resolution error lost its message: {:#}",
+            removal.failures[0]
         );
     }
 

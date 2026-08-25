@@ -215,7 +215,12 @@ fn start_watching_with_runtime(
 
     let idx_dir = vera_core::indexing::index_dir(&repo_path);
     if !idx_dir.exists() {
-        return Err("No index found. Run search_code first to auto-index.".to_string());
+        // This error surfaces to both audiences: `vera watch` (CLI) and the
+        // MCP `start_watch` tool, so it cannot assume MCP wording.
+        return Err(
+            "No index found. Run `vera index` (CLI) or call search_code (MCP) first to auto-index."
+                .to_string(),
+        );
     }
 
     ExclusionMatcher::new(&repo_path, indexing)

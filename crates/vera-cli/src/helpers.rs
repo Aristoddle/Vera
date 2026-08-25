@@ -325,8 +325,9 @@ pub fn resolve_backend_flags(flags: &LocalBackendFlags) -> vera_core::config::In
 /// Output search results with a total character budget.
 ///
 /// Priority: `--json` compact JSON > `--raw` verbose > default markdown codeblocks.
-/// When `budget` is non-zero, output is progressively truncated so the combined
-/// content stays within the budget. Lower-ranked results are truncated first.
+/// When `budget` is non-zero, output is truncated so it stays within the budget:
+/// markdown and raw mode spend it progressively across results (lower-ranked
+/// results are dropped first), JSON mode truncates the serialized document.
 /// When `compact` is true, function/class bodies are stripped to show only signatures.
 pub fn output_results(
     results: &[vera_core::types::SearchResult],
@@ -346,63 +347,26 @@ pub fn output_results(
     } else {
         Vec::new()
     };
-    // Helper: pick compacted or original content by index.
-    macro_rules! content_for {
-        ($i:expr, $r:expr) => {
+    let contents: Vec<&str> = results
+        .iter()
+        .enumerate()
+        .map(|(i, r)| {
             if compact {
-                compacted[$i].as_str()
+                compacted[i].as_str()
             } else {
-                $r.content.as_str()
+                r.content.as_str()
             }
-        };
-    }
+        })
+        .collect();
 
     if json_output {
-        let json_results: Vec<CompactResult> = results
-            .iter()
-            .enumerate()
-            .map(|(i, r)| {
-                let mut cr = CompactResult::from_search_result(r);
-                if compact {
-                    cr.content = std::borrow::Cow::Borrowed(compacted[i].as_str());
-                }
-                cr
-            })
-            .collect();
-        let json = serde_json::to_string(&json_results)
-            .unwrap_or_else(|e| format!("{{\"error\": \"failed to serialize: {e}\"}}"));
-        println!("{json}");
+        let json = json_results_string(results, &contents);
+        print_budgeted(&json, budget);
     } else if raw {
         if results.is_empty() {
             println!("No results found.");
         } else {
-            for (i, result) in results.iter().enumerate() {
-                println!(
-                    "{}. {} (lines {}-{}, {})",
-                    i + 1,
-                    result.file_path,
-                    result.line_start,
-                    result.line_end,
-                    result.language,
-                );
-                if let Some(ref name) = result.symbol_name {
-                    if let Some(ref stype) = result.symbol_type {
-                        println!("   {stype} {name}");
-                    } else {
-                        println!("   {name}");
-                    }
-                }
-                println!("   score: {:.6}", result.score);
-                let display_content = content_for!(i, result);
-                let preview: String = display_content
-                    .lines()
-                    .take(3)
-                    .map(|l| format!("   │ {l}"))
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                println!("{preview}");
-                println!();
-            }
+            print!("{}", format_raw_results(results, &contents, budget));
         }
     } else {
         // Default: markdown codeblocks (most token-efficient for LLM agents).
@@ -414,25 +378,106 @@ pub fn output_results(
             if i > 0 {
                 println!();
             }
-            let mut info = format!("{}:{}-{}", r.file_path, r.line_start, r.line_end);
-            if let (Some(stype), Some(name)) = (&r.symbol_type, &r.symbol_name) {
-                info.push_str(&format!(" {stype}:{name}"));
-            }
-            println!("```{info}");
-            let base_content = content_for!(i, r);
-            let content = if budget > 0 {
-                let c = truncate_to_budget(base_content, remaining);
-                remaining = remaining.saturating_sub(c.len());
-                c
-            } else {
-                std::borrow::Cow::Borrowed(base_content)
-            };
+            println!("```{}", result_info_line(r));
+            let content = budget_slice(contents[i], budget, &mut remaining);
             print!("{}", content);
             if !content.ends_with('\n') {
                 println!();
             }
             println!("```");
         }
+    }
+}
+
+fn result_info_line(r: &vera_core::types::SearchResult) -> String {
+    let mut info = format!("{}:{}-{}", r.file_path, r.line_start, r.line_end);
+    if let (Some(stype), Some(name)) = (&r.symbol_type, &r.symbol_name) {
+        info.push_str(&format!(" {stype}:{name}"));
+    }
+    info
+}
+
+/// Spend `remaining` on this chunk of content when a budget is set, returning
+/// the part that fits.
+fn budget_slice<'a>(
+    content: &'a str,
+    budget: usize,
+    remaining: &mut usize,
+) -> std::borrow::Cow<'a, str> {
+    if budget == 0 {
+        return std::borrow::Cow::Borrowed(content);
+    }
+    let c = truncate_to_budget(content, *remaining);
+    *remaining = remaining.saturating_sub(c.len());
+    c
+}
+
+fn json_results_string(results: &[vera_core::types::SearchResult], contents: &[&str]) -> String {
+    let json_results: Vec<CompactResult> = results
+        .iter()
+        .zip(contents)
+        .map(|(r, content)| {
+            let mut cr = CompactResult::from_search_result(r);
+            cr.content = std::borrow::Cow::Borrowed(content);
+            cr
+        })
+        .collect();
+    serde_json::to_string(&json_results)
+        .unwrap_or_else(|e| format!("{{\"error\": \"failed to serialize: {e}\"}}"))
+}
+
+/// Numbered verbose listing, one block per result. With a budget, each result's
+/// content spends from a shared allowance like markdown mode does; once it runs
+/// out, lower-ranked results are dropped (headers never consume budget).
+fn format_raw_results(
+    results: &[vera_core::types::SearchResult],
+    contents: &[&str],
+    budget: usize,
+) -> String {
+    let mut out = String::new();
+    let mut remaining = budget;
+    for (i, result) in results.iter().enumerate() {
+        if budget > 0 && remaining == 0 {
+            break;
+        }
+        out.push_str(&format!(
+            "{}. {} (lines {}-{}, {})\n",
+            i + 1,
+            result.file_path,
+            result.line_start,
+            result.line_end,
+            result.language,
+        ));
+        if let Some(ref name) = result.symbol_name {
+            match &result.symbol_type {
+                Some(stype) => out.push_str(&format!("   {stype} {name}\n")),
+                None => out.push_str(&format!("   {name}\n")),
+            }
+        }
+        out.push_str(&format!("   score: {:.6}\n", result.score));
+        let content = budget_slice(contents[i], budget, &mut remaining);
+        for line in content.lines().take(3) {
+            out.push_str("   │ ");
+            out.push_str(line);
+            out.push('\n');
+        }
+        out.push('\n');
+    }
+    out
+}
+
+/// Print within the budget: truncate serialized output when one is set. A
+/// mid-string cut is acceptable there — the budget is a hard cap for machine
+/// consumers, not a formatting guarantee.
+fn print_budgeted(output: &str, budget: usize) {
+    println!("{}", budgeted_output(output, budget));
+}
+
+fn budgeted_output(output: &str, budget: usize) -> String {
+    if budget > 0 && output.len() > budget {
+        truncate_to_budget(output, budget).into_owned()
+    } else {
+        output.to_string()
     }
 }
 
@@ -524,6 +569,87 @@ pub fn print_human_summary(summary: &vera_core::indexing::IndexSummary, verbose:
 #[cfg(test)]
 mod tests {
     use super::*;
+    use vera_core::types::Language;
+
+    /// Two results whose combined content far exceeds a small budget.
+    fn two_results() -> Vec<vera_core::types::SearchResult> {
+        let content = "fn a() {\n    body\n}\n".repeat(20);
+        vec![
+            vera_core::types::SearchResult {
+                file_path: "src/a.rs".to_string(),
+                line_start: 1,
+                line_end: 3,
+                content: content.clone(),
+                language: Language::Rust,
+                score: 0.9,
+                symbol_name: Some("a".to_string()),
+                symbol_type: None,
+            },
+            vera_core::types::SearchResult {
+                file_path: "src/b.rs".to_string(),
+                line_start: 10,
+                line_end: 12,
+                content,
+                language: Language::Rust,
+                score: 0.5,
+                symbol_name: None,
+                symbol_type: None,
+            },
+        ]
+    }
+
+    #[test]
+    fn json_output_respects_the_character_budget() {
+        let results = two_results();
+        let contents: Vec<&str> = results.iter().map(|r| r.content.as_str()).collect();
+        let json = json_results_string(&results, &contents);
+        assert!(json.len() > 300, "fixture must exceed the budget below");
+
+        let budgeted = budgeted_output(&json, 300);
+        assert!(budgeted.len() <= 300, "{}", budgeted.len());
+        assert!(budgeted.contains("[...truncated]"));
+        // Without a budget the document is untouched (and still valid JSON).
+        assert_eq!(budgeted_output(&json, 0), json);
+    }
+
+    #[test]
+    fn raw_output_spends_the_budget_across_results_and_drops_lower_ranked_ones() {
+        // Single-line contents: truncation cannot stop early at a line
+        // boundary, so each result spends its whole remaining allowance.
+        let results = two_results();
+        let results: Vec<vera_core::types::SearchResult> = results
+            .into_iter()
+            .map(|mut r| {
+                r.content = "x".repeat(400);
+                r
+            })
+            .collect();
+        let contents: Vec<&str> = results.iter().map(|r| r.content.as_str()).collect();
+
+        // No budget: both blocks print in full.
+        let unlimited = format_raw_results(&results, &contents, 0);
+        assert_eq!(unlimited.matches("(lines ").count(), 2);
+        assert!(unlimited.contains("src/b.rs"));
+
+        // A budget the first result exhausts exactly: its header stays
+        // visible, but the second result is dropped entirely.
+        let first_only = format_raw_results(&results, &contents, 200);
+        assert!(first_only.contains("src/a.rs"));
+        assert!(!first_only.contains("src/b.rs"), "{first_only}");
+    }
+
+    #[test]
+    fn raw_output_format_is_stable_without_a_budget() {
+        let mut result = two_results().remove(0);
+        result.content = "line one\nline two\nline three\nline four\n".to_string();
+        let out = format_raw_results(std::slice::from_ref(&result), &[result.content.as_str()], 0);
+        assert_eq!(
+            out,
+            "1. src/a.rs (lines 1-3, rust)\n   \
+             a\n   score: 0.900000\n   \
+             │ line one\n   │ line two\n   │ line three\n\n"
+        );
+    }
 
     #[test]
     fn every_local_embedding_flag_on_its_own_counts_as_set() {

@@ -374,18 +374,26 @@ pub fn suggested_update_command(install_method: Option<&str>) -> String {
     }
 }
 
-/// Compare two semver-ish strings. Returns true if `latest` > `current`.
+/// Compare two release tags. Returns true if `latest` > `current`.
+///
+/// Tags are semver (`major.minor.patch[-pre][+build]`), compared with full
+/// precedence so pre-release identifiers order correctly (`0.6.0-rc.2` above
+/// `0.6.0-rc.1`, `1.2.0` above all of its own pre-releases) instead of the old
+/// behavior that parsed non-numeric segments as 0. A pre-release never counts
+/// as newer than a stable version: GitHub's "latest release" endpoint only
+/// serves stable tags, and a stable install must not be nudged onto an RC. A
+/// tag that does not parse is never reported as newer.
 fn is_newer(latest: &str, current: &str) -> bool {
-    let parse = |s: &str| -> (u32, u32, u32) {
-        let s = s.strip_prefix('v').unwrap_or(s);
-        let mut parts = s.split('.').map(|p| p.parse::<u32>().unwrap_or(0));
-        (
-            parts.next().unwrap_or(0),
-            parts.next().unwrap_or(0),
-            parts.next().unwrap_or(0),
-        )
+    let parse = |tag: &str| -> Option<semver::Version> {
+        let tag = tag.trim();
+        let tag = tag.strip_prefix('v').unwrap_or(tag);
+        semver::Version::parse(tag).ok()
     };
-    parse(latest) > parse(current)
+    let (Some(latest), Some(current)) = (parse(latest), parse(current)) else {
+        return false;
+    };
+    let latest_is_prerelease = !latest.pre.is_empty();
+    !(latest_is_prerelease && current.pre.is_empty()) && latest > current
 }
 
 fn fetch_latest_version() -> Option<String> {
@@ -781,6 +789,41 @@ mod tests {
     fn format_command_joins_args() {
         assert_eq!(format_command("npm", &["update", "-g"]), "npm update -g");
         assert_eq!(format_command("vera", &[]), "vera");
+    }
+
+    /// #183 regression: pre-release segments used to parse as 0, so tags like
+    /// `1.2.0-beta` collapsed to `1.2.0` and pre-release ordering was lost.
+    #[test]
+    fn is_newer_orders_pre_release_tags_by_semver_precedence() {
+        // A later RC outranks an earlier one; the old parser saw both as
+        // `0.5.0` and missed the update.
+        assert!(is_newer("0.6.0-rc.2", "0.6.0-rc.1"));
+        assert!(is_newer("0.6.0-beta", "0.6.0-alpha"));
+
+        // Stable beats its own pre-releases: a user on an RC gets the update.
+        assert!(is_newer("0.6.0", "0.6.0-rc.1"));
+        assert!(is_newer("v1.2.0", "v1.2.0-beta.11"));
+
+        // Ordinary triples still compare numerically.
+        assert!(is_newer("1.10.0", "1.9.9"));
+        assert!(!is_newer("1.2.0", "1.2.1"));
+    }
+
+    #[test]
+    fn is_newer_never_pushes_a_stable_install_onto_a_pre_release() {
+        // Same triple with a pre-release suffix on latest: not an upgrade.
+        assert!(!is_newer("1.2.1-rc.1", "1.2.1"));
+        // Even a higher-triple RC is skipped for a stable current version.
+        assert!(!is_newer("2.0.0-rc.1", "1.9.9"));
+    }
+
+    #[test]
+    fn is_newer_treats_unparsable_tags_as_not_newer() {
+        assert!(!is_newer("", "1.0.0"));
+        assert!(!is_newer("not-a-version", "1.0.0"));
+        assert!(!is_newer("1.2", "1.0.0"), "two-segment tag is not semver");
+        // A broken current version must not trigger an update either.
+        assert!(!is_newer("2.0.0", ""));
     }
 
     #[test]
