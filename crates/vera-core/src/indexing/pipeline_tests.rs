@@ -489,6 +489,7 @@ fn store_index_into(idx_dir: &Path) -> Result<()> {
             file_states: &[],
             indexing_config: &indexing_config,
             model_name: "mock-model",
+            document_prefix: "",
         },
     )
 }

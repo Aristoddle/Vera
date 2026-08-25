@@ -7,6 +7,7 @@ use reqwest::Client;
 use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use tokio::fs;
 
 use super::cuda::*;
@@ -17,25 +18,32 @@ use super::*;
 /// Accepts an optional pre-resolved library path (from `ensure_ort_library`).
 /// Falls back to system library search if no path is provided.
 ///
-/// Safe to call multiple times — only the first call takes effect.
+/// Safe to call multiple times with the same path. A different path after
+/// initialization is rejected because `ort` can load only one global runtime.
 pub fn ensure_ort_runtime(lib_path: Option<&std::path::Path>) -> Result<()> {
-    let result = ORT_INIT_RESULT.get_or_init(|| {
-        let lib_name = match lib_path {
-            Some(p) => p.display().to_string(),
-            None => ort_lib_filename(),
-        };
-        match ::ort::init_from(&lib_name) {
-            Ok(builder) => {
-                builder.commit();
-                Ok(())
-            }
-            Err(e) => Err(format!(
-                "ONNX Runtime shared library not found.\n\
+    let requested = lib_path
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(ort_lib_filename);
+    if let Some(initialized) = ORT_INIT_LIBRARY_PATH.get() {
+        validate_ort_library_path(Some(initialized), &requested)?;
+    }
+
+    let result = ORT_INIT_RESULT.get_or_init(|| match ::ort::init_from(&requested) {
+        Ok(builder) => {
+            builder.commit();
+            let _ = ORT_INIT_LIBRARY_PATH.set(requested.clone());
+            Ok(())
+        }
+        Err(e) => Err(format!(
+            "ONNX Runtime shared library not found.\n\
                  Run `vera setup` to auto-download it, or use API mode instead.\n\
                  Original error: {e}"
-            )),
-        }
+        )),
     });
+
+    if let Some(initialized) = ORT_INIT_LIBRARY_PATH.get() {
+        validate_ort_library_path(Some(initialized), &requested)?;
+    }
 
     match result {
         Ok(()) => Ok(()),
@@ -43,11 +51,60 @@ pub fn ensure_ort_runtime(lib_path: Option<&std::path::Path>) -> Result<()> {
     }
 }
 
+fn validate_ort_library_path(initialized: Option<&str>, requested: &str) -> Result<()> {
+    if let Some(initialized) = initialized.filter(|path| *path != requested) {
+        anyhow::bail!(
+            "ONNX Runtime is already initialized with `{initialized}`, but `{requested}` was requested; one process cannot load both libraries"
+        );
+    }
+    Ok(())
+}
+
+static ORT_INIT_LIBRARY_PATH: OnceLock<String> = OnceLock::new();
+
 /// Return whether ONNX Runtime has already been initialized successfully.
 pub(crate) fn ort_runtime_initialized() -> bool {
     ORT_INIT_RESULT
         .get()
         .is_some_and(std::result::Result::is_ok)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_ort_library_path;
+
+    #[test]
+    fn rejects_cpu_after_gpu_runtime_initialization() {
+        let error = validate_ort_library_path(
+            Some("/vera/lib/libonnxruntime-cuda.so"),
+            "/vera/lib/libonnxruntime-cpu.so",
+        )
+        .expect_err("different runtime paths must be rejected");
+        let message = error.to_string();
+        assert!(message.contains("libonnxruntime-cuda.so"));
+        assert!(message.contains("libonnxruntime-cpu.so"));
+    }
+
+    #[test]
+    fn rejects_gpu_after_cpu_runtime_initialization() {
+        let error = validate_ort_library_path(
+            Some("/vera/lib/libonnxruntime-cpu.so"),
+            "/vera/lib/libonnxruntime-cuda.so",
+        )
+        .expect_err("different runtime paths must be rejected");
+        let message = error.to_string();
+        assert!(message.contains("libonnxruntime-cpu.so"));
+        assert!(message.contains("libonnxruntime-cuda.so"));
+    }
+
+    #[test]
+    fn accepts_repeated_initialization_with_same_path() {
+        validate_ort_library_path(
+            Some("/vera/lib/libonnxruntime.so"),
+            "/vera/lib/libonnxruntime.so",
+        )
+        .expect("same runtime path should be accepted");
+    }
 }
 
 /// Returns the pip package name for EPs that require pip-based installation, or None

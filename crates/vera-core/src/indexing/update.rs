@@ -14,6 +14,7 @@
 //! 5. For deleted files: remove chunks, vectors, BM25 entries, and hashes
 //! 6. Return an UpdateSummary describing what changed
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::Instant;
@@ -164,8 +165,24 @@ pub(crate) fn hash_for_indexing_source(
     repo_root: &Path,
     max_file_size_bytes: u64,
 ) -> String {
+    content_hash(&source_for_indexing_hash(
+        content,
+        rel_path,
+        language,
+        repo_root,
+        max_file_size_bytes,
+    ))
+}
+
+fn source_for_indexing_hash<'a>(
+    content: &'a str,
+    rel_path: &str,
+    language: Language,
+    repo_root: &Path,
+    max_file_size_bytes: u64,
+) -> Cow<'a, str> {
     if language != Language::Rst {
-        return content_hash(content);
+        return Cow::Borrowed(content);
     }
 
     let absolute_path = repo_root.join(rel_path);
@@ -175,14 +192,14 @@ pub(crate) fn hash_for_indexing_source(
         repo_root,
         max_file_size_bytes,
     ) {
-        Ok(preprocessed) => content_hash(&preprocessed),
+        Ok(preprocessed) => Cow::Owned(preprocessed),
         Err(err) => {
             warn!(
                 file = %rel_path,
                 error = %err,
                 "failed to preprocess rst for hashing; falling back to raw source"
             );
-            content_hash(content)
+            Cow::Borrowed(content)
         }
     }
 }
@@ -337,6 +354,21 @@ where
                 model_name
             );
         }
+        // A changed document prefix means the stored vectors live in a
+        // different vector space. Indexes written before this guard have no
+        // stored prefix, and their documents were never prefixed.
+        let stored_prefix = metadata_store
+            .get_index_meta("document_prefix")
+            .unwrap_or(None)
+            .unwrap_or_default();
+        let active_prefix = provider.document_prefix_identity();
+        if stored_prefix != active_prefix {
+            bail!(
+                "Index was created with document prefix '{}', but the active provider uses '{}'. Please re-index to rebuild the vector space.",
+                stored_prefix,
+                active_prefix
+            );
+        }
         if let Ok(dim) = s_dim.parse::<usize>() {
             if let Some(provider_dim) = provider.expected_dim() {
                 if provider_dim < dim {
@@ -407,13 +439,15 @@ where
     for (rel_path, content) in &current_files {
         cancellation.check()?;
         let language = detect_language_for_path(rel_path);
-        let hash = hash_for_indexing_source(
+        let normalized_source = source_for_indexing_hash(
             content,
             rel_path,
             language,
             &repo_root,
             config.indexing.max_file_size_bytes,
         );
+        let hash = content_hash(&normalized_source);
+        let normalized_source = (language == Language::Rst).then(|| normalized_source.into_owned());
         let stored_hash = metadata_store
             .get_file_hash(rel_path)
             .context("failed to get stored hash")?;
@@ -425,12 +459,12 @@ where
                     unchanged += 1;
                 }
                 _ => {
-                    modified.push((rel_path.clone(), content.clone(), hash));
+                    modified.push((rel_path.clone(), content.clone(), hash, normalized_source));
                 }
             }
         } else {
             // New file (not in index).
-            added.push((rel_path.clone(), content.clone(), hash));
+            added.push((rel_path.clone(), content.clone(), hash, normalized_source));
         }
     }
 
@@ -475,15 +509,19 @@ where
     });
 
     // ── 4. Prepare modifications and additions ───────────────────
-    let files_to_index: Vec<(String, String, String, bool)> = modified
+    let files_to_index: Vec<(String, String, String, Option<String>, bool)> = modified
         .iter()
         .cloned()
-        .map(|(path, content, hash)| (path, content, hash, true))
+        .map(|(path, content, hash, normalized_source)| {
+            (path, content, hash, normalized_source, true)
+        })
         .chain(
             added
                 .iter()
                 .cloned()
-                .map(|(path, content, hash)| (path, content, hash, false)),
+                .map(|(path, content, hash, normalized_source)| {
+                    (path, content, hash, normalized_source, false)
+                }),
         )
         .collect();
     let mut prepared_files = Vec::new();
@@ -497,60 +535,45 @@ where
         // earlier.
         let parsed: Vec<(PreparedFile, Option<FileError>)> = files_to_index
             .par_iter()
-            .map(|(rel_path, content, hash, is_modified)| {
-                cancellation.check()?;
-                let language = detect_language_for_path(rel_path);
+            .map(
+                |(rel_path, content, hash, normalized_source, is_modified)| {
+                    cancellation.check()?;
+                    let language = detect_language_for_path(rel_path);
 
-                // For RST, refs come from raw source; chunks from preprocessed.
-                // For all other languages, parse once for both.
-                let (chunks, refs, file_state, parse_error) = if language == Language::Rst {
-                    let refs = parsing::parse_and_extract_references(content, language);
-                    let absolute_path = repo_root.join(rel_path);
-                    let normalized_source = match parsing::sphinx::preprocess_rst_with_limit(
-                        content,
-                        &absolute_path,
-                        &repo_root,
-                        config.indexing.max_file_size_bytes,
-                    ) {
-                        Ok(preprocessed) => Some(preprocessed),
-                        Err(err) => {
-                            warn!(
-                                file = %rel_path,
-                                error = %err,
-                                "failed to preprocess rst during update; falling back to raw source"
-                            );
-                            None
-                        }
+                    // For RST, refs come from raw source; chunks from preprocessed.
+                    // For all other languages, parse once for both.
+                    let (chunks, refs, file_state, parse_error) = if language == Language::Rst {
+                        let refs = parsing::parse_and_extract_references(content, language);
+                        let src = normalized_source.as_deref().unwrap_or(content);
+                        chunk_file_for_update(src, rel_path, language, config, Some(refs))
+                    } else {
+                        chunk_file_for_update(content, rel_path, language, config, None)
                     };
-                    let src = normalized_source.as_deref().unwrap_or(content);
-                    chunk_file_for_update(src, rel_path, language, config, Some(refs))
-                } else {
-                    chunk_file_for_update(content, rel_path, language, config, None)
-                };
 
-                let type_relations = parsing::type_relations::extract_type_relations(&chunks);
+                    let type_relations = parsing::type_relations::extract_type_relations(&chunks);
 
-                debug!(
-                    file = %rel_path,
-                    chunks = chunks.len(),
-                    refs = refs.len(),
-                    type_relations = type_relations.len(),
-                    "parsed file"
-                );
+                    debug!(
+                        file = %rel_path,
+                        chunks = chunks.len(),
+                        refs = refs.len(),
+                        type_relations = type_relations.len(),
+                        "parsed file"
+                    );
 
-                Ok((
-                    PreparedFile {
-                        path: rel_path.clone(),
-                        hash: hash.clone(),
-                        modified: *is_modified,
-                        chunks,
-                        references: refs,
-                        type_relations,
-                        state: file_state,
-                    },
-                    parse_error,
-                ))
-            })
+                    Ok((
+                        PreparedFile {
+                            path: rel_path.clone(),
+                            hash: hash.clone(),
+                            modified: *is_modified,
+                            chunks,
+                            references: refs,
+                            type_relations,
+                            state: file_state,
+                        },
+                        parse_error,
+                    ))
+                },
+            )
             .collect::<Result<_>>()?;
         cancellation.check()?;
 
@@ -901,6 +924,7 @@ mod tests;
 
 #[cfg(test)]
 mod regression_tests {
+    use super::{content_hash, hash_for_indexing_source};
     use crate::config::VeraConfig;
     use crate::embedding::test_helpers::MockProvider;
     use crate::indexing::{
@@ -908,7 +932,32 @@ mod regression_tests {
         update_repository_with_options_and_progress,
     };
     use crate::storage::bm25::Bm25Index;
+    use crate::types::Language;
     use tempfile::tempdir;
+
+    #[test]
+    fn rst_update_hash_matches_the_preprocessed_source_the_pipeline_indexes() {
+        // The pipeline hashes the preprocessed RST it chunks (even in its
+        // parse-error branch), so the update-side hash must agree or the file
+        // is re-parsed on every run.
+        let temp = tempdir().unwrap();
+        let source_path = temp.path().join("guide.rst");
+        let source = "Guide\n=====\n\nSee :doc:`Other </other>`.\n";
+        std::fs::write(&source_path, source).unwrap();
+
+        let preprocessed = crate::parsing::sphinx::preprocess_rst_with_limit(
+            source,
+            &source_path,
+            temp.path(),
+            1024,
+        )
+        .unwrap();
+        let update_hash =
+            hash_for_indexing_source(source, "guide.rst", Language::Rst, temp.path(), 1024);
+
+        assert_ne!(content_hash(source), update_hash);
+        assert_eq!(content_hash(&preprocessed), update_hash);
+    }
 
     #[tokio::test]
     async fn update_removes_old_chunks_when_modified_file_has_no_chunks() {

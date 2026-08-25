@@ -70,6 +70,16 @@ impl EmbeddingProvider for DynamicProvider {
         }
     }
 
+    fn document_prefix_identity(&self) -> String {
+        match self {
+            Self::Api(p) => p.document_prefix_identity(),
+            Self::Local(p) => p.document_prefix_identity(),
+            Self::Model2Vec(p) => p.document_prefix_identity(),
+            #[cfg(test)]
+            Self::Stub(p) => p.document_prefix_identity(),
+        }
+    }
+
     fn max_batch_size(&self) -> Option<usize> {
         match self {
             Self::Api(p) => p.max_batch_size(),

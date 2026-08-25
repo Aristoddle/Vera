@@ -6,7 +6,9 @@ use ort::session::{Session, builder::GraphOptimizationLevel};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokenizers::{Encoding, Tokenizer};
@@ -14,6 +16,7 @@ use tokio::task;
 use tokio_util::sync::CancellationToken;
 
 const ADAPTIVE_BATCH_SCALER_STATE_VERSION: u32 = 1;
+static BATCH_SCALER_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone)]
 pub struct LocalEmbeddingProvider {
@@ -697,6 +700,11 @@ fn save_persisted_batch_scaler(
     profile: &AdaptiveBatchScalerProfile,
     scaler: &AdaptiveBatchScaler,
 ) -> Result<()> {
+    // Serialize read-modify-write operations with a lockfile, then publish the
+    // merged registry with a temp-file rename so concurrent processes cannot
+    // clobber profiles or leave a partially written JSON document.
+    let lock_path = path.with_extension("json.lock");
+    let _lock = acquire_batch_scaler_lock(&lock_path)?;
     let mut registry = if path.exists() {
         let data = fs::read(path).with_context(|| {
             format!(
@@ -738,12 +746,81 @@ fn save_persisted_batch_scaler(
     }
     let json = serde_json::to_vec_pretty(&registry)
         .context("failed to serialize adaptive batch scaler state")?;
-    fs::write(path, json).with_context(|| {
+    let temp_id = BATCH_SCALER_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let temp_path = path.with_extension(format!("json.tmp.{}.{}", std::process::id(), temp_id));
+    let mut file = fs::File::create(&temp_path).with_context(|| {
         format!(
-            "failed to write adaptive batch scaler state {}",
+            "failed to create temporary adaptive batch scaler state {}",
+            temp_path.display()
+        )
+    })?;
+    file.write_all(&json).with_context(|| {
+        format!(
+            "failed to write temporary adaptive batch scaler state {}",
+            temp_path.display()
+        )
+    })?;
+    file.sync_all().with_context(|| {
+        format!(
+            "failed to sync temporary adaptive batch scaler state {}",
+            temp_path.display()
+        )
+    })?;
+    fs::rename(&temp_path, path).with_context(|| {
+        format!(
+            "failed to replace adaptive batch scaler state {}",
             path.display()
         )
     })
+}
+
+struct BatchScalerLock {
+    path: PathBuf,
+}
+
+impl Drop for BatchScalerLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+fn acquire_batch_scaler_lock(path: &Path) -> Result<BatchScalerLock> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create lock directory {}", parent.display()))?;
+    }
+    for _ in 0..100 {
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+        {
+            Ok(mut file) => {
+                if let Err(error) = writeln!(file, "{}", std::process::id()) {
+                    let _ = fs::remove_file(path);
+                    return Err(error).context("failed to write adaptive batch scaler lock");
+                }
+                return Ok(BatchScalerLock {
+                    path: path.to_path_buf(),
+                });
+            }
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to create adaptive batch scaler lock {}",
+                        path.display()
+                    )
+                });
+            }
+        }
+    }
+    anyhow::bail!(
+        "timed out acquiring adaptive batch scaler lock {}",
+        path.display()
+    )
 }
 
 fn now_unix_secs() -> u64 {
@@ -1196,6 +1273,39 @@ mod tests {
             .unwrap();
 
         assert_eq!(loaded.recommend_batch_len(128, 512), 112);
+    }
+
+    #[test]
+    fn concurrent_persisted_scaler_saves_keep_all_profiles() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("adaptive-batch-scaler.json");
+        let profiles = (0..8)
+            .map(|index| AdaptiveBatchScalerProfile {
+                key: format!("cuda|device=rtx-{index}|model=jina|max_length=512"),
+                backend: OnnxExecutionProvider::Cuda,
+                device_fingerprint: format!("rtx-{index}"),
+                model_identity: "jina".to_string(),
+                max_length: 512,
+            })
+            .collect::<Vec<_>>();
+
+        std::thread::scope(|scope| {
+            for profile in &profiles {
+                let path = &path;
+                scope.spawn(move || {
+                    let mut scaler = AdaptiveBatchScaler::new(512, 0);
+                    scaler.note_success(512, 40);
+                    save_persisted_batch_scaler(path, profile, &scaler).unwrap();
+                });
+            }
+        });
+
+        let registry: PersistedAdaptiveBatchScalerRegistry =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(registry.profiles.len(), profiles.len());
+        for profile in profiles {
+            assert!(registry.profiles.contains_key(&profile.key));
+        }
     }
 
     #[test]

@@ -321,6 +321,7 @@ where
     // Publication is synchronous, so cancellation must win before any artifact is replaced.
     cancellation.check()?;
     let idx_dir = index_dir(&repo_root);
+    let document_prefix = provider.document_prefix_identity();
     store_index(
         &idx_dir,
         &all_chunks,
@@ -332,6 +333,7 @@ where
             file_states: &file_states,
             indexing_config: &config.indexing,
             model_name,
+            document_prefix: &document_prefix,
         },
     )
     .context("failed to write index artifacts")?;
@@ -434,6 +436,11 @@ fn parse_discovered_files_parallel(
 
             // RST files need preprocessing before chunking, but refs
             // come from the raw source, so they can't share a single parse.
+            // The hash is computed before the parse so the error branch can
+            // store the hash of the source that was actually attempted;
+            // otherwise a parse-failing RST file looks modified on every
+            // update and is re-parsed forever.
+            let hash;
             let parsed = if language == Language::Rst {
                 let refs = parsing::parse_and_extract_references(&source, language);
                 let normalized_source = match parsing::sphinx::preprocess_rst_with_limit(
@@ -453,27 +460,26 @@ fn parse_discovered_files_parallel(
                     }
                 };
                 let src = normalized_source.as_deref().unwrap_or(&source);
-                let hash = content_hash(src);
+                hash = content_hash(src);
                 parsing::parse_file_with_diagnostics(
                     src,
                     &file.relative_path,
                     language,
                     &config.indexing,
                 )
-                .map(|(chunks, _ignored_refs, diagnostics)| (chunks, refs, hash, diagnostics))
+                .map(|(chunks, _ignored_refs, diagnostics)| (chunks, refs, diagnostics))
             } else {
-                let hash = content_hash(&source);
+                hash = content_hash(&source);
                 parsing::parse_file_with_diagnostics(
                     &source,
                     &file.relative_path,
                     language,
                     &config.indexing,
                 )
-                .map(|(chunks, refs, diagnostics)| (chunks, refs, hash, diagnostics))
             };
 
             match parsed {
-                Ok((chunks, refs, hash, diagnostics)) => {
+                Ok((chunks, refs, diagnostics)) => {
                     let chunk_count = chunks.len() as u64;
                     let type_relations = parsing::type_relations::extract_type_relations(&chunks);
                     debug!(
@@ -512,7 +518,7 @@ fn parse_discovered_files_parallel(
                             file_path: file.relative_path.clone(),
                             error: err.to_string(),
                         }),
-                        file_hash: Some((file.relative_path.clone(), content_hash(&source))),
+                        file_hash: Some((file.relative_path.clone(), hash)),
                         refs: None,
                         type_relations: None,
                         file_state: Some(FileIndexState {
@@ -572,6 +578,7 @@ struct IndexBuildMetadata<'a> {
     file_states: &'a [FileIndexState],
     indexing_config: &'a crate::config::IndexingConfig,
     model_name: &'a str,
+    document_prefix: &'a str,
 }
 
 fn store_index(
@@ -615,6 +622,9 @@ fn store_index(
     metadata_store
         .set_index_meta("model_name", metadata.model_name)
         .context("failed to store model_name")?;
+    metadata_store
+        .set_index_meta("document_prefix", metadata.document_prefix)
+        .context("failed to store document_prefix")?;
     metadata_store
         .set_index_meta("embedding_dim", &dim.to_string())
         .context("failed to store embedding_dim")?;

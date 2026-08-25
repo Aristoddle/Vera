@@ -1,7 +1,7 @@
 //! Embedding provider abstraction and OpenAI-compatible implementation.
 
 use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -85,6 +85,15 @@ pub trait EmbeddingProvider: Send + Sync {
         document.to_string()
     }
 
+    /// Identity of the document-side text preparation, stored in the index
+    /// metadata so a changed document prefix trips the stale-index guard
+    /// instead of silently mixing vector spaces. The empty string means
+    /// documents embed unprefixed. Local providers may leave the default:
+    /// their stored model identity already covers prefix configuration.
+    fn document_prefix_identity(&self) -> String {
+        String::new()
+    }
+
     /// Return the maximum number of inputs the provider accepts per request.
     ///
     /// `None` means Vera should use the configured batch size as-is.
@@ -126,6 +135,9 @@ pub struct EmbeddingProviderConfig {
     /// Optional prefix prepended to query text for asymmetric embedding models.
     /// Read from `EMBEDDING_QUERY_PREFIX` env var.
     pub query_prefix: Option<String>,
+    /// Optional prefix prepended to indexed passage text for asymmetric
+    /// embedding models. Read from `EMBEDDING_DOCUMENT_PREFIX` env var.
+    pub document_prefix: Option<String>,
 }
 
 impl std::fmt::Debug for EmbeddingProviderConfig {
@@ -143,13 +155,16 @@ impl std::fmt::Debug for EmbeddingProviderConfig {
 impl EmbeddingProviderConfig {
     /// Create a new config. The API key is stored opaquely and never exposed.
     pub fn new(base_url: String, model_id: String, api_key: String) -> Self {
+        let query_prefix = default_query_prefix_for_known_model(&model_id);
+        let document_prefix = default_document_prefix_for_model(&model_id);
         Self {
             base_url,
             model_id,
             api_key,
             timeout: Duration::from_secs(30),
             max_retries: 3,
-            query_prefix: None,
+            query_prefix,
+            document_prefix,
         }
     }
 
@@ -160,6 +175,7 @@ impl EmbeddingProviderConfig {
     /// - `EMBEDDING_MODEL_ID`
     /// - `EMBEDDING_MODEL_API_KEY`
     /// - `EMBEDDING_QUERY_PREFIX` (optional override; auto-detected from model ID if unset)
+    /// - `EMBEDDING_DOCUMENT_PREFIX` (optional override; auto-detected from model ID if unset)
     pub fn from_env() -> Result<Self> {
         let base_url = std::env::var("EMBEDDING_MODEL_BASE_URL")
             .context("EMBEDDING_MODEL_BASE_URL not set")?;
@@ -170,9 +186,47 @@ impl EmbeddingProviderConfig {
             .ok()
             .filter(|s| !s.is_empty())
             .or_else(|| default_query_prefix_for_model(&model_id));
+        let document_prefix = std::env::var("EMBEDDING_DOCUMENT_PREFIX")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .or_else(|| default_document_prefix_for_model(&model_id));
 
         let mut config = Self::new(base_url, model_id, api_key);
         config.query_prefix = query_prefix;
+        config.document_prefix = document_prefix;
+        Ok(config)
+    }
+
+    /// Create config from environment variables without blocking an async
+    /// runtime worker on the best-effort HuggingFace lookup.
+    pub async fn from_env_async() -> Result<Self> {
+        let base_url = std::env::var("EMBEDDING_MODEL_BASE_URL")
+            .context("EMBEDDING_MODEL_BASE_URL not set")?;
+        let model_id = std::env::var("EMBEDDING_MODEL_ID").context("EMBEDDING_MODEL_ID not set")?;
+        let api_key =
+            std::env::var("EMBEDDING_MODEL_API_KEY").context("EMBEDDING_MODEL_API_KEY not set")?;
+        let query_prefix = std::env::var("EMBEDDING_QUERY_PREFIX")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .or_else(|| default_query_prefix_for_known_model(&model_id));
+        let query_prefix = match query_prefix {
+            Some(prefix) => Some(prefix),
+            None => {
+                let model_id_for_fetch = model_id.clone();
+                tokio::task::spawn_blocking(move || fetch_query_prefix_from_hf(&model_id_for_fetch))
+                    .await
+                    .ok()
+                    .flatten()
+            }
+        };
+        let document_prefix = std::env::var("EMBEDDING_DOCUMENT_PREFIX")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .or_else(|| default_document_prefix_for_model(&model_id));
+
+        let mut config = Self::new(base_url, model_id, api_key);
+        config.query_prefix = query_prefix;
+        config.document_prefix = document_prefix;
         Ok(config)
     }
 
@@ -196,6 +250,39 @@ impl EmbeddingProviderConfig {
 /// Returns `None` for symmetric models or unrecognized model IDs.
 /// Users can always override via `EMBEDDING_QUERY_PREFIX` env var.
 fn default_query_prefix_for_model(model_id: &str) -> Option<String> {
+    default_query_prefix_for_known_model(model_id)
+        .or_else(|| fetch_query_prefix_off_runtime(model_id))
+}
+
+fn fetch_query_prefix_off_runtime(model_id: &str) -> Option<String> {
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        let model_id = model_id.to_string();
+        return match handle.runtime_flavor() {
+            tokio::runtime::RuntimeFlavor::MultiThread => tokio::task::block_in_place(|| {
+                handle
+                    .block_on(tokio::task::spawn_blocking(move || {
+                        fetch_query_prefix_from_hf(&model_id)
+                    }))
+                    .ok()
+                    .flatten()
+            }),
+            tokio::runtime::RuntimeFlavor::CurrentThread => {
+                std::thread::spawn(move || fetch_query_prefix_from_hf(&model_id))
+                    .join()
+                    .ok()
+                    .flatten()
+            }
+            _ => std::thread::spawn(move || fetch_query_prefix_from_hf(&model_id))
+                .join()
+                .ok()
+                .flatten(),
+        };
+    }
+
+    fetch_query_prefix_from_hf(model_id)
+}
+
+fn default_query_prefix_for_known_model(model_id: &str) -> Option<String> {
     let id = model_id.to_lowercase();
     if id.contains("qwen3-embedding") || id.contains("qwen3_embedding") {
         Some("Instruct: Given a code search query, retrieve relevant code snippets that match the query\nQuery: ".into())
@@ -208,8 +295,19 @@ fn default_query_prefix_for_model(model_id: &str) -> Option<String> {
     } else if id.contains("bge-") || id.contains("bge_") {
         Some("Represent this sentence for searching relevant passages: ".into())
     } else {
-        // Unrecognized model: try fetching prefix from HuggingFace.
-        fetch_query_prefix_from_hf(model_id)
+        None
+    }
+}
+
+/// Auto-detect a documented passage prefix for known asymmetric models.
+fn default_document_prefix_for_model(model_id: &str) -> Option<String> {
+    let id = model_id.to_lowercase();
+    if id.contains("e5-") || id.contains("e5_") {
+        Some("passage: ".into())
+    } else {
+        // BGE and the other known API presets document a query instruction but
+        // no passage prefix, so leave indexed text unchanged.
+        None
     }
 }
 
@@ -223,6 +321,13 @@ fn fetch_query_prefix_from_hf(model_id: &str) -> Option<String> {
     if !model_id.contains('/') {
         return None;
     }
+    let cache = QUERY_PREFIX_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    cached_lookup_or_fetch(cache, model_id, || {
+        fetch_query_prefix_from_hf_uncached(model_id)
+    })
+}
+
+fn fetch_query_prefix_from_hf_uncached(model_id: &str) -> Option<String> {
     let url = format!(
         "https://huggingface.co/{}/resolve/main/tokenizer_config.json",
         model_id
@@ -253,6 +358,28 @@ fn fetch_query_prefix_from_hf(model_id: &str) -> Option<String> {
         debug!(model_id, prefix = %p, "auto-detected query prefix from HuggingFace");
         format!("{p} ")
     })
+}
+
+type QueryPrefixCacheEntry = Arc<OnceLock<Option<String>>>;
+type QueryPrefixCache = Mutex<HashMap<String, QueryPrefixCacheEntry>>;
+
+static QUERY_PREFIX_CACHE: OnceLock<QueryPrefixCache> = OnceLock::new();
+
+fn cached_lookup_or_fetch<F>(cache: &QueryPrefixCache, model_id: &str, fetch: F) -> Option<String>
+where
+    F: FnOnce() -> Option<String>,
+{
+    let entry = {
+        let mut entries = cache.lock().unwrap();
+        entries
+            .entry(model_id.to_string())
+            .or_insert_with(|| Arc::new(OnceLock::new()))
+            .clone()
+    };
+
+    // Each model gets its own single-flight cell. The map lock is released
+    // before the request starts, so a slow lookup cannot block other models.
+    entry.get_or_init(fetch).clone()
 }
 
 // ── OpenAI-compatible provider ───────────────────────────────────────
@@ -475,6 +602,22 @@ impl EmbeddingProvider for OpenAiProvider {
         }
     }
 
+    fn prepare_document_text(&self, document: &str) -> String {
+        match &self.config.document_prefix {
+            Some(prefix) => format!("{prefix}{document}"),
+            None => document.to_string(),
+        }
+    }
+
+    fn document_prefix_identity(&self) -> String {
+        self.config
+            .document_prefix
+            .as_deref()
+            .unwrap_or("")
+            .trim()
+            .to_string()
+    }
+
     fn max_batch_size(&self) -> Option<usize> {
         provider_batch_limit(&self.config)
     }
@@ -667,6 +810,10 @@ impl<P: EmbeddingProvider> EmbeddingProvider for CachedEmbeddingProvider<P> {
 
     fn prepare_document_text(&self, document: &str) -> String {
         self.inner.prepare_document_text(document)
+    }
+
+    fn document_prefix_identity(&self) -> String {
+        self.inner.document_prefix_identity()
     }
 
     fn max_batch_size(&self) -> Option<usize> {
@@ -1352,6 +1499,65 @@ mod tests {
         assert_eq!(provider.prepare_query_text("find foo"), "find foo");
     }
 
+    #[test]
+    fn document_prefix_identity_normalizes_and_defaults_to_empty() {
+        let mut config =
+            EmbeddingProviderConfig::new("http://x".into(), "vendor/model".into(), "k".into());
+        assert_eq!(
+            OpenAiProvider::new(config.clone())
+                .unwrap()
+                .document_prefix_identity(),
+            ""
+        );
+
+        config.document_prefix = Some("  passage: ".into());
+        assert_eq!(
+            OpenAiProvider::new(config.clone())
+                .unwrap()
+                .document_prefix_identity(),
+            "passage:"
+        );
+
+        // An empty prefix embeds documents unprefixed, so it must share the
+        // bare identity instead of demanding its own re-index.
+        config.document_prefix = Some("   ".into());
+        assert_eq!(
+            OpenAiProvider::new(config)
+                .unwrap()
+                .document_prefix_identity(),
+            ""
+        );
+    }
+
+    #[test]
+    fn api_document_prefix_matches_known_model_conventions() {
+        let mut e5_config = EmbeddingProviderConfig::new(
+            "http://x".into(),
+            "intfloat/e5-large-v2".into(),
+            "k".into(),
+        );
+        e5_config.document_prefix = default_document_prefix_for_model(&e5_config.model_id);
+        let e5 = OpenAiProvider::new(e5_config).unwrap();
+        assert_eq!(
+            e5.prepare_document_text("fn main() {}"),
+            "passage: fn main() {}"
+        );
+
+        for model_id in [
+            "jinaai/jina-embeddings-v5-text-nano-retrieval",
+            "minishlab/potion-code-16M-v2",
+        ] {
+            let mut config =
+                EmbeddingProviderConfig::new("http://x".into(), model_id.into(), "k".into());
+            config.document_prefix = default_document_prefix_for_model(&config.model_id);
+            let provider = OpenAiProvider::new(config).unwrap();
+            assert_eq!(
+                provider.prepare_document_text("fn main() {}"),
+                "fn main() {}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn cached_provider_forwards_cancellation_on_cache_miss() {
         let cached = CachedEmbeddingProvider::new(CancellationAwareProvider, 8);
@@ -1444,6 +1650,54 @@ mod tests {
         // Unknown model without '/' won't attempt HF fetch.
         let prefix = default_query_prefix_for_model("some-unknown-model");
         assert!(prefix.is_none());
+    }
+
+    #[test]
+    fn query_prefix_cache_caches_negative_results() {
+        let cache: QueryPrefixCache = Mutex::new(HashMap::new());
+        let fetches = AtomicUsize::new(0);
+
+        assert_eq!(
+            cached_lookup_or_fetch(&cache, "acme/unknown", || {
+                fetches.fetch_add(1, Ordering::SeqCst);
+                None
+            }),
+            None
+        );
+        assert_eq!(
+            cached_lookup_or_fetch(&cache, "acme/unknown", || {
+                fetches.fetch_add(1, Ordering::SeqCst);
+                Some("should not be used".to_string())
+            }),
+            None
+        );
+        assert_eq!(fetches.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn query_prefix_cache_single_flights_each_model_without_serializing_models() {
+        let cache = Arc::new(Mutex::new(HashMap::new()));
+        let first_started = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let first_release = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let cache_for_thread = cache.clone();
+        let first_started_for_thread = first_started.clone();
+        let first_release_for_thread = first_release.clone();
+
+        let first = std::thread::spawn(move || {
+            cached_lookup_or_fetch(&cache_for_thread, "acme/slow", || {
+                first_started_for_thread.wait();
+                first_release_for_thread.wait();
+                Some("slow".to_string())
+            })
+        });
+
+        first_started.wait();
+        assert_eq!(
+            cached_lookup_or_fetch(&cache, "acme/fast", || Some("fast".to_string())),
+            Some("fast".to_string())
+        );
+        first_release.wait();
+        assert_eq!(first.join().unwrap(), Some("slow".to_string()));
     }
 
     #[test]

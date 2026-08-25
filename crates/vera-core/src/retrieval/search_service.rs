@@ -248,9 +248,12 @@ impl SearchContext {
                 metadata_store
                     .get_index_meta("embedding_dim")
                     .unwrap_or(None),
+                metadata_store
+                    .get_index_meta("document_prefix")
+                    .unwrap_or(None),
             )
         });
-        if let Some((Some(s_model), Some(s_dim))) = index_meta {
+        if let Some((Some(s_model), Some(s_dim), s_prefix)) = index_meta {
             if let Some(model_name) = self.model_name.as_deref() {
                 if !crate::config::model_names_match_with_aliases(
                     &s_model,
@@ -270,6 +273,25 @@ impl SearchContext {
                         &stores,
                     );
                 }
+            }
+            // A changed document prefix means the stored vectors live in a
+            // different vector space. Indexes written before this guard have
+            // no stored prefix, and their documents were never prefixed.
+            let active_prefix = provider.document_prefix_identity();
+            if s_prefix.as_deref().unwrap_or("") != active_prefix {
+                warn!(
+                    "Index document prefix '{}' does not match active prefix '{}'; using BM25-only search (re-index to restore vector search)",
+                    s_prefix.as_deref().unwrap_or(""),
+                    active_prefix
+                );
+                return run_bm25_only(
+                    query,
+                    filters,
+                    fetch_limit,
+                    result_limit,
+                    total_start,
+                    &stores,
+                );
             }
             if let Ok(dim) = s_dim.parse::<usize>() {
                 if let Some(provider_dim) = provider.expected_dim() {
@@ -648,6 +670,75 @@ mod tests {
             .unwrap();
         store.set_index_meta("model_name", "indexed-model").unwrap();
         store.set_index_meta("embedding_dim", "64").unwrap();
+
+        let bm25 = Bm25Index::open(&index_dir.join("bm25")).unwrap();
+        bm25.insert_batch(&[Bm25Document {
+            chunk_id: "auth:0",
+            file_path: "src/auth.rs",
+            content: "pub fn authenticate_user() -> bool { true }",
+            symbol_name: Some("authenticate_user"),
+            language: "rust",
+        }])
+        .unwrap();
+
+        let mut config = VeraConfig::default();
+        config.embedding.timeout_secs = 1;
+        config.embedding.max_retries = 0;
+        let filters = SearchFilters::default();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let context = rt.block_on(SearchContext::new(
+            &config,
+            crate::config::InferenceBackend::Api,
+        ));
+
+        let (results, timings) = rt
+            .block_on(context.search(index_dir, "authenticate user", None, &config, &filters, 10))
+            .unwrap();
+
+        assert_eq!(results[0].file_path, "src/auth.rs");
+        assert!(timings.bm25.is_some());
+        assert!(timings.vector.is_none());
+    }
+
+    #[test]
+    fn document_prefix_mismatch_falls_back_to_bm25() {
+        run_env_test(
+            "retrieval::search_service::tests::document_prefix_mismatch_falls_back_to_bm25_probe",
+            &[
+                ("EMBEDDING_MODEL_BASE_URL", Some("http://127.0.0.1:0")),
+                ("EMBEDDING_MODEL_ID", Some("indexed-model")),
+                ("EMBEDDING_MODEL_API_KEY", Some("dummy-key")),
+            ],
+        );
+    }
+
+    #[test]
+    #[ignore = "driven by document_prefix_mismatch_falls_back_to_bm25"]
+    fn document_prefix_mismatch_falls_back_to_bm25_probe() {
+        crate::init_tls();
+        let dir = tempdir().unwrap();
+        let index_dir = dir.path();
+
+        let store = MetadataStore::open(&index_dir.join("metadata.db")).unwrap();
+        store
+            .insert_chunks(&[Chunk {
+                id: "auth:0".to_string(),
+                file_path: "src/auth.rs".to_string(),
+                line_start: 1,
+                line_end: 4,
+                content: "pub fn authenticate_user() -> bool { true }".to_string(),
+                language: Language::Rust,
+                symbol_type: Some(SymbolType::Function),
+                symbol_name: Some("authenticate_user".to_string()),
+            }])
+            .unwrap();
+        store.set_index_meta("model_name", "indexed-model").unwrap();
+        store.set_index_meta("embedding_dim", "64").unwrap();
+        // The index was built with a document prefix, but the active provider
+        // configuration has none: the stored vectors are in another space.
+        store
+            .set_index_meta("document_prefix", "passage: ")
+            .unwrap();
 
         let bm25 = Bm25Index::open(&index_dir.join("bm25")).unwrap();
         bm25.insert_batch(&[Bm25Document {
