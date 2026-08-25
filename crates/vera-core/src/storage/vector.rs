@@ -1171,9 +1171,12 @@ impl VectorStore {
             .context("failed to get rowid for chunk")?;
 
         // Delete any existing vector for this rowid before inserting.
-        // vec0 virtual tables do not support INSERT OR REPLACE.
+        // vec0 virtual tables do not support INSERT OR REPLACE. Deleting an
+        // absent rowid is Ok with 0 rows, so only genuine failures (I/O,
+        // virtual-table malfunction) reach this error path; swallowing them
+        // would persist a mapping row the count and KNN cannot agree on.
         tx.execute("DELETE FROM vec_chunks WHERE rowid = ?1", params![rowid])
-            .ok(); // Ignore error if row doesn't exist.
+            .context("failed to delete stale vector")?;
 
         tx.execute(
             "INSERT INTO vec_chunks (rowid, embedding) VALUES (?1, ?2)",
@@ -1241,8 +1244,11 @@ impl VectorStore {
                     .query_row(params![chunk_id], |row| row.get(0))
                     .context("failed to get rowid")?;
 
-                // Delete old vector if exists (vec0 doesn't support upsert).
-                del_vec_stmt.execute(params![rowid]).ok();
+                // Same as in insert(): deleting an absent rowid is Ok with 0
+                // rows, so only genuine failures reach the error path.
+                del_vec_stmt
+                    .execute(params![rowid])
+                    .context("failed to delete stale vector")?;
 
                 vec_stmt
                     .execute(params![rowid, vector.as_bytes()])
@@ -1382,11 +1388,18 @@ impl VectorStore {
         Ok(mapped)
     }
 
-    /// Count total vectors in the store.
+    /// Count vectors actually stored, and therefore searchable.
+    ///
+    /// `chunk_id_map` historically backed this number, but a mapping row can
+    /// exist without a backing vector in databases written before single
+    /// inserts became transactional. KNN resolves every hit through
+    /// `vec_chunks`, so that is what an honest count reports; orphan mappings
+    /// neither inflate it nor surface in searches, and they disappear when
+    /// their file is next re-indexed.
     pub fn count(&self) -> Result<u64> {
         let count: i64 = self
             .conn
-            .query_row("SELECT COUNT(*) FROM chunk_id_map", [], |row| row.get(0))
+            .query_row("SELECT COUNT(*) FROM vec_chunks", [], |row| row.get(0))
             .context("failed to count vectors")?;
         Ok(count as u64)
     }
@@ -1912,6 +1925,46 @@ mod tests {
         let results = store.search(&[0.0, 0.0, 1.0, 0.0], 1).unwrap();
         assert_eq!(results[0].chunk_id, "c1");
         assert!(results[0].distance < 0.001);
+    }
+
+    #[test]
+    fn orphan_mapping_row_does_not_inflate_count() {
+        let store = VectorStore::open_in_memory(4).unwrap();
+        store.insert("real", &[1.0, 0.0, 0.0, 0.0]).unwrap();
+
+        // Simulate a database written before single inserts became
+        // transactional: a mapping row whose vector write never landed.
+        store
+            .conn
+            .execute(
+                "INSERT INTO chunk_id_map (chunk_id) VALUES (?1)",
+                params!["ghost"],
+            )
+            .unwrap();
+
+        assert_eq!(
+            store.count().unwrap(),
+            1,
+            "count must report stored vectors, not mapping rows"
+        );
+        let results = store.search(&[1.0, 0.0, 0.0, 0.0], 5).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].chunk_id, "real");
+    }
+
+    #[test]
+    fn batch_failure_rolls_back_earlier_items() {
+        let store = VectorStore::open_in_memory(4).unwrap();
+        let items: Vec<(&str, &[f32])> = vec![
+            ("good-1", &[1.0, 0.0, 0.0, 0.0]),
+            ("bad-dim", &[1.0, 0.0]), // dimension mismatch aborts mid-batch
+        ];
+        assert!(store.insert_batch(&items).is_err());
+
+        // The earlier item's mapping row and vector are both gone: the
+        // transaction rolls back when commit never runs.
+        assert_eq!(store.count().unwrap(), 0);
+        assert!(store.search(&[1.0, 0.0, 0.0, 0.0], 5).unwrap().is_empty());
     }
 
     #[test]

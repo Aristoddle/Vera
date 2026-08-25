@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 
 use anyhow::{Context, Result};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 
 use crate::parsing::type_relations::{RawTypeRelation, TypeRelationKind};
 use crate::types::{Chunk, Language, SymbolType};
@@ -85,6 +85,18 @@ pub struct FileIndexState {
     pub chunk_count: u64,
 }
 
+/// Per-file chunk aggregates fetched without the `content` column.
+#[derive(Debug, Clone)]
+pub struct FileChunkSummary {
+    /// Number of chunks stored for the file.
+    pub chunk_count: u64,
+    /// Highest `line_end` across the file's chunks.
+    pub max_line_end: u32,
+    /// `MIN(language)` for the file. Real-world files are single-language;
+    /// an aggregate cannot know which chunk came first.
+    pub language: String,
+}
+
 /// Aggregate index health derived from persisted file states.
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct IndexHealth {
@@ -143,6 +155,21 @@ const SQL_FIND_DEAD_SYMBOLS: &str = "SELECT c.symbol_name, c.file_path, c.line_s
                    )
                  ORDER BY c.file_path, c.line_start";
 
+/// Tables every complete index must contain. `open_existing` refuses
+/// half-written or truncated databases instead of serving empty results.
+const REQUIRED_TABLES: &[&str] = &[
+    "chunks",
+    "file_hashes",
+    "file_index_state",
+    "index_metadata",
+    "references",
+    "type_relations",
+];
+
+/// Stay below SQLite's lowest plausible host-parameter limit so a single
+/// `IN (...)` batch never fails on large file sets.
+const SQL_PARAMETER_BATCH: usize = 900;
+
 /// SQLite-backed metadata store for chunk attributes.
 pub struct MetadataStore {
     conn: Connection,
@@ -156,6 +183,48 @@ impl MetadataStore {
         let store = Self { conn };
         store.init_schema()?;
         Ok(store)
+    }
+
+    /// Open an existing metadata store without creating or modifying it.
+    ///
+    /// Read-side commands must use this instead of [`Self::open`]: `open`
+    /// creates the database file when missing and stamps schema DDL, so a
+    /// read against a crashed or deleted index would fabricate an empty
+    /// database and report success. Here a missing file, or a file missing
+    /// any required table, becomes a re-index hint instead.
+    pub fn open_existing(db_path: &std::path::Path) -> Result<Self> {
+        if !db_path.is_file() {
+            anyhow::bail!(
+                "no index metadata found at: {}\nRun `vera index <path>` first to create an index.",
+                db_path.display()
+            );
+        }
+        let conn = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .with_context(|| format!("failed to open metadata db: {}", db_path.display()))?;
+        let store = Self { conn };
+        store.validate_schema()?;
+        Ok(store)
+    }
+
+    /// Fail unless every table a complete index relies on is present.
+    fn validate_schema(&self) -> Result<()> {
+        let db_path = self.conn.path().unwrap_or_default();
+        for table in REQUIRED_TABLES {
+            let present: bool = self
+                .conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+                    params![table],
+                    |row| row.get(0),
+                )
+                .context("failed to inspect metadata schema")?;
+            anyhow::ensure!(
+                present,
+                "metadata db at {} is missing the `{table}` table\nRun `vera index <path>` to rebuild the index.",
+                db_path
+            );
+        }
+        Ok(())
     }
 
     /// Create an in-memory metadata store (useful for testing).
@@ -399,6 +468,75 @@ impl MetadataStore {
             .context("failed to query chunks by file")?;
 
         collect_rows(rows)?.into_iter().collect()
+    }
+
+    /// Per-file chunk aggregates for many files in one grouped query per
+    /// batch, never fetching chunk content.
+    ///
+    /// Files with no chunk rows are absent from the map.
+    pub fn file_chunk_summaries(
+        &self,
+        file_paths: &[String],
+    ) -> Result<HashMap<String, FileChunkSummary>> {
+        let mut summaries = HashMap::with_capacity(file_paths.len());
+        for batch in file_paths.chunks(SQL_PARAMETER_BATCH) {
+            let placeholders = std::iter::repeat_n("?", batch.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT file_path, COUNT(*), MAX(line_end), MIN(language)
+                 FROM chunks WHERE file_path IN ({placeholders})
+                 GROUP BY file_path"
+            );
+            let mut stmt = self
+                .conn
+                .prepare(&sql)
+                .context("failed to prepare file chunk summaries query")?;
+            let rows = stmt
+                .query_map(rusqlite::params_from_iter(batch.iter()), |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        FileChunkSummary {
+                            chunk_count: row.get::<_, i64>(1)? as u64,
+                            max_line_end: row.get(2)?,
+                            language: row.get(3)?,
+                        },
+                    ))
+                })
+                .context("failed to query file chunk summaries")?;
+            for (file_path, summary) in collect_rows(rows)? {
+                summaries.insert(file_path, summary);
+            }
+        }
+        Ok(summaries)
+    }
+
+    /// Symbol-type totals across a set of files, aggregated in SQL.
+    pub fn symbol_type_counts(&self, file_paths: &[String]) -> Result<Vec<(String, u64)>> {
+        let mut totals: HashMap<String, u64> = HashMap::new();
+        for batch in file_paths.chunks(SQL_PARAMETER_BATCH) {
+            let placeholders = std::iter::repeat_n("?", batch.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT symbol_type, COUNT(*) FROM chunks
+                 WHERE file_path IN ({placeholders}) AND symbol_type IS NOT NULL
+                 GROUP BY symbol_type"
+            );
+            let mut stmt = self
+                .conn
+                .prepare(&sql)
+                .context("failed to prepare symbol type counts query")?;
+            let rows = stmt
+                .query_map(rusqlite::params_from_iter(batch.iter()), |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64))
+                })
+                .context("failed to query symbol type counts")?;
+            for (symbol_type, count) in collect_rows(rows)? {
+                *totals.entry(symbol_type).or_default() += count;
+            }
+        }
+        Ok(totals.into_iter().collect())
     }
 
     /// Get all chunks whose symbol name matches exactly (case-insensitive).
@@ -1062,26 +1200,14 @@ impl MetadataStore {
 
     /// Find likely entry point files (main.*, index.*, app.*, etc.).
     pub fn entry_points(&self) -> Result<Vec<String>> {
-        let mut stmt = self
-            .conn
-            .prepare(
-                "SELECT DISTINCT file_path FROM chunks
-                 WHERE file_path LIKE '%/main.%'
-                    OR file_path LIKE 'main.%'
-                    OR file_path LIKE '%/index.%'
-                    OR file_path LIKE '%/app.%'
-                    OR file_path LIKE 'app.%'
-                    OR file_path LIKE '%/lib.%'
-                    OR file_path LIKE 'lib.%'
-                    OR file_path LIKE '%/mod.%'
-                    OR file_path LIKE '%/server.%'
-                 ORDER BY file_path",
-            )
-            .context("failed to prepare entry points query")?;
-        let rows = stmt
-            .query_map([], |row| row.get::<_, String>(0))
-            .context("failed to query entry points")?;
-        collect_rows(rows)
+        // Filter the distinct file set here rather than in SQL: nine
+        // leading-wildcard LIKEs forced a scan of every chunk row, while this
+        // is O(files) over paths SQLite already deduplicates.
+        let files = self.indexed_files()?;
+        Ok(files
+            .into_iter()
+            .filter(|file_path| is_entry_point_path(file_path))
+            .collect())
     }
 }
 
@@ -1114,7 +1240,13 @@ fn row_to_chunk(row: &rusqlite::Row<'_>) -> Result<Chunk> {
 /// Parse a language string back into the enum.
 /// Delegates to `Language::from_str()` to stay in sync with the `Display` impl.
 fn parse_language(s: &str) -> Language {
-    s.parse::<Language>().unwrap_or(Language::Unknown)
+    match s.parse::<Language>() {
+        Ok(language) => language,
+        Err(_) => {
+            warn_unknown_enum_value("language", s);
+            Language::Unknown
+        }
+    }
 }
 
 /// Parse a symbol type string back into the enum.
@@ -1131,8 +1263,49 @@ fn parse_symbol_type(s: &str) -> SymbolType {
         "constant" => SymbolType::Constant,
         "variable" => SymbolType::Variable,
         "module" => SymbolType::Module,
-        _ => SymbolType::Block,
+        "block" => SymbolType::Block,
+        other => {
+            warn_unknown_enum_value("symbol type", other);
+            SymbolType::Block
+        }
     }
+}
+
+/// Warn once per process and enum kind about a persisted value that resolves
+/// to no known variant. A newer binary can persist variants older readers
+/// cannot represent, and coercion is then unavoidable, but it must be loud,
+/// independently per kind: a broken `language` column must not mute a broken
+/// `symbol_type` column. Repeat rows describe the same defect; warning on
+/// each would flood the log over a large index.
+fn warn_unknown_enum_value(kind: &'static str, value: &str) {
+    static WARNED_KINDS: std::sync::OnceLock<std::sync::Mutex<HashMap<&'static str, String>>> =
+        std::sync::OnceLock::new();
+    let warned = WARNED_KINDS.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    let Ok(mut warned) = warned.lock() else {
+        return;
+    };
+    if warned.insert(kind, value.to_string()).is_none() {
+        tracing::warn!(
+            enum_kind = kind,
+            value = value,
+            "unknown persisted enum value; reporting the fallback variant"
+        );
+    }
+}
+
+/// Whether a path's final component names a conventional entry point file
+/// (`main.rs`, `index.ts`, `app.py`, ...).
+pub(crate) fn is_entry_point_path(file_path: &str) -> bool {
+    let Some(file_name) = std::path::Path::new(file_path)
+        .file_name()
+        .and_then(|name| name.to_str())
+    else {
+        return false;
+    };
+    let Some((stem, _rest)) = file_name.split_once('.') else {
+        return false;
+    };
+    matches!(stem, "main" | "index" | "app" | "lib" | "mod" | "server")
 }
 
 /// Collect fallible mapped rows into a Vec, attaching a read-failure context.
@@ -1674,5 +1847,154 @@ mod tests {
     fn parse_language_unknown_input() {
         assert_eq!(parse_language("nonexistent"), Language::Unknown);
         assert_eq!(parse_language(""), Language::Unknown);
+    }
+
+    #[test]
+    fn open_existing_errors_on_missing_db_without_creating_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("metadata.db");
+
+        let error = match MetadataStore::open_existing(&db_path) {
+            Ok(_) => panic!("open_existing must fail on a missing database"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("no index metadata found"),
+            "error was: {error:#}"
+        );
+        assert!(
+            !db_path.exists(),
+            "a failed read-side open must not create the database"
+        );
+
+        // The write-side open keeps create-or-open semantics, and once the
+        // database exists the read-side open succeeds against it.
+        assert!(MetadataStore::open(&db_path).is_ok());
+        assert!(MetadataStore::open_existing(&db_path).is_ok());
+    }
+
+    #[test]
+    fn open_existing_rejects_partial_schemas_instead_of_serving_empty_results() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("metadata.db");
+        drop(MetadataStore::open(&db_path).unwrap());
+
+        // Simulate an index truncated mid-write by dropping a required table.
+        Connection::open(&db_path)
+            .unwrap()
+            .execute_batch("DROP TABLE chunks;")
+            .unwrap();
+
+        let error = match MetadataStore::open_existing(&db_path) {
+            Ok(_) => panic!("open_existing must reject a partial schema"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("`chunks`"),
+            "error must name the missing table, was: {error:#}"
+        );
+    }
+
+    #[test]
+    fn file_summaries_and_symbol_counts_aggregate_in_sql_without_content() {
+        let store = MetadataStore::open_in_memory().unwrap();
+        store.insert_chunks(&sample_chunks()).unwrap();
+
+        let files = vec!["src/main.rs".to_string(), "src/lib.py".to_string()];
+        let summaries = store.file_chunk_summaries(&files).unwrap();
+
+        let main_rs = &summaries["src/main.rs"];
+        assert_eq!(main_rs.chunk_count, 2);
+        assert_eq!(main_rs.max_line_end, 12);
+        assert_eq!(main_rs.language, "rust");
+        assert_eq!(summaries["src/lib.py"].chunk_count, 1);
+        assert_eq!(summaries.len(), 2);
+
+        let mut symbol_types = store.symbol_type_counts(&files).unwrap();
+        symbol_types.sort();
+        assert_eq!(
+            symbol_types,
+            vec![("function".to_string(), 2), ("struct".to_string(), 1),]
+        );
+
+        // Empty input runs zero batches and absent files have no rows.
+        assert!(store.file_chunk_summaries(&[]).unwrap().is_empty());
+        let missing = vec!["gone.rs".to_string()];
+        assert!(store.file_chunk_summaries(&missing).unwrap().is_empty());
+    }
+
+    #[test]
+    fn file_summaries_cover_batches_beyond_the_parameter_limit() {
+        let store = MetadataStore::open_in_memory().unwrap();
+        let total = SQL_PARAMETER_BATCH + 50;
+        let chunks: Vec<Chunk> = (0..total)
+            .map(|index| Chunk {
+                id: format!("f{index}:0"),
+                file_path: format!("f{index}.rs"),
+                line_start: 1,
+                line_end: 3,
+                content: String::new(),
+                language: Language::Rust,
+                symbol_type: None,
+                symbol_name: None,
+            })
+            .collect();
+        store.insert_chunks(&chunks).unwrap();
+
+        let files: Vec<String> = (0..total).map(|index| format!("f{index}.rs")).collect();
+        let summaries = store.file_chunk_summaries(&files).unwrap();
+        assert_eq!(summaries.len(), total);
+        assert!(summaries.values().all(|summary| summary.chunk_count == 1));
+        // No chunk set a symbol type, so the totals are empty rather than wrong.
+        assert!(store.symbol_type_counts(&files).unwrap().is_empty());
+    }
+
+    #[test]
+    fn entry_points_come_from_distinct_files_without_a_full_chunk_scan() {
+        let store = MetadataStore::open_in_memory().unwrap();
+        let chunk = |id: &str, path: &str| Chunk {
+            id: id.to_string(),
+            file_path: path.to_string(),
+            line_start: 1,
+            line_end: 2,
+            content: String::new(),
+            language: Language::Rust,
+            symbol_type: None,
+            symbol_name: None,
+        };
+        let chunks = vec![
+            chunk("a", "src/main.rs"),
+            // A second chunk of the same file must not duplicate the entry point.
+            chunk("b", "src/main.rs"),
+            chunk("c", "server.ts"),
+            chunk("d", "src/domain.rs"),
+        ];
+        store.insert_chunks(&chunks).unwrap();
+
+        // Root-level server.ts counts too: the predicate is shared with the
+        // filtered-overview path instead of the old SQL's slash-only arm, and
+        // results inherit indexed_files()' path ordering.
+        assert_eq!(
+            store.entry_points().unwrap(),
+            vec!["server.ts".to_string(), "src/main.rs".to_string()]
+        );
+    }
+
+    #[test]
+    fn unknown_persisted_enum_values_fall_back_per_kind_while_valid_values_survive() {
+        // Unknown strings coerce to the documented fallbacks...
+        assert_eq!(
+            parse_symbol_type("invented_by_a_newer_binary"),
+            SymbolType::Block
+        );
+        assert_eq!(
+            parse_language("invented_by_a_newer_binary"),
+            Language::Unknown
+        );
+        // ...and each kind warns independently without corrupting the others:
+        // valid values, including Block itself, pass through untouched.
+        assert_eq!(parse_symbol_type("block"), SymbolType::Block);
+        assert_eq!(parse_symbol_type("type_alias"), SymbolType::TypeAlias);
+        assert_eq!(parse_language("rust"), Language::Rust);
     }
 }
