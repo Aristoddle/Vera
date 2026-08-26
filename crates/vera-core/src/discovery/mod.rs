@@ -367,17 +367,25 @@ pub fn discover_files_with_cancellation(
             Err(_) => path.to_string_lossy().to_string(),
         };
 
-        // Get file metadata through the root capability for size checking.
-        let metadata = match root_dir.metadata(Path::new(&relative_path)) {
-            Ok(m) => m,
+        // Open once and stat through the handle, so the size gate and the
+        // binary sniff below observe the same file even if the path is swapped
+        // between opens; a fresh path stat here could bless another inode.
+        let mut file = match root_dir.open(Path::new(&relative_path)) {
+            Ok(file) => file,
+            Err(err) => {
+                warn!("cannot open {}: {err}", path.display());
+                error_skipped += 1;
+                continue;
+            }
+        };
+        let size = match file.metadata() {
+            Ok(metadata) => metadata.len(),
             Err(err) => {
                 warn!("cannot read metadata for {}: {err}", path.display());
                 error_skipped += 1;
                 continue;
             }
         };
-
-        let size = metadata.len();
 
         // Skip large files.
         if size > config.max_file_size_bytes {
@@ -409,7 +417,7 @@ pub fn discover_files_with_cancellation(
         }
 
         // Skip binary files by content detection (read first 8KB).
-        match is_binary_content_at(&root_dir, Path::new(&relative_path)) {
+        match is_binary_file(&mut file) {
             Ok(true) => {
                 debug!("skipping binary (content): {}", path.display());
                 binary_skipped += 1;
@@ -1170,34 +1178,44 @@ fn is_rst_include_fragment(path: &Path) -> bool {
         .is_some_and(|name| name.to_ascii_lowercase().ends_with(".rst.inc"))
 }
 
-/// Check if a file contains binary content by reading the first 8KB.
+/// Fill `buf` from `reader`, looping past short reads until it is full or EOF,
+/// and return how many bytes were filled.
 ///
-/// Uses the null-byte heuristic: if any null bytes are found in the
-/// first 8KB, the file is considered binary.
-fn is_binary_content(path: &Path) -> Result<bool> {
-    use std::io::Read;
-
-    let mut file = std::fs::File::open(path)
-        .with_context(|| format!("cannot open for binary check: {}", path.display()))?;
-
-    let mut buf = [0u8; 8192];
-    let n = file.read(&mut buf)?;
-
-    // Null byte detection: any \0 in the sample means binary.
-    Ok(buf[..n].contains(&0))
+/// A network or FUSE filesystem may return fewer bytes than requested even when
+/// more follow, so a single `read` cannot distinguish EOF from a short read;
+/// trusting one would classify the unread tail of a binary file as absent.
+fn read_prefix(reader: &mut impl std::io::Read, buf: &mut [u8]) -> std::io::Result<usize> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        match reader.read(&mut buf[filled..]) {
+            Ok(0) => break,
+            Ok(count) => filled += count,
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(filled)
 }
 
-fn is_binary_content_at(root_dir: &Dir, relative_path: &Path) -> Result<bool> {
-    use std::io::Read;
-
-    let mut file = root_dir
-        .open(relative_path)
-        .with_context(|| format!("cannot open for binary check: {}", relative_path.display()))?;
-
+/// Check whether an already-open file contains binary content in its first 8KB.
+///
+/// Uses the null-byte heuristic: if any null bytes are found in the sample, the
+/// file is considered binary. Takes the open handle so callers that already hold
+/// the file do not reopen it by path and risk inspecting a different file.
+fn is_binary_file(file: &mut impl std::io::Read) -> Result<bool> {
     let mut buf = [0u8; 8192];
-    let n = file.read(&mut buf)?;
+    let filled = read_prefix(file, &mut buf)?;
 
-    Ok(buf[..n].contains(&0))
+    // Null byte detection: any \0 in the sample means binary.
+    Ok(buf[..filled].contains(&0))
+}
+
+/// Check if a file contains binary content by reading its first 8KB through a
+/// fresh open at `path`; see [`is_binary_file`] for the heuristic.
+fn is_binary_content(path: &Path) -> Result<bool> {
+    let mut file = std::fs::File::open(path)
+        .with_context(|| format!("cannot open for binary check: {}", path.display()))?;
+    is_binary_file(&mut file)
 }
 
 #[cfg(test)]
@@ -2172,5 +2190,46 @@ mod tests {
             explain_path(dir.path(), Path::new("null-device"), &default_config()).unwrap();
         assert_eq!(explanation.decision, PathDecision::Excluded);
         assert_eq!(explanation.reason, PathReason::NonRegularFile);
+    }
+
+    /// Emulates network and FUSE filesystems: every `read` returns at most two
+    /// bytes even though more data follows until the content runs out.
+    struct ShortReader<'a> {
+        remaining: &'a [u8],
+    }
+
+    impl std::io::Read for ShortReader<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let count = buf.len().min(self.remaining.len()).min(2);
+            buf[..count].copy_from_slice(&self.remaining[..count]);
+            self.remaining = &self.remaining[count..];
+            Ok(count)
+        }
+    }
+
+    /// Regression test: a single `read` stops at the first short read, before
+    /// the null byte, and would classify this content as text.
+    #[test]
+    fn binary_sniff_reads_past_short_reads_to_the_null_byte() {
+        let content = b"ok\x00rest of a binary file";
+        let mut reader = ShortReader { remaining: content };
+        let mut buf = [0u8; 8192];
+
+        let filled = read_prefix(&mut reader, &mut buf).unwrap();
+
+        assert_eq!(filled, content.len());
+        assert!(buf[..filled].contains(&0));
+    }
+
+    #[test]
+    fn binary_sniff_stops_filling_at_end_of_input() {
+        let content = b"plain text, no null bytes";
+        let mut reader = ShortReader { remaining: content };
+        let mut buf = [0u8; 8192]; // Larger than the content.
+
+        let filled = read_prefix(&mut reader, &mut buf).unwrap();
+
+        assert_eq!(filled, content.len());
+        assert!(!buf[..filled].contains(&0));
     }
 }
