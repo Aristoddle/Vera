@@ -425,13 +425,13 @@ impl LocalEmbeddingModelConfig {
         // non-default value via env vars. Note: the CLI config loader sets
         // this env var from saved config even for default values, so we
         // check the actual value, not just presence.
-        if let Some(env_val) = env_override(LOCAL_EMBEDDING_ONNX_FILE_ENV) {
-            if env_val != EMBEDDING_ONNX_FILE {
-                tracing::debug!(
-                    "adjust_for_gpu: user overrode ONNX file via env to {env_val}, skipping swap"
-                );
-                return;
-            }
+        if let Some(env_val) = env_override(LOCAL_EMBEDDING_ONNX_FILE_ENV)
+            && env_val != EMBEDDING_ONNX_FILE
+        {
+            tracing::debug!(
+                "adjust_for_gpu: user overrode ONNX file via env to {env_val}, skipping swap"
+            );
+            return;
         }
         if matches!(
             &self.source,
@@ -982,10 +982,10 @@ pub use ort::{
 /// 3. `$XDG_DATA_HOME/vera` (XDG standard, defaults to `~/.local/share/vera`)
 /// 4. `~/.vera` as final fallback
 pub fn vera_home_dir() -> Result<PathBuf> {
-    if let Ok(path) = std::env::var("VERA_HOME") {
-        if !path.trim().is_empty() {
-            return Ok(PathBuf::from(path));
-        }
+    if let Ok(path) = std::env::var("VERA_HOME")
+        && !path.trim().is_empty()
+    {
+        return Ok(PathBuf::from(path));
     }
 
     let home = dirs::home_dir().context("Could not find home directory")?;

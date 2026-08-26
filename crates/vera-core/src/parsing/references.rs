@@ -261,17 +261,16 @@ fn collect_calls(
     let mut cursor = root.walk();
     loop {
         let node = cursor.node();
-        if is_call_node(lang, node.kind()) {
-            if let Some(callee) = extract_callee(&node, source) {
-                if !is_jsx_host_element(&node, source) {
-                    let caller = find_enclosing_symbol(symbols, node.start_byte());
-                    refs.push(RawReference {
-                        callee,
-                        caller,
-                        line: node.start_position().row as u32 + 1,
-                    });
-                }
-            }
+        if is_call_node(lang, node.kind())
+            && let Some(callee) = extract_callee(&node, source)
+            && !is_jsx_host_element(&node, source)
+        {
+            let caller = find_enclosing_symbol(symbols, node.start_byte());
+            refs.push(RawReference {
+                callee,
+                caller,
+                line: node.start_position().row as u32 + 1,
+            });
         }
         // Depth-first: try child, then sibling, then backtrack.
         if cursor.goto_first_child() {

@@ -668,15 +668,15 @@ impl LruCache {
 
     fn insert(&mut self, key: String, vector: Vec<f32>) {
         // Evict oldest entry if at capacity and this is a new key.
-        if self.entries.len() >= self.max_entries && !self.entries.contains_key(&key) {
-            if let Some(oldest_key) = self
+        if self.entries.len() >= self.max_entries
+            && !self.entries.contains_key(&key)
+            && let Some(oldest_key) = self
                 .entries
                 .iter()
                 .min_by_key(|(_, e)| e.inserted_at)
                 .map(|(k, _)| k.clone())
-            {
-                self.entries.remove(&oldest_key);
-            }
+        {
+            self.entries.remove(&oldest_key);
         }
         self.entries.insert(
             key,

@@ -562,15 +562,15 @@ pub async fn refresh_ort_library_for_ep(ep: OnnxExecutionProvider) -> Result<Pat
                 )
             })?;
         }
-    } else if let Some(dir) = target_path.parent() {
-        if dir.exists() {
-            fs::remove_dir_all(dir).await.with_context(|| {
-                format!(
-                    "failed to remove stale ONNX Runtime directory {}",
-                    dir.display()
-                )
-            })?;
-        }
+    } else if let Some(dir) = target_path.parent()
+        && dir.exists()
+    {
+        fs::remove_dir_all(dir).await.with_context(|| {
+            format!(
+                "failed to remove stale ONNX Runtime directory {}",
+                dir.display()
+            )
+        })?;
     }
 
     ensure_ort_library_for_ep_with_cuda_major(ep, detected_cuda_major).await
@@ -1056,19 +1056,19 @@ pub(super) fn collect_runtime_libraries(
     suffix: &str,
 ) -> Vec<PathBuf> {
     let mut inspected_files = vec![runtime_path.to_path_buf()];
-    if let Some(dir) = runtime_path.parent() {
-        if let Ok(entries) = std::fs::read_dir(dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-                    continue;
-                };
-                if (name.starts_with("libonnxruntime") || name.starts_with("onnxruntime"))
-                    && name.contains(suffix)
-                    && path != runtime_path
-                {
-                    inspected_files.push(path);
-                }
+    if let Some(dir) = runtime_path.parent()
+        && let Ok(entries) = std::fs::read_dir(dir)
+    {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            if (name.starts_with("libonnxruntime") || name.starts_with("onnxruntime"))
+                && name.contains(suffix)
+                && path != runtime_path
+            {
+                inspected_files.push(path);
             }
         }
     }

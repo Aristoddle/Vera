@@ -211,10 +211,10 @@ fn rust_relations(chunk: &Chunk, header: &str) -> Vec<RawTypeRelation> {
     }
 
     let mut body = header.trim_start_matches("impl").trim();
-    if body.starts_with('<') {
-        if let Some(end) = matching_delimiter(body, 0, '<', '>') {
-            body = body[end + 1..].trim();
-        }
+    if body.starts_with('<')
+        && let Some(end) = matching_delimiter(body, 0, '<', '>')
+    {
+        body = body[end + 1..].trim();
     }
 
     let Some(idx) = top_level_keyword_index(body, " for ") else {
@@ -339,16 +339,16 @@ fn objective_c_relations(chunk: &Chunk, owner: &str) -> Vec<RawTypeRelation> {
         }
     }
 
-    if let Some(start) = header.find('<') {
-        if let Some(end) = header[start + 1..].find('>') {
-            let protocols = &header[start + 1..start + 1 + end];
-            relations.extend(build_relations(
-                chunk.line_start,
-                owner,
-                split_targets(protocols, &[',']),
-                TypeRelationKind::Conforms,
-            ));
-        }
+    if let Some(start) = header.find('<')
+        && let Some(end) = header[start + 1..].find('>')
+    {
+        let protocols = &header[start + 1..start + 1 + end];
+        relations.extend(build_relations(
+            chunk.line_start,
+            owner,
+            split_targets(protocols, &[',']),
+            TypeRelationKind::Conforms,
+        ));
     }
 
     relations

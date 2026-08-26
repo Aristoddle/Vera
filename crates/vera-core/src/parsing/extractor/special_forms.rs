@@ -178,23 +178,22 @@ pub(super) fn extract_elixir_name(node: &tree_sitter::Node<'_>, source: &[u8]) -
         }
     }
 
-    if let Some(args_node) = args {
-        if args_node.named_child_count() > 0 {
-            if let Some(first_arg) = args_node.named_child(0) {
-                if first_arg.kind() == "call" {
-                    if let Some(target) = first_arg.child_by_field_name("target") {
-                        return target.utf8_text(source).ok().map(|s| s.to_string());
-                    }
-                }
-                let mut inner_cursor = first_arg.walk();
-                for child in first_arg.children(&mut inner_cursor) {
-                    if child.kind() == "identifier" || child.kind() == "alias" {
-                        return child.utf8_text(source).ok().map(|s| s.to_string());
-                    }
-                }
-                return first_arg.utf8_text(source).ok().map(|s| s.to_string());
+    if let Some(args_node) = args
+        && args_node.named_child_count() > 0
+        && let Some(first_arg) = args_node.named_child(0)
+    {
+        if first_arg.kind() == "call"
+            && let Some(target) = first_arg.child_by_field_name("target")
+        {
+            return target.utf8_text(source).ok().map(|s| s.to_string());
+        }
+        let mut inner_cursor = first_arg.walk();
+        for child in first_arg.children(&mut inner_cursor) {
+            if child.kind() == "identifier" || child.kind() == "alias" {
+                return child.utf8_text(source).ok().map(|s| s.to_string());
             }
         }
+        return first_arg.utf8_text(source).ok().map(|s| s.to_string());
     }
     None
 }
@@ -509,13 +508,13 @@ pub(super) fn extract_general_class_methods(
                     let mut end_row = item.end_position().row;
 
                     // Dart detached method body
-                    if lang == Language::Dart && item.kind() == "method_signature" {
-                        if let Some(next) = item.next_sibling() {
-                            if next.kind() == "function_body" {
-                                end_byte = next.end_byte();
-                                end_row = next.end_position().row;
-                            }
-                        }
+                    if lang == Language::Dart
+                        && item.kind() == "method_signature"
+                        && let Some(next) = item.next_sibling()
+                        && next.kind() == "function_body"
+                    {
+                        end_byte = next.end_byte();
+                        end_row = next.end_position().row;
                     }
 
                     let name = extract_name(&item, source);
@@ -534,13 +533,12 @@ pub(super) fn extract_general_class_methods(
                             let mut end_byte = cm_child.end_byte();
                             let mut end_row = cm_child.end_position().row;
 
-                            if cm_child.kind() == "method_signature" {
-                                if let Some(next) = cm_child.next_sibling() {
-                                    if next.kind() == "function_body" {
-                                        end_byte = next.end_byte();
-                                        end_row = next.end_position().row;
-                                    }
-                                }
+                            if cm_child.kind() == "method_signature"
+                                && let Some(next) = cm_child.next_sibling()
+                                && next.kind() == "function_body"
+                            {
+                                end_byte = next.end_byte();
+                                end_row = next.end_position().row;
                             }
 
                             let name = extract_name(&cm_child, source);

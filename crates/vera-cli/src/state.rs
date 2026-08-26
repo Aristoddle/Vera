@@ -181,10 +181,10 @@ pub fn vera_dir() -> Result<PathBuf> {
 }
 
 pub fn user_home_dir() -> Result<PathBuf> {
-    if let Ok(path) = std::env::var("VERA_USER_HOME") {
-        if !path.trim().is_empty() {
-            return Ok(PathBuf::from(path));
-        }
+    if let Ok(path) = std::env::var("VERA_USER_HOME")
+        && !path.trim().is_empty()
+    {
+        return Ok(PathBuf::from(path));
     }
     dirs::home_dir().context("Could not find home directory")
 }

@@ -182,10 +182,10 @@ fn search_env_reads(
                     let Some(found_name) = first_capture(&captures) else {
                         continue;
                     };
-                    if let Some(target) = target {
-                        if !found_name.eq_ignore_ascii_case(target) {
-                            continue;
-                        }
+                    if let Some(target) = target
+                        && !found_name.eq_ignore_ascii_case(target)
+                    {
+                        continue;
                     }
                     results.push(StructuralMatch {
                         start_byte: full.start(),
@@ -356,21 +356,20 @@ fn result_for_match(
     prefer_chunk: bool,
 ) -> SearchResult {
     let line = crate::retrieval::file_scan::byte_to_line(content, start_byte);
-    if prefer_chunk {
-        if let Some(chunk) = smallest_symbol_chunk_for_line(chunks, line)
+    if prefer_chunk
+        && let Some(chunk) = smallest_symbol_chunk_for_line(chunks, line)
             .filter(|chunk| chunk.line_end.saturating_sub(chunk.line_start) <= 80)
-        {
-            return SearchResult {
-                file_path: file_path.to_string(),
-                line_start: chunk.line_start,
-                line_end: chunk.line_end,
-                content: chunk.content.clone(),
-                language,
-                score: 1.0,
-                symbol_name: chunk.symbol_name.clone(),
-                symbol_type: chunk.symbol_type,
-            };
-        }
+    {
+        return SearchResult {
+            file_path: file_path.to_string(),
+            line_start: chunk.line_start,
+            line_end: chunk.line_end,
+            content: chunk.content.clone(),
+            language,
+            score: 1.0,
+            symbol_name: chunk.symbol_name.clone(),
+            symbol_type: chunk.symbol_type,
+        };
     }
 
     let (snippet, line_start, line_end) = bounded_byte_snippet(content, start_byte, end_byte, 220);

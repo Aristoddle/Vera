@@ -102,10 +102,10 @@ pub(crate) fn extract_name(node: &tree_sitter::Node<'_>, source: &[u8]) -> Optio
     if node.kind() == "method_signature" {
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
-            if child.kind() == "function_signature" {
-                if let Some(name_child) = child.child_by_field_name("name") {
-                    return name_from_node(&name_child, source);
-                }
+            if child.kind() == "function_signature"
+                && let Some(name_child) = child.child_by_field_name("name")
+            {
+                return name_from_node(&name_child, source);
             }
         }
     }

@@ -88,10 +88,10 @@ struct SharedEngine {
 impl SharedEngine {
     fn get(&self, runtime: &WatchRuntime) -> Result<Engine, anyhow::Error> {
         let mut guard = self.cached.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(cached) = guard.as_ref() {
-            if cached.provider_identity == runtime.provider_identity {
-                return Ok(Arc::clone(&cached.engine));
-            }
+        if let Some(cached) = guard.as_ref()
+            && cached.provider_identity == runtime.provider_identity
+        {
+            return Ok(Arc::clone(&cached.engine));
         }
         let engine = (self.build)(runtime)?;
         *guard = Some(CachedEngine {

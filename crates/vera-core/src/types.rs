@@ -80,10 +80,10 @@ impl SearchFilters {
 
     /// Check whether a file-level candidate matches active language/path filters.
     pub fn matches_file(&self, file_path: &str, language: Language) -> bool {
-        if let Some(ref lang) = self.language {
-            if !language.to_string().eq_ignore_ascii_case(lang) {
-                return false;
-            }
+        if let Some(ref lang) = self.language
+            && !language.to_string().eq_ignore_ascii_case(lang)
+        {
+            return false;
         }
 
         if !self.path_glob.is_empty()
@@ -147,14 +147,14 @@ impl SearchFilters {
             })
         };
 
-        if let Some(scope) = self.scope {
-            if !crate::corpus::matches_scope(
+        if let Some(scope) = self.scope
+            && !crate::corpus::matches_scope(
                 content_class(),
                 scope,
                 self.include_generated.unwrap_or(true),
-            ) {
-                return false;
-            }
+            )
+        {
+            return false;
         }
 
         if self.include_generated == Some(false)
@@ -254,10 +254,10 @@ fn glob_match_recursive(pattern: &str, text: &str) -> bool {
     // Match literal characters.
     let mut p_chars = pattern.chars();
     let mut t_chars = text.chars();
-    if let (Some(pc), Some(tc)) = (p_chars.next(), t_chars.next()) {
-        if pc == tc {
-            return glob_match_recursive(p_chars.as_str(), t_chars.as_str());
-        }
+    if let (Some(pc), Some(tc)) = (p_chars.next(), t_chars.next())
+        && pc == tc
+    {
+        return glob_match_recursive(p_chars.as_str(), t_chars.as_str());
     }
 
     false

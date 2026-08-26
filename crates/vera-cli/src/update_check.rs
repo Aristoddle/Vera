@@ -200,13 +200,13 @@ impl SkillInstallDescription {
 }
 
 fn describe_skill_install(path: &Path, cwd: Option<&Path>, home: &Path) -> SkillInstallDescription {
-    if let Some(cwd) = cwd {
-        if let Ok(relative) = path.strip_prefix(cwd) {
-            return SkillInstallDescription {
-                scope: SkillInstallScope::Project,
-                path: format!("./{}", relative.display()),
-            };
-        }
+    if let Some(cwd) = cwd
+        && let Ok(relative) = path.strip_prefix(cwd)
+    {
+        return SkillInstallDescription {
+            scope: SkillInstallScope::Project,
+            path: format!("./{}", relative.display()),
+        };
     }
 
     if let Ok(relative) = path.strip_prefix(home) {
@@ -240,10 +240,10 @@ fn cache_path() -> Option<PathBuf> {
 
 fn check_binary_staleness() {
     let status = binary_version_status(false);
-    if let Some(latest) = status.latest_version.as_deref() {
-        if status.update_available() {
-            print_binary_nudge(latest, &status);
-        }
+    if let Some(latest) = status.latest_version.as_deref()
+        && status.update_available()
+    {
+        print_binary_nudge(latest, &status);
     }
 }
 
@@ -289,17 +289,16 @@ fn binary_version_status_inner(
 
     let cached = load_cache(&cache_file);
 
-    if !force_refresh {
-        if let Some(cached) = cached.as_ref() {
-            if now.saturating_sub(cached.checked_at_secs) < CHECK_INTERVAL.as_secs() {
-                let resolution = cached_install_method(cached).unwrap_or_else(resolve);
-                return status_from(
-                    Some(cached.latest_version.clone()),
-                    resolution,
-                    VersionCheckSource::Cache,
-                );
-            }
-        }
+    if !force_refresh
+        && let Some(cached) = cached.as_ref()
+        && now.saturating_sub(cached.checked_at_secs) < CHECK_INTERVAL.as_secs()
+    {
+        let resolution = cached_install_method(cached).unwrap_or_else(resolve);
+        return status_from(
+            Some(cached.latest_version.clone()),
+            resolution,
+            VersionCheckSource::Cache,
+        );
     }
 
     let resolution = resolve();
@@ -426,24 +425,24 @@ fn fetch_latest_version() -> Option<String> {
 }
 
 pub fn resolve_install_method() -> InstallMethodResolution {
-    if let Ok(provenance) = crate::state::load_install_provenance() {
-        if let Some(method) = provenance.install_method {
-            return InstallMethodResolution {
-                detected_install_methods: vec![method.clone()],
-                install_method: Some(method),
-                source: InstallMethodSource::Provenance,
-            };
-        }
+    if let Ok(provenance) = crate::state::load_install_provenance()
+        && let Some(method) = provenance.install_method
+    {
+        return InstallMethodResolution {
+            detected_install_methods: vec![method.clone()],
+            install_method: Some(method),
+            source: InstallMethodSource::Provenance,
+        };
     }
 
-    if let Ok(config) = crate::state::load_saved_config() {
-        if let Some(method) = config.install_method {
-            return InstallMethodResolution {
-                detected_install_methods: vec![method.clone()],
-                install_method: Some(method),
-                source: InstallMethodSource::Heuristic,
-            };
-        }
+    if let Ok(config) = crate::state::load_saved_config()
+        && let Some(method) = config.install_method
+    {
+        return InstallMethodResolution {
+            detected_install_methods: vec![method.clone()],
+            install_method: Some(method),
+            source: InstallMethodSource::Heuristic,
+        };
     }
 
     let detected_install_methods = detect_install_methods();
@@ -478,10 +477,9 @@ pub fn detect_install_methods() -> Vec<String> {
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .output()
+        && String::from_utf8_lossy(&output.stdout).contains("@vera-ai/cli")
     {
-        if String::from_utf8_lossy(&output.stdout).contains("@vera-ai/cli") {
-            methods.push("bun".to_string());
-        }
+        methods.push("bun".to_string());
     }
 
     if command_succeeds("pip", &["show", "vera-ai"]) {

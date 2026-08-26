@@ -584,10 +584,10 @@ pub(super) async fn ensure_model_file_impl_with_revision(
             })?;
         }
         fs::rename(&temp_path, &target_path).await?;
-        if let Some(expected) = expected_digest {
-            if pinned_digest.is_none() {
-                fs::write(&sidecar_path, format!("{expected}\n")).await?;
-            }
+        if let Some(expected) = expected_digest
+            && pinned_digest.is_none()
+        {
+            fs::write(&sidecar_path, format!("{expected}\n")).await?;
         }
         Ok(())
     }

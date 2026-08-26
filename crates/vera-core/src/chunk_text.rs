@@ -532,10 +532,10 @@ fn looks_like_signature_line(line: &str, symbol_name: Option<&str>) -> bool {
         return false;
     }
 
-    if let Some(name) = symbol_name {
-        if line.contains(name) {
-            return true;
-        }
+    if let Some(name) = symbol_name
+        && line.contains(name)
+    {
+        return true;
     }
 
     [

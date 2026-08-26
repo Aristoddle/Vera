@@ -308,10 +308,11 @@ fn configure_backend_with_api_setup(
         }
     }
 
-    if persist_state && state::load_saved_config()?.install_method.is_none() {
-        if let Some(install_method) = crate::update_check::resolve_install_method().install_method {
-            state::save_install_method(Some(&install_method))?;
-        }
+    if persist_state
+        && state::load_saved_config()?.install_method.is_none()
+        && let Some(install_method) = crate::update_check::resolve_install_method().install_method
+    {
+        state::save_install_method(Some(&install_method))?;
     }
 
     if let Some(path) = index_path.as_deref() {
@@ -592,10 +593,10 @@ fn configure_api_interactive() -> anyhow::Result<()> {
     state::save_api_setup(&embedding, reranker.as_ref())?;
     state::apply_saved_env_force()?;
 
-    if state::load_saved_config()?.install_method.is_none() {
-        if let Some(install_method) = crate::update_check::resolve_install_method().install_method {
-            state::save_install_method(Some(&install_method))?;
-        }
+    if state::load_saved_config()?.install_method.is_none()
+        && let Some(install_method) = crate::update_check::resolve_install_method().install_method
+    {
+        state::save_install_method(Some(&install_method))?;
     }
 
     cliclack::log::success("API backend configured.")?;

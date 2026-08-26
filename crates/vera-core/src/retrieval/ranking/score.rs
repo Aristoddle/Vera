@@ -71,10 +71,11 @@ fn content_covers_keyword(content_lower: &str, keyword: &str) -> bool {
         return true;
     }
     for suffix in ["ing", "ed", "s"] {
-        if let Some(stem) = keyword.strip_suffix(suffix) {
-            if stem.len() >= 4 && content_lower.contains(stem) {
-                return true;
-            }
+        if let Some(stem) = keyword.strip_suffix(suffix)
+            && stem.len() >= 4
+            && content_lower.contains(stem)
+        {
+            return true;
         }
     }
     false
@@ -190,12 +191,11 @@ pub(super) fn score_prior(
         && !features.keywords.is_empty()
         && !features.wants_config_paths
         && allow_filename_semantic_bonus
+        && let Some(symbol_name) = result.symbol_name.as_deref()
     {
-        if let Some(symbol_name) = result.symbol_name.as_deref() {
-            let symbol_bonus = symbol_keyword_bonus(symbol_name, &features.keywords);
-            if symbol_bonus > 0.0 {
-                bonus += stage_weight * symbol_bonus;
-            }
+        let symbol_bonus = symbol_keyword_bonus(symbol_name, &features.keywords);
+        if symbol_bonus > 0.0 {
+            bonus += stage_weight * symbol_bonus;
         }
     }
 
@@ -237,42 +237,40 @@ pub(super) fn score_prior(
     if features.query_type == QueryType::NaturalLanguage
         && is_definition_symbol(result.symbol_type)
         && result.symbol_name.is_some()
+        && let Some(symbol_name) = result.symbol_name.as_deref()
     {
-        if let Some(symbol_name) = result.symbol_name.as_deref() {
-            let sym_stems = identifier_stems(symbol_name);
-            // Count keyword overlaps where the keyword is non-trivial (5+ chars)
-            // to avoid short keywords like "file", "type", "list" causing false boosts.
-            let overlap_count = features
+        let sym_stems = identifier_stems(symbol_name);
+        // Count keyword overlaps where the keyword is non-trivial (5+ chars)
+        // to avoid short keywords like "file", "type", "list" causing false boosts.
+        let overlap_count = features
+            .keywords
+            .iter()
+            .filter(|kw| {
+                kw.len() >= 5
+                    && sym_stems
+                        .iter()
+                        .any(|s| s == kw.as_str() || shares_keyword_stem(s, kw))
+            })
+            .count();
+        if overlap_count > 0 {
+            // Scale by overlap ratio: single keyword match in a 5-word query
+            // gets a modest boost; full overlap gets the maximum.
+            let long_keywords = features
                 .keywords
                 .iter()
-                .filter(|kw| {
-                    kw.len() >= 5
-                        && sym_stems
-                            .iter()
-                            .any(|s| s == kw.as_str() || shares_keyword_stem(s, kw))
-                })
-                .count();
-            if overlap_count > 0 {
-                // Scale by overlap ratio: single keyword match in a 5-word query
-                // gets a modest boost; full overlap gets the maximum.
-                let long_keywords = features
-                    .keywords
-                    .iter()
-                    .filter(|k| k.len() >= 5)
-                    .count()
-                    .max(1);
-                let ratio = (overlap_count as f64 / long_keywords as f64).min(1.0);
+                .filter(|k| k.len() >= 5)
+                .count()
+                .max(1);
+            let ratio = (overlap_count as f64 / long_keywords as f64).min(1.0);
 
-                // Extra boost when the file stem also matches the symbol.
-                let stem = file_stem(&result_filename);
-                let stem_aligns = file_stem(&result_filename).eq_ignore_ascii_case(symbol_name)
-                    || sym_stems.iter().any(|s| {
-                        s == &normalize_token(stem)
-                            || shares_keyword_stem(s, &normalize_token(stem))
-                    });
-                let base_boost = if stem_aligns { 1.5 } else { 1.0 };
-                bonus += stage_weight * base_boost * ratio;
-            }
+            // Extra boost when the file stem also matches the symbol.
+            let stem = file_stem(&result_filename);
+            let stem_aligns = file_stem(&result_filename).eq_ignore_ascii_case(symbol_name)
+                || sym_stems.iter().any(|s| {
+                    s == &normalize_token(stem) || shares_keyword_stem(s, &normalize_token(stem))
+                });
+            let base_boost = if stem_aligns { 1.5 } else { 1.0 };
+            bonus += stage_weight * base_boost * ratio;
         }
     }
 
@@ -297,10 +295,10 @@ pub(super) fn score_prior(
     // the fraction of distinct query keywords the chunk content covers.
     // Explicit config-path requests use path intent instead of content
     // coverage.
-    if !features.wants_config_paths {
-        if let Some(ratio) = coverage_ratio(features, &result.content) {
-            bonus += stage_weight * coverage_weight(features) * ratio.powf(COVERAGE_EXPONENT);
-        }
+    if !features.wants_config_paths
+        && let Some(ratio) = coverage_ratio(features, &result.content)
+    {
+        bonus += stage_weight * coverage_weight(features) * ratio.powf(COVERAGE_EXPONENT);
     }
 
     // --- Noise penalties ---
@@ -788,15 +786,14 @@ fn rest_starts_with_symbol(rest: &str, symbol: &str, case_insensitive: bool) -> 
             text = stripped.trim_start();
             continue;
         }
-        if let Some(stripped) = after.strip_prefix('.') {
-            if stripped
+        if let Some(stripped) = after.strip_prefix('.')
+            && stripped
                 .chars()
                 .next()
                 .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
-            {
-                text = stripped.trim_start();
-                continue;
-            }
+        {
+            text = stripped.trim_start();
+            continue;
         }
         let matches = if case_insensitive {
             ident.eq_ignore_ascii_case(symbol)
@@ -821,10 +818,10 @@ fn keyword_path_match_ratio(keywords: &[&str], file_path: &str) -> f64 {
     let lowered = file_path.to_ascii_lowercase();
     let stem = file_stem(file_name(&lowered));
     let mut parts = identifier_stems(stem);
-    if let Some((dirs, _)) = lowered.rsplit_once('/') {
-        if let Some(parent) = dirs.rsplit('/').next() {
-            parts.extend(identifier_stems(parent));
-        }
+    if let Some((dirs, _)) = lowered.rsplit_once('/')
+        && let Some(parent) = dirs.rsplit('/').next()
+    {
+        parts.extend(identifier_stems(parent));
     }
     if parts.is_empty() {
         return 0.0;

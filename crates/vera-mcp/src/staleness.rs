@@ -47,15 +47,14 @@ fn cached_notice(key: &Path) -> Option<Option<String>> {
 fn store_notice(key: PathBuf, notice: Option<String>) {
     let mut guard = CACHE.lock().unwrap_or_else(|err| err.into_inner());
     guard.retain(|cached| cached.repo != key);
-    if guard.len() >= CACHE_CAPACITY {
-        if let Some(oldest) = guard
+    if guard.len() >= CACHE_CAPACITY
+        && let Some(oldest) = guard
             .iter()
             .enumerate()
             .min_by_key(|(_, cached)| cached.checked_at)
             .map(|(index, _)| index)
-        {
-            guard.remove(oldest);
-        }
+    {
+        guard.remove(oldest);
     }
     guard.push(CachedStaleness {
         repo: key,

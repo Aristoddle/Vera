@@ -370,24 +370,23 @@ where
             );
         }
         if let Ok(dim) = s_dim.parse::<usize>() {
-            if let Some(provider_dim) = provider.expected_dim() {
-                if provider_dim < dim {
-                    bail!(
-                        "Dimension mismatch: index has {} dimensions but active provider only returns {}. Please re-index with matching provider.",
-                        dim,
-                        provider_dim
-                    );
-                }
+            if let Some(provider_dim) = provider.expected_dim()
+                && provider_dim < dim
+            {
+                bail!(
+                    "Dimension mismatch: index has {} dimensions but active provider only returns {}. Please re-index with matching provider.",
+                    dim,
+                    provider_dim
+                );
             }
             stored_dim = dim;
         }
     } else if let Some(s_dim) = metadata_store
         .get_index_meta("embedding_dim")
         .unwrap_or(None)
+        && let Ok(dim) = s_dim.parse::<usize>()
     {
-        if let Ok(dim) = s_dim.parse::<usize>() {
-            stored_dim = dim;
-        }
+        stored_dim = dim;
     }
 
     let stored_files: HashSet<String> = metadata_store

@@ -753,8 +753,10 @@ fn decode_f32_vector(bytes: &[u8], dim: usize) -> Result<Vec<f32>> {
         );
     }
     Ok(bytes
-        .chunks_exact(std::mem::size_of::<f32>())
-        .map(|bytes| f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+        .as_chunks::<{ std::mem::size_of::<f32>() }>()
+        .0
+        .iter()
+        .map(|bytes| f32::from_le_bytes(*bytes))
         .collect())
 }
 

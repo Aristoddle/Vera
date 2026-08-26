@@ -16,10 +16,10 @@ pub(super) fn ort_dylib_path_from_env() -> Option<PathBuf> {
 
 /// Get the platform-specific ONNX Runtime shared library filename.
 pub(super) fn ort_lib_filename() -> String {
-    if let Ok(path) = std::env::var("ORT_DYLIB_PATH") {
-        if !path.is_empty() {
-            return path;
-        }
+    if let Ok(path) = std::env::var("ORT_DYLIB_PATH")
+        && !path.is_empty()
+    {
+        return path;
     }
 
     #[cfg(target_os = "windows")]

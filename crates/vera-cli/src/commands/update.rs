@@ -63,36 +63,35 @@ pub fn run(path: &str, json_output: bool, options: CommandOptions) -> anyhow::Re
     let metadata_path = repo_path.join(".vera").join("metadata.db");
     if let Ok(metadata_store) =
         vera_core::storage::metadata::MetadataStore::open_existing(&metadata_path)
-    {
-        if let (Some(s_model), Some(s_dim)) = (
+        && let (Some(s_model), Some(s_dim)) = (
             metadata_store.get_index_meta("model_name").unwrap_or(None),
             metadata_store
                 .get_index_meta("embedding_dim")
                 .unwrap_or(None),
+        )
+    {
+        if !vera_core::config::model_names_match_with_aliases(
+            &s_model,
+            &model_name,
+            &config.embedding.model_aliases,
         ) {
-            if !vera_core::config::model_names_match_with_aliases(
-                &s_model,
-                &model_name,
-                &config.embedding.model_aliases,
-            ) {
+            bail!(
+                "Index was created with model '{}' ({} dimensions), but you are using model '{}'. Please re-index with matching provider.",
+                s_model,
+                s_dim,
+                model_name
+            );
+        }
+        if let Ok(dim) = s_dim.parse::<usize>() {
+            use vera_core::embedding::EmbeddingProvider;
+            if let Some(provider_dim) = provider.expected_dim()
+                && provider_dim < dim
+            {
                 bail!(
-                    "Index was created with model '{}' ({} dimensions), but you are using model '{}'. Please re-index with matching provider.",
-                    s_model,
-                    s_dim,
-                    model_name
+                    "Dimension mismatch: index has {} dimensions but active provider only returns {}. Please re-index with matching provider.",
+                    dim,
+                    provider_dim
                 );
-            }
-            if let Ok(dim) = s_dim.parse::<usize>() {
-                use vera_core::embedding::EmbeddingProvider;
-                if let Some(provider_dim) = provider.expected_dim() {
-                    if provider_dim < dim {
-                        bail!(
-                            "Dimension mismatch: index has {} dimensions but active provider only returns {}. Please re-index with matching provider.",
-                            dim,
-                            provider_dim
-                        );
-                    }
-                }
             }
         }
     }

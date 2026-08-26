@@ -43,12 +43,12 @@ pub fn run(
         config.retrieval.max_output_chars,
     );
 
-    if results.is_empty() {
-        if let Some(hint) = alternation_hint(pattern) {
-            let stderr = std::io::stderr();
-            let mut err = stderr.lock();
-            let _ = writeln!(err, "{hint}");
-        }
+    if results.is_empty()
+        && let Some(hint) = alternation_hint(pattern)
+    {
+        let stderr = std::io::stderr();
+        let mut err = stderr.lock();
+        let _ = writeln!(err, "{hint}");
     }
 
     if timing {

@@ -271,23 +271,20 @@ struct ChatResponseFormat {
 
 fn parse_query_candidates(raw: &str, limit: usize) -> Result<Vec<String>> {
     // Try parsing the whole string as JSON.
-    if let Ok(value) = serde_json::from_str::<serde_json::Value>(raw.trim()) {
-        if let Some(parsed) = json_value_to_queries(&value) {
-            return Ok(normalize_query_list(parsed, limit));
-        }
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(raw.trim())
+        && let Some(parsed) = json_value_to_queries(&value)
+    {
+        return Ok(normalize_query_list(parsed, limit));
     }
 
     // Try extracting a JSON array from within the response (e.g. fenced code blocks).
-    if let Some((start, end)) = raw.find('[').zip(raw.rfind(']')) {
-        if end >= start {
-            if let Some(candidate) = raw.get(start..=end) {
-                if let Ok(value) = serde_json::from_str::<serde_json::Value>(candidate) {
-                    if let Some(parsed) = json_value_to_queries(&value) {
-                        return Ok(normalize_query_list(parsed, limit));
-                    }
-                }
-            }
-        }
+    if let Some((start, end)) = raw.find('[').zip(raw.rfind(']'))
+        && end >= start
+        && let Some(candidate) = raw.get(start..=end)
+        && let Ok(value) = serde_json::from_str::<serde_json::Value>(candidate)
+        && let Some(parsed) = json_value_to_queries(&value)
+    {
+        return Ok(normalize_query_list(parsed, limit));
     }
 
     let preview = raw.lines().take(3).collect::<Vec<_>>().join(" ");

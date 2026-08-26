@@ -254,25 +254,25 @@ impl SearchContext {
             )
         });
         if let Some((Some(s_model), Some(s_dim), s_prefix)) = index_meta {
-            if let Some(model_name) = self.model_name.as_deref() {
-                if !crate::config::model_names_match_with_aliases(
+            if let Some(model_name) = self.model_name.as_deref()
+                && !crate::config::model_names_match_with_aliases(
                     &s_model,
                     model_name,
                     &config.embedding.model_aliases,
-                ) {
-                    warn!(
-                        "Index model '{}' does not match active model '{}'; using BM25-only search",
-                        s_model, model_name
-                    );
-                    return run_bm25_only(
-                        query,
-                        filters,
-                        fetch_limit,
-                        result_limit,
-                        total_start,
-                        &stores,
-                    );
-                }
+                )
+            {
+                warn!(
+                    "Index model '{}' does not match active model '{}'; using BM25-only search",
+                    s_model, model_name
+                );
+                return run_bm25_only(
+                    query,
+                    filters,
+                    fetch_limit,
+                    result_limit,
+                    total_start,
+                    &stores,
+                );
             }
             // A changed document prefix means the stored vectors live in a
             // different vector space. Indexes written before this guard have
@@ -294,21 +294,21 @@ impl SearchContext {
                 );
             }
             if let Ok(dim) = s_dim.parse::<usize>() {
-                if let Some(provider_dim) = provider.expected_dim() {
-                    if provider_dim < dim {
-                        warn!(
-                            "Index dimension {} exceeds provider dimension {}; using BM25-only search",
-                            dim, provider_dim
-                        );
-                        return run_bm25_only(
-                            query,
-                            filters,
-                            fetch_limit,
-                            result_limit,
-                            total_start,
-                            &stores,
-                        );
-                    }
+                if let Some(provider_dim) = provider.expected_dim()
+                    && provider_dim < dim
+                {
+                    warn!(
+                        "Index dimension {} exceeds provider dimension {}; using BM25-only search",
+                        dim, provider_dim
+                    );
+                    return run_bm25_only(
+                        query,
+                        filters,
+                        fetch_limit,
+                        result_limit,
+                        total_start,
+                        &stores,
+                    );
                 }
                 stored_dim = dim;
             }
