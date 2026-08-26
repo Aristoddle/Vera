@@ -114,6 +114,13 @@ impl Bm25Index {
     /// Insert a batch of documents into the index.
     ///
     /// Each document is a tuple of (chunk_id, file_path, content, symbol_name, language).
+    ///
+    /// The per-call cost is the writer lifecycle: allocating a
+    /// `WRITER_HEAP_SIZE` writer, committing a segment and joining the merge
+    /// threads costs on the order of tens of milliseconds regardless of batch
+    /// size. Incremental updates batch many files into one call; full builds
+    /// must use [`Bm25Index::begin_bulk_build`] instead of calling this once
+    /// per window.
     pub fn insert_batch(&self, docs: &[Bm25Document<'_>]) -> Result<()> {
         let mut writer: IndexWriter = self
             .index
@@ -121,32 +128,7 @@ impl Bm25Index {
             .context("failed to create BM25 index writer")?;
 
         for doc_data in docs {
-            let sym_name = doc_data.symbol_name.unwrap_or("");
-            let chunk = crate::types::Chunk {
-                id: doc_data.chunk_id.to_string(),
-                file_path: doc_data.file_path.to_string(),
-                line_start: 0,
-                line_end: 0,
-                content: doc_data.content.to_string(),
-                language: doc_data
-                    .language
-                    .parse()
-                    .unwrap_or(crate::types::Language::Unknown),
-                symbol_type: None,
-                symbol_name: doc_data.symbol_name.map(ToString::to_string),
-            };
-            let searchable_text = chunk_text::build_bm25_text(&chunk);
-            writer
-                .add_document(doc!(
-                    self.schema.chunk_id => doc_data.chunk_id.to_string(),
-                    self.schema.file_path => doc_data.file_path.to_string(),
-                    self.schema.filename => chunk_text::file_name(doc_data.file_path).to_string(),
-                    self.schema.path_tokens => chunk_text::normalize_path_tokens(doc_data.file_path),
-                    self.schema.content => searchable_text,
-                    self.schema.symbol_name => sym_name.to_string(),
-                    self.schema.language => doc_data.language.to_string(),
-                ))
-                .context("failed to add document to BM25 index")?;
+            add_document(&writer, &self.schema, doc_data)?;
         }
 
         writer.commit().context("failed to commit BM25 index")?;
@@ -156,6 +138,26 @@ impl Bm25Index {
             .map_err(|e| anyhow::anyhow!("BM25 merge failed: {e}"))?;
 
         Ok(())
+    }
+
+    /// Open a long-lived writer for a full-index build.
+    ///
+    /// A windowed build would otherwise pay the writer lifecycle (creation,
+    /// commit, merge-thread join) once per window. The bulk writer amortizes
+    /// all three: documents flow in continuously, Tantivy merges segments in
+    /// the background while the pipeline parses and embeds the next window,
+    /// and [`Bm25BulkWriter::finish`] commits exactly once. Memory stays
+    /// bounded by the writer heap because Tantivy flushes segments as the
+    /// heap fills, same as with per-window writers.
+    pub fn begin_bulk_build(&self) -> Result<Bm25BulkWriter> {
+        let writer = self
+            .index
+            .writer(WRITER_HEAP_SIZE)
+            .context("failed to create BM25 bulk writer")?;
+        Ok(Bm25BulkWriter {
+            writer,
+            schema: self.schema.clone(),
+        })
     }
 
     /// Insert all chunks as BM25 documents in one batch.
@@ -315,6 +317,86 @@ pub struct Bm25Document<'a> {
     pub language: &'a str,
 }
 
+/// Long-lived Tantivy writer for full-index builds; see
+/// [`Bm25Index::begin_bulk_build`].
+pub struct Bm25BulkWriter {
+    writer: IndexWriter,
+    schema: Bm25Schema,
+}
+
+impl Bm25BulkWriter {
+    /// Buffer one window of chunks. Nothing is committed here; segments flush
+    /// to disk automatically as the writer heap fills.
+    pub fn insert_chunks(&self, chunks: &[crate::types::Chunk]) -> Result<()> {
+        for_each_chunk_document(chunks, |doc_data| {
+            add_document(&self.writer, &self.schema, doc_data)
+        })
+    }
+
+    /// Commit the index once and wait for the final merge to finish.
+    pub fn finish(self) -> Result<()> {
+        let mut writer = self.writer;
+        writer.commit().context("failed to commit BM25 index")?;
+        writer
+            .wait_merging_threads()
+            .map_err(|e| anyhow::anyhow!("BM25 merge failed: {e}"))?;
+        Ok(())
+    }
+}
+
+/// Borrow each chunk as a BM25 document for the duration of `f`, avoiding a
+/// materialized document vector for callers that stream into a writer.
+fn for_each_chunk_document(
+    chunks: &[crate::types::Chunk],
+    mut f: impl FnMut(&Bm25Document<'_>) -> Result<()>,
+) -> Result<()> {
+    let lang_strings: Vec<String> = chunks.iter().map(|c| c.language.to_string()).collect();
+    for (chunk, language) in chunks.iter().zip(lang_strings.iter()) {
+        f(&Bm25Document {
+            chunk_id: &chunk.id,
+            file_path: &chunk.file_path,
+            content: &chunk.content,
+            symbol_name: chunk.symbol_name.as_deref(),
+            language,
+        })?;
+    }
+    Ok(())
+}
+
+fn add_document(
+    writer: &IndexWriter,
+    schema: &Bm25Schema,
+    doc_data: &Bm25Document<'_>,
+) -> Result<()> {
+    let sym_name = doc_data.symbol_name.unwrap_or("");
+    let chunk = crate::types::Chunk {
+        id: doc_data.chunk_id.to_string(),
+        file_path: doc_data.file_path.to_string(),
+        line_start: 0,
+        line_end: 0,
+        content: doc_data.content.to_string(),
+        language: doc_data
+            .language
+            .parse()
+            .unwrap_or(crate::types::Language::Unknown),
+        symbol_type: None,
+        symbol_name: doc_data.symbol_name.map(ToString::to_string),
+    };
+    let searchable_text = chunk_text::build_bm25_text(&chunk);
+    writer
+        .add_document(doc!(
+            schema.chunk_id => doc_data.chunk_id.to_string(),
+            schema.file_path => doc_data.file_path.to_string(),
+            schema.filename => chunk_text::file_name(doc_data.file_path).to_string(),
+            schema.path_tokens => chunk_text::normalize_path_tokens(doc_data.file_path),
+            schema.content => searchable_text,
+            schema.symbol_name => sym_name.to_string(),
+            schema.language => doc_data.language.to_string(),
+        ))
+        .context("failed to add document to BM25 index")?;
+    Ok(())
+}
+
 /// Build the Tantivy schema for BM25 indexing.
 fn build_schema() -> Bm25Schema {
     let mut builder = Schema::builder();
@@ -463,6 +545,72 @@ mod tests {
         let index = Bm25Index::open_in_memory().unwrap();
         index.insert_batch(&sample_docs()).unwrap();
         assert_eq!(index.doc_count().unwrap(), 8);
+    }
+
+    #[test]
+    fn bulk_writer_matches_insert_batch_results() {
+        let docs = sample_docs();
+
+        let batched = Bm25Index::open_in_memory().unwrap();
+        batched.insert_batch(&docs).unwrap();
+
+        let bulk = Bm25Index::open_in_memory().unwrap();
+        let writer = bulk.begin_bulk_build().unwrap();
+        // Split into two "windows" to prove the final commit covers all adds.
+        writer
+            .insert_chunks(
+                &docs[..4]
+                    .iter()
+                    .map(|d| crate::types::Chunk {
+                        id: d.chunk_id.to_string(),
+                        file_path: d.file_path.to_string(),
+                        line_start: 0,
+                        line_end: 0,
+                        content: d.content.to_string(),
+                        language: d.language.parse().unwrap(),
+                        symbol_type: None,
+                        symbol_name: d.symbol_name.map(ToString::to_string),
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+        writer
+            .insert_chunks(
+                &docs[4..]
+                    .iter()
+                    .map(|d| crate::types::Chunk {
+                        id: d.chunk_id.to_string(),
+                        file_path: d.file_path.to_string(),
+                        line_start: 0,
+                        line_end: 0,
+                        content: d.content.to_string(),
+                        language: d.language.parse().unwrap(),
+                        symbol_type: None,
+                        symbol_name: d.symbol_name.map(ToString::to_string),
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+        writer.finish().unwrap();
+
+        assert_eq!(bulk.doc_count().unwrap(), batched.doc_count().unwrap());
+        for query in ["println hello world", "Config port", "Pipeline outputs"] {
+            let mut expected: Vec<_> = batched
+                .search(query, 10)
+                .unwrap()
+                .into_iter()
+                .map(|r| r.chunk_id)
+                .collect();
+            let mut actual: Vec<_> = bulk
+                .search(query, 10)
+                .unwrap()
+                .into_iter()
+                .map(|r| r.chunk_id)
+                .collect();
+            expected.sort();
+            actual.sort();
+            assert_eq!(actual, expected, "bulk writer diverged on query {query}");
+        }
     }
 
     #[test]

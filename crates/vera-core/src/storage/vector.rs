@@ -1262,6 +1262,62 @@ impl VectorStore {
         Ok(())
     }
 
+    /// Insert a batch of vectors whose chunk ids are all new to this store.
+    ///
+    /// Full builds write into a freshly created staging store, where the
+    /// per-row `INSERT OR IGNORE` + rowid lookup + stale-vector delete that
+    /// [`VectorStore::insert_batch`] performs can never match anything. This
+    /// path halves the per-row statement count for that case. A pre-existing
+    /// chunk id violates the PRIMARY KEY and fails loudly, so callers cannot
+    /// silently corrupt an existing mapping.
+    pub fn insert_batch_fresh(&self, items: &[(&str, &[f32])]) -> Result<()> {
+        if items.is_empty() {
+            return Ok(());
+        }
+        self.refresh_flat()?;
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .context("failed to begin vector insert transaction")?;
+        let mut flat_inserts = Vec::with_capacity(items.len());
+        {
+            let mut id_stmt = self
+                .conn
+                .prepare_cached("INSERT INTO chunk_id_map (chunk_id) VALUES (?1)")
+                .context("failed to prepare id insert")?;
+
+            let mut vec_stmt = self
+                .conn
+                .prepare_cached("INSERT INTO vec_chunks (rowid, embedding) VALUES (?1, ?2)")
+                .context("failed to prepare vector insert")?;
+
+            for (chunk_id, vector) in items {
+                if vector.len() != self.dim {
+                    anyhow::bail!(
+                        "vector dimension mismatch for {}: expected {}, got {}",
+                        chunk_id,
+                        self.dim,
+                        vector.len()
+                    );
+                }
+
+                id_stmt
+                    .execute(params![chunk_id])
+                    .context("failed to insert chunk id")?;
+                let rowid = self.conn.last_insert_rowid();
+
+                vec_stmt
+                    .execute(params![rowid, vector.as_bytes()])
+                    .context("failed to insert vector")?;
+                flat_inserts.push((rowid, *vector));
+            }
+        }
+        let generation = bump_generation(&tx)?;
+        tx.commit().context("failed to commit vector batch")?;
+        self.update_flat(&flat_inserts, &[], generation)?;
+        Ok(())
+    }
+
     /// Find the nearest neighbors to a query vector.
     ///
     /// Returns up to `limit` results sorted by ascending distance.
@@ -1839,6 +1895,27 @@ mod tests {
             ("c3", &[0.0, 0.0, 1.0, 0.0]),
         ];
         store.insert_batch(&items).unwrap();
+        assert_eq!(store.count().unwrap(), 3);
+    }
+
+    #[test]
+    fn insert_batch_fresh_inserts_and_rejects_duplicates() {
+        let store = VectorStore::open_in_memory(4).unwrap();
+        let items: Vec<(&str, &[f32])> = vec![
+            ("c1", &[1.0, 0.0, 0.0, 0.0]),
+            ("c2", &[0.0, 1.0, 0.0, 0.0]),
+            ("c3", &[0.0, 0.0, 1.0, 0.0]),
+        ];
+        store.insert_batch_fresh(&items).unwrap();
+        assert_eq!(store.count().unwrap(), 3);
+
+        let results = store.search(&[1.0, 0.0, 0.0, 0.0], 1).unwrap();
+        assert_eq!(results[0].chunk_id, "c1");
+        assert!(results[0].distance < 0.001);
+
+        // A pre-existing chunk id must fail loudly, not silently remap.
+        let dup: Vec<(&str, &[f32])> = vec![("c1", &[0.0, 0.0, 1.0, 0.0])];
+        assert!(store.insert_batch_fresh(&dup).is_err());
         assert_eq!(store.count().unwrap(), 3);
     }
 

@@ -295,20 +295,18 @@ where
     // Build into a sibling directory. The guard removes it on every error or
     // cancellation, leaving the previous live index untouched until swap.
     let mut staging = StagingIndex::new(&idx_dir).context("failed to create staging index")?;
-    let metadata_store = MetadataStore::open(&staging.build_dir.join(METADATA_DB))
-        .context("failed to open staging metadata store")?;
-    metadata_store
-        .set_index_meta("model_name", model_name)
-        .context("failed to store model_name")?;
-    let document_prefix = provider.document_prefix_identity();
-    metadata_store
-        .set_index_meta("document_prefix", &document_prefix)
-        .context("failed to store document_prefix")?;
 
-    let bm25_index = Bm25Index::open(&staging.build_dir.join(BM25_SUBDIR))
-        .context("failed to open staging BM25 index")?;
-    let mut vector_store = None;
-    let mut stored_dim = None;
+    // Store windows on a dedicated blocking thread. Parsing, embedding, and
+    // storing are each CPU-heavy, so serializing stores behind embedding
+    // idles whole stages at every window boundary. The worker owns the
+    // staging stores, applies windows in send order, and reports back through
+    // the Finish command, so store order and the crash contract are
+    // unchanged: a failed build discards the staging directory either way.
+    let mut stores = StoreHandle::spawn(
+        staging.build_dir.clone(),
+        model_name.to_string(),
+        provider.document_prefix_identity(),
+    );
 
     // ── 3. Parse, embed, and store bounded windows ───────────────
     let (batch_size, max_concurrent_requests) = config.embedding.bounded_parallelism();
@@ -326,57 +324,53 @@ where
     }
 
     let parse_group_size = window_chunk_target.min(MAX_PARSE_FILE_GROUP);
-    let mut next_file_index = 0;
+    let discovery = Arc::new(discovery);
+    let repo_root = Arc::new(repo_root);
     let mut parsed_chunk_count = 0;
     let mut embedded_count = 0;
     let mut parse_errors = Vec::new();
     let mut file_hashes = Vec::new();
     let mut file_states = Vec::new();
 
-    while next_file_index < discovery.files.len() {
-        cancellation.check()?;
-
-        let window_start = next_file_index;
-        let mut window_chunks = Vec::new();
-        let mut window_parse_errors = Vec::new();
-        let mut window_file_hashes = Vec::new();
-        let mut window_refs = Vec::new();
-        let mut window_type_relations = Vec::new();
-        let mut window_file_states = Vec::new();
-
-        while next_file_index < discovery.files.len()
-            && (next_file_index == window_start || window_chunks.len() < window_chunk_target)
-        {
-            let group_end = (next_file_index + parse_group_size).min(discovery.files.len());
-            let (
-                chunks,
-                group_parse_errors,
-                group_file_hashes,
-                group_refs,
-                group_type_relations,
-                group_file_states,
-            ) = parse_discovered_files_parallel(
+    // Parse one window ahead of the embed+store stage. Parsing is pure (it
+    // only reads source files), so running window N+1 on a blocking thread
+    // while window N embeds and stores keeps the CPU busy across window
+    // boundaries without changing store order or the crash contract. A build
+    // that fails or is cancelled drops the in-flight handle; the detached
+    // task only reads sources, observes the cancellation token, and exits.
+    let spawn_parse = |start_file_index: usize| {
+        let discovery = Arc::clone(&discovery);
+        let repo_root = Arc::clone(&repo_root);
+        let config = config.clone();
+        let cancellation = cancellation.clone();
+        tokio::task::spawn_blocking(move || {
+            parse_window(
                 &discovery,
-                &discovery.files[next_file_index..group_end],
+                start_file_index,
+                window_chunk_target,
+                parse_group_size,
                 &repo_root,
-                config,
-                cancellation,
-            )?;
-            next_file_index = group_end;
-            parsed_chunk_count += chunks.len();
-            window_chunks.extend(chunks);
-            window_parse_errors.extend(group_parse_errors);
-            window_file_hashes.extend(group_file_hashes);
-            window_refs.extend(group_refs);
-            window_type_relations.extend(group_type_relations);
-            window_file_states.extend(group_file_states);
-        }
+                &config,
+                &cancellation,
+            )
+        })
+    };
 
-        let is_final_window = next_file_index == discovery.files.len();
-        if is_final_window {
+    let total_files = discovery.files.len();
+    let mut parse_ahead = (0 < total_files).then(|| spawn_parse(0));
+    while let Some(handle) = parse_ahead.take() {
+        cancellation.check()?;
+        let window = handle
+            .await
+            .map_err(|error| anyhow::anyhow!("parse task panicked: {error}"))??;
+        let next_file_index = window.next_file_index;
+        parse_ahead = (next_file_index < total_files).then(|| spawn_parse(next_file_index));
+
+        parsed_chunk_count += window.chunks.len();
+        if next_file_index == total_files {
             info!(
                 chunks = parsed_chunk_count,
-                parse_errors = window_parse_errors.len() + parse_errors.len(),
+                parse_errors = window.parse_errors.len() + parse_errors.len(),
                 "parsing complete"
             );
             on_progress(IndexProgress::ParsingDone {
@@ -384,12 +378,12 @@ where
             });
         }
 
-        parse_errors.extend(window_parse_errors);
-        file_hashes.extend(window_file_hashes);
-        file_states.extend(window_file_states.iter().cloned());
+        parse_errors.extend(window.parse_errors);
+        file_hashes.extend(window.file_hashes);
+        file_states.extend(window.file_states.iter().cloned());
 
         cancellation.check()?;
-        if !window_chunks.is_empty() {
+        if !window.chunks.is_empty() {
             let embedded_before_window = embedded_count;
             let parsed_through_window = parsed_chunk_count;
             let window_batch_size = batch_size.min(window_chunk_target);
@@ -401,7 +395,7 @@ where
             };
             let embedding_result = embed_chunks_concurrent_with_progress_and_cancellation(
                 provider,
-                &window_chunks,
+                &window.chunks,
                 window_batch_size,
                 max_concurrent_requests,
                 config.indexing.max_chunk_bytes,
@@ -417,6 +411,7 @@ where
                     if matches!(error, EmbeddingError::Cancelled) {
                         cancellation.check()?;
                     }
+                    stores.abort().await;
                     return Err(error).context("embedding generation failed");
                 }
             };
@@ -424,64 +419,38 @@ where
 
             let window_dim =
                 super::truncate_embeddings(&mut embeddings, config.embedding.max_stored_dim);
-            if !embeddings.is_empty() {
-                if let Some(existing_dim) = stored_dim {
-                    anyhow::ensure!(
-                        existing_dim == window_dim,
-                        "embedding dimension changed between windows: expected {}, got {}",
-                        existing_dim,
-                        window_dim
-                    );
-                } else {
-                    let store = VectorStore::open(&staging.build_dir.join(VECTOR_DB), window_dim)
-                        .context("failed to open staging vector store")?;
-                    metadata_store
-                        .set_index_meta("embedding_dim", &window_dim.to_string())
-                        .context("failed to store embedding_dim")?;
-                    vector_store = Some(store);
-                    stored_dim = Some(window_dim);
-                }
-            }
             embedded_count += embeddings.len();
 
-            cancellation.check()?;
-            metadata_store
-                .insert_chunks(&window_chunks)
-                .context("failed to insert chunk metadata")?;
-            metadata_store
-                .insert_file_states(&window_file_states)
-                .context("failed to store file index states")?;
-            metadata_store
-                .insert_parse_artifacts_batch(&window_refs, &window_type_relations)
-                .context("failed to store references and type relations")?;
-
-            if let Some(vector_store) = vector_store.as_ref() {
-                let batch: Vec<(&str, &[f32])> = embeddings
-                    .iter()
-                    .map(|(id, vector)| (id.as_str(), vector.as_slice()))
-                    .collect();
-                vector_store
-                    .insert_batch(&batch)
-                    .context("failed to insert vectors")?;
-            }
-            bm25_index
-                .insert_chunks(&window_chunks)
-                .context("failed to insert BM25 documents")?;
+            stores
+                .send_window(WindowStore {
+                    chunks: window.chunks,
+                    embeddings,
+                    window_dim,
+                    file_states: window.file_states,
+                    refs: window.refs,
+                    type_relations: window.type_relations,
+                })
+                .await?;
         } else {
             // Parse-error-only windows still need their file state and parse
             // artifacts persisted if a later window contains chunks.
-            metadata_store
-                .insert_file_states(&window_file_states)
-                .context("failed to store file index states")?;
-            metadata_store
-                .insert_parse_artifacts_batch(&window_refs, &window_type_relations)
-                .context("failed to store references and type relations")?;
+            stores
+                .send_window(WindowStore {
+                    chunks: Vec::new(),
+                    embeddings: Vec::new(),
+                    window_dim: 0,
+                    file_states: window.file_states,
+                    refs: window.refs,
+                    type_relations: window.type_relations,
+                })
+                .await?;
         }
 
         cancellation.check()?;
     }
 
     if parsed_chunk_count == 0 {
+        stores.abort().await;
         return Ok(IndexSummary {
             files_parsed: discovery.files.len() - parse_errors.len(),
             chunks_created: 0,
@@ -501,22 +470,13 @@ where
         count: embedded_count,
     });
 
-    // A provider returning no vectors is not expected, but preserve the old
-    // empty-vector dimensionality fallback for a non-empty parsed corpus.
-    if stored_dim.is_none() {
-        let fallback_dim = 4096;
-        let store = VectorStore::open(&staging.build_dir.join(VECTOR_DB), fallback_dim)
-            .context("failed to open staging vector store")?;
-        metadata_store
-            .set_index_meta("embedding_dim", &fallback_dim.to_string())
-            .context("failed to store embedding_dim")?;
-        vector_store = Some(store);
-    }
-
     // Publication is synchronous, so cancellation must win before any artifact is replaced.
     cancellation.check()?;
-    publish_index_certification(&metadata_store, &file_hashes, &config.indexing)
-        .context("failed to publish index freshness metadata")?;
+    // The worker commits the BM25 index, applies the empty-vector
+    // dimensionality fallback, and certifies the build before replying.
+    stores
+        .finish(parsed_chunk_count > 0, file_hashes, config.indexing.clone())
+        .await?;
 
     let files_parsed = discovery.files.len() - parse_errors.len();
     let summary = IndexSummary {
@@ -525,7 +485,7 @@ where
         embeddings_generated: embedded_count,
         binary_skipped: discovery.binary_skipped,
         large_skipped: discovery.large_skipped,
-        large_skipped_paths: discovery.large_skipped_paths,
+        large_skipped_paths: discovery.large_skipped_paths.clone(),
         error_skipped: discovery.error_skipped,
         files_with_tree_sitter_errors: count_tree_sitter_error_files(&file_states),
         files_using_tier0_fallback: count_tier0_fallback_files(&file_states),
@@ -533,9 +493,6 @@ where
         elapsed_secs: start.elapsed().as_secs_f64(),
     };
 
-    drop(vector_store);
-    drop(bm25_index);
-    drop(metadata_store);
     swap_staging_index(&idx_dir, &staging.build_dir, &staging.old_dir)
         .context("failed to publish staged index")?;
     staging.committed = true;
@@ -547,6 +504,287 @@ where
 }
 
 // ── Internal helpers ─────────────────────────────────────────────────
+
+/// One parsed window of the full-index pipeline.
+struct ParsedWindow {
+    chunks: Vec<Chunk>,
+    parse_errors: Vec<FileError>,
+    file_hashes: Vec<(String, String)>,
+    refs: Vec<(String, Vec<RawReference>)>,
+    type_relations: Vec<(String, Vec<RawTypeRelation>)>,
+    file_states: Vec<FileIndexState>,
+    next_file_index: usize,
+}
+
+/// Parse file groups into a window holding at least `window_chunk_target`
+/// chunks (bounded above by the target plus one group). Pure with respect to
+/// the index: it only reads source files, so it can run ahead of storage on a
+/// blocking thread.
+fn parse_window(
+    discovery: &DiscoveryResult,
+    start_file_index: usize,
+    window_chunk_target: usize,
+    parse_group_size: usize,
+    repo_root: &Path,
+    config: &VeraConfig,
+    cancellation: &CancellationToken,
+) -> Result<ParsedWindow> {
+    let mut window = ParsedWindow {
+        chunks: Vec::new(),
+        parse_errors: Vec::new(),
+        file_hashes: Vec::new(),
+        refs: Vec::new(),
+        type_relations: Vec::new(),
+        file_states: Vec::new(),
+        next_file_index: start_file_index,
+    };
+
+    while window.next_file_index < discovery.files.len()
+        && (window.next_file_index == start_file_index || window.chunks.len() < window_chunk_target)
+    {
+        let group_end = (window.next_file_index + parse_group_size).min(discovery.files.len());
+        let (
+            chunks,
+            group_parse_errors,
+            group_file_hashes,
+            group_refs,
+            group_type_relations,
+            group_file_states,
+        ) = parse_discovered_files_parallel(
+            discovery,
+            &discovery.files[window.next_file_index..group_end],
+            repo_root,
+            config,
+            cancellation,
+        )?;
+        window.next_file_index = group_end;
+        window.chunks.extend(chunks);
+        window.parse_errors.extend(group_parse_errors);
+        window.file_hashes.extend(group_file_hashes);
+        window.refs.extend(group_refs);
+        window.type_relations.extend(group_type_relations);
+        window.file_states.extend(group_file_states);
+    }
+
+    Ok(window)
+}
+
+/// One parsed and embedded window handed to the store worker.
+struct WindowStore {
+    chunks: Vec<Chunk>,
+    embeddings: Vec<(String, Vec<f32>)>,
+    window_dim: usize,
+    file_states: Vec<FileIndexState>,
+    refs: Vec<(String, Vec<RawReference>)>,
+    type_relations: Vec<(String, Vec<RawTypeRelation>)>,
+}
+
+/// Commands for the staging store worker.
+enum StoreCommand {
+    Window(WindowStore),
+    Finish {
+        /// Set when the build parsed chunks but no embedding ever produced a
+        /// stored dimension, triggering the empty-vector fallback store.
+        create_fallback_vector_store: bool,
+        file_hashes: Vec<(String, String)>,
+        indexing_config: crate::config::IndexingConfig,
+    },
+}
+
+/// Sending end of the staging store worker plus its join handle.
+///
+/// Dropping the handle without `finish` or `abort` closes the channel; the
+/// worker drains the bounded queue, observes the hangup, and exits without
+/// committing or certifying anything. In-flight work is bounded by the
+/// channel capacity, so a dropped worker terminates on its own while the
+/// staging guard removes the build directory.
+struct StoreHandle {
+    tx: tokio::sync::mpsc::Sender<StoreCommand>,
+    worker: Option<tokio::task::JoinHandle<Result<()>>>,
+}
+
+impl StoreHandle {
+    fn spawn(build_dir: PathBuf, model_name: String, document_prefix: String) -> Self {
+        // Capacity bounds in-flight windows to one being stored plus one
+        // queued, applying backpressure to the embed stage if stores lag.
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let worker = tokio::task::spawn_blocking(move || {
+            store_worker(&build_dir, &model_name, &document_prefix, rx)
+        });
+        Self {
+            tx,
+            worker: Some(worker),
+        }
+    }
+
+    async fn send_window(&mut self, job: WindowStore) -> Result<()> {
+        if self.tx.send(StoreCommand::Window(job)).await.is_err() {
+            // The worker stopped; surface its real error rather than the
+            // channel's.
+            self.join().await?;
+            anyhow::bail!("store worker stopped without reporting an error");
+        }
+        Ok(())
+    }
+
+    async fn finish(
+        mut self,
+        create_fallback_vector_store: bool,
+        file_hashes: Vec<(String, String)>,
+        indexing_config: crate::config::IndexingConfig,
+    ) -> Result<()> {
+        self.tx
+            .send(StoreCommand::Finish {
+                create_fallback_vector_store,
+                file_hashes,
+                indexing_config,
+            })
+            .await
+            .map_err(|_| anyhow::anyhow!("store worker stopped before finalization"))?;
+        self.join().await
+    }
+
+    /// Close the channel and wait for the worker to drain and exit. Used on
+    /// error paths; the worker's own result is superseded by the error the
+    /// caller is already returning.
+    async fn abort(mut self) {
+        drop(self.tx);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.await;
+        }
+    }
+
+    async fn join(&mut self) -> Result<()> {
+        if let Some(worker) = self.worker.take() {
+            worker
+                .await
+                .map_err(|error| anyhow::anyhow!("store worker panicked: {error}"))??;
+        }
+        Ok(())
+    }
+}
+
+/// Apply parsed and embedded windows to the staging stores in order.
+///
+/// Owns every staging store so window storage overlaps parsing and embedding
+/// on other threads. Replies through the join handle only at `Finish` — after
+/// the single BM25 commit and index certification — or at the first failure.
+/// A channel hangup without `Finish` means the build was abandoned; nothing
+/// is committed and the staging guard removes the directory.
+fn store_worker(
+    build_dir: &Path,
+    model_name: &str,
+    document_prefix: &str,
+    mut rx: tokio::sync::mpsc::Receiver<StoreCommand>,
+) -> Result<()> {
+    let metadata_store = MetadataStore::open(&build_dir.join(METADATA_DB))
+        .context("failed to open staging metadata store")?;
+    metadata_store
+        .set_index_meta("model_name", model_name)
+        .context("failed to store model_name")?;
+    metadata_store
+        .set_index_meta("document_prefix", document_prefix)
+        .context("failed to store document_prefix")?;
+    let bm25_index = Bm25Index::open(&build_dir.join(BM25_SUBDIR))
+        .context("failed to open staging BM25 index")?;
+    // One writer for the whole build: a writer per window would pay creation,
+    // commit, and a merge-thread join for every window and serialize segment
+    // merges with embedding.
+    let bm25_writer = bm25_index
+        .begin_bulk_build()
+        .context("failed to open bulk BM25 writer")?;
+    let mut vector_store = None;
+    let mut stored_dim = None;
+
+    while let Some(command) = rx.blocking_recv() {
+        match command {
+            StoreCommand::Window(job) => {
+                if job.chunks.is_empty() {
+                    // Parse-error-only windows still need their file state and
+                    // parse artifacts persisted if a later window has chunks.
+                    metadata_store
+                        .insert_file_states(&job.file_states)
+                        .context("failed to store file index states")?;
+                    metadata_store
+                        .insert_parse_artifacts_batch(&job.refs, &job.type_relations)
+                        .context("failed to store references and type relations")?;
+                    continue;
+                }
+                metadata_store
+                    .insert_chunks(&job.chunks)
+                    .context("failed to insert chunk metadata")?;
+                metadata_store
+                    .insert_file_states(&job.file_states)
+                    .context("failed to store file index states")?;
+                metadata_store
+                    .insert_parse_artifacts_batch(&job.refs, &job.type_relations)
+                    .context("failed to store references and type relations")?;
+
+                if !job.embeddings.is_empty() {
+                    if let Some(existing_dim) = stored_dim {
+                        anyhow::ensure!(
+                            existing_dim == job.window_dim,
+                            "embedding dimension changed between windows: expected {}, got {}",
+                            existing_dim,
+                            job.window_dim
+                        );
+                    } else {
+                        let store = VectorStore::open(&build_dir.join(VECTOR_DB), job.window_dim)
+                            .context("failed to open staging vector store")?;
+                        metadata_store
+                            .set_index_meta("embedding_dim", &job.window_dim.to_string())
+                            .context("failed to store embedding_dim")?;
+                        vector_store = Some(store);
+                        stored_dim = Some(job.window_dim);
+                    }
+                }
+                if let Some(vector_store) = vector_store.as_ref() {
+                    let batch: Vec<(&str, &[f32])> = job
+                        .embeddings
+                        .iter()
+                        .map(|(id, vector)| (id.as_str(), vector.as_slice()))
+                        .collect();
+                    // The staging store is freshly created, so every chunk id
+                    // is new and the re-insert defenses of insert_batch
+                    // cannot match.
+                    vector_store
+                        .insert_batch_fresh(&batch)
+                        .context("failed to insert vectors")?;
+                }
+                bm25_writer
+                    .insert_chunks(&job.chunks)
+                    .context("failed to insert BM25 documents")?;
+            }
+            StoreCommand::Finish {
+                create_fallback_vector_store,
+                file_hashes,
+                indexing_config,
+            } => {
+                // A provider returning no vectors is not expected, but
+                // preserve the empty-vector dimensionality fallback for a
+                // non-empty parsed corpus.
+                if create_fallback_vector_store && stored_dim.is_none() {
+                    let fallback_dim = 4096;
+                    let _store = VectorStore::open(&build_dir.join(VECTOR_DB), fallback_dim)
+                        .context("failed to open staging vector store")?;
+                    metadata_store
+                        .set_index_meta("embedding_dim", &fallback_dim.to_string())
+                        .context("failed to store embedding_dim")?;
+                }
+                // Commit the BM25 index once for the whole build.
+                // Certification stays last: it attests that every staged
+                // insert, BM25 included, landed.
+                bm25_writer
+                    .finish()
+                    .context("failed to commit BM25 index")?;
+                publish_index_certification(&metadata_store, &file_hashes, &indexing_config)
+                    .context("failed to publish index freshness metadata")?;
+                return Ok(());
+            }
+        }
+    }
+    Ok(())
+}
 
 /// Parse all discovered files in parallel using rayon and collect chunks.
 ///
