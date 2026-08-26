@@ -360,8 +360,7 @@ pub fn output_results(
         .collect();
 
     if json_output {
-        let json = json_results_string(results, &contents);
-        print_budgeted(&json, budget);
+        println!("{}", json_within_budget(results, &contents, budget));
     } else if raw {
         if results.is_empty() {
             println!("No results found.");
@@ -426,6 +425,35 @@ fn json_results_string(results: &[vera_core::types::SearchResult], contents: &[&
         .unwrap_or_else(|e| format!("{{\"error\": \"failed to serialize: {e}\"}}"))
 }
 
+/// Serialize results so the document stays valid JSON within `budget`.
+///
+/// Cutting the serialized text at a byte offset splits string literals and
+/// leaves arrays unclosed, which breaks every programmatic consumer. Whole
+/// results are dropped instead, and a lone oversized result has its content
+/// shortened before serialization.
+fn json_within_budget(
+    results: &[vera_core::types::SearchResult],
+    contents: &[&str],
+    budget: usize,
+) -> String {
+    let json = json_results_string(results, contents);
+    if budget == 0 || json.len() <= budget || results.is_empty() {
+        return json;
+    }
+    for count in (1..results.len()).rev() {
+        let shorter = json_results_string(&results[..count], &contents[..count]);
+        if shorter.len() <= budget {
+            return shorter;
+        }
+    }
+    // One result still exceeds the budget: shorten its content instead.
+    let head = &results[..1];
+    let overhead = json_results_string(head, &[""]).len();
+    let room = budget.saturating_sub(overhead).max(1);
+    let trimmed = truncate_to_budget(contents[0], room);
+    json_results_string(head, &[trimmed.as_ref()])
+}
+
 /// Numbered verbose listing, one block per result. With a budget, each result's
 /// content spends from a shared allowance like markdown mode does; once it runs
 /// out, lower-ranked results are dropped (headers never consume budget).
@@ -464,21 +492,6 @@ fn format_raw_results(
         out.push('\n');
     }
     out
-}
-
-/// Print within the budget: truncate serialized output when one is set. A
-/// mid-string cut is acceptable there — the budget is a hard cap for machine
-/// consumers, not a formatting guarantee.
-fn print_budgeted(output: &str, budget: usize) {
-    println!("{}", budgeted_output(output, budget));
-}
-
-fn budgeted_output(output: &str, budget: usize) -> String {
-    if budget > 0 && output.len() > budget {
-        truncate_to_budget(output, budget).into_owned()
-    } else {
-        output.to_string()
-    }
 }
 
 /// Format a byte count as a compact human-readable string (e.g. "1.2 MB").
@@ -599,17 +612,33 @@ mod tests {
     }
 
     #[test]
-    fn json_output_respects_the_character_budget() {
+    fn json_output_stays_parseable_within_the_character_budget() {
         let results = two_results();
         let contents: Vec<&str> = results.iter().map(|r| r.content.as_str()).collect();
-        let json = json_results_string(&results, &contents);
-        assert!(json.len() > 300, "fixture must exceed the budget below");
+        let full = json_results_string(&results, &contents);
+        assert!(full.len() > 300, "fixture must exceed the budget below");
 
-        let budgeted = budgeted_output(&json, 300);
-        assert!(budgeted.len() <= 300, "{}", budgeted.len());
-        assert!(budgeted.contains("[...truncated]"));
-        // Without a budget the document is untouched (and still valid JSON).
-        assert_eq!(budgeted_output(&json, 0), json);
+        let budgeted = json_within_budget(&results, &contents, 300);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&budgeted).expect("budgeted JSON must parse");
+        assert!(parsed.as_array().is_some_and(|a| !a.is_empty()));
+        assert!(
+            budgeted.len() < full.len(),
+            "budget must drop or shorten results"
+        );
+
+        // Without a budget the document is untouched.
+        assert_eq!(json_within_budget(&results, &contents, 0), full);
+    }
+
+    #[test]
+    fn json_output_shortens_a_single_oversized_result() {
+        let results = two_results();
+        let contents: Vec<&str> = results.iter().map(|r| r.content.as_str()).collect();
+        let budgeted = json_within_budget(&results[..1], &contents[..1], 120);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&budgeted).expect("budgeted JSON must parse");
+        assert_eq!(parsed.as_array().map(Vec::len), Some(1));
     }
 
     #[test]

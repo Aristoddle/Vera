@@ -16,7 +16,7 @@ The default embedding model is `minishlab/potion-code-16M-v2`, a static embeddin
 3. Index the repo: `vera index .` (first time) or `vera update .` (after edits; pass `--max-files <N>` to bound processed files per run and report deferred files, or `--no-progress` to disable interactive progress). Use `vera stats --json` to inspect index health (parse failures, tree-sitter error nodes, Tier 0 fallback).
 4. For long sessions, start the watcher: `vera watch .` (background process, Ctrl-C to stop, 2s debounce). This auto-updates the index on file changes and replaces manual `vera update .` calls.
 5. Get oriented: `vera overview` returns a project summary: language breakdown, directory structure, entry points, complexity hotspots, and detected conventions (frameworks, patterns, config files). Add `--changed`, `--since <rev>`, or `--base <rev>` when the task is limited to modified files or a PR diff.
-6. Use `vera references <symbol>` to find callers; add `--callees` to see what it calls. `vera dead-code` lists functions with no callers.
+6. Use `vera references <symbol>` to find callers; add `--callees` to see what it calls. When several definitions share a name, the output lists the receivers the calls went through: rerun with `--receiver <name>` (as in `vera references get --receiver app`) to keep only calls made through that object. `vera dead-code` lists functions with no callers.
 7. Search:
    ```sh
      vera search "authentication middleware"

@@ -42,7 +42,7 @@ pub mod regex_search;
 pub mod structural;
 
 pub use local_reranker::LocalReranker;
-pub use references::search_callers;
+pub use references::{search_callers, search_callers_through};
 pub use regex_search::search_regex;
 pub use structural::{StructuralSearchKind, search_structural};
 

@@ -288,6 +288,7 @@ mod tests {
         let references = [RawReference {
             callee: "target".to_string(),
             caller: Some("caller".to_string()),
+            qualifier: None,
             line: 2,
         }];
         store

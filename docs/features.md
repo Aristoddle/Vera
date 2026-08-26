@@ -128,6 +128,8 @@ This makes parser regressions and partial indexing visible instead of silent.
 
 `vera references foo` finds all callers of a symbol as search-style snippets. `vera references foo --callees` finds what a symbol calls. Add `--changed`, `--since`, or `--base` when you want exact call relationships limited to a diff. The call graph is built during indexing from tree-sitter AST analysis, so lookups are instant.
 
+Call sites are stored under the symbol's name, so definitions sharing a name share an answer. Indexing also records the receiver each call was written through, so `vera references get --receiver app` returns only `app.get(...)` calls and leaves dictionary lookups out. The output names the available receivers whenever more than one exists. See [query-guide.md](query-guide.md) for when this matters.
+
 ### Agent-Oriented Structural Search
 
 `vera structural <intent> [query]` covers the common structural tasks agents hit repeatedly without forcing raw tree-sitter syntax.

@@ -520,6 +520,9 @@ pub enum Commands {
         /// Show what this symbol calls instead of what calls it.
         #[arg(long)]
         callees: bool,
+        /// Only calls made through this receiver, as in `app.symbol()`.
+        #[arg(long, value_name = "NAME")]
+        receiver: Option<String>,
         /// Maximum number of results to return (default: 20).
         #[arg(long, short = 'n')]
         limit: Option<usize>,

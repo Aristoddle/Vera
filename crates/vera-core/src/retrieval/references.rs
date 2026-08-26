@@ -20,6 +20,21 @@ pub fn search_callers(
     limit: usize,
     filters: &SearchFilters,
 ) -> Result<Vec<SearchResult>> {
+    search_callers_through(index_dir, symbol, None, limit, filters)
+}
+
+/// Search call sites, optionally limited to calls made through one receiver.
+///
+/// `receiver` is matched against the text before the dot at the call site, so
+/// `state.add_url_rule()` and `app.add_url_rule()` can be told apart even
+/// though both are stored under the callee name `add_url_rule`.
+pub fn search_callers_through(
+    index_dir: &Path,
+    symbol: &str,
+    receiver: Option<&str>,
+    limit: usize,
+    filters: &SearchFilters,
+) -> Result<Vec<SearchResult>> {
     if limit == 0 {
         anyhow::bail!("limit must be greater than zero");
     }
@@ -28,7 +43,7 @@ pub fn search_callers(
     let store = MetadataStore::open(&metadata_path)?;
     let repo_root = canonical_project_root(index_dir)?;
     let root_dir = crate::discovery::open_root_dir(&repo_root)?;
-    let callers = store.find_callers(symbol)?;
+    let callers = store.find_callers_through(symbol, receiver)?;
     let mut results = Vec::new();
     let mut seen = HashSet::new();
 

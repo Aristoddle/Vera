@@ -250,6 +250,7 @@ fn main() {
         Commands::References {
             symbol,
             callees,
+            receiver,
             limit,
             git_scope,
             compact,
@@ -258,6 +259,7 @@ fn main() {
             commands::references::run(
                 &symbol,
                 callees,
+                receiver.as_deref(),
                 limit,
                 git_scope.resolve(),
                 cli.json,

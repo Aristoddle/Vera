@@ -135,6 +135,13 @@ const SQL_FIND_CALLERS: &str = "SELECT file_path, line, caller FROM [references]
                  WHERE lower(callee) = lower(?1)
                  ORDER BY file_path, line";
 
+/// Same lookup restricted to calls made through one receiver, so callers of
+/// `state.add_url_rule()` can be separated from callers of `app.add_url_rule()`
+/// without resolving types.
+const SQL_FIND_CALLERS_BY_QUALIFIER: &str = "SELECT file_path, line, caller FROM [references]
+                 WHERE lower(callee) = lower(?1) AND lower(qualifier) = lower(?2)
+                 ORDER BY file_path, line";
+
 const SQL_FIND_CALLEES: &str = "SELECT file_path, line, callee FROM [references]
                  WHERE lower(caller) = lower(?1)
                  ORDER BY file_path, line";
@@ -315,7 +322,8 @@ impl MetadataStore {
                     file_path TEXT NOT NULL,
                     line INTEGER NOT NULL,
                     callee TEXT NOT NULL,
-                    caller TEXT
+                    caller TEXT,
+                    qualifier TEXT
                 );
                 CREATE INDEX IF NOT EXISTS idx_refs_callee
                     ON [references](callee);
@@ -332,6 +340,15 @@ impl MetadataStore {
                     ON [references](lower(caller));",
             )
             .context("failed to create references table")?;
+
+        // Indexes written before call receivers were recorded lack the column.
+        // Adding it keeps them readable: existing rows report no receiver and
+        // fall back to name-only matching until the file is reindexed.
+        if !self.column_exists("references", "qualifier")? {
+            self.conn
+                .execute_batch("ALTER TABLE [references] ADD COLUMN qualifier TEXT;")
+                .context("failed to add qualifier column to references table")?;
+        }
 
         self.conn
             .execute_batch(
@@ -833,14 +850,14 @@ impl MetadataStore {
         {
             let mut ref_stmt = tx
                 .prepare_cached(
-                    "INSERT INTO [references] (file_path, line, callee, caller)
-                     VALUES (?1, ?2, ?3, ?4)",
+                    "INSERT INTO [references] (file_path, line, callee, caller, qualifier)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
                 )
                 .context("failed to prepare batch reference insert")?;
             for &(file_path, refs) in file_refs {
                 for r in refs {
                     ref_stmt
-                        .execute(params![file_path, r.line, r.callee, r.caller])
+                        .execute(params![file_path, r.line, r.callee, r.caller, r.qualifier])
                         .with_context(|| format!("failed to insert reference for {file_path}"))?;
                 }
             }
@@ -895,20 +912,80 @@ impl MetadataStore {
     }
 
     /// Find all call sites that reference a given symbol name.
-    pub fn find_callers(&self, symbol_name: &str) -> Result<Vec<CallerRef>> {
+    fn column_exists(&self, table: &str, column: &str) -> Result<bool> {
         let mut stmt = self
             .conn
-            .prepare_cached(SQL_FIND_CALLERS)
-            .context("failed to prepare callers query")?;
+            .prepare(&format!("PRAGMA table_info([{table}])"))
+            .with_context(|| format!("failed to inspect {table} columns"))?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            if row.get::<_, String>(1)? == column {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    pub fn find_callers(&self, symbol_name: &str) -> Result<Vec<CallerRef>> {
+        self.find_callers_through(symbol_name, None)
+    }
+
+    /// Find callers, optionally limited to calls made through `qualifier`
+    /// (the receiver in `receiver.symbol()`).
+    pub fn find_callers_through(
+        &self,
+        symbol_name: &str,
+        qualifier: Option<&str>,
+    ) -> Result<Vec<CallerRef>> {
+        let read = |row: &rusqlite::Row<'_>| {
+            Ok(CallerRef {
+                file_path: row.get(0)?,
+                line: row.get(1)?,
+                caller: row.get(2)?,
+            })
+        };
+        match qualifier {
+            Some(qualifier) => {
+                let mut stmt = self
+                    .conn
+                    .prepare_cached(SQL_FIND_CALLERS_BY_QUALIFIER)
+                    .context("failed to prepare receiver-filtered callers query")?;
+                let rows = stmt
+                    .query_map(params![symbol_name, qualifier], read)
+                    .context("failed to query callers")?;
+                collect_rows(rows)
+            }
+            None => {
+                let mut stmt = self
+                    .conn
+                    .prepare_cached(SQL_FIND_CALLERS)
+                    .context("failed to prepare callers query")?;
+                let rows = stmt
+                    .query_map(params![symbol_name], read)
+                    .context("failed to query callers")?;
+                collect_rows(rows)
+            }
+        }
+    }
+
+    /// Receivers that calls to `symbol_name` are made through, most frequent
+    /// first. Two definitions sharing a name usually show up here as two
+    /// receivers, which is what makes the ambiguity visible to a caller.
+    pub fn caller_qualifiers(&self, symbol_name: &str) -> Result<Vec<(String, usize)>> {
+        let mut stmt = self
+            .conn
+            .prepare_cached(
+                "SELECT qualifier, COUNT(*) FROM [references]
+                 WHERE lower(callee) = lower(?1) AND qualifier IS NOT NULL
+                 GROUP BY lower(qualifier)
+                 ORDER BY COUNT(*) DESC, qualifier",
+            )
+            .context("failed to prepare receiver summary query")?;
         let rows = stmt
             .query_map(params![symbol_name], |row| {
-                Ok(CallerRef {
-                    file_path: row.get(0)?,
-                    line: row.get(1)?,
-                    caller: row.get(2)?,
-                })
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as usize))
             })
-            .context("failed to query callers")?;
+            .context("failed to query receivers")?;
         collect_rows(rows)
     }
 
@@ -1488,6 +1565,7 @@ mod tests {
                 vec![crate::parsing::references::RawReference {
                     callee: "helper".to_string(),
                     caller: Some("main".to_string()),
+                    qualifier: None,
                     line: 3,
                 }],
             ),
@@ -1496,6 +1574,7 @@ mod tests {
                 vec![crate::parsing::references::RawReference {
                     callee: "helper".to_string(),
                     caller: None,
+                    qualifier: None,
                     line: 9,
                 }],
             ),

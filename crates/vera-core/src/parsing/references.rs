@@ -41,8 +41,60 @@ pub struct RawReference {
     pub callee: String,
     /// Name of the enclosing symbol that contains this call (if known).
     pub caller: Option<String>,
+    /// Receiver the call was made through, when the call site is a member
+    /// expression: `state.add_url_rule()` records `state`. Plain calls and
+    /// receivers that are not simple identifier paths record `None`.
+    ///
+    /// This is the only evidence this layer has for telling two definitions of
+    /// the same name apart, since it never resolves imports or types.
+    pub qualifier: Option<String>,
     /// 1-based line number of the call site.
     pub line: u32,
+}
+
+/// Longest receiver text worth storing. Real receivers are short names or
+/// short dotted paths; anything longer is an expression this layer cannot use.
+const MAX_QUALIFIER_LEN: usize = 64;
+
+/// Extract the receiver of a member call: the object part of `obj.method()`.
+///
+/// Returns `None` unless the receiver is an identifier or a dotted path of
+/// identifiers, so `foo().bar()` and `items[0].bar()` record nothing rather
+/// than a fragment that cannot be matched against anything.
+fn extract_qualifier(node: &tree_sitter::Node, source: &[u8]) -> Option<String> {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        let receiver = match child.kind() {
+            "field_expression"
+            | "member_expression"
+            | "attribute"
+            | "selector_expression"
+            | "member_access_expression"
+            | "navigation_expression" => child
+                .child_by_field_name("object")
+                .or_else(|| child.child_by_field_name("value"))
+                .or_else(|| child.child_by_field_name("operand"))
+                .or_else(|| child.child(0)),
+            "scoped_identifier" | "qualified_identifier" => child
+                .child_by_field_name("path")
+                .or_else(|| child.child_by_field_name("scope"))
+                .or_else(|| child.child(0)),
+            _ => None,
+        };
+        let Some(receiver) = receiver else { continue };
+        let text = receiver.utf8_text(source).ok()?.trim();
+        if text.is_empty() || text.len() > MAX_QUALIFIER_LEN {
+            return None;
+        }
+        if text
+            .chars()
+            .all(|ch| ch.is_alphanumeric() || ch == '_' || ch == '.' || ch == ':' || ch == '$')
+        {
+            return Some(text.to_string());
+        }
+        return None;
+    }
+    None
 }
 
 /// Extract call-site references from a parsed tree.
@@ -269,6 +321,7 @@ fn collect_calls(
             refs.push(RawReference {
                 callee,
                 caller,
+                qualifier: extract_qualifier(&node, source),
                 line: node.start_position().row as u32 + 1,
             });
         }
@@ -462,5 +515,76 @@ export function App() {
     fn empty_source_returns_no_refs() {
         let refs = parse_and_extract("", Language::Rust);
         assert!(refs.is_empty());
+    }
+
+    fn qualifier_of<'a>(refs: &'a [RawReference], callee: &str) -> Option<&'a str> {
+        refs.iter()
+            .find(|r| r.callee == callee)
+            .and_then(|r| r.qualifier.as_deref())
+    }
+
+    #[test]
+    fn python_records_the_call_receiver() {
+        let source = "def register(app, state):\n    app.add_url_rule('/')\n    state.add_url_rule('/x')\n    helper()\n";
+        let refs = parse_and_extract_for_path(source, "mod.py", Language::Python);
+        let receivers: Vec<Option<&str>> = refs
+            .iter()
+            .filter(|r| r.callee == "add_url_rule")
+            .map(|r| r.qualifier.as_deref())
+            .collect();
+        assert!(receivers.contains(&Some("app")), "{refs:?}");
+        assert!(receivers.contains(&Some("state")), "{refs:?}");
+        assert_eq!(qualifier_of(&refs, "helper"), None, "{refs:?}");
+    }
+
+    #[test]
+    fn javascript_records_dotted_receivers() {
+        let source = "function run(list) {\n  utils.forEach(list, fn);\n  list.forEach(fn);\n}\n";
+        let refs = parse_and_extract_for_path(source, "mod.js", Language::JavaScript);
+        let receivers: Vec<Option<&str>> = refs
+            .iter()
+            .filter(|r| r.callee == "forEach")
+            .map(|r| r.qualifier.as_deref())
+            .collect();
+        assert!(receivers.contains(&Some("utils")), "{refs:?}");
+        assert!(receivers.contains(&Some("list")), "{refs:?}");
+    }
+
+    #[test]
+    fn rust_records_the_path_of_a_scoped_call() {
+        let source = "fn main() {\n    helpers::build();\n    value.build();\n    build();\n}\n";
+        let refs = parse_and_extract_for_path(source, "main.rs", Language::Rust);
+        let receivers: Vec<Option<&str>> = refs
+            .iter()
+            .filter(|r| r.callee == "build")
+            .map(|r| r.qualifier.as_deref())
+            .collect();
+        assert!(receivers.contains(&Some("helpers")), "{refs:?}");
+        assert!(receivers.contains(&Some("value")), "{refs:?}");
+        assert!(
+            receivers.contains(&None),
+            "a bare call has no receiver: {refs:?}"
+        );
+    }
+
+    #[test]
+    fn a_receiver_that_is_not_an_identifier_path_is_dropped() {
+        // `build()` here is reached through a call and an index expression.
+        // Recording a fragment of either would produce a receiver that can
+        // never match a name the caller could pass.
+        let source = "fn main() {\n    factory().build();\n    items[0].build();\n}\n";
+        let refs = parse_and_extract_for_path(source, "main.rs", Language::Rust);
+        for reference in refs.iter().filter(|r| r.callee == "build") {
+            assert_eq!(reference.qualifier, None, "{refs:?}");
+        }
+    }
+
+    #[test]
+    fn go_records_the_package_or_variable_receiver() {
+        let source =
+            "package main\n\nfunc run(r Router) {\n\tfmt.Println(\"x\")\n\tr.Handle(\"/\")\n}\n";
+        let refs = parse_and_extract_for_path(source, "main.go", Language::Go);
+        assert_eq!(qualifier_of(&refs, "Println"), Some("fmt"), "{refs:?}");
+        assert_eq!(qualifier_of(&refs, "Handle"), Some("r"), "{refs:?}");
     }
 }
