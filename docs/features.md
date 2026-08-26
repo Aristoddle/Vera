@@ -9,7 +9,7 @@ Vera (Vector Enhanced Reranking Agent) is a code search tool that combines BM25 
 Every query runs two retrieval paths in parallel:
 
 - **BM25 keyword search** via Tantivy. Handles exact identifiers, config keys, and literal strings. Sub-millisecond latency.
-- **Vector similarity search** via sqlite-vec. Catches conceptual matches even when the exact words don't appear in the code.
+- **Vector similarity search** against the memory-mapped `.vera/vectors.f32` sidecar using SIMD L2 distance (`VERA_VECTOR_SCAN=vec0` selects sqlite-vec instead). Catches conceptual matches even when the exact words don't appear in the code.
 
 Results from both paths merge through Reciprocal Rank Fusion (RRF), so a result that scores well in both lists rises to the top. Full details: [how-it-works.md](how-it-works.md).
 
@@ -168,7 +168,7 @@ Indexing, storage, and search always stay on your machine. The backend choice on
 
 ### Curated Local Models
 
-The default local embedding model is `minishlab/potion-code-16M-v2`, a static embedding model that runs locally on CPU on any supported machine; no GPU or ONNX Runtime needed:
+The default local embedding model is `minishlab/potion-code-16M-v2`, a static embedding model that runs locally on CPU:
 
 | Model | Role |
 |-------|------|

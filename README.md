@@ -84,20 +84,9 @@ bunx @vera-ai/cli install   # or: npx -y @vera-ai/cli install / uvx vera-ai inst
 
 Vera itself is always local: the index lives in `.vera/` per project, config and models in `$XDG_DATA_HOME/vera` (or `~/.vera` for existing installs). The backend choice only affects where embeddings and reranking run.
 
-| You have | Run this | What happens |
-|----------|----------|-------------|
-| Not sure | `vera setup` | Interactive wizard auto-detects your hardware |
-| CPU only | `vera setup --potion-code` | Uses the default `minishlab/potion-code-16M-v2` local model on any supported machine |
-| Remote models | `vera setup --api` | Prompts for an OpenAI-compatible endpoint and key |
-| Apple Silicon (M1/M2/M3/M4) | `vera setup --onnx-jina-coreml` | Downloads local models, uses CoreML GPU acceleration |
-| NVIDIA GPU | `vera setup --onnx-jina-cuda` | Downloads local models, uses CUDA. Fastest local option |
-| AMD GPU (Linux) | `vera setup --onnx-jina-rocm` | Downloads local models, uses ROCm |
-| Intel GPU (Linux) | `vera setup --onnx-jina-openvino` | Downloads local models, uses OpenVINO |
-| DirectX 12 GPU (Windows) | `vera setup --onnx-jina-directml` | Downloads local models, uses DirectML |
+Pick the `vera setup` flag that matches your hardware from the quick start above. The full hardware-to-command matrix, step-by-step instructions, API provider options, Docker, and building from source live in the [Installation Guide](docs/installation.md).
 
-API mode works with any OpenAI-compatible endpoint and needs no local compute. Use `vera setup --api --yes` with `EMBEDDING_MODEL_*` variables for non-interactive setup. The default `minishlab/potion-code-16M-v2` model runs locally on CPU on any supported machine; no GPU or ONNX Runtime needed. Jina ONNX and CodeRankEmbed are opt-in alternatives. Reranking is opt-in and disabled by default. After the first index, `vera update .` only re-embeds changed files, so incremental updates are fast on any backend. Full details: [docs/models.md](docs/models.md).
-
-For step-by-step instructions, API provider options, Docker, building from source, and troubleshooting, see the full [Installation Guide](docs/installation.md).
+API mode works with any OpenAI-compatible endpoint and needs no local compute. Use `vera setup --api --yes` with `EMBEDDING_MODEL_*` variables for non-interactive setup. Jina ONNX and CodeRankEmbed are opt-in alternatives. Reranking is opt-in and disabled by default. After the first index, `vera update .` only re-embeds changed files, so incremental updates are fast on any backend. Full details: [docs/models.md](docs/models.md).
 
 <details>
 <summary>MCP server</summary>

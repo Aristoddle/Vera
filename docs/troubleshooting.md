@@ -113,22 +113,7 @@ See the [query guide](query-guide.md) for more tips on writing effective queries
 
 ## Need an exact text match?
 
-Use `vera grep` for exact string or regex matching across indexed files:
-
-```bash
-vera grep "EMBEDDING_MODEL_BASE_URL"
-vera grep "TODO\(" -i
-vera grep "queryClient|invalidateQueries" --path "frontend/src/**"
-```
-
-Vera uses Rust regex syntax. Use `|` for alternation. `\|` matches a literal pipe.
-
-Use `rg` when you need to count matches, search filenames, or scan files outside the index:
-
-```bash
-rg "TODO\(" -n
-rg --files | rg "docker"
-```
+Use `vera grep` for exact string or regex matching across indexed files, and `rg` when you need counting, filename search, or files outside the index. Examples and syntax notes: [query guide](query-guide.md#when-to-use-vera-grep-vs-rg).
 
 ## Search misses new files or recent edits
 

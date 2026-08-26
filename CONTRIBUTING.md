@@ -2,7 +2,7 @@
 
 ## Build from Source
 
-Rust 1.86+ required (see `Cargo.toml` `rust-version` for exact MSRV).
+Rust 1.88+ required (see `Cargo.toml` `rust-version` for exact MSRV).
 
 ```bash
 git clone https://github.com/VeraTools/Vera.git

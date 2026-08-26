@@ -67,7 +67,7 @@ All stored in `.vera/` at the project root.
 
 ### Other modules
 
-- `types.rs`: `Language` enum (60+ variants), `SearchResult`, `CodeChunk`, `SymbolType`
+- `types.rs`: `Language` enum (65 variants plus `Unknown`), `SearchResult`, `CodeChunk`, `SymbolType`
 - `config.rs`: `RetrievalConfig`, `IndexingConfig` defaults
 - `local_models/`: Manages local embedding presets, custom ONNX embedding configs, and ORT/model assets under the Vera data directory (XDG-compliant)
 - `discovery/`: File discovery with gitignore support, binary/size filtering
