@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run a small agent-level A/B benchmark for Vera."""
+"""Run a small agent-level benchmark comparing tool arms for Vera."""
 
 from __future__ import annotations
 
@@ -23,7 +23,15 @@ SOURCE_REPO = REPO_ROOT / ".bench" / "semble-repos" / "flask"
 QUESTIONS_FILE = Path(__file__).resolve().parent / "flask" / "questions.md"
 VERA_BINARY = REPO_ROOT / "target" / "release" / "vera"
 RUNS_ROOT = Path("/tmp/agent-bench")
-ARMS = ("with-vera", "control")
+ARMS = ("with-vera", "with-semble", "control")
+# Shims make a binary exit 127 so an arm cannot reach another arm's tool.
+ARM_SHIMS = {
+    "with-vera": ("semble",),
+    "with-semble": ("vera",),
+    "control": ("vera", "semble"),
+}
+SEMBLE_PREWARM_QUERY = "authentication"
+SEMBLE_PREWARM_TIMEOUT_S = 600
 PROMPT_HEADER = """Answer the question about the codebase in the current directory.
 
 This is a read-only task: do not modify files and do not install anything.
@@ -54,7 +62,7 @@ def parse_args() -> argparse.Namespace:
     mode.add_argument(
         "--setup-only",
         action="store_true",
-        help="Create both arms and index the Vera arm, without agent runs",
+        help="Create all arms and index the Vera arm, without agent runs",
     )
     mode.add_argument("--run", type=Path, metavar="RUN_DIR", help="Run agents in an existing run")
     mode.add_argument(
@@ -211,42 +219,117 @@ def copy_repo(destination: Path) -> None:
     )
 
 
-def environment_for(arm: str, *, shim_dir: Path | None = None) -> dict[str, str]:
+FACTORY_HOME_FILES = (
+    "settings.json",
+    "auth.v2.file",
+    "auth.v2.key",
+    "host.json",
+    "last-startup-version",
+)
+
+
+def build_factory_home(run_dir: Path) -> Path:
+    """Copy the minimum droid config into a run-local home.
+
+    The real `~/.factory` carries global AGENTS.md instructions, personal
+    skills, and custom droids. Any of those would reach into every arm and
+    change agent behavior in ways that have nothing to do with the tool under
+    test, so cells run against a home that holds only credentials and model
+    settings.
+    """
+    home = run_dir / "factory-home"
+    config = home / ".factory"
+    config.mkdir(parents=True, exist_ok=True)
+    source = Path.home() / ".factory"
+    for name in FACTORY_HOME_FILES:
+        candidate = source / name
+        if candidate.is_file():
+            shutil.copy2(candidate, config / name)
+    return home
+
+
+def environment_for(arm: str, run_dir: Path) -> dict[str, str]:
     env = os.environ.copy()
-    binary_dir = str(VERA_BINARY.parent)
-    path_parts = [binary_dir]
-    if shim_dir is not None:
-        path_parts.insert(0, str(shim_dir))
-        env.pop("VERA_LOCAL", None)
-    else:
+    env["FACTORY_HOME_OVERRIDE"] = str(build_factory_home(run_dir))
+    path_parts: list[str] = []
+    if arm == "with-vera":
         env["VERA_LOCAL"] = "1"
+        path_parts.append(str(VERA_BINARY.parent))
+    else:
+        env.pop("VERA_LOCAL", None)
+    if ARM_SHIMS[arm]:
+        shim_dir = run_dir / arm / "bin"
+        write_shims(shim_dir, ARM_SHIMS[arm])
+        path_parts.insert(0, str(shim_dir))
+    if arm == "with-semble":
+        env["SEMBLE_CACHE_LOCATION"] = str(run_dir / arm / "cache")
     env["PATH"] = os.pathsep.join(path_parts + [env.get("PATH", "")])
     return env
 
 
-def write_control_shim(shim_dir: Path) -> None:
+def write_shims(shim_dir: Path, binaries: Iterable[str]) -> None:
+    """Shim executables to exit 127 so an arm cannot use another arm's tool."""
     shim_dir.mkdir(parents=True, exist_ok=True)
-    shim = shim_dir / "vera"
-    shim.write_text(
-        "#!/bin/sh\nprintf '%s\\n' 'vera: not available in this environment' >&2\nexit 127\n",
-        encoding="ascii",
-    )
-    shim.chmod(0o755)
+    for name in binaries:
+        shim = shim_dir / name
+        shim.write_text(
+            f"#!/bin/sh\nprintf '%s\\n' '{name}: not available in this environment' >&2\nexit 127\n",
+            encoding="ascii",
+        )
+        shim.chmod(0o755)
+
+
+SEMBLE_AGENTS_MD = """\
+## Semble Code Search
+
+Use the `semble` CLI to find relevant code before reading files. Queries take
+natural language or code identifiers.
+
+```bash
+semble search "how does the app factory work?" .
+semble search "database host port" . --top-k 10
+semble search "deployment guide" . --content docs
+semble search "database host port" . --content config
+semble search "rate limiting" . --content all
+semble find-related flask/app.py 10 .
+```
+
+Results give file paths, line numbers, and snippets; open the file for full
+context. The index builds on first search and is cached automatically.
+
+rg/grep remain available for exact strings, symbol names, and regex search.
+"""
+
+
+def write_semble_agents_md(repo: Path) -> str:
+    """Write the with-semble arm's AGENTS.md and return its provenance label.
+
+    Uses a hand-written CLI-only snippet: this arm has no MCP server, so
+    Semble's installer text (which leads with `mcp__semble__*` tool calls)
+    would send the agent after tools that do not exist in this environment.
+    """
+    (repo / "AGENTS.md").write_text(SEMBLE_AGENTS_MD, encoding="utf-8")
+    return "hand-written CLI snippet (SEMBLE_AGENTS_MD)"
 
 
 def setup_run(questions: list[dict[str, Any]]) -> Path:
     binary = ensure_binary()
     run_dir = make_run_dir()
     with_repo = run_dir / "with-vera" / "repo"
+    sem_repo = run_dir / "with-semble" / "repo"
     control_repo = run_dir / "control" / "repo"
     copy_repo(with_repo)
+    copy_repo(sem_repo)
     copy_repo(control_repo)
+    shutil.rmtree(sem_repo / ".vera", ignore_errors=True)
+    shutil.rmtree(sem_repo / ".factory", ignore_errors=True)
     shutil.rmtree(control_repo / ".vera", ignore_errors=True)
     shutil.rmtree(control_repo / ".factory", ignore_errors=True)
+    for arm in ARMS:
+        if ARM_SHIMS[arm]:
+            write_shims(run_dir / arm / "bin", ARM_SHIMS[arm])
 
-    shim_dir = run_dir / "control" / "bin"
-    write_control_shim(shim_dir)
-    with_env = environment_for("with-vera")
+    with_env = environment_for("with-vera", run_dir)
     index_log = run_dir / "with-vera" / "index.log"
     install_log = run_dir / "with-vera" / "agent-install.log"
     with index_log.open("w", encoding="utf-8") as output:
@@ -282,6 +365,28 @@ def setup_run(questions: list[dict[str, Any]]) -> Path:
         fail(f"Vera agent installation failed; see {install_log}")
     if (control_repo / ".vera").exists() or (control_repo / ".factory").exists():
         fail("control arm contains Vera artifacts")
+    if (sem_repo / ".vera").exists() or (sem_repo / ".factory").exists():
+        fail("with-semble arm contains Vera artifacts")
+
+    sem_env = environment_for("with-semble", run_dir)
+    sem_cache = Path(sem_env["SEMBLE_CACHE_LOCATION"])
+    sem_cache.mkdir(parents=True, exist_ok=True)
+    # Pre-warm the Semble index so question runs measure search, not indexing.
+    sem_index_log = run_dir / "with-semble" / "index.log"
+    with sem_index_log.open("w", encoding="utf-8") as output:
+        result = subprocess.run(
+            ["semble", "search", SEMBLE_PREWARM_QUERY, "."],
+            cwd=sem_repo,
+            env=sem_env,
+            text=True,
+            stdout=output,
+            stderr=subprocess.STDOUT,
+            timeout=SEMBLE_PREWARM_TIMEOUT_S,
+            check=False,
+        )
+    if result.returncode != 0:
+        fail(f"Semble index pre-warm failed; see {sem_index_log}")
+    agents_md_source = write_semble_agents_md(sem_repo)
 
     metadata = {
         "created_at": datetime.now(timezone.utc).isoformat(),
@@ -290,8 +395,21 @@ def setup_run(questions: list[dict[str, Any]]) -> Path:
         "questions_file": str(QUESTIONS_FILE),
         "questions": questions,
         "arms": {
-            "with-vera": {"repo": str(with_repo), "path_prefix": str(binary.parent)},
-            "control": {"repo": str(control_repo), "shim": str(shim_dir)},
+            "with-vera": {
+                "repo": str(with_repo),
+                "path_prefix": str(binary.parent),
+                "shims": list(ARM_SHIMS["with-vera"]),
+            },
+            "with-semble": {
+                "repo": str(sem_repo),
+                "shims": list(ARM_SHIMS["with-semble"]),
+                "cache": str(sem_cache),
+                "agents_md_source": agents_md_source,
+            },
+            "control": {
+                "repo": str(control_repo),
+                "shims": list(ARM_SHIMS["control"]),
+            },
         },
     }
     (run_dir / "setup.json").write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
@@ -326,8 +444,7 @@ def run_question(
                 return
         except json.JSONDecodeError:
             pass
-    shim_dir = run_dir / "control" / "bin" if arm == "control" else None
-    env = environment_for(arm, shim_dir=shim_dir)
+    env = environment_for(arm, run_dir)
     start = time.monotonic()
     timeout_s = 7200
     returncode: int | None = None
@@ -342,6 +459,7 @@ def run_question(
                     "exec",
                     "--cwd",
                     str(repo_dir),
+                    "--disable-builtin-skills",
                     "--auto",
                     "medium",
                     "-o",
@@ -380,8 +498,11 @@ def run_agents(
         if not (run_dir / arm / "repo").is_dir():
             fail(f"run directory is missing {arm}/repo: {run_dir}")
     write_prompts(run_dir, questions)
+    # Rotate the starting arm by question number so each arm leads roughly
+    # equally often and no arm is systematically disadvantaged by position.
     arms_by_question = [
-        ("with-vera", "control") if question["number"] % 2 else ("control", "with-vera")
+        ARMS[(question["number"] - 1) % len(ARMS) :]
+        + ARMS[: (question["number"] - 1) % len(ARMS)]
         for question in questions
     ]
     print(f"Running {len(questions)} questions in {run_dir} with {model} ({effort})")
@@ -507,6 +628,10 @@ def analyze_run(
 ) -> dict[str, Any]:
     if not run_dir.is_dir():
         fail(f"run directory does not exist: {run_dir}")
+    # Arms missing from an older run dir are simply absent from its summary.
+    present_arms = [arm for arm in ARMS if (run_dir / arm / "repo").is_dir()]
+    if not present_arms:
+        fail(f"run directory contains no arm repositories: {run_dir}")
     result: dict[str, Any] = {
         "run_dir": str(run_dir),
         "model": model,
@@ -518,7 +643,7 @@ def analyze_run(
     for question in questions:
         number = question["number"]
         result["questions"][f"q{number:02d}"] = {}
-        for arm in ARMS:
+        for arm in present_arms:
             arm_dir = run_dir / arm
             parsed = parse_jsonl(
                 arm_dir / f"q{number:02d}.{slug}.jsonl",
@@ -534,7 +659,7 @@ def analyze_run(
                 parsed["failed"] = True
             result["questions"][f"q{number:02d}"][arm] = parsed
 
-    for arm in ARMS:
+    for arm in present_arms:
         rows = [result["questions"][f"q{q['number']:02d}"][arm] for q in questions]
         failed = sum(1 for row in rows if row.get("failed"))
         rows = [row for row in rows if not row.get("failed")]
@@ -558,12 +683,11 @@ def analyze_run(
 
 def print_comparison(result: dict[str, Any]) -> None:
     print("\nArm comparison")
-    print("arm         questions  failed  tool calls  tokens in  tokens out  wall s  duration ms")
-    for arm in ARMS:
-        summary = result["summary"][arm]
+    print("arm          questions  failed  tool calls  tokens in  tokens out  wall s  duration ms")
+    for arm, summary in result["summary"].items():
         tool_count = sum(summary["tool_calls"].values())
         print(
-            f"{arm:<11} {summary['questions']:>9}  {summary['failed']:>6}  {tool_count:>10}  "
+            f"{arm:<12} {summary['questions']:>9}  {summary['failed']:>6}  {tool_count:>10}  "
             f"{summary['tokens_in']:>9}  {summary['tokens_out']:>10}  "
             f"{summary['wall_s_total']:>6.1f}  {summary['duration_ms_total']:>12.0f}"
         )
