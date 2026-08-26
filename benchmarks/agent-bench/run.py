@@ -445,8 +445,54 @@ def run_question(
         except json.JSONDecodeError:
             pass
     env = environment_for(arm, run_dir)
+    for attempt in range(2):
+        returncode, timed_out, wall_s = execute_cell(
+            repo_dir, prompt, output_path, stderr_path, env, model, effort
+        )
+        if returncode == 0 or timed_out or not transient_provider_error(output_path):
+            break
+        print(f"  {arm} q{question['number']:02d}: provider error, retrying")
+        time.sleep(60 * (attempt + 1))
+    metadata = {"returncode": returncode, "wall_s": wall_s}
+    if timed_out:
+        metadata.update({"failed": True, "timed_out": True, "timeout_s": TIMEOUT_S})
+    meta_path.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
+    status = "timeout" if timed_out else ("ok" if returncode == 0 else f"failed ({returncode})")
+    print(f"  {arm} q{question['number']:02d}: {status}, {wall_s:.1f}s")
+
+
+TIMEOUT_S = 7200
+
+
+def transient_provider_error(transcript: Path) -> bool:
+    """True when the run died on an upstream error worth retrying.
+
+    A model gateway returning 429/503 says nothing about the arm under test,
+    so retrying keeps a provider hiccup from leaving a hole in the data. A
+    wrong model name or an exhausted quota is not retried: it would fail the
+    same way every time.
+    """
+    try:
+        text = transcript.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    return any(
+        marker in text
+        for marker in ("service_overloaded", "temporarily overloaded", " 429 ", " 503 ")
+    )
+
+
+def execute_cell(
+    repo_dir: Path,
+    prompt: Path,
+    output_path: Path,
+    stderr_path: Path,
+    env: dict[str, str],
+    model: str,
+    effort: str,
+) -> tuple[int | None, bool, float]:
     start = time.monotonic()
-    timeout_s = 7200
+    timeout_s = TIMEOUT_S
     returncode: int | None = None
     timed_out = False
     try:
@@ -482,13 +528,7 @@ def run_question(
             returncode = result.returncode
     except subprocess.TimeoutExpired:
         timed_out = True
-    wall_s = time.monotonic() - start
-    metadata = {"returncode": returncode, "wall_s": wall_s}
-    if timed_out:
-        metadata.update({"failed": True, "timed_out": True, "timeout_s": timeout_s})
-    meta_path.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
-    status = "timeout" if timed_out else ("ok" if returncode == 0 else f"failed ({returncode})")
-    print(f"  {arm} q{question['number']:02d}: {status}, {wall_s:.1f}s")
+    return returncode, timed_out, time.monotonic() - start
 
 
 def run_agents(
