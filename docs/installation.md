@@ -20,7 +20,7 @@ The installer downloads the `vera` binary for your platform, writes a shim to a 
 **Prebuilt binaries:**
 Download from [GitHub Releases](https://github.com/VeraTools/Vera/releases) for Linux (x86_64, aarch64), macOS (x86_64, aarch64), or Windows (x86_64). For Alpine, NixOS, or minimal containers without glibc, use the `x86_64-unknown-linux-musl` archive (fully static, zero runtime dependencies). The npm/pip wrappers auto-detect musl systems; to force a specific target, set `VERA_TARGET=x86_64-unknown-linux-musl` before running the install command.
 
-**Build from source** (Rust 1.86+):
+**Build from source** (Rust 1.88+):
 ```bash
 git clone https://github.com/VeraTools/Vera.git && cd Vera
 bash scripts/bootstrap-vendored-grammars.sh   # downloads the four grammars that are not tracked in git
