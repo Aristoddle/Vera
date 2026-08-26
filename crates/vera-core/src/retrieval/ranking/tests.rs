@@ -632,6 +632,32 @@ fn fixture_definition_in_tests_loses_content_symbol_boost() {
 }
 
 #[test]
+fn testing_module_file_keeps_content_symbol_boost() {
+    // click ships the CliRunner definition in src/click/testing.py: a
+    // first-class module whose filename merely looks test-ish. The gate keys
+    // off directory components and test-file naming conventions, so this
+    // chunk keeps its definition boost despite the filename.
+    let results = vec![
+        make_result(
+            "src/click/core.py",
+            None,
+            None,
+            "class Command:\n    def invoke(self): ...",
+        ),
+        make_result(
+            "src/click/testing.py",
+            None,
+            None,
+            "class CliRunner:\n    def invoke(self, cli): ...",
+        ),
+    ];
+
+    let ranked = apply_query_ranking("CliRunner", results, RankingStage::Initial);
+
+    assert_eq!(ranked[0].file_path, "src/click/testing.py");
+}
+
+#[test]
 fn path_weighted_query_requires_path_shaped_token() {
     // Slash prose stays semantic.
     assert!(!is_path_weighted_query("read/write request handling"));

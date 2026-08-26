@@ -640,15 +640,66 @@ pub(super) fn apply_content_symbol_boost(
 }
 
 /// A chunk counts as a definition site for the content-symbol boost only
-/// when its content role is source-like. Definitions in tests, examples, and
-/// benches are fixtures or usage samples; they qualify only when the query
-/// explicitly asks for those paths.
+/// when its path marks it as source-like. Definitions in test, example, and
+/// bench trees are fixtures or usage samples; they qualify only when the
+/// query explicitly asks for those paths.
+///
+/// Directory components decide, not bare filename tokens: a first-class
+/// module named `testing.py` (click's CliRunner lives in
+/// src/click/testing.py) or `example.py` is still a definition site.
 fn definition_site_role_blocked(features: &QueryFeatures, result: &SearchResult) -> bool {
-    match classify_content(&result.file_path, result.language, &result.content) {
-        ContentClass::Test => !features.wants_test_paths,
-        ContentClass::Example | ContentClass::Bench => !features.wants_example_paths,
-        _ => false,
+    const TEST_DIRS: &[&str] = &[
+        "t",
+        "test",
+        "tests",
+        "testing",
+        "__tests__",
+        "spec",
+        "specs",
+        "testdata",
+        "fixture",
+        "fixtures",
+    ];
+    const EXAMPLE_DIRS: &[&str] = &[
+        "example",
+        "examples",
+        "sample",
+        "samples",
+        "demo",
+        "demos",
+        "bench",
+        "benches",
+        "benchmark",
+        "benchmarks",
+    ];
+    let lower = result.file_path.to_ascii_lowercase();
+    let mut parts = lower.rsplit('/');
+    let filename = parts.next().unwrap_or("");
+    let in_test_dir = parts.clone().any(|dir| TEST_DIRS.contains(&dir));
+    let in_example_dir = parts.any(|dir| EXAMPLE_DIRS.contains(&dir));
+    if in_test_dir || is_test_filename(filename) {
+        return !features.wants_test_paths;
     }
+    if in_example_dir {
+        return !features.wants_example_paths;
+    }
+    false
+}
+
+/// Conventional test-file names: test_foo.py, foo_test.go, foo.test.ts,
+/// foo-spec.rb. Deliberately narrower than substring matching so modules
+/// like `testing.py` or `attest.py` stay source-like.
+fn is_test_filename(filename: &str) -> bool {
+    filename.starts_with("test_")
+        || filename.starts_with("test-")
+        || filename.starts_with("spec_")
+        || filename.starts_with("spec-")
+        || filename.contains("_test.")
+        || filename.contains("-test.")
+        || filename.contains(".test.")
+        || filename.contains("_spec.")
+        || filename.contains("-spec.")
+        || filename.contains(".spec.")
 }
 
 /// Stem-vs-symbol match: exact, underscore-normalised, or plural-adjusted.
