@@ -606,6 +606,32 @@ fn definition_queries_boost_symbol_definitions() {
 }
 
 #[test]
+fn fixture_definition_in_tests_loses_content_symbol_boost() {
+    // Both chunks define the queried symbol in content, but the test chunk is
+    // a fixture, not the definition site: the content-symbol boost must not
+    // apply to it. Without the role gate the +3.0 pool-relative boost would
+    // outweigh the test-path penalty and rank the fixture first.
+    let results = vec![
+        make_result(
+            "tests/test_registry.py",
+            None,
+            None,
+            "class TaskRegistry:\n    def register(self, task): ...",
+        ),
+        make_result(
+            "celery/app/registry.py",
+            None,
+            None,
+            "class TaskRegistry:\n    def register(self, task): ...",
+        ),
+    ];
+
+    let ranked = apply_query_ranking("TaskRegistry", results, RankingStage::Initial);
+
+    assert_eq!(ranked[0].file_path, "celery/app/registry.py");
+}
+
+#[test]
 fn path_weighted_query_requires_path_shaped_token() {
     // Slash prose stays semantic.
     assert!(!is_path_weighted_query("read/write request handling"));

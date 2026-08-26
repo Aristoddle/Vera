@@ -609,6 +609,11 @@ pub(super) fn apply_content_symbol_boost(
 
     let identifier_query = features.query_type == QueryType::Identifier;
     for (score, result) in scores.iter_mut().zip(results) {
+        // A definition inside test/example content is a fixture or usage
+        // sample, not the definition site a symbol query is after.
+        if definition_site_role_blocked(features, result) {
+            continue;
+        }
         let mut boost = 0.0_f64;
         for (name, unit) in &targets {
             // Backstop only: chunks whose symbol metadata already matches the
@@ -633,6 +638,18 @@ pub(super) fn apply_content_symbol_boost(
             }
         }
         *score += boost;
+    }
+}
+
+/// A chunk counts as a definition site for the content-symbol boost only
+/// when its content role is source-like. Definitions in tests, examples, and
+/// benches are fixtures or usage samples; they qualify only when the query
+/// explicitly asks for those paths.
+fn definition_site_role_blocked(features: &QueryFeatures, result: &SearchResult) -> bool {
+    match classify_content(&result.file_path, result.language, &result.content) {
+        ContentClass::Test => !features.wants_test_paths,
+        ContentClass::Example | ContentClass::Bench => !features.wants_example_paths,
+        _ => false,
     }
 }
 
