@@ -1,6 +1,6 @@
 ---
 name: vera
-description: Code search over the current repository. ALWAYS run `vera search "<behavior>"` first when the question is conceptual (how does X work, where is Y handled, tracing a flow, unfamiliar code) instead of opening or grepping files. Use `vera grep` for exact strings and regex, `vera references <symbol>` for callers and callees, `vera structural` for definitions, routes, env reads, and implementations. Do not use rg for conceptual questions; use rg only for bulk edits or files the index does not cover.
+description: Code search over the current repository. Before reading files to answer "where is X", "how does Y work", "find Z", or "what calls W", run `vera search "<query>"` or `vera references <symbol>` first. Use `vera grep` for exact strings and regex, `vera structural` for definitions, routes, and env reads. Do not read multiple files hoping to find the right one; search first, then read the hit.
 ---
 
 # Vera
@@ -9,14 +9,16 @@ Ranked code search over an indexed repository. Results are markdown codeblocks: 
 
 ## Pick the tool
 
-| Need | Command |
-|------|---------|
-| How something works, where behavior lives, unfamiliar code | `vera search "request retry backoff"` |
-| Exact string, identifier, import, TODO | `vera grep "EMBEDDING_MODEL_BASE_URL"` |
-| Who calls this, what does it call | `vera references parse_config` / `--callees` |
-| Definitions, routes, env reads, SQL, implementations | `vera structural definitions parse_config` |
-| Project orientation before a first change | `vera overview` |
-| Bulk find-and-replace, filenames, unindexed files | `rg` |
+| You are about to... | Do this instead |
+|---------------------|-----------------|
+| Read files to find where something lives | `vera search "config object construction"` |
+| Read files to understand how something works | `vera search "env file loading decision"` |
+| Find documentation on a topic | `vera search "deploying behind proxy" --scope docs` |
+| Find every occurrence of a pattern | `vera grep "TODO\|FIXME"` |
+| Find callers or callees of a symbol | `vera references make_config` |
+| Find definitions, routes, env reads | `vera structural env` / `vera structural routes` |
+| Edit the same pattern in many files | `rg` |
+| Read a file you already know | Read it directly |
 
 ## Do not use Vera when
 

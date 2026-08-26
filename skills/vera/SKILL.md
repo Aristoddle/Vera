@@ -1,129 +1,63 @@
 ---
 name: vera
-description: Semantic code search, exact regex search, structural intent search, and symbol reference lookup across a local repository. Returns ranked markdown codeblocks with file path, line range, content, and optional symbol info. Use `vera search` for conceptual/behavioral queries, `vera grep` for exact text, `vera structural` for common structural tasks, `vera references` for callers/callees, and `vera explain-path` to debug indexing decisions. Use rg only for bulk find-and-replace or files outside the index.
+description: Code search over the current repository. Before reading files to answer "where is X", "how does Y work", "find Z", or "what calls W", run `vera search "<query>"` or `vera references <symbol>` first. Use `vera grep` for exact strings and regex, `vera structural` for definitions, routes, and env reads. Do not read multiple files hoping to find the right one; search first, then read the hit.
 ---
 
 # Vera
 
-Semantic code search CLI. Combines BM25 keyword matching with vector similarity and optional cross-encoder reranking to return the most relevant code for a natural-language query.
+Ranked code search over an indexed repository. Results are markdown codeblocks: `path:line_start-line_end symbol_type:symbol_name`, then the code.
 
-The default embedding model is `minishlab/potion-code-16M-v2`, a static embedding model that runs locally on CPU on any supported machine; no GPU or ONNX Runtime needed. Reranking is opt-in through `retrieval.reranking_enabled` and is off by default.
+## Pick the tool
 
-## Workflow
+| You are about to... | Do this instead |
+|---------------------|-----------------|
+| Read files to find where something lives | `vera search "config object construction"` |
+| Read files to understand how something works | `vera search "env file loading decision"` |
+| Find documentation on a topic | `vera search "deploying behind proxy" --scope docs` |
+| Find every occurrence of a pattern | `vera grep "TODO\|FIXME"` |
+| Find callers or callees of a symbol | `vera references make_config` |
+| Find definitions, routes, env reads | `vera structural env` / `vera structural routes` |
+| Edit the same pattern in many files | `rg` |
+| Read a file you already know | Read it directly |
 
-1. Ensure Vera is installed and on `PATH` (add `.vera/` to `.gitignore` on first use). If missing: `references/install.md`.
-2. Configure exclusions: Vera respects `.gitignore` by default (no setup needed). If you need custom exclusions, create a `.veraignore` file (gitignore syntax). Important: `.veraignore` **replaces** `.gitignore` rules entirely. To keep gitignore rules and add your own on top, start `.veraignore` with `#include .gitignore`, then add only your extra patterns (do not repeat entries already in `.gitignore`). Use `--exclude` for one-off exclusions, `--no-ignore` to disable all ignore parsing, and `vera explain-path path/to/file` to debug why a file is or is not indexed.
-3. Index the repo: `vera index .` (first time) or `vera update .` (after edits; pass `--max-files <N>` to bound processed files per run and report deferred files, or `--no-progress` to disable interactive progress). Use `vera stats --json` to inspect index health (parse failures, tree-sitter error nodes, Tier 0 fallback).
-4. For long sessions, start the watcher: `vera watch .` (background process, Ctrl-C to stop, 2s debounce). This auto-updates the index on file changes and replaces manual `vera update .` calls.
-5. Get oriented: `vera overview` returns a project summary: language breakdown, directory structure, entry points, complexity hotspots, and detected conventions (frameworks, patterns, config files). Add `--changed`, `--since <rev>`, or `--base <rev>` when the task is limited to modified files or a PR diff.
-6. Use `vera references <symbol>` to find callers; add `--callees` to see what it calls. When several definitions share a name, the output lists the receivers the calls went through: rerun with `--receiver <name>` (as in `vera references get --receiver app`) to keep only calls made through that object. `vera dead-code` lists functions with no callers.
-7. Search:
-   ```sh
-     vera search "authentication middleware"
-     vera search "parse_config" --type function --limit 5
-     vera search "database connection" --lang rust --path "src/**" --path "tests/**"
-     vera search "token validation" --changed          # only modified, staged, and untracked files
-     vera search "config loading" --base origin/main   # only files changed since merge-base
-     vera search "OAuth token refresh" "JWT expiry handling" "auth middleware"
-     vera search "config" --intent "find where database connection strings are loaded"
-     vera search "keybind handling" --scope docs
-    vera search "mod loader" --scope runtime --include-generated
-    vera search "config loading" --deep    # RAG-fusion query expansion (falls back to iterative symbol-following)
-    vera search "auth" --compact            # signatures only: broad exploration in fewer tokens
-   ```
-8. Regex search (exact patterns, imports, TODOs). `vera grep` only searches indexed files, so `.veraignore` and exclusion rules apply:
-   ```sh
-     vera grep "fn\s+main"
-     vera grep "TODO|FIXME" -i              # case-insensitive
-     vera grep "queryClient|invalidateQueries" --path "frontend/src/**"
-     vera grep "Authorization" --lang rust --type function
-     vera grep "TODO" --changed             # only modified files
-     vera grep "keybind" --scope docs        # scoped to docs
-     vera grep "use std::collections" --context 0  # no surrounding lines
-     vera grep "handler" --compact           # signatures only
-   ```
-9. Structural search for common agent tasks:
-   ```sh
-    vera structural definitions parse_config
-    vera structural env DATABASE_URL
-    vera structural routes --path "src/**"
-    vera structural sql
-    vera structural impls Loader
-    vera references parse_config --changed
-   ```
-   Use `vera structural impls <symbol>` for explicit inheritance or conformance declarations only. It does not infer implicit interface satisfaction.
-10. Use the first results (they are ranked by relevance). Output is markdown codeblocks by default.
+## Do not use Vera when
 
-## Example Output
+- You already know the exact path and line: open the file.
+- You are editing across many files mechanically: use `rg`.
+- The answer is a literal string you can match: `vera grep` beats `vera search`.
+- You have already run two searches that returned the same region: stop searching and read the code.
 
-```sh
-vera search "hybrid search" --limit 1
-```
+## Search well
 
-````
-```crates/vera-core/src/retrieval/hybrid.rs:58-110 function:search_hybrid
-pub async fn search_hybrid(...) -> Result<Vec<SearchResult>> { ... }
-```
-````
+- Search behavior, not nouns: `"JWT expiry handling"`, not `"auth"` or `"utils"`.
+- Pass several angles in one call: `vera search "OAuth token refresh" "JWT expiry" "auth middleware"`.
+- Start broad with `--compact` (signatures only, fewer tokens), then narrow with `--lang`, `--path`, `--type`, `--limit`.
+- Add `--intent "<goal>"` when the query is vague but the goal is clear.
+- Scope to a change with `--changed`, `--since <rev>`, or `--base <rev>` when reviewing a diff.
+- `--deep` rewrites the query through an LLM; use it only after normal search misses.
 
-The info string contains `file_path:line_start-line_end` and optional `symbol_type:symbol_name`. Use `--json` for compact single-line JSON (programmatic consumption). `--raw` works with `vera search`, `vera grep`, and `vera references`; `--timing` works with `vera search` and `vera grep`. Both can appear before or after the subcommand.
+## Treat hits as leads
 
-## Choosing the Right Tool
+- A search hit is a lead, not evidence. Before stating how something behaves, open the cited lines.
+- Follow the call graph rather than re-searching: `vera references <symbol>` on a promising hit answers "who drives this" in one step.
+- Cite `path:line` from code you actually read.
+- After editing files, run `vera update .` before searching again.
 
-| Need | Tool |
-|------|------|
-| Concepts, behavior, "how does X work" | `vera search` |
-| Exact strings, regex, imports, TODOs within indexed files | `vera grep` |
-| Definitions, env reads, routes, SQL, explicit implementation lookups | `vera structural` |
-| Exact callers or callees | `vera references` |
-| Explain why a file is or is not indexed | `vera explain-path` |
-| Bulk find-and-replace, file names, files outside index | `rg` |
+## Recovery
 
-`vera search` understands synonyms and related concepts. `vera grep` matches literal patterns. `vera structural` is the high-signal structural layer for agents, and `vera references` is the exact call-graph tool.
-
-## Search Scopes
-
-| Scope | What it includes |
-|-------|------------------|
-| `source` | Application source code (default bias) |
-| `docs` | Markdown, READMEs, ADRs, guides |
-| `runtime` | Extracted runtime trees, bundled app code |
-| `all` | Everything, no filtering |
-
-Vera favors source files by default. Use `--scope docs` for prose and ADRs, `--scope runtime` for extracted bundles, and `--include-generated` for minified/dist artifacts.
-
-## Search Modes
-
-- **Default**: full results with code bodies. Best for targeted retrieval ("how does BM25 scoring work?").
-- **`--deep`**: deep search. Runs a BM25 pre-filter to gather real symbol names and file paths, then feeds them to an LLM to generate query rewrites grounded in actual codebase identifiers. Each rewrite runs a full hybrid search and results fuse with RRF. Requires `VERA_COMPLETION_BASE_URL`; falls back to iterative symbol-following when unconfigured. Use when initial results miss the mark or you need broader context.
-- **`--compact`**: signatures only (name, parameters, return type). Fits more results into fewer tokens. Best for broad exploration ("what functions handle auth?"). Works with `vera grep` too.
-
-## Query Strategy
-
-- Describe behavior or intent: "JWT token validation", "request rate limiting", not "code" or "utils".
-- Avoid overly broad queries like "authentication" or "tools". Be specific about what aspect you need.
-- Match your intent to the query: for documentation, use doc-focused keywords ("setup guide", "configuration README"); for code, use implementation terms ("token refresh logic", "error handling implementation").
-- Use 2-3 varied queries to capture different aspects (e.g., "OAuth token refresh", "JWT expiry handling", "auth middleware"). You can pass them in one call: `vera search "OAuth token refresh" "JWT expiry handling" "auth middleware"`.
-- Add `--intent` when the query is ambiguous but your higher-level goal is clear (e.g., `vera search "config" --intent "find where database connection strings are loaded from environment variables"`).
-- For known symbol names, search the exact name: `vera search "parse_config"`.
-- Start broad, then narrow with `--lang`, `--path`, `--type`, `--limit`. Repeat `--path` to OR multiple path patterns.
-- When reviewing a PR or a narrow worktree change, add `--changed`, `--since <rev>`, or `--base <rev>` before broadening the query.
-- After code changes mid-session, run `vera update .` before searching again (or use `vera watch .` to auto-update).
-
-## Failure Recovery
-
-- `no index found` → `vera index .`
-- stale results after edits → `vera update .`
-- indexing surprise / missing file → `vera explain-path path/to/file`
-- local model/ONNX fails → `vera doctor --probe`, then `references/troubleshooting.md`
-- missing local assets → `vera repair`
-- switch GPU/model backend → `vera backend`
-- API credentials missing → `references/install.md`
-- MCP requested → `references/mcp.md`
+| Symptom | Fix |
+|---------|-----|
+| `no index found` | `vera index .` |
+| Stale results after edits | `vera update .` (or `vera watch .`) |
+| A file is missing from results | `vera explain-path path/to/file` |
+| Local model or ONNX error | `vera doctor --probe`, then `references/troubleshooting.md` |
+| Missing local assets | `vera repair` |
+| Install, API keys, backends | `references/install.md` |
+| MCP server | `references/mcp.md` |
 
 ## References
 
-- `references/install.md`: install, setup, API and local config
+- `references/install.md`: install, setup, API and local config, `.veraignore` rules
 - `references/query-patterns.md`: more query examples and rg guidance
 - `references/troubleshooting.md`: common errors and fixes
 - `references/mcp.md`: optional MCP server usage

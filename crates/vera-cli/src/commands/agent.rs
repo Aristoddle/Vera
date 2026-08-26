@@ -1181,20 +1181,19 @@ fn sync_with_options(
 const VERA_SNIPPET_BEGIN_MARKER: &str = "<!-- vera:begin -->";
 const VERA_SNIPPET_END_MARKER: &str = "<!-- vera:end -->";
 const AGENTS_MD_SNIPPET_HEADING: &str = "## Code Search";
-const AGENTS_MD_SNIPPET_INTRO: &str = "Use Vera before opening many files or running broad text search when you need to find where logic lives or how a feature works.";
+const AGENTS_MD_SNIPPET_INTRO: &str = "Before reading files to answer \"where is X\", \"how does Y work\", or \"find Z\", search first with Vera.";
 
 const AGENTS_MD_SNIPPET: &str = r#"## Code Search
 
 <!-- vera:begin -->
 
-Use Vera before opening many files or running broad text search when you need to find where logic lives or how a feature works.
+Before reading files to answer "where is X", "how does Y work", or "find Z", search first with Vera.
 
 - `vera search "query"` for semantic code search. Describe behavior: "JWT validation", not "auth". If one phrasing misses, try 2-3 varied queries or add `--intent "goal"`.
-- `vera search ... --changed`, `--since <rev>`, or `--base <rev>` when the task is limited to modified files or a PR diff
 - `vera grep "pattern"` for exact text or regex in indexed files
-- `vera structural definitions <symbol>`, `vera structural env <NAME>`, `vera structural routes`, or `vera structural impls <symbol>` for common structural tasks and explicit type relationships
+- `vera references <symbol>` for callers and `vera references <symbol> --callees` for callees; add `--receiver <name>` when several definitions share a name
+- `vera structural definitions <symbol>`, `vera structural env <NAME>`, `vera structural routes`, or `vera structural impls <symbol>` for common structural tasks
 - `vera explain-path path/to/file` to explain why a file is or is not indexed
-- `vera references <symbol>` for callers and `vera references <symbol> --callees` for callees
 - `vera overview` for a project summary (languages, entry points, hotspots). Add `--changed`, `--since <rev>`, or `--base <rev>` to scope it to modified files.
 - `vera stats --json` for index health, including tree-sitter error, parse-failure, and Tier 0 fallback counts
 - `vera search --deep "query"` for RAG-fusion query expansion + merged ranking
