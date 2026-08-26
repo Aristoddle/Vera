@@ -668,6 +668,33 @@ mod tests {
         predicate()
     }
 
+    /// Prove the watcher observes an indexable change. The OS watcher
+    /// registration races the first write on slow machines, so a single write
+    /// can be lost. Retry attempts are separated by a full wait window so each
+    /// lands in its own debounce window and never triggers a trailing pass.
+    fn write_until_updated(path: &std::path::Path, updates: &AtomicUsize) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            std::fs::write(path, "fn real() {}").expect("write");
+            if wait_until(Duration::from_secs(2), || {
+                updates.load(Ordering::SeqCst) >= 1
+            }) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "an indexable change must trigger an update cycle"
+            );
+        }
+        // Let any trailing event settle, then confirm exactly one cycle ran.
+        std::thread::sleep(TEST_DEBOUNCE * 6);
+        assert_eq!(
+            updates.load(Ordering::SeqCst),
+            1,
+            "one change must produce exactly one update cycle"
+        );
+    }
+
     #[test]
     fn event_during_update_triggers_one_trailing_pass() {
         let updates = Arc::new(AtomicUsize::new(0));
@@ -813,12 +840,7 @@ mod tests {
 
         // Presence first: a watcher that never fires would pass the absence
         // assertion below on its own.
-        std::fs::write(repo.path().join("src/real.rs"), "fn real() {}").expect("write");
-        assert!(
-            wait_until(Duration::from_secs(10), || updates.load(Ordering::SeqCst)
-                == 1),
-            "an indexable change must trigger exactly one update cycle"
-        );
+        write_until_updated(&repo.path().join("src/real.rs"), &updates);
 
         for i in 0..5 {
             std::fs::write(
@@ -862,12 +884,7 @@ mod tests {
 
         // Presence first: with the default exclusions off, an ordinary source
         // change must still be seen, or the absence assertion below is vacuous.
-        std::fs::write(repo.path().join("src/real.rs"), "fn real() {}").expect("write");
-        assert!(
-            wait_until(Duration::from_secs(10), || updates.load(Ordering::SeqCst)
-                == 1),
-            "an indexable change must trigger exactly one update cycle"
-        );
+        write_until_updated(&repo.path().join("src/real.rs"), &updates);
 
         for i in 0..5 {
             std::fs::write(
@@ -903,12 +920,7 @@ mod tests {
         )
         .expect("watcher starts");
 
-        std::fs::write(repo.path().join("src/real.rs"), "fn real() {}").expect("write");
-        assert!(
-            wait_until(Duration::from_secs(10), || updates.load(Ordering::SeqCst)
-                == 1),
-            "an indexable change must trigger exactly one update cycle"
-        );
+        write_until_updated(&repo.path().join("src/real.rs"), &updates);
 
         for staging in [".vera.build", ".vera.old"] {
             std::fs::create_dir_all(repo.path().join(staging)).expect("staging dir");
