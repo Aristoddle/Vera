@@ -8,16 +8,18 @@ Semble-derived runs use the task set from [Semble v0.5.5](https://github.com/Min
 
 Vera reports `vera-graded-2-1-task-mean-v1`: primary targets have relevance 2, secondary targets have relevance 1, duplicate matching chunks receive credit once, and scores are averaged over tasks. Historical Semble published tables use binary relevance and repository/language macro averages. The current 2026-08-23 comparison below uses the same graded scorer for both tools. New JSON reports record both the Semble snapshot and metric contract; older reports without those fields are `unknown-legacy` and use Vera's graded calculation.
 
-## 2026-08-23 Semble Comparison
+## 2026-08-23 Semble Comparison (Vera row refreshed for v1.2.0)
 
 The Semble benchmark uses 1,251 tasks across 63 repositories. Both tools used the same `minishlab/potion-code-16M-v2` embeddings, harness, graded relevance, and suffix-corrected path matching in the scorer.
 
 | Tool | nDCG@10 | R@1 | R@5 | R@10 | MRR | Query p50 | Index time | Index size |
 |------|---------|------|------|-------|-----|-----------|------------|------------|
-| Vera | 0.8441 | 0.6711 | **0.9203** | 0.9514 | 0.8262 | 9.9 ms | 174 s | **4.7 GB** |
+| Vera v1.2.0 | 0.8450 | 0.6719 | **0.9203** | 0.9514 | 0.8267 | 9.4 ms | 139 s | **4.7 GB** |
 | Semble 0.5.5, full rerank stack | **0.8514** | **0.6747** | 0.9177 | **0.9656** | **0.8348** | **2.3 ms** | **100 s** | 32 GB |
 
-On the 320-task tuning subset, Vera scored `0.8540` versus Semble at `0.8494` nDCG. On the contamination-check independent set, Vera scored `0.7644` versus Semble at `0.7655`. The aggregate table is the comparison summary; repo-level variation is not a substitute for the full result.
+The Vera row was re-measured on 2026-08-26 at v1.2.0 with the same harness and corpus pins as the 2026-08-23 run; the Semble column is unchanged. Retrieval quality moved within the observed run-to-run tie-break noise (two full-suite runs: 0.8452, 0.8448; the v1.1.0 row read 0.8441). Indexing time improved from 174 s to 139 s (the v1.2.0 pipeline overlap work), and query p50 from 9.9 ms to 9.4 ms. Run-to-run p50 across three full-suite runs spanned 9.3 to 9.8 ms.
+
+On the 320-task tuning subset, Vera scored `0.8534` versus Semble at `0.8494` nDCG. On the contamination-check independent set, Vera scored `0.7654` versus Semble at `0.7655`. The aggregate table is the comparison summary; repo-level variation is not a substitute for the full result.
 
 Vector search uses an exact flat SIMD scan over memory-mapped vectors, dual-written alongside sqlite-vec (`VERA_VECTOR_SCAN=vec0` selects the old path). On the largest corpus repo (zig, 336k chunks) the vector stage dropped from ~460 ms to ~21 ms per query; quality is unchanged because the scan is exact. Index size grew because vectors are stored in both backends during the transition.
 

@@ -2,9 +2,26 @@
 
 Release highlights from v1.0 onward. For the current benchmark tables and methodology, see [benchmarks.md](benchmarks.md). For the full command surface, see [features.md](features.md).
 
-## Unreleased
+## v1.2.0
 
-These changes are on `master` after v1.1.0 and are candidates for the next tag.
+### Query latency
+
+- The ranked exact-match augmentation no longer re-scans the chunk metadata for the indexed file list on every query. The list is cached per open index and revalidated with a database-plus-WAL stamp, so edits still invalidate it immediately. On the zig repository (about 336,000 chunks) the augmentation stage dropped from p50 18.4 ms to 1.4 ms and total warm p50 from 31.1 ms to 14.1 ms. Full-suite p95 improved from 73.3 ms to 64.5 ms.
+
+### Indexing throughput
+
+- Full builds now overlap the parse, embed, and store stages: parsing runs one window ahead on a worker, and a dedicated store thread owns all staging writes behind a bounded channel, so the embedding thread never waits on SQLite or Tantivy. Tantivy writes go through a single bulk writer with one final commit, and fresh vector builds use a two-statement insert path.
+- Full Semble corpus indexing dropped from 213.5 s to about 137 s (-36%); the zig repository alone went from 62.7 s to 36.7 s. Peak RSS stays within the windowed budget (533 MB on zig). Search output over the resulting index was verified byte-identical to the previous pipeline.
+
+### Ranking
+
+- The content-based symbol definition boost no longer treats fixture definitions in test, example, and bench trees as definition sites unless the query asks for them. A `TaskRegistry` lookup previously ranked a test fixture above the real class; the fix keys off directory components and conventional test-file names, so first-class modules like click's `testing.py` keep their boost.
+
+### CI and supply chain
+
+- Pull requests now run a CI workflow: rustfmt, clippy with warnings as errors, the full test suite, cargo deny, cargo machete, and cargo audit, plus a pinned MSRV check job.
+- `cargo deny` now fails on unsound advisories from transitive dependencies, not just workspace crates. The one currently known instance (RUSTSEC-2026-0253, `lru` via tantivy) is documented in `deny.toml` with a reachability analysis and a removal trigger.
+- The declared MSRV is corrected to 1.88: the tree has used let-chains for some time, so 1.86 could never build it. The lockfile pins `ordered-float` 5.0.0 so no locked dependency requires more than 1.88.
 
 ### Indexing memory and crash recovery
 

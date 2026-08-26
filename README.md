@@ -185,14 +185,14 @@ vera explain-path path/to/file
 
 ## Benchmarks
 
-Semble benchmark comparison, measured 2026-08-23 on 1,251 tasks across 63 repositories:
+Semble benchmark comparison on 1,251 tasks across 63 repositories (Vera v1.2.0 row measured 2026-08-26; Semble column from the 2026-08-23 comparison):
 
 | Tool | nDCG@10 | R@1 | R@5 | R@10 | MRR | Query p50 | Index time | Index size |
 |------|---------|------|------|-------|-----|-----------|------------|------------|
-| Vera | 0.8441 | 0.6711 | **0.9203** | 0.9514 | 0.8262 | 9.9 ms | 174 s | **4.7 GB** |
+| Vera | 0.8450 | 0.6719 | **0.9203** | 0.9514 | 0.8267 | 9.4 ms | 139 s | **4.7 GB** |
 | Semble 0.5.5, full rerank stack | **0.8514** | **0.6747** | 0.9177 | **0.9656** | **0.8348** | **2.3 ms** | **100 s** | 32 GB |
 
-Both tools used the same `minishlab/potion-code-16M-v2` embeddings, harness, graded relevance, and suffix-corrected path matching in the scorer. On the 320-task tuning subset, Vera scored `0.8540` versus Semble at `0.8494` nDCG. On the contamination-check independent set, Vera scored `0.7644` versus Semble at `0.7655`. See [docs/benchmarks.md](docs/benchmarks.md) for the screening tables and historical comparisons.
+Both tools used the same `minishlab/potion-code-16M-v2` embeddings, harness, graded relevance, and suffix-corrected path matching in the scorer. On the 320-task tuning subset, Vera scored `0.8534` versus Semble at `0.8494` nDCG. On the contamination-check independent set, Vera scored `0.7654` versus Semble at `0.7655`. See [docs/benchmarks.md](docs/benchmarks.md) for the screening tables and historical comparisons.
 
 Full methodology and version history: [docs/benchmarks.md](docs/benchmarks.md).
 
