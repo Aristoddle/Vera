@@ -8,7 +8,8 @@ use anyhow::{Context, bail};
 use vera_core::config::InferenceBackend;
 use vera_core::indexing::{UpdateOptions, UpdateProgress};
 
-use crate::helpers::{cancel_on_signal, load_runtime_config, wait_for_interrupt};
+use crate::helpers::{cancel_task_on_signal, wait_for_interrupt};
+use crate::state;
 
 pub struct CommandOptions {
     pub backend: InferenceBackend,
@@ -47,7 +48,7 @@ pub fn run(path: &str, json_output: bool, options: CommandOptions) -> anyhow::Re
     let rt = tokio::runtime::Runtime::new()
         .map_err(|e| anyhow::anyhow!("failed to create async runtime: {e}"))?;
 
-    let mut config = load_runtime_config()?;
+    let mut config = state::load_runtime_config()?;
     config.adjust_for_backend(backend);
     config.indexing.extra_excludes = exclude;
     config.indexing.no_ignore = no_ignore;
@@ -57,52 +58,56 @@ pub fn run(path: &str, json_output: bool, options: CommandOptions) -> anyhow::Re
         &config, backend,
     ))?;
 
-    // Check metadata mismatch
+    // Check metadata mismatch. Read-only open: a missing database means
+    // "no index yet", which the update itself will create.
     let metadata_path = repo_path.join(".vera").join("metadata.db");
-    if let Ok(metadata_store) = vera_core::storage::metadata::MetadataStore::open(&metadata_path) {
-        if let (Some(s_model), Some(s_dim)) = (
+    if let Ok(metadata_store) =
+        vera_core::storage::metadata::MetadataStore::open_existing(&metadata_path)
+        && let (Some(s_model), Some(s_dim)) = (
             metadata_store.get_index_meta("model_name").unwrap_or(None),
             metadata_store
                 .get_index_meta("embedding_dim")
                 .unwrap_or(None),
+        )
+    {
+        if !vera_core::config::model_names_match_with_aliases(
+            &s_model,
+            &model_name,
+            &config.embedding.model_aliases,
         ) {
-            if !vera_core::config::model_names_match_with_aliases(
-                &s_model,
-                &model_name,
-                &config.embedding.model_aliases,
-            ) {
+            bail!(
+                "Index was created with model '{}' ({} dimensions), but you are using model '{}'. Please re-index with matching provider.",
+                s_model,
+                s_dim,
+                model_name
+            );
+        }
+        if let Ok(dim) = s_dim.parse::<usize>() {
+            use vera_core::embedding::EmbeddingProvider;
+            if let Some(provider_dim) = provider.expected_dim()
+                && provider_dim < dim
+            {
                 bail!(
-                    "Index was created with model '{}' ({} dimensions), but you are using model '{}'. Please re-index with matching provider.",
-                    s_model,
-                    s_dim,
-                    model_name
+                    "Dimension mismatch: index has {} dimensions but active provider only returns {}. Please re-index with matching provider.",
+                    dim,
+                    provider_dim
                 );
-            }
-            if let Ok(dim) = s_dim.parse::<usize>() {
-                use vera_core::embedding::EmbeddingProvider;
-                if let Some(provider_dim) = provider.expected_dim() {
-                    if provider_dim < dim {
-                        bail!(
-                            "Dimension mismatch: index has {} dimensions but active provider only returns {}. Please re-index with matching provider.",
-                            dim,
-                            provider_dim
-                        );
-                    }
-                }
             }
         }
     }
 
     let show_progress = !json_output && !no_progress && std::io::stderr().is_terminal();
     let options = UpdateOptions { max_files };
+    let cancellation = vera_core::CancellationToken::new();
+    let operation_cancellation = cancellation.clone();
     let summary = if show_progress {
         let multi = cliclack::multi_progress("Updating...");
-        let spinner = multi.add(cliclack::spinner());
+        let spinner = Arc::new(multi.add(cliclack::spinner()));
         spinner.start("Discovering files...");
         let embed_bar: Arc<cliclack::ProgressBar> = Arc::new(multi.add(cliclack::progress_bar(0)));
         let embed_started = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-        let spinner_ref = &spinner;
+        let spinner_ref = Arc::clone(&spinner);
         let embed_bar_ref = embed_bar.clone();
         let embed_started_ref = embed_started.clone();
 
@@ -152,34 +157,40 @@ pub fn run(path: &str, json_output: bool, options: CommandOptions) -> anyhow::Re
             }
         };
 
-        let result = rt.block_on(cancel_on_signal(
-            vera_core::indexing::update_repository_with_options_and_progress(
-                repo_path,
+        let task_repo_path = repo_path.to_path_buf();
+        let signal = wait_for_interrupt(rt.handle())?;
+        let task = rt.handle().spawn(async move {
+            vera_core::indexing::update_repository_with_options_and_progress_and_cancellation(
+                &task_repo_path,
                 &provider,
                 &config,
                 &model_name,
                 &options,
                 on_progress,
-            ),
-            wait_for_interrupt(),
-            "update",
-        ));
+                &operation_cancellation,
+            )
+            .await
+        });
+        let result = rt.block_on(cancel_task_on_signal(task, signal, cancellation, "update"));
         multi.stop();
         result.context("update failed")?
     } else {
-        rt.block_on(cancel_on_signal(
-            vera_core::indexing::update_repository_with_options_and_progress(
-                repo_path,
+        let task_repo_path = repo_path.to_path_buf();
+        let signal = wait_for_interrupt(rt.handle())?;
+        let task = rt.handle().spawn(async move {
+            vera_core::indexing::update_repository_with_options_and_progress_and_cancellation(
+                &task_repo_path,
                 &provider,
                 &config,
                 &model_name,
                 &options,
                 |_| {},
-            ),
-            wait_for_interrupt(),
-            "update",
-        ))
-        .context("update failed")?
+                &operation_cancellation,
+            )
+            .await
+        });
+        rt.block_on(cancel_task_on_signal(task, signal, cancellation, "update"))
+            .context("update failed")?
     };
 
     // Output results.
@@ -228,7 +239,7 @@ fn print_update_summary(summary: &vera_core::indexing::UpdateSummary) {
         + summary.files_added
         + summary.files_deleted
         + summary.files_deferred;
-    if total_pending == 0 {
+    if total_pending == 0 && summary.parse_errors.is_empty() {
         println!();
         println!("  Index is up to date — no changes detected.");
     }

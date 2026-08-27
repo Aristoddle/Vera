@@ -1,0 +1,147 @@
+{
+  "tolerance_lines": 3,
+  "cases": [
+    {
+      "id": "flask-add-url-rule",
+      "repo": "flask",
+      "category": "receiver_disambiguation",
+      "symbol": "add_url_rule",
+      "target": {
+        "definition": "src/flask/sansio/app.py:602",
+        "note": "App.add_url_rule, the application-level route registration"
+      },
+      "target_call": "(?:^|[^\\w.])(?:app|self|self\\.app)\\.add_url_rule\\(",
+      "other_call": "(?:^|[^\\w.])(?:state|s|bp|blueprint)\\.add_url_rule\\(",
+      "other_definitions": [
+        "src/flask/sansio/blueprints.py:87",
+        "src/flask/sansio/blueprints.py:413",
+        "src/flask/sansio/scaffold.py:368"
+      ],
+      "verified_by": "rg '\\.add_url_rule\\(' over src/: app/self receivers reach App.add_url_rule; state/s receivers reach BlueprintSetupState.add_url_rule",
+      "target_receivers": [
+        "app",
+        "self",
+        "self.app"
+      ]
+    },
+    {
+      "id": "flask-open-resource",
+      "repo": "flask",
+      "category": "same_name_methods",
+      "symbol": "open_resource",
+      "target": {
+        "definition": "src/flask/app.py:414",
+        "note": "Flask.open_resource"
+      },
+      "target_call": "(?:^|[^\\w.])app\\.open_resource\\(",
+      "other_call": "(?:^|[^\\w.])(?:bp|blueprint|self)\\.open_resource\\(",
+      "other_definitions": [
+        "src/flask/blueprints.py:104"
+      ],
+      "verified_by": "two definitions (Flask and Blueprint); call sites distinguished by receiver",
+      "target_receivers": [
+        "app"
+      ]
+    },
+    {
+      "id": "flask-get-route-decorator",
+      "repo": "flask",
+      "category": "same_name_methods",
+      "symbol": "get",
+      "target": {
+        "definition": "src/flask/sansio/scaffold.py:296",
+        "note": "Scaffold.get, the @app.get route decorator"
+      },
+      "target_call": "@(?:app|bp|blueprint|self)\\.get\\(",
+      "other_call": "(?:^|[^\\w.])(?:\\w+)\\.get\\((?![^)]*\\brule\\b)",
+      "other_definitions": [
+        "src/flask/ctx.py:68",
+        "src/flask/views.py:153"
+      ],
+      "verified_by": "the route decorator is always used as @<obj>.get(...); every other .get( call in the repo is a mapping lookup or View.get",
+      "target_receivers": [
+        "app",
+        "bp",
+        "blueprint"
+      ]
+    },
+    {
+      "id": "flask-dispatch-request",
+      "repo": "flask",
+      "category": "cross_file_callers",
+      "symbol": "dispatch_request",
+      "target": {
+        "definition": "src/flask/app.py:966",
+        "note": "Flask.dispatch_request"
+      },
+      "target_call": "self\\.dispatch_request\\(",
+      "other_call": "(?:^|[^\\w.])(?:view|self\\.view_class|meth)\\.dispatch_request\\(",
+      "other_definitions": [
+        "src/flask/views.py:78",
+        "src/flask/views.py:182"
+      ],
+      "verified_by": "rg '\\.dispatch_request\\(' over src/",
+      "target_receivers": [
+        "self"
+      ]
+    },
+    {
+      "id": "flask-make-response",
+      "repo": "flask",
+      "category": "cross_file_callers",
+      "symbol": "make_response",
+      "target": {
+        "definition": "src/flask/app.py:1224",
+        "note": "Flask.make_response"
+      },
+      "target_call": "self\\.make_response\\(|app\\.make_response\\(",
+      "other_call": "(?:^|[^\\w.])(?:helpers|flask)\\.make_response\\(",
+      "other_definitions": [
+        "src/flask/helpers.py"
+      ],
+      "verified_by": "method on Flask plus a module-level helper of the same name in helpers.py",
+      "target_receivers": [
+        "self",
+        "app"
+      ]
+    },
+    {
+      "id": "axios-foreach",
+      "repo": "axios",
+      "category": "receiver_disambiguation",
+      "symbol": "forEach",
+      "target": {
+        "definition": "lib/utils.js:314",
+        "note": "utils.forEach, the library's own iteration helper"
+      },
+      "target_call": "utils\\.forEach\\(|(?:^|[^\\w.])forEach\\(",
+      "other_call": "(?:^|[^\\w.])(?!utils\\.)\\w+\\.forEach\\(",
+      "other_definitions": [
+        "Array.prototype.forEach (built-in, not defined in repo)"
+      ],
+      "verified_by": "utils.forEach is called qualified; every other x.forEach( in lib/ is the array built-in",
+      "target_receivers": [
+        "utils"
+      ]
+    },
+    {
+      "id": "axios-merge",
+      "repo": "axios",
+      "category": "imported_alias",
+      "symbol": "merge",
+      "target": {
+        "definition": "lib/utils.js:404",
+        "note": "utils.merge"
+      },
+      "target_call": "utils\\.merge\\(",
+      "other_call": "(?:^|[^\\w.])merge\\((?!.*utils)",
+      "other_definitions": [
+        "lib/core/mergeConfig.js:101 (local const merge)"
+      ],
+      "verified_by": "mergeConfig.js binds a local const merge that shadows utils.merge inside that function",
+      "target_receivers": [
+        "utils"
+      ]
+    }
+  ]
+}

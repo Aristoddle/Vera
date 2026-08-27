@@ -5,11 +5,13 @@ use std::path::Path;
 use std::sync::LazyLock;
 
 use anyhow::{Result, bail};
+use cap_std::fs::Dir;
 use regex::{Captures, Regex};
 use tree_sitter::Parser;
 
 use crate::corpus::{ContentClass, classify_content};
 use crate::parsing::languages;
+use crate::path_containment::canonical_project_root;
 use crate::retrieval::apply_filters;
 use crate::retrieval::file_scan::{
     allows_class, bounded_byte_snippet, language_for_path, smallest_symbol_chunk_for_line,
@@ -17,6 +19,14 @@ use crate::retrieval::file_scan::{
 };
 use crate::storage::metadata::MetadataStore;
 use crate::types::{Chunk, Language, SearchFilters, SearchResult, SearchScope};
+
+#[cfg(test)]
+use std::cell::Cell;
+
+#[cfg(test)]
+thread_local! {
+    static SYNTAX_FILTER_CREATIONS: Cell<usize> = const { Cell::new(0) };
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -56,9 +66,9 @@ pub fn search_structural(
 
     let metadata_path = index_dir.join("metadata.db");
     let store = MetadataStore::open(&metadata_path)?;
-    let repo_root = index_dir
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("Cannot determine project root from index dir"))?;
+    let repo_root = canonical_project_root(index_dir)?;
+    let root_dir = crate::discovery::open_root_dir(&repo_root)?;
+    let max_file_size_bytes = super::configured_max_file_size_bytes(&store);
     let filters = structural_filters(filters);
 
     match kind {
@@ -66,13 +76,22 @@ pub fn search_structural(
             let symbol = required_query(kind, query)?;
             search_definitions(&store, symbol, limit, &filters)
         }
-        StructuralSearchKind::EnvReads => {
-            search_env_reads(repo_root, &store, query, limit, &filters)
-        }
+        StructuralSearchKind::EnvReads => search_env_reads(
+            &root_dir,
+            &store,
+            max_file_size_bytes,
+            query,
+            limit,
+            &filters,
+        ),
         StructuralSearchKind::RouteHandlers => {
-            search_route_handlers(repo_root, &store, limit, &filters)
+            reject_query(kind, query)?;
+            search_route_handlers(&root_dir, &store, max_file_size_bytes, limit, &filters)
         }
-        StructuralSearchKind::SqlQueries => search_sql_queries(repo_root, &store, limit, &filters),
+        StructuralSearchKind::SqlQueries => {
+            reject_query(kind, query)?;
+            search_sql_queries(&root_dir, &store, max_file_size_bytes, limit, &filters)
+        }
         StructuralSearchKind::Implementations => {
             let target = required_query(kind, query)?;
             search_implementations(index_dir, target, limit, &filters)
@@ -89,10 +108,24 @@ fn structural_filters(filters: &SearchFilters) -> SearchFilters {
 }
 
 fn required_query(kind: StructuralSearchKind, query: Option<&str>) -> Result<&str> {
-    query
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| anyhow::anyhow!("{} requires a query", kind_label(kind)))
+    non_blank(query).ok_or_else(|| anyhow::anyhow!("{} requires a query", kind_label(kind)))
+}
+
+fn non_blank(query: Option<&str>) -> Option<&str> {
+    query.map(str::trim).filter(|value| !value.is_empty())
+}
+
+/// `ROUTE_PATTERNS` and `SQL_PATTERNS` carry no capture group, so unlike `ENV_PATTERNS`
+/// there is no term-bearing entity for a query to narrow against. Dropping the argument
+/// instead of rejecting it makes an unfiltered result set read as a match failure.
+fn reject_query(kind: StructuralSearchKind, query: Option<&str>) -> Result<()> {
+    match non_blank(query) {
+        Some(value) => bail!(
+            "{} accepts no query term; got {value:?}. Narrow with path, language, or scope filters instead.",
+            kind_label(kind)
+        ),
+        None => Ok(()),
+    }
 }
 
 fn kind_label(kind: StructuralSearchKind) -> &'static str {
@@ -129,20 +162,22 @@ fn search_definitions(
 }
 
 fn search_env_reads(
-    repo_root: &Path,
+    root_dir: &Dir,
     store: &MetadataStore,
+    max_file_size_bytes: u64,
     query: Option<&str>,
     limit: usize,
     filters: &SearchFilters,
 ) -> Result<Vec<SearchResult>> {
-    let target = query.map(str::trim).filter(|value| !value.is_empty());
+    let target = non_blank(query);
     search_regex_intent(
-        repo_root,
+        root_dir,
         store,
+        max_file_size_bytes,
         limit,
         filters,
         true,
-        |_, language, content, _| {
+        |_, language, content| {
             let Some(patterns) = patterns_for_language(&ENV_PATTERNS, language) else {
                 return Ok(Vec::new());
             };
@@ -155,10 +190,10 @@ fn search_env_reads(
                     let Some(found_name) = first_capture(&captures) else {
                         continue;
                     };
-                    if let Some(target) = target {
-                        if !found_name.eq_ignore_ascii_case(target) {
-                            continue;
-                        }
+                    if let Some(target) = target
+                        && !found_name.eq_ignore_ascii_case(target)
+                    {
+                        continue;
                     }
                     results.push(StructuralMatch {
                         start_byte: full.start(),
@@ -172,18 +207,20 @@ fn search_env_reads(
 }
 
 fn search_route_handlers(
-    repo_root: &Path,
+    root_dir: &Dir,
     store: &MetadataStore,
+    max_file_size_bytes: u64,
     limit: usize,
     filters: &SearchFilters,
 ) -> Result<Vec<SearchResult>> {
     search_regex_intent(
-        repo_root,
+        root_dir,
         store,
+        max_file_size_bytes,
         limit,
         filters,
         true,
-        |_, language, content, _| {
+        |_, language, content| {
             let Some(patterns) = patterns_for_language(&ROUTE_PATTERNS, language) else {
                 return Ok(Vec::new());
             };
@@ -200,18 +237,20 @@ fn search_route_handlers(
 }
 
 fn search_sql_queries(
-    repo_root: &Path,
+    root_dir: &Dir,
     store: &MetadataStore,
+    max_file_size_bytes: u64,
     limit: usize,
     filters: &SearchFilters,
 ) -> Result<Vec<SearchResult>> {
     search_regex_intent(
-        repo_root,
+        root_dir,
         store,
+        max_file_size_bytes,
         limit,
         filters,
         true,
-        |_, language, content, _| {
+        |_, language, content| {
             let Some(patterns) = patterns_for_language(&SQL_PATTERNS, language) else {
                 return Ok(Vec::new());
             };
@@ -237,15 +276,16 @@ fn search_implementations(
 }
 
 fn search_regex_intent<F>(
-    repo_root: &Path,
+    root_dir: &Dir,
     store: &MetadataStore,
+    max_file_size_bytes: u64,
     limit: usize,
     filters: &SearchFilters,
     prefer_chunk: bool,
     mut collect: F,
 ) -> Result<Vec<SearchResult>>
 where
-    F: FnMut(&str, Language, &str, &[Chunk]) -> Result<Vec<StructuralMatch>>,
+    F: FnMut(&str, Language, &str) -> Result<Vec<StructuralMatch>>,
 {
     let mut files = store.indexed_files()?;
     sort_files_by_scan_priority(&mut files, filters);
@@ -263,8 +303,11 @@ where
             continue;
         }
 
-        let file_abs = repo_root.join(&file_rel);
-        let content = match crate::discovery::read_source_lossy(&file_abs) {
+        let content = match crate::discovery::read_source_lossy_capped(
+            root_dir,
+            Path::new(&file_rel),
+            max_file_size_bytes,
+        ) {
             Ok(content) => content,
             Err(e) => {
                 tracing::debug!("skipping {}: {e}", file_rel);
@@ -281,9 +324,14 @@ where
             continue;
         }
 
+        let candidates = collect(&file_rel, language, &content)?;
+        if candidates.is_empty() {
+            continue;
+        }
+
         let chunks = store.get_chunks_by_file(&file_rel)?;
-        let syntax_filter = SyntaxFilter::new(language, &content);
-        for candidate in collect(&file_rel, language, &content, &chunks)? {
+        let syntax_filter = SyntaxFilter::new(language, &file_rel, &content);
+        for candidate in candidates {
             if results.len() >= limit {
                 break;
             }
@@ -325,21 +373,20 @@ fn result_for_match(
     prefer_chunk: bool,
 ) -> SearchResult {
     let line = crate::retrieval::file_scan::byte_to_line(content, start_byte);
-    if prefer_chunk {
-        if let Some(chunk) = smallest_symbol_chunk_for_line(chunks, line)
+    if prefer_chunk
+        && let Some(chunk) = smallest_symbol_chunk_for_line(chunks, line)
             .filter(|chunk| chunk.line_end.saturating_sub(chunk.line_start) <= 80)
-        {
-            return SearchResult {
-                file_path: file_path.to_string(),
-                line_start: chunk.line_start,
-                line_end: chunk.line_end,
-                content: chunk.content.clone(),
-                language,
-                score: 1.0,
-                symbol_name: chunk.symbol_name.clone(),
-                symbol_type: chunk.symbol_type,
-            };
-        }
+    {
+        return SearchResult {
+            file_path: file_path.to_string(),
+            line_start: chunk.line_start,
+            line_end: chunk.line_end,
+            content: chunk.content.clone(),
+            language,
+            score: 1.0,
+            symbol_name: chunk.symbol_name.clone(),
+            symbol_type: chunk.symbol_type,
+        };
     }
 
     let (snippet, line_start, line_end) = bounded_byte_snippet(content, start_byte, end_byte, 220);
@@ -376,12 +423,16 @@ struct StructuralMatch {
 struct SyntaxFilter(Option<tree_sitter::Tree>);
 
 impl SyntaxFilter {
-    fn new(language: Language, content: &str) -> Self {
-        let tree = languages::tree_sitter_grammar(language).and_then(|grammar| {
-            let mut parser = Parser::new();
-            parser.set_language(&grammar).ok()?;
-            parser.parse(content, None)
-        });
+    fn new(language: Language, file_path: &str, content: &str) -> Self {
+        #[cfg(test)]
+        SYNTAX_FILTER_CREATIONS.with(|count| count.set(count.get() + 1));
+
+        let tree =
+            languages::tree_sitter_grammar_for_path(language, file_path).and_then(|grammar| {
+                let mut parser = Parser::new();
+                parser.set_language(&grammar).ok()?;
+                parser.parse(content, None)
+            });
         Self(tree)
     }
 
@@ -618,6 +669,84 @@ mod tests {
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].symbol_name.as_deref(), Some("parse_config"));
+    }
+
+    /// Structural search over a JSX-bearing `.tsx` file: the real env read is
+    /// found and attributed, the comment and JSX-attribute decoys are not.
+    ///
+    /// This characterises behaviour rather than guarding the grammar switch.
+    /// It passes under both grammars, which is the point: tree-sitter still
+    /// lexes comments and strings inside an error region, and still recognises
+    /// the enclosing `function_declaration`, so swapping `typescript` for `tsx`
+    /// leaves structural results unchanged. Nothing covered `.tsx` structural
+    /// search before, so the coverage is new either way.
+    #[tokio::test]
+    async fn structural_search_works_in_jsx_bearing_tsx() {
+        let dir = index_repo(&[(
+            "src/Panel.tsx",
+            r#"export function Panel() {
+  // const decoy = process.env.FAKE_URL;
+  const real = process.env.API_URL;
+  return <div title="process.env.FAKE_URL">{real}</div>;
+}
+"#,
+        )])
+        .await;
+        let index_dir = crate::indexing::index_dir(dir.path());
+
+        let real = search_structural(
+            &index_dir,
+            StructuralSearchKind::EnvReads,
+            Some("API_URL"),
+            10,
+            &SearchFilters::default(),
+        )
+        .unwrap();
+        assert_eq!(real.len(), 1, "real env read should be found: {real:?}");
+        assert_eq!(real[0].file_path, "src/Panel.tsx");
+        assert_eq!(
+            real[0].symbol_name.as_deref(),
+            Some("Panel"),
+            "match should be attributed to the enclosing component"
+        );
+
+        let decoy = search_structural(
+            &index_dir,
+            StructuralSearchKind::EnvReads,
+            Some("FAKE_URL"),
+            10,
+            &SearchFilters::default(),
+        )
+        .unwrap();
+        assert!(
+            decoy.is_empty(),
+            "comment and JSX attribute string should be filtered: {decoy:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn definitions_find_const_assigned_functions() {
+        let dir = index_repo(&[(
+            "src/shapes.ts",
+            "export function declaredFn(a: number): number { return a; }\n\
+             export const arrowFn = (a: number): number => a;\n\
+             export const MyButton: React.FC = () => null;\n",
+        )])
+        .await;
+        let index_dir = crate::indexing::index_dir(dir.path());
+
+        for symbol in ["declaredFn", "arrowFn", "MyButton"] {
+            let results = search_structural(
+                &index_dir,
+                StructuralSearchKind::Definitions,
+                Some(symbol),
+                10,
+                &SearchFilters::default(),
+            )
+            .unwrap();
+            assert_eq!(results.len(), 1, "no definition found for {symbol}");
+            assert_eq!(results[0].symbol_name.as_deref(), Some(symbol));
+        }
     }
 
     #[tokio::test]
@@ -873,5 +1002,79 @@ mod tests {
         .unwrap();
 
         assert!(results.is_empty(), "unexpected route matches: {results:?}");
+    }
+
+    /// Routes and SQL cannot narrow by term, so a supplied query has to fail loudly.
+    /// Dropping it returned the same unfiltered set the no-query call returns, which a
+    /// caller reads as "no match for my query".
+    #[tokio::test]
+    async fn routes_and_sql_reject_a_query_they_cannot_honour() {
+        let dir = index_repo(&[
+            ("src/router.ts", "router.get('/users', handler)\n"),
+            (
+                "db.py",
+                "def load(cursor):\n    cursor.execute('SELECT * FROM users')\n",
+            ),
+        ])
+        .await;
+        let index_dir = crate::indexing::index_dir(dir.path());
+
+        for (kind, label) in [
+            (StructuralSearchKind::RouteHandlers, "route handlers"),
+            (StructuralSearchKind::SqlQueries, "SQL queries"),
+        ] {
+            let unfiltered =
+                search_structural(&index_dir, kind, None, 10, &SearchFilters::default()).unwrap();
+            assert_eq!(
+                unfiltered.len(),
+                1,
+                "{label} fixture must produce the hit a dropped query would return: {unfiltered:?}"
+            );
+
+            let error = search_structural(
+                &index_dir,
+                kind,
+                Some("find_user_by_email"),
+                10,
+                &SearchFilters::default(),
+            )
+            .expect_err(&format!("{label} accepted a query it cannot honour"))
+            .to_string();
+            assert!(
+                error.contains(label) && error.contains("find_user_by_email"),
+                "error must name the kind and the rejected term: {error}"
+            );
+
+            for blank in ["", "   "] {
+                let results =
+                    search_structural(&index_dir, kind, Some(blank), 10, &SearchFilters::default())
+                        .unwrap();
+                assert_eq!(
+                    results.len(),
+                    1,
+                    "{label} must treat a blank query as absent: {results:?}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn unmatched_intent_skips_syntax_filter_parsing() {
+        let dir = index_repo(&[("src/app.ts", "const value = 1;\n")]).await;
+        let index_dir = crate::indexing::index_dir(dir.path());
+        let before = SYNTAX_FILTER_CREATIONS.with(|count| count.get());
+
+        let results = search_structural(
+            &index_dir,
+            StructuralSearchKind::EnvReads,
+            Some("MISSING_ENV_NAME"),
+            10,
+            &SearchFilters::default(),
+        )
+        .unwrap();
+
+        let after = SYNTAX_FILTER_CREATIONS.with(|count| count.get());
+        assert!(results.is_empty());
+        assert_eq!(after, before, "unmatched files must not be parsed");
     }
 }

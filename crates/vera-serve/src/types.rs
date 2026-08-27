@@ -97,12 +97,12 @@ pub struct HealthResponse {
     pub backend: String,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 pub struct ApiError {
     pub error: ApiErrorDetails,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 pub struct ApiErrorDetails {
     pub message: String,
     #[serde(rename = "type")]

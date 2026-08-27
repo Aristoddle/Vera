@@ -1,7 +1,9 @@
 # Embedding Model
 
-**API mode:** Qwen3-Embedding-8B (4096-dim) via any OpenAI-compatible endpoint.
-**Local mode:** Jina v5 text-nano (768-dim ONNX) for offline use.
+> Status: historical spike evaluation. Since v1.1.0, the default local embedding model is `minishlab/potion-code-16M-v2`; Jina ONNX backends and API endpoints are opt-in.
+
+**Original API mode:** Qwen3-Embedding-8B (4096-dim) via any OpenAI-compatible endpoint.
+**Original local mode:** Jina v5 text-nano (768-dim ONNX) for offline use.
 
 We originally planned Qwen3-0.6B as the local fallback but switched to Jina for simpler ONNX inference.
 
@@ -36,5 +38,5 @@ Qwen3-8B has the highest recall and nDCG but its MRR (0.28) trails cocoindex-cod
 ## Trade-offs
 
 - 4096-dim vectors: 16KB per chunk, ~48MB for 3K chunks. acceptable
-- API dependency in default mode. mitigated by local mode fallback
+- API dependency when API mode is selected. The current default local path uses Potion Code
 - Provider abstraction via env vars makes switching trivial

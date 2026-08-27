@@ -3,7 +3,8 @@
 use std::io::Write;
 use std::time::Instant;
 
-use crate::helpers::{load_runtime_config, output_results, prepare_indexed_search};
+use crate::helpers::{output_results, prepare_indexed_search};
+use crate::state;
 
 /// Run the `vera grep <pattern>` command.
 #[allow(clippy::too_many_arguments)]
@@ -19,7 +20,7 @@ pub fn run(
     git_scope: Option<vera_core::git_scope::GitScope>,
     compact: bool,
 ) -> anyhow::Result<()> {
-    let config = load_runtime_config()?;
+    let config = state::load_runtime_config()?;
     let (index_dir, filters) =
         prepare_indexed_search(&config.indexing, filters, git_scope.as_ref())?;
 
@@ -42,12 +43,12 @@ pub fn run(
         config.retrieval.max_output_chars,
     );
 
-    if results.is_empty() {
-        if let Some(hint) = alternation_hint(pattern) {
-            let stderr = std::io::stderr();
-            let mut err = stderr.lock();
-            let _ = writeln!(err, "{hint}");
-        }
+    if results.is_empty()
+        && let Some(hint) = alternation_hint(pattern)
+    {
+        let stderr = std::io::stderr();
+        let mut err = stderr.lock();
+        let _ = writeln!(err, "{hint}");
     }
 
     if timing {

@@ -1,7 +1,7 @@
 //! Embedding provider abstraction and OpenAI-compatible implementation.
 
 use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -11,6 +11,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 use crate::chunk_text;
+use crate::local_models::CODERANK_QUERY_PREFIX;
 use crate::types::Chunk;
 
 // ── Error types ──────────────────────────────────────────────────────
@@ -78,6 +79,21 @@ pub trait EmbeddingProvider: Send + Sync {
         query.to_string()
     }
 
+    /// Rewrite passage text for providers that require asymmetric document
+    /// prefixes. Applied on the indexing path only.
+    fn prepare_document_text(&self, document: &str) -> String {
+        document.to_string()
+    }
+
+    /// Identity of the document-side text preparation, stored in the index
+    /// metadata so a changed document prefix trips the stale-index guard
+    /// instead of silently mixing vector spaces. The empty string means
+    /// documents embed unprefixed. Local providers may leave the default:
+    /// their stored model identity already covers prefix configuration.
+    fn document_prefix_identity(&self) -> String {
+        String::new()
+    }
+
     /// Return the maximum number of inputs the provider accepts per request.
     ///
     /// `None` means Vera should use the configured batch size as-is.
@@ -119,6 +135,9 @@ pub struct EmbeddingProviderConfig {
     /// Optional prefix prepended to query text for asymmetric embedding models.
     /// Read from `EMBEDDING_QUERY_PREFIX` env var.
     pub query_prefix: Option<String>,
+    /// Optional prefix prepended to indexed passage text for asymmetric
+    /// embedding models. Read from `EMBEDDING_DOCUMENT_PREFIX` env var.
+    pub document_prefix: Option<String>,
 }
 
 impl std::fmt::Debug for EmbeddingProviderConfig {
@@ -136,13 +155,16 @@ impl std::fmt::Debug for EmbeddingProviderConfig {
 impl EmbeddingProviderConfig {
     /// Create a new config. The API key is stored opaquely and never exposed.
     pub fn new(base_url: String, model_id: String, api_key: String) -> Self {
+        let query_prefix = default_query_prefix_for_known_model(&model_id);
+        let document_prefix = default_document_prefix_for_model(&model_id);
         Self {
             base_url,
             model_id,
             api_key,
             timeout: Duration::from_secs(30),
             max_retries: 3,
-            query_prefix: None,
+            query_prefix,
+            document_prefix,
         }
     }
 
@@ -153,6 +175,7 @@ impl EmbeddingProviderConfig {
     /// - `EMBEDDING_MODEL_ID`
     /// - `EMBEDDING_MODEL_API_KEY`
     /// - `EMBEDDING_QUERY_PREFIX` (optional override; auto-detected from model ID if unset)
+    /// - `EMBEDDING_DOCUMENT_PREFIX` (optional override; auto-detected from model ID if unset)
     pub fn from_env() -> Result<Self> {
         let base_url = std::env::var("EMBEDDING_MODEL_BASE_URL")
             .context("EMBEDDING_MODEL_BASE_URL not set")?;
@@ -163,9 +186,47 @@ impl EmbeddingProviderConfig {
             .ok()
             .filter(|s| !s.is_empty())
             .or_else(|| default_query_prefix_for_model(&model_id));
+        let document_prefix = std::env::var("EMBEDDING_DOCUMENT_PREFIX")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .or_else(|| default_document_prefix_for_model(&model_id));
 
         let mut config = Self::new(base_url, model_id, api_key);
         config.query_prefix = query_prefix;
+        config.document_prefix = document_prefix;
+        Ok(config)
+    }
+
+    /// Create config from environment variables without blocking an async
+    /// runtime worker on the best-effort HuggingFace lookup.
+    pub async fn from_env_async() -> Result<Self> {
+        let base_url = std::env::var("EMBEDDING_MODEL_BASE_URL")
+            .context("EMBEDDING_MODEL_BASE_URL not set")?;
+        let model_id = std::env::var("EMBEDDING_MODEL_ID").context("EMBEDDING_MODEL_ID not set")?;
+        let api_key =
+            std::env::var("EMBEDDING_MODEL_API_KEY").context("EMBEDDING_MODEL_API_KEY not set")?;
+        let query_prefix = std::env::var("EMBEDDING_QUERY_PREFIX")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .or_else(|| default_query_prefix_for_known_model(&model_id));
+        let query_prefix = match query_prefix {
+            Some(prefix) => Some(prefix),
+            None => {
+                let model_id_for_fetch = model_id.clone();
+                tokio::task::spawn_blocking(move || fetch_query_prefix_from_hf(&model_id_for_fetch))
+                    .await
+                    .ok()
+                    .flatten()
+            }
+        };
+        let document_prefix = std::env::var("EMBEDDING_DOCUMENT_PREFIX")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .or_else(|| default_document_prefix_for_model(&model_id));
+
+        let mut config = Self::new(base_url, model_id, api_key);
+        config.query_prefix = query_prefix;
+        config.document_prefix = document_prefix;
         Ok(config)
     }
 
@@ -189,18 +250,64 @@ impl EmbeddingProviderConfig {
 /// Returns `None` for symmetric models or unrecognized model IDs.
 /// Users can always override via `EMBEDDING_QUERY_PREFIX` env var.
 fn default_query_prefix_for_model(model_id: &str) -> Option<String> {
+    default_query_prefix_for_known_model(model_id)
+        .or_else(|| fetch_query_prefix_off_runtime(model_id))
+}
+
+fn fetch_query_prefix_off_runtime(model_id: &str) -> Option<String> {
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        let model_id = model_id.to_string();
+        return match handle.runtime_flavor() {
+            tokio::runtime::RuntimeFlavor::MultiThread => tokio::task::block_in_place(|| {
+                handle
+                    .block_on(tokio::task::spawn_blocking(move || {
+                        fetch_query_prefix_from_hf(&model_id)
+                    }))
+                    .ok()
+                    .flatten()
+            }),
+            tokio::runtime::RuntimeFlavor::CurrentThread => {
+                std::thread::spawn(move || fetch_query_prefix_from_hf(&model_id))
+                    .join()
+                    .ok()
+                    .flatten()
+            }
+            _ => std::thread::spawn(move || fetch_query_prefix_from_hf(&model_id))
+                .join()
+                .ok()
+                .flatten(),
+        };
+    }
+
+    fetch_query_prefix_from_hf(model_id)
+}
+
+fn default_query_prefix_for_known_model(model_id: &str) -> Option<String> {
     let id = model_id.to_lowercase();
     if id.contains("qwen3-embedding") || id.contains("qwen3_embedding") {
         Some("Instruct: Given a code search query, retrieve relevant code snippets that match the query\nQuery: ".into())
     } else if id.contains("coderankembed") {
-        Some("Represent this query for retrieving relevant code: ".into())
+        // `prepare_query_text` concatenates without a separator, so the
+        // trailing space belongs here rather than in the shared constant.
+        Some(format!("{CODERANK_QUERY_PREFIX} "))
     } else if id.contains("e5-") || id.contains("e5_") {
         Some("query: ".into())
     } else if id.contains("bge-") || id.contains("bge_") {
         Some("Represent this sentence for searching relevant passages: ".into())
     } else {
-        // Unrecognized model: try fetching prefix from HuggingFace.
-        fetch_query_prefix_from_hf(model_id)
+        None
+    }
+}
+
+/// Auto-detect a documented passage prefix for known asymmetric models.
+fn default_document_prefix_for_model(model_id: &str) -> Option<String> {
+    let id = model_id.to_lowercase();
+    if id.contains("e5-") || id.contains("e5_") {
+        Some("passage: ".into())
+    } else {
+        // BGE and the other known API presets document a query instruction but
+        // no passage prefix, so leave indexed text unchanged.
+        None
     }
 }
 
@@ -214,12 +321,20 @@ fn fetch_query_prefix_from_hf(model_id: &str) -> Option<String> {
     if !model_id.contains('/') {
         return None;
     }
+    let cache = QUERY_PREFIX_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    cached_lookup_or_fetch(cache, model_id, || {
+        fetch_query_prefix_from_hf_uncached(model_id)
+    })
+}
+
+fn fetch_query_prefix_from_hf_uncached(model_id: &str) -> Option<String> {
     let url = format!(
         "https://huggingface.co/{}/resolve/main/tokenizer_config.json",
         model_id
     );
     debug!(model_id, url = %url, "fetching query prefix from HuggingFace");
 
+    crate::init_tls();
     let body = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(5))
         .build()
@@ -243,6 +358,28 @@ fn fetch_query_prefix_from_hf(model_id: &str) -> Option<String> {
         debug!(model_id, prefix = %p, "auto-detected query prefix from HuggingFace");
         format!("{p} ")
     })
+}
+
+type QueryPrefixCacheEntry = Arc<OnceLock<Option<String>>>;
+type QueryPrefixCache = Mutex<HashMap<String, QueryPrefixCacheEntry>>;
+
+static QUERY_PREFIX_CACHE: OnceLock<QueryPrefixCache> = OnceLock::new();
+
+fn cached_lookup_or_fetch<F>(cache: &QueryPrefixCache, model_id: &str, fetch: F) -> Option<String>
+where
+    F: FnOnce() -> Option<String>,
+{
+    let entry = {
+        let mut entries = cache.lock().unwrap();
+        entries
+            .entry(model_id.to_string())
+            .or_insert_with(|| Arc::new(OnceLock::new()))
+            .clone()
+    };
+
+    // Each model gets its own single-flight cell. The map lock is released
+    // before the request starts, so a slow lookup cannot block other models.
+    entry.get_or_init(fetch).clone()
 }
 
 // ── OpenAI-compatible provider ───────────────────────────────────────
@@ -365,15 +502,17 @@ impl OpenAiProvider {
         let status = response.status().as_u16();
 
         if status == 401 || status == 403 {
-            let text = read_response_text(response, "failed to read authentication error response")
-                .await?;
+            let text =
+                read_error_response_text(response, "failed to read authentication error response")
+                    .await?;
             return Err(EmbeddingError::AuthError {
                 message: sanitize_error_message(&text),
             });
         }
 
         if status == 429 {
-            let text = read_response_text(response, "failed to read rate limit response").await?;
+            let text =
+                read_error_response_text(response, "failed to read rate limit response").await?;
             return Err(EmbeddingError::RateLimitError {
                 message: sanitize_error_message(&text),
             });
@@ -381,7 +520,8 @@ impl OpenAiProvider {
 
         if !response.status().is_success() {
             let text =
-                read_response_text(response, "failed to read embedding error response").await?;
+                read_error_response_text(response, "failed to read embedding error response")
+                    .await?;
             // Some providers return 400 with "Unable to process" for transient
             // overload conditions. Treat these as rate limits so they get retried.
             if status == 400 && text.contains("Unable to process") {
@@ -432,14 +572,15 @@ fn response_read_error(error: reqwest::Error, context: &str) -> EmbeddingError {
     }
 }
 
-async fn read_response_text(
+async fn read_error_response_text(
     response: reqwest::Response,
     context: &str,
 ) -> Result<String, EmbeddingError> {
-    response
-        .text()
-        .await
-        .map_err(|error| response_read_error(error, context))
+    match response.text().await {
+        Ok(text) => Ok(text),
+        Err(error) if error.is_timeout() => Err(response_read_error(error, context)),
+        Err(error) => Ok(format!("{context}: {error}")),
+    }
 }
 
 impl EmbeddingProvider for OpenAiProvider {
@@ -459,6 +600,22 @@ impl EmbeddingProvider for OpenAiProvider {
             Some(prefix) => format!("{prefix}{query}"),
             None => query.to_string(),
         }
+    }
+
+    fn prepare_document_text(&self, document: &str) -> String {
+        match &self.config.document_prefix {
+            Some(prefix) => format!("{prefix}{document}"),
+            None => document.to_string(),
+        }
+    }
+
+    fn document_prefix_identity(&self) -> String {
+        self.config
+            .document_prefix
+            .as_deref()
+            .unwrap_or("")
+            .trim()
+            .to_string()
     }
 
     fn max_batch_size(&self) -> Option<usize> {
@@ -511,15 +668,15 @@ impl LruCache {
 
     fn insert(&mut self, key: String, vector: Vec<f32>) {
         // Evict oldest entry if at capacity and this is a new key.
-        if self.entries.len() >= self.max_entries && !self.entries.contains_key(&key) {
-            if let Some(oldest_key) = self
+        if self.entries.len() >= self.max_entries
+            && !self.entries.contains_key(&key)
+            && let Some(oldest_key) = self
                 .entries
                 .iter()
                 .min_by_key(|(_, e)| e.inserted_at)
                 .map(|(k, _)| k.clone())
-            {
-                self.entries.remove(&oldest_key);
-            }
+        {
+            self.entries.remove(&oldest_key);
         }
         self.entries.insert(
             key,
@@ -649,6 +806,14 @@ impl<P: EmbeddingProvider> EmbeddingProvider for CachedEmbeddingProvider<P> {
 
     fn prepare_query_text(&self, query: &str) -> String {
         self.inner.prepare_query_text(query)
+    }
+
+    fn prepare_document_text(&self, document: &str) -> String {
+        self.inner.prepare_document_text(document)
+    }
+
+    fn document_prefix_identity(&self) -> String {
+        self.inner.document_prefix_identity()
     }
 
     fn max_batch_size(&self) -> Option<usize> {
@@ -875,14 +1040,24 @@ fn shrink_text_for_context_limit(
 async fn embed_batch_resilient<P: EmbeddingProvider>(
     provider: &P,
     items: Vec<EmbeddingBatchItem>,
+    cancel: &CancellationToken,
 ) -> Result<Vec<(usize, String, Vec<f32>)>, EmbeddingError> {
     let mut pending = vec![items];
     let mut completed = Vec::new();
 
     while let Some(batch) = pending.pop() {
+        if cancel.is_cancelled() {
+            return Err(EmbeddingError::Cancelled);
+        }
         let texts: Vec<String> = batch.iter().map(|item| item.text.clone()).collect();
 
-        match provider.embed_batch(&texts).await {
+        let result = tokio::select! {
+            biased;
+            result = provider.embed_batch_cancellable(&texts, cancel) => result,
+            _ = cancel.cancelled() => Err(EmbeddingError::Cancelled),
+        };
+
+        match result {
             Ok(vectors) => {
                 completed.extend(
                     batch
@@ -950,24 +1125,30 @@ pub async fn embed_chunks_concurrent<P: EmbeddingProvider>(
     max_concurrent: usize,
     max_chunk_bytes: usize,
 ) -> Result<Vec<(String, Vec<f32>)>, EmbeddingError> {
-    embed_chunks_concurrent_with_progress(
+    embed_chunks_concurrent_with_progress_and_cancellation(
         provider,
         chunks,
         batch_size,
         max_concurrent,
         max_chunk_bytes,
+        &CancellationToken::new(),
         |_, _| {},
     )
     .await
 }
 
-/// Like `embed_chunks_concurrent` but calls `on_progress(done, total)` after each batch.
-pub async fn embed_chunks_concurrent_with_progress<P, F>(
+/// Embed chunks concurrently while allowing the caller to cancel active batches.
+///
+/// The token remains owned by the indexing operation. Cancellation drops every
+/// active provider future and returns [`EmbeddingError::Cancelled`] without
+/// reporting further progress.
+pub(crate) async fn embed_chunks_concurrent_with_progress_and_cancellation<P, F>(
     provider: &P,
     chunks: &[Chunk],
     batch_size: usize,
     max_concurrent: usize,
     max_chunk_bytes: usize,
+    cancel: &CancellationToken,
     on_progress: F,
 ) -> Result<Vec<(String, Vec<f32>)>, EmbeddingError>
 where
@@ -991,6 +1172,8 @@ where
     let mut indexed_chunks: Vec<(usize, &Chunk)> = chunks.iter().enumerate().collect();
     indexed_chunks.sort_by_key(|(_, c)| c.content.len());
 
+    let body_budget = budget_after_prefix(max_chunk_bytes, document_prefix_overhead(provider));
+
     let batch_inputs: Vec<Vec<EmbeddingBatchItem>> = indexed_chunks
         .chunks(batch_size)
         .map(|batch| {
@@ -999,7 +1182,8 @@ where
                 .map(|(orig_idx, chunk)| EmbeddingBatchItem {
                     original_index: *orig_idx,
                     chunk_id: chunk.id.clone(),
-                    text: chunk_to_embedding_text(chunk, max_chunk_bytes),
+                    text: provider
+                        .prepare_document_text(&chunk_to_embedding_text(chunk, body_budget)),
                 })
                 .collect()
         })
@@ -1019,14 +1203,19 @@ where
                 let batch_idx = group_start + i;
                 async move {
                     debug!(batch = batch_idx + 1, total_batches, "embedding batch");
-                    embed_batch_resilient(provider, items.clone()).await
+                    embed_batch_resilient(provider, items.clone(), cancel).await
                 }
             })
             .collect();
 
         let results = futures::future::join_all(futures).await;
         for result in results {
+            // Batch errors (real provider failures or Cancelled) win over a
+            // pending cancellation so the caller sees the actual failure.
             let batch_results = result?;
+            if cancel.is_cancelled() {
+                return Err(EmbeddingError::Cancelled);
+            }
             done_count += batch_results.len();
             all_results.extend(batch_results);
             on_progress(done_count, total);
@@ -1054,6 +1243,33 @@ fn chunk_to_embedding_text(chunk: &Chunk, max_bytes: usize) -> String {
     } else {
         chunk_text::build_embedding_text(chunk)
     }
+}
+
+/// Measure how many bytes `prepare_document_text` adds to a passage.
+///
+/// Read off the provider rather than off the model config, so it stays correct
+/// for any implementation of the hook, including the identity default.
+fn document_prefix_overhead<P: EmbeddingProvider>(provider: &P) -> usize {
+    const PROBE: &str = "x";
+    provider
+        .prepare_document_text(PROBE)
+        .len()
+        .saturating_sub(PROBE.len())
+}
+
+/// Shrink the chunk byte budget so the document prefix fits inside it.
+///
+/// The prefix spends the same context window the budget exists to protect, so
+/// it has to be reserved before truncation rather than added after it.
+///
+/// `0` means "unbounded" to [`chunk_to_embedding_text`], so a prefix at least
+/// as large as the budget floors at 1 instead of saturating to 0, which would
+/// silently switch truncation off entirely.
+fn budget_after_prefix(max_chunk_bytes: usize, prefix_overhead: usize) -> usize {
+    if max_chunk_bytes == 0 {
+        return 0;
+    }
+    max_chunk_bytes.saturating_sub(prefix_overhead).max(1)
 }
 
 // ── Sanitization ─────────────────────────────────────────────────────
@@ -1196,6 +1412,53 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    async fn provider_with_truncated_error_body(
+        status: &'static str,
+    ) -> (OpenAiProvider, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 2048];
+            let _ = stream.read(&mut request).await;
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Length: 32\r\nConnection: close\r\n\r\nshort"
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+            stream.shutdown().await.unwrap();
+        });
+        let config = EmbeddingProviderConfig::new(
+            format!("http://{address}"),
+            "test-model".into(),
+            "test-key".into(),
+        )
+        .with_max_retries(0);
+        (OpenAiProvider::new(config).unwrap(), server)
+    }
+
+    /// Cancels the token mid-request but still returns vectors, modelling an
+    /// embedding response that completes at the same moment cancellation fires.
+    struct CancelThenSucceedProvider;
+
+    impl EmbeddingProvider for CancelThenSucceedProvider {
+        async fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+            Ok(vec![vec![0.0; 8]; texts.len()])
+        }
+
+        async fn embed_batch_cancellable(
+            &self,
+            texts: &[String],
+            cancel: &CancellationToken,
+        ) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+            cancel.cancel();
+            self.embed_batch(texts).await
+        }
+
+        fn expected_dim(&self) -> Option<usize> {
+            Some(8)
+        }
+    }
+
     struct CancellationAwareProvider;
 
     impl EmbeddingProvider for CancellationAwareProvider {
@@ -1239,6 +1502,65 @@ mod tests {
         assert_eq!(provider.prepare_query_text("find foo"), "find foo");
     }
 
+    #[test]
+    fn document_prefix_identity_normalizes_and_defaults_to_empty() {
+        let mut config =
+            EmbeddingProviderConfig::new("http://x".into(), "vendor/model".into(), "k".into());
+        assert_eq!(
+            OpenAiProvider::new(config.clone())
+                .unwrap()
+                .document_prefix_identity(),
+            ""
+        );
+
+        config.document_prefix = Some("  passage: ".into());
+        assert_eq!(
+            OpenAiProvider::new(config.clone())
+                .unwrap()
+                .document_prefix_identity(),
+            "passage:"
+        );
+
+        // An empty prefix embeds documents unprefixed, so it must share the
+        // bare identity instead of demanding its own re-index.
+        config.document_prefix = Some("   ".into());
+        assert_eq!(
+            OpenAiProvider::new(config)
+                .unwrap()
+                .document_prefix_identity(),
+            ""
+        );
+    }
+
+    #[test]
+    fn api_document_prefix_matches_known_model_conventions() {
+        let mut e5_config = EmbeddingProviderConfig::new(
+            "http://x".into(),
+            "intfloat/e5-large-v2".into(),
+            "k".into(),
+        );
+        e5_config.document_prefix = default_document_prefix_for_model(&e5_config.model_id);
+        let e5 = OpenAiProvider::new(e5_config).unwrap();
+        assert_eq!(
+            e5.prepare_document_text("fn main() {}"),
+            "passage: fn main() {}"
+        );
+
+        for model_id in [
+            "jinaai/jina-embeddings-v5-text-nano-retrieval",
+            "minishlab/potion-code-16M-v2",
+        ] {
+            let mut config =
+                EmbeddingProviderConfig::new("http://x".into(), model_id.into(), "k".into());
+            config.document_prefix = default_document_prefix_for_model(&config.model_id);
+            let provider = OpenAiProvider::new(config).unwrap();
+            assert_eq!(
+                provider.prepare_document_text("fn main() {}"),
+                "fn main() {}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn cached_provider_forwards_cancellation_on_cache_miss() {
         let cached = CachedEmbeddingProvider::new(CancellationAwareProvider, 8);
@@ -1263,8 +1585,53 @@ mod tests {
     #[test]
     fn auto_detect_coderankembed_prefix() {
         let prefix = default_query_prefix_for_model("krlvi/CodeRankEmbed");
-        assert!(prefix.is_some());
-        assert!(prefix.unwrap().contains("Represent this query"));
+        // Exact: the published prompt in the model's
+        // `config_sentence_transformers.json`, trailing space included.
+        assert_eq!(
+            prefix.as_deref(),
+            Some("Represent this query for searching relevant code: ")
+        );
+    }
+
+    /// The local ONNX path and the API path must embed the same query
+    /// identically. They apply the prefix differently (`query_text` trims the
+    /// *prefix* and rejoins it with one space, `prepare_query_text`
+    /// concatenates a prefix that already carries its own trailing space), so
+    /// this pins the resulting text rather than the constant.
+    ///
+    /// Neither path touches the query itself, so an un-normalized query has to
+    /// survive verbatim and identically on both sides; that case is covered
+    /// here so a one-sided `trim()` cannot be added without failing.
+    #[test]
+    fn coderankembed_query_text_matches_across_local_and_api_paths() {
+        let cases = [
+            (
+                "find router code",
+                "Represent this query for searching relevant code: find router code",
+            ),
+            (
+                "  find router code  ",
+                "Represent this query for searching relevant code:   find router code  ",
+            ),
+        ];
+
+        for (query, expected) in cases {
+            let local =
+                crate::local_models::LocalEmbeddingModelConfig::coderankembed().query_text(query);
+
+            let mut config = EmbeddingProviderConfig::new(
+                "http://x".into(),
+                "krlvi/CodeRankEmbed".into(),
+                "k".into(),
+            );
+            config.query_prefix = default_query_prefix_for_model(&config.model_id);
+            let api = OpenAiProvider::new(config)
+                .unwrap()
+                .prepare_query_text(query);
+
+            assert_eq!(local, api, "paths diverged on {query:?}");
+            assert_eq!(local, expected, "unexpected prefixed text for {query:?}");
+        }
     }
 
     #[test]
@@ -1286,6 +1653,54 @@ mod tests {
         // Unknown model without '/' won't attempt HF fetch.
         let prefix = default_query_prefix_for_model("some-unknown-model");
         assert!(prefix.is_none());
+    }
+
+    #[test]
+    fn query_prefix_cache_caches_negative_results() {
+        let cache: QueryPrefixCache = Mutex::new(HashMap::new());
+        let fetches = AtomicUsize::new(0);
+
+        assert_eq!(
+            cached_lookup_or_fetch(&cache, "acme/unknown", || {
+                fetches.fetch_add(1, Ordering::SeqCst);
+                None
+            }),
+            None
+        );
+        assert_eq!(
+            cached_lookup_or_fetch(&cache, "acme/unknown", || {
+                fetches.fetch_add(1, Ordering::SeqCst);
+                Some("should not be used".to_string())
+            }),
+            None
+        );
+        assert_eq!(fetches.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn query_prefix_cache_single_flights_each_model_without_serializing_models() {
+        let cache = Arc::new(Mutex::new(HashMap::new()));
+        let first_started = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let first_release = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let cache_for_thread = cache.clone();
+        let first_started_for_thread = first_started.clone();
+        let first_release_for_thread = first_release.clone();
+
+        let first = std::thread::spawn(move || {
+            cached_lookup_or_fetch(&cache_for_thread, "acme/slow", || {
+                first_started_for_thread.wait();
+                first_release_for_thread.wait();
+                Some("slow".to_string())
+            })
+        });
+
+        first_started.wait();
+        assert_eq!(
+            cached_lookup_or_fetch(&cache, "acme/fast", || Some("fast".to_string())),
+            Some("fast".to_string())
+        );
+        first_release.wait();
+        assert_eq!(first.join().unwrap(), Some("slow".to_string()));
     }
 
     #[test]
@@ -1471,5 +1886,217 @@ mod tests {
         assert!(matches!(error, EmbeddingError::TimeoutError { .. }));
         assert_eq!(request_count.load(Ordering::SeqCst), 1);
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn truncated_auth_body_preserves_authentication_classification() {
+        let (provider, server) = provider_with_truncated_error_body("401 Unauthorized").await;
+        let texts = ["input".to_string()];
+        let body = EmbeddingRequest {
+            model: &provider.config.model_id,
+            input: &texts,
+        };
+
+        let error = provider
+            .send_request(&provider.endpoint_url(), &body)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, EmbeddingError::AuthError { .. }));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn truncated_rate_limit_body_preserves_rate_limit_classification() {
+        let (provider, server) = provider_with_truncated_error_body("429 Too Many Requests").await;
+        let texts = ["input".to_string()];
+        let body = EmbeddingRequest {
+            model: &provider.config.model_id,
+            input: &texts,
+        };
+
+        let error = provider
+            .send_request(&provider.endpoint_url(), &body)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, EmbeddingError::RateLimitError { .. }));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_completed_batch_suppresses_further_progress() {
+        let chunks = vec![crate::types::Chunk {
+            id: "chunk-0".to_string(),
+            file_path: "src/main.rs".to_string(),
+            line_start: 1,
+            line_end: 1,
+            content: "fn main() {}".to_string(),
+            language: crate::types::Language::Rust,
+            symbol_type: None,
+            symbol_name: None,
+        }];
+        let progress_events = AtomicUsize::new(0);
+
+        let result = embed_chunks_concurrent_with_progress_and_cancellation(
+            &CancelThenSucceedProvider,
+            &chunks,
+            1,
+            1,
+            0,
+            &CancellationToken::new(),
+            |_, _| {
+                progress_events.fetch_add(1, Ordering::SeqCst);
+            },
+        )
+        .await;
+
+        assert!(matches!(result, Err(EmbeddingError::Cancelled)));
+        assert_eq!(progress_events.load(Ordering::SeqCst), 0);
+    }
+
+    /// Records the texts it is asked to embed and prefixes passages, so the
+    /// test can prove the indexing funnel actually calls the document hook
+    /// rather than merely defining it.
+    struct RecordingProvider {
+        seen: Mutex<Vec<String>>,
+    }
+
+    impl EmbeddingProvider for RecordingProvider {
+        async fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+            self.seen.lock().unwrap().extend(texts.iter().cloned());
+            Ok(texts.iter().map(|_| vec![0.0]).collect())
+        }
+
+        fn expected_dim(&self) -> Option<usize> {
+            Some(1)
+        }
+
+        fn prepare_document_text(&self, document: &str) -> String {
+            format!("Document: {document}")
+        }
+
+        fn prepare_query_text(&self, query: &str) -> String {
+            format!("Query: {query}")
+        }
+    }
+
+    #[tokio::test]
+    async fn indexing_applies_the_document_prefix_and_not_the_query_prefix() {
+        let chunks = vec![crate::types::Chunk {
+            id: "chunk-0".to_string(),
+            file_path: "src/main.rs".to_string(),
+            line_start: 1,
+            line_end: 1,
+            content: "fn main() {}".to_string(),
+            language: crate::types::Language::Rust,
+            symbol_type: None,
+            symbol_name: None,
+        }];
+        let provider = RecordingProvider {
+            seen: Mutex::new(Vec::new()),
+        };
+
+        embed_chunks_concurrent_with_progress_and_cancellation(
+            &provider,
+            &chunks,
+            1,
+            1,
+            0,
+            &CancellationToken::new(),
+            |_, _| {},
+        )
+        .await
+        .expect("embedding should succeed");
+
+        let seen = provider.seen.lock().unwrap();
+        assert_eq!(seen.len(), 1, "expected exactly one embedded passage");
+        assert!(
+            seen[0].starts_with("Document: "),
+            "indexing path did not apply the document prefix: {:?}",
+            seen[0]
+        );
+        assert!(
+            !seen[0].contains("Query: "),
+            "indexed passage was given the query prefix: {:?}",
+            seen[0]
+        );
+        assert!(
+            seen[0].contains("fn main() {}"),
+            "prefix replaced the chunk body instead of prefixing it: {:?}",
+            seen[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn the_document_prefix_fits_inside_the_chunk_byte_budget() {
+        const BUDGET: usize = 200;
+        let chunks = vec![crate::types::Chunk {
+            id: "chunk-0".to_string(),
+            file_path: "src/main.rs".to_string(),
+            line_start: 1,
+            line_end: 200,
+            // Far past the budget, so the bounded builder is the thing that
+            // decides the length. Short lines keep the line-boundary cut from
+            // landing well inside the budget and hiding the overshoot.
+            content: "ab\n".repeat(400),
+            language: crate::types::Language::Rust,
+            symbol_type: None,
+            symbol_name: None,
+        }];
+        let provider = RecordingProvider {
+            seen: Mutex::new(Vec::new()),
+        };
+
+        embed_chunks_concurrent_with_progress_and_cancellation(
+            &provider,
+            &chunks,
+            1,
+            1,
+            BUDGET,
+            &CancellationToken::new(),
+            |_, _| {},
+        )
+        .await
+        .expect("embedding should succeed");
+
+        let seen = provider.seen.lock().unwrap();
+        assert_eq!(seen.len(), 1, "expected exactly one embedded passage");
+        assert!(
+            seen[0].starts_with("Document: "),
+            "the passage lost its document prefix: {:?}",
+            seen[0]
+        );
+        assert!(
+            seen[0].contains("Code:\nab\nab"),
+            "the reservation ate the chunk body: {:?}",
+            seen[0]
+        );
+        assert!(
+            seen[0].len() <= BUDGET,
+            "prefixed passage is {} bytes against a {BUDGET}-byte budget",
+            seen[0].len()
+        );
+    }
+
+    #[test]
+    fn a_prefix_larger_than_the_budget_still_leaves_a_budget() {
+        // 0 means "unbounded" to chunk_to_embedding_text, so saturating to it
+        // would turn an over-long prefix into no truncation at all.
+        assert_eq!(budget_after_prefix(8, 10), 1);
+        assert_eq!(budget_after_prefix(8, 8), 1);
+        assert_eq!(budget_after_prefix(200, 10), 190);
+        // An unbounded budget stays unbounded.
+        assert_eq!(budget_after_prefix(0, 10), 0);
+    }
+
+    #[test]
+    fn the_prefix_overhead_is_measured_from_the_provider() {
+        let provider = RecordingProvider {
+            seen: Mutex::new(Vec::new()),
+        };
+        assert_eq!(document_prefix_overhead(&provider), "Document: ".len());
+        // A provider that takes the identity default reserves nothing.
+        assert_eq!(document_prefix_overhead(&CancelThenSucceedProvider), 0);
     }
 }

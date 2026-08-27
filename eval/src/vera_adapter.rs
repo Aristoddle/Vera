@@ -10,6 +10,7 @@ use vera_core::indexing::{index_dir, index_repository};
 use vera_core::retrieval::search_service::SearchContext;
 use vera_core::types::SearchFilters;
 
+use crate::lanes::LaneSpec;
 use crate::runner::ToolAdapter;
 use crate::types::RetrievalResult;
 
@@ -168,7 +169,7 @@ fn index_with<P: EmbeddingProvider>(
 ) -> (f64, u64) {
     match runtime.block_on(index_repository(repo_path, provider, config, model_name)) {
         Ok(summary) => (summary.elapsed_secs, dir_size(&index_dir(repo_path))),
-        Err(err) => panic!("{label} index failed for {}: {err}", repo_path.display()),
+        Err(err) => panic!("{label} index failed for {}: {err:#}", repo_path.display()),
     }
 }
 
@@ -204,19 +205,42 @@ pub struct VeraFullAdapter {
     runtime: Runtime,
     config: VeraConfig,
     backend: InferenceBackend,
+    name: String,
     search_context: SearchContext,
 }
 
 impl VeraFullAdapter {
-    pub fn new(backend: InferenceBackend) -> anyhow::Result<Self> {
+    pub fn new_with_options(
+        backend: InferenceBackend,
+        reranking_enabled: bool,
+        name: impl Into<String>,
+        lane: &LaneSpec,
+    ) -> anyhow::Result<Self> {
         let mut config = VeraConfig::default();
+        config.retrieval.reranking_enabled = reranking_enabled;
         config.adjust_for_backend(backend);
+        if let Some(batch_size) = lane.batch_size {
+            config.embedding.batch_size = batch_size;
+        }
+        if let Some(max_concurrent) = lane.max_concurrent_requests {
+            config.embedding.max_concurrent_requests = max_concurrent;
+        }
+        if let Some(timeout_secs) = lane.timeout_secs {
+            config.embedding.timeout_secs = timeout_secs;
+        }
+        if let Some(max_retries) = lane.max_retries {
+            config.embedding.max_retries = max_retries;
+        }
         let runtime = Runtime::new()?;
         let search_context = runtime.block_on(SearchContext::new(&config, backend));
+        if search_context.embedding_provider().is_none() {
+            anyhow::bail!("failed to initialize the embedding provider for backend {backend}");
+        }
         Ok(Self {
             runtime,
             config,
             backend,
+            name: name.into(),
             search_context,
         })
     }
@@ -224,7 +248,7 @@ impl VeraFullAdapter {
 
 impl ToolAdapter for VeraFullAdapter {
     fn name(&self) -> &str {
-        "vera-full"
+        &self.name
     }
 
     fn version(&self) -> String {

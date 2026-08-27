@@ -2,12 +2,11 @@
 
 use anyhow::{Context, bail};
 
-use crate::helpers::load_runtime_config;
 use crate::state;
 
 /// Run the `vera config` command.
 pub fn run(args: &[String], json_output: bool) -> anyhow::Result<()> {
-    let mut config = load_runtime_config()?;
+    let mut config = state::load_runtime_config()?;
 
     match args.first().map(|s| s.as_str()) {
         None | Some("show") => {
@@ -97,6 +96,14 @@ fn print_human_config(config: &vera_core::config::VeraConfig) {
         "    default_excludes          {:?}",
         config.indexing.default_excludes
     );
+    println!(
+        "    extra_excludes            {:?}",
+        config.indexing.extra_excludes
+    );
+    println!(
+        "    max_chunk_bytes           {}",
+        config.indexing.max_chunk_bytes
+    );
     println!();
     println!("  Retrieval:");
     println!(
@@ -116,6 +123,10 @@ fn print_human_config(config: &vera_core::config::VeraConfig) {
         "    reranking_enabled         {}",
         config.retrieval.reranking_enabled
     );
+    println!(
+        "    max_rerank_batch          {}",
+        config.retrieval.max_rerank_batch
+    );
     println!();
     println!("  Embedding:");
     println!(
@@ -125,6 +136,10 @@ fn print_human_config(config: &vera_core::config::VeraConfig) {
     println!(
         "    max_concurrent_requests   {}",
         config.embedding.max_concurrent_requests
+    );
+    println!(
+        "    max_in_flight_inputs      {}",
+        config.embedding.max_in_flight_inputs
     );
     println!(
         "    timeout_secs              {}",
@@ -137,6 +152,22 @@ fn print_human_config(config: &vera_core::config::VeraConfig) {
     println!(
         "    max_stored_dim            {}",
         config.embedding.max_stored_dim
+    );
+    println!(
+        "    gpu_mem_limit_mb          {}",
+        config.embedding.gpu_mem_limit_mb
+    );
+    println!(
+        "    low_vram                  {}",
+        config.embedding.low_vram
+    );
+    println!(
+        "    query_prefix              {:?}",
+        config.embedding.query_prefix
+    );
+    println!(
+        "    document_prefix           {:?}",
+        config.embedding.document_prefix
     );
     println!(
         "    model_aliases             {}",
@@ -157,6 +188,10 @@ pub fn get_config_value(
             config.indexing.max_file_size_bytes.into(),
         )),
         "indexing.default_excludes" => serde_json::to_value(&config.indexing.default_excludes).ok(),
+        "indexing.extra_excludes" => serde_json::to_value(&config.indexing.extra_excludes).ok(),
+        "indexing.max_chunk_bytes" => Some(serde_json::Value::Number(
+            config.indexing.max_chunk_bytes.into(),
+        )),
         "retrieval.default_limit" => Some(serde_json::Value::Number(
             config.retrieval.default_limit.into(),
         )),
@@ -170,11 +205,17 @@ pub fn get_config_value(
         "retrieval.max_output_chars" => Some(serde_json::Value::Number(
             config.retrieval.max_output_chars.into(),
         )),
+        "retrieval.max_rerank_batch" => Some(serde_json::Value::Number(
+            config.retrieval.max_rerank_batch.into(),
+        )),
         "embedding.batch_size" => Some(serde_json::Value::Number(
             config.embedding.batch_size.into(),
         )),
         "embedding.max_concurrent_requests" => Some(serde_json::Value::Number(
             config.embedding.max_concurrent_requests.into(),
+        )),
+        "embedding.max_in_flight_inputs" => Some(serde_json::Value::Number(
+            config.embedding.max_in_flight_inputs.into(),
         )),
         "embedding.timeout_secs" => Some(serde_json::Value::Number(
             config.embedding.timeout_secs.into(),
@@ -185,6 +226,12 @@ pub fn get_config_value(
         "embedding.max_stored_dim" => Some(serde_json::Value::Number(
             config.embedding.max_stored_dim.into(),
         )),
+        "embedding.gpu_mem_limit_mb" => Some(serde_json::Value::Number(
+            config.embedding.gpu_mem_limit_mb.into(),
+        )),
+        "embedding.low_vram" => Some(serde_json::Value::Bool(config.embedding.low_vram)),
+        "embedding.query_prefix" => serde_json::to_value(&config.embedding.query_prefix).ok(),
+        "embedding.document_prefix" => serde_json::to_value(&config.embedding.document_prefix).ok(),
         "embedding.model_aliases" => serde_json::to_value(&config.embedding.model_aliases).ok(),
         _ => None,
     }
@@ -197,24 +244,32 @@ fn set_config_value(
 ) -> anyhow::Result<()> {
     match key {
         "indexing.max_chunk_lines" => {
-            config.indexing.max_chunk_lines = parse_value(key, value)?;
+            config.indexing.max_chunk_lines = parse_positive(key, value)?;
         }
         "indexing.max_file_size_bytes" => {
-            config.indexing.max_file_size_bytes = parse_value(key, value)?;
+            config.indexing.max_file_size_bytes = parse_positive(key, value)?;
         }
         "indexing.default_excludes" => {
             config.indexing.default_excludes = serde_json::from_str(value).with_context(|| {
                 format!("failed to parse {key} as JSON array of strings: {value}")
             })?;
         }
+        "indexing.extra_excludes" => {
+            config.indexing.extra_excludes = serde_json::from_str(value).with_context(|| {
+                format!("failed to parse {key} as JSON array of strings: {value}")
+            })?;
+        }
+        "indexing.max_chunk_bytes" => {
+            config.indexing.max_chunk_bytes = parse_value(key, value)?;
+        }
         "retrieval.default_limit" => {
-            config.retrieval.default_limit = parse_value(key, value)?;
+            config.retrieval.default_limit = parse_positive(key, value)?;
         }
         "retrieval.rrf_k" => {
-            config.retrieval.rrf_k = parse_value(key, value)?;
+            config.retrieval.rrf_k = parse_positive_finite(key, value)?;
         }
         "retrieval.rerank_candidates" => {
-            config.retrieval.rerank_candidates = parse_value(key, value)?;
+            config.retrieval.rerank_candidates = parse_positive(key, value)?;
         }
         "retrieval.reranking_enabled" => {
             config.retrieval.reranking_enabled = parse_value(key, value)?;
@@ -222,20 +277,38 @@ fn set_config_value(
         "retrieval.max_output_chars" => {
             config.retrieval.max_output_chars = parse_value(key, value)?;
         }
+        "retrieval.max_rerank_batch" => {
+            config.retrieval.max_rerank_batch = parse_value(key, value)?;
+        }
         "embedding.batch_size" => {
-            config.embedding.batch_size = parse_value(key, value)?;
+            config.embedding.batch_size = parse_positive(key, value)?;
         }
         "embedding.max_concurrent_requests" => {
-            config.embedding.max_concurrent_requests = parse_value(key, value)?;
+            config.embedding.max_concurrent_requests = parse_positive(key, value)?;
+        }
+        "embedding.max_in_flight_inputs" => {
+            config.embedding.max_in_flight_inputs = parse_positive(key, value)?;
         }
         "embedding.timeout_secs" => {
-            config.embedding.timeout_secs = parse_value(key, value)?;
+            config.embedding.timeout_secs = parse_positive(key, value)?;
         }
         "embedding.max_retries" => {
             config.embedding.max_retries = parse_value(key, value)?;
         }
         "embedding.max_stored_dim" => {
             config.embedding.max_stored_dim = parse_value(key, value)?;
+        }
+        "embedding.gpu_mem_limit_mb" => {
+            config.embedding.gpu_mem_limit_mb = parse_value(key, value)?;
+        }
+        "embedding.low_vram" => {
+            config.embedding.low_vram = parse_value(key, value)?;
+        }
+        "embedding.query_prefix" => {
+            config.embedding.query_prefix = parse_optional_string(key, value)?;
+        }
+        "embedding.document_prefix" => {
+            config.embedding.document_prefix = parse_optional_string(key, value)?;
         }
         "embedding.model_aliases" => {
             config.embedding.model_aliases = serde_json::from_str(value).with_context(|| {
@@ -259,4 +332,97 @@ where
     value
         .parse::<T>()
         .map_err(|e| anyhow::anyhow!("failed to parse {key}: {e}"))
+}
+
+fn parse_positive<T>(key: &str, value: &str) -> anyhow::Result<T>
+where
+    T: std::str::FromStr + PartialOrd + Default,
+    T::Err: std::fmt::Display,
+{
+    let parsed = parse_value(key, value)?;
+    if parsed <= T::default() {
+        bail!("{key} must be greater than 0")
+    }
+    Ok(parsed)
+}
+
+fn parse_positive_finite(key: &str, value: &str) -> anyhow::Result<f64> {
+    let parsed: f64 = parse_value(key, value)?;
+    if !parsed.is_finite() || parsed <= 0.0 {
+        bail!("{key} must be finite and greater than 0")
+    }
+    Ok(parsed)
+}
+
+fn parse_optional_string(key: &str, value: &str) -> anyhow::Result<Option<String>> {
+    if value == "null" {
+        return Ok(None);
+    }
+    if let Ok(parsed) = serde_json::from_str::<String>(value) {
+        return Ok(Some(parsed));
+    }
+    if value.is_empty() {
+        return Ok(Some(String::new()));
+    }
+    if value.starts_with('"') || value.ends_with('"') {
+        bail!("failed to parse {key} as a string: {value}")
+    }
+    Ok(Some(value.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_set_rejects_zero_default_limit() {
+        let mut config = vera_core::config::VeraConfig::default();
+        let error = set_config_value(&mut config, "retrieval.default_limit", "0")
+            .expect_err("zero results should not be accepted");
+        assert!(error.to_string().contains("greater than 0"));
+    }
+
+    #[test]
+    fn config_set_rejects_non_finite_rrf_k() {
+        let mut config = vera_core::config::VeraConfig::default();
+        let error = set_config_value(&mut config, "retrieval.rrf_k", "NaN")
+            .expect_err("non-finite fusion constants should not be accepted");
+        assert!(error.to_string().contains("finite"));
+    }
+
+    #[test]
+    fn config_set_allows_unlimited_output_and_no_rerank_batching() {
+        let mut config = vera_core::config::VeraConfig::default();
+        set_config_value(&mut config, "retrieval.max_output_chars", "0").unwrap();
+        set_config_value(&mut config, "retrieval.max_rerank_batch", "0").unwrap();
+        assert_eq!(config.retrieval.max_output_chars, 0);
+        assert_eq!(config.retrieval.max_rerank_batch, 0);
+    }
+
+    #[test]
+    fn config_set_and_get_include_issue_180_keys() {
+        let mut config = vera_core::config::VeraConfig::default();
+        set_config_value(&mut config, "indexing.extra_excludes", r#"["vendor"]"#).unwrap();
+        set_config_value(&mut config, "embedding.gpu_mem_limit_mb", "2048").unwrap();
+        set_config_value(&mut config, "embedding.low_vram", "true").unwrap();
+        set_config_value(&mut config, "embedding.query_prefix", "Query:").unwrap();
+        set_config_value(&mut config, "embedding.document_prefix", "Passage:").unwrap();
+
+        assert_eq!(
+            get_config_value(&config, "indexing.extra_excludes"),
+            Some(serde_json::json!(["vendor"]))
+        );
+        assert_eq!(
+            get_config_value(&config, "embedding.gpu_mem_limit_mb"),
+            Some(serde_json::json!(2048))
+        );
+        assert_eq!(
+            get_config_value(&config, "embedding.query_prefix"),
+            Some(serde_json::json!("Query:"))
+        );
+        assert_eq!(
+            get_config_value(&config, "embedding.document_prefix"),
+            Some(serde_json::json!("Passage:"))
+        );
+    }
 }

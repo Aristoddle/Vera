@@ -1,16 +1,18 @@
 use crate::config::OnnxExecutionProvider;
-use crate::local_models::ensure_model_file;
 use crate::retrieval::reranker::{RerankScore, Reranker, RerankerError};
 use anyhow::{Context, Result};
 use ort::session::{Session, builder::GraphOptimizationLevel};
 use std::sync::{Arc, Mutex};
-use tokenizers::Tokenizer;
+use tokenizers::{Encoding, Tokenizer};
 use tokio::task;
 use tokio_util::sync::CancellationToken;
 
-const RERANKER_REPO: &str = "jinaai/jina-reranker-v2-base-multilingual";
-const TOKENIZER_FILE: &str = "tokenizer.json";
 const MAX_RERANK_BATCH_SIZE: usize = 8;
+
+struct TokenizedCandidate {
+    index: usize,
+    encoding: Encoding,
+}
 
 #[derive(Clone)]
 pub struct LocalReranker {
@@ -20,24 +22,50 @@ pub struct LocalReranker {
 
 impl LocalReranker {
     pub async fn new_with_ep(ep: OnnxExecutionProvider) -> Result<Self, RerankerError> {
-        let ort_path = crate::local_models::ensure_ort_library_for_ep(ep)
-            .await
-            .map_err(|e| RerankerError::ApiError {
-                status: 500,
-                message: e.to_string(),
+        // Resolve before acquiring anything. No prebuilt reranker export runs
+        // on the CoreML GPU, so `reranker_execution_provider` maps CoreMl to
+        // Cpu; acquiring and dependency-checking the requested provider's
+        // library would validate one library and then build a session that
+        // wants another. `ensure_ort_runtime` is a process-wide OnceLock, so
+        // only the first path passed to it in a process is actually loaded,
+        // which makes that mismatch silent rather than loud.
+        let requested_ep = ep;
+        let ep = crate::local_models::reranker_execution_provider(requested_ep);
+        // A CoreML embedding provider may have already initialized ORT with
+        // its CoreML-capable runtime. The reranker is CPU-only under CoreML,
+        // but that process-wide runtime is still valid for its CPU session;
+        // requiring the separate CPU cache here would make initialization
+        // depend on an unused download. A cold start still acquires the CPU
+        // runtime, and other providers retain their existing acquisition path.
+        let ort_path = if should_acquire_ort_library(
+            requested_ep,
+            crate::local_models::ort::ort_runtime_initialized(),
+        ) {
+            Some(
+                crate::local_models::ensure_ort_library_for_ep(ep)
+                    .await
+                    .map_err(|e| RerankerError::ApiError {
+                        status: 500,
+                        message: e.to_string(),
+                    })?,
+            )
+        } else {
+            None
+        };
+        if let Some(ort_path) = ort_path.as_deref() {
+            crate::local_models::ensure_ort_runtime(Some(ort_path)).map_err(|e| {
+                RerankerError::ApiError {
+                    status: 500,
+                    message: e.to_string(),
+                }
             })?;
-        crate::local_models::ensure_ort_runtime(Some(&ort_path)).map_err(|e| {
-            RerankerError::ApiError {
-                status: 500,
-                message: e.to_string(),
-            }
-        })?;
-        crate::local_models::ensure_provider_dependencies(ep, &ort_path).map_err(|e| {
-            RerankerError::ApiError {
-                status: 500,
-                message: e.to_string(),
-            }
-        })?;
+            crate::local_models::ensure_provider_dependencies(ep, ort_path).map_err(|e| {
+                RerankerError::ApiError {
+                    status: 500,
+                    message: e.to_string(),
+                }
+            })?;
+        }
 
         let components = load_reranker_components(ep).await;
         let (session, tokenizer) = match components {
@@ -74,6 +102,7 @@ impl LocalReranker {
     }
 
     pub fn probe_session(ep: OnnxExecutionProvider) -> Result<()> {
+        let ep = crate::local_models::reranker_execution_provider(ep);
         let ort_path = crate::local_models::ort_library_path_for_ep(ep)?;
         crate::local_models::ensure_ort_runtime(Some(&ort_path))?;
         let (onnx_path, _) = default_asset_paths()?;
@@ -82,6 +111,7 @@ impl LocalReranker {
     }
 
     pub fn probe_inference(ep: OnnxExecutionProvider) -> Result<()> {
+        let ep = crate::local_models::reranker_execution_provider(ep);
         let ort_path = crate::local_models::ort_library_path_for_ep(ep)?;
         crate::local_models::ensure_ort_runtime(Some(&ort_path))?;
         let (onnx_path, tokenizer_path) = default_asset_paths()?;
@@ -91,25 +121,11 @@ impl LocalReranker {
     }
 
     #[allow(clippy::needless_range_loop)]
-    fn do_rerank_batch(
-        &self,
-        query: &str,
-        documents: &[String],
-        index_offset: usize,
-    ) -> Result<Vec<RerankScore>> {
-        let mut encodings = Vec::with_capacity(documents.len());
-        for doc in documents {
-            let encoding = self
-                .tokenizer
-                .encode((query.to_string(), doc.clone()), true)
-                .map_err(|e| anyhow::anyhow!("Tokenizer error: {}", e))?;
-            encodings.push(encoding);
-        }
-
-        let batch_size = documents.len();
-        let mut max_len = encodings
+    fn do_rerank_batch(&self, candidates: &[TokenizedCandidate]) -> Result<Vec<RerankScore>> {
+        let batch_size = candidates.len();
+        let mut max_len = candidates
             .iter()
-            .map(|e| e.get_ids().len())
+            .map(|candidate| candidate.encoding.get_ids().len())
             .max()
             .unwrap_or(0);
         if max_len == 0 {
@@ -124,9 +140,9 @@ impl LocalReranker {
         let mut input_ids = ndarray::Array2::<i64>::zeros((batch_size, max_len));
         let mut attention_mask = ndarray::Array2::<i64>::zeros((batch_size, max_len));
 
-        for (i, encoding) in encodings.iter().enumerate() {
-            let ids = encoding.get_ids();
-            let mask = encoding.get_attention_mask();
+        for (i, candidate) in candidates.iter().enumerate() {
+            let ids = candidate.encoding.get_ids();
+            let mask = candidate.encoding.get_attention_mask();
             let len = std::cmp::min(ids.len(), max_len);
             for j in 0..len {
                 input_ids[[i, j]] = ids[j] as i64;
@@ -151,27 +167,14 @@ impl LocalReranker {
         let (shape, data) = output_value.try_extract_tensor::<f32>()?;
         let ndim = shape.len();
 
-        let mut results = Vec::with_capacity(batch_size);
-        if ndim == 2 {
+        let mut results = if ndim == 2 {
             let dim = shape[1] as usize;
-            for i in 0..batch_size {
-                let score = data[i * dim];
-                results.push(RerankScore {
-                    index: index_offset + i,
-                    relevance_score: score as f64,
-                });
-            }
+            map_scores_to_original_indices(candidates, (0..batch_size).map(|i| data[i * dim]))
         } else if ndim == 1 {
-            for i in 0..batch_size {
-                let score = data[i];
-                results.push(RerankScore {
-                    index: index_offset + i,
-                    relevance_score: score as f64,
-                });
-            }
+            map_scores_to_original_indices(candidates, (0..batch_size).map(|i| data[i]))
         } else {
             anyhow::bail!("Unexpected tensor shape for reranker: {:?}", shape);
-        }
+        };
 
         results.sort_by(|a, b| {
             b.relevance_score
@@ -192,13 +195,29 @@ impl LocalReranker {
             return Ok(Vec::new());
         }
 
+        let mut candidates = Vec::with_capacity(documents.len());
+        for (index, document) in documents.iter().enumerate() {
+            if cancel.is_cancelled() {
+                return Err(RerankerError::Cancelled);
+            }
+            let encoding = self
+                .tokenizer
+                .encode((query, document.as_str()), true)
+                .map_err(|e| RerankerError::ApiError {
+                    status: 500,
+                    message: format!("Tokenizer error: {e}"),
+                })?;
+            candidates.push(TokenizedCandidate { index, encoding });
+        }
+        sort_candidates_by_tokenized_length(&mut candidates);
+
         let mut combined = Vec::with_capacity(documents.len());
-        for (batch_index, batch) in documents.chunks(MAX_RERANK_BATCH_SIZE).enumerate() {
+        for batch in candidates.chunks(MAX_RERANK_BATCH_SIZE) {
             if cancel.is_cancelled() {
                 return Err(RerankerError::Cancelled);
             }
             let scores = self
-                .do_rerank_batch(query, batch, batch_index * MAX_RERANK_BATCH_SIZE)
+                .do_rerank_batch(batch)
                 .map_err(|e| RerankerError::ApiError {
                     status: 500,
                     message: e.to_string(),
@@ -215,19 +234,33 @@ impl LocalReranker {
     }
 }
 
-async fn load_reranker_components(ep: OnnxExecutionProvider) -> Result<(Session, Tokenizer)> {
-    let onnx_path = ensure_model_file(RERANKER_REPO, crate::local_models::RERANKER_ONNX_FILE)
-        .await
-        .with_context(|| {
-            format!(
-                "Failed to download ONNX model: {}",
-                crate::local_models::RERANKER_ONNX_FILE
-            )
-        })?;
+fn map_scores_to_original_indices(
+    candidates: &[TokenizedCandidate],
+    scores: impl Iterator<Item = f32>,
+) -> Vec<RerankScore> {
+    candidates
+        .iter()
+        .zip(scores)
+        .map(|(candidate, score)| RerankScore {
+            index: candidate.index,
+            relevance_score: score as f64,
+        })
+        .collect()
+}
 
-    let tokenizer_path = ensure_model_file(RERANKER_REPO, TOKENIZER_FILE)
+fn sort_candidates_by_tokenized_length(candidates: &mut [TokenizedCandidate]) {
+    candidates.sort_unstable_by_key(|candidate| candidate.encoding.get_ids().len());
+}
+
+async fn load_reranker_components(ep: OnnxExecutionProvider) -> Result<(Session, Tokenizer)> {
+    let config = crate::local_models::LocalRerankerConfig::from_env()?;
+    let paths = crate::local_models::ensure_local_reranker_assets(&config)
         .await
-        .context("Failed to download tokenizer")?;
+        .with_context(|| format!("Failed to download reranker model from {}", config.repo))?;
+    let crate::local_models::LocalRerankerAssetPaths {
+        onnx_path,
+        tokenizer_path,
+    } = paths;
 
     let tokenizer = task::spawn_blocking(move || load_tokenizer(tokenizer_path)).await??;
     let session = task::spawn_blocking(move || build_session(ep, onnx_path)).await??;
@@ -236,13 +269,8 @@ async fn load_reranker_components(ep: OnnxExecutionProvider) -> Result<(Session,
 }
 
 fn default_asset_paths() -> Result<(std::path::PathBuf, std::path::PathBuf)> {
-    let model_dir = crate::local_models::vera_home_dir()?
-        .join("models")
-        .join(RERANKER_REPO);
-    Ok((
-        model_dir.join(crate::local_models::RERANKER_ONNX_FILE),
-        model_dir.join(TOKENIZER_FILE),
-    ))
+    let paths = crate::local_models::LocalRerankerConfig::from_env()?.cached_asset_paths()?;
+    Ok((paths.onnx_path, paths.tokenizer_path))
 }
 
 fn load_tokenizer(tokenizer_path: std::path::PathBuf) -> Result<Tokenizer> {
@@ -250,8 +278,12 @@ fn load_tokenizer(tokenizer_path: std::path::PathBuf) -> Result<Tokenizer> {
         .map_err(|e| anyhow::anyhow!("Tokenizer init failed: {}", e))
 }
 
+/// Build a session on an already-resolved execution provider.
+///
+/// `ep` must come from `reranker_execution_provider`. Resolving again here
+/// would put the same contract in two places that could drift apart; all three
+/// callers resolve at their entry point.
 fn build_session(ep: OnnxExecutionProvider, onnx_path: std::path::PathBuf) -> Result<Session> {
-    let ep = crate::local_models::reranker_execution_provider(ep);
     let threads = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1);
@@ -373,9 +405,116 @@ fn register_execution_provider(
     }
 }
 
+fn should_acquire_ort_library(
+    requested_ep: OnnxExecutionProvider,
+    runtime_initialized: bool,
+) -> bool {
+    requested_ep != OnnxExecutionProvider::CoreMl || !runtime_initialized
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn candidate(index: usize, token_count: usize) -> TokenizedCandidate {
+        TokenizedCandidate {
+            index,
+            encoding: Encoding::new(
+                vec![0; token_count],
+                vec![0; token_count],
+                vec![String::new(); token_count],
+                vec![None; token_count],
+                vec![(0, 0); token_count],
+                vec![0; token_count],
+                vec![1; token_count],
+                Vec::new(),
+                Default::default(),
+            ),
+        }
+    }
+
+    /// Loads neither model assets nor ONNX Runtime, so it always runs and
+    /// always asserts. Deliberate: `test_local_reranker` below early-returns
+    /// when ONNX Runtime is not on the default lookup path, and would pass
+    /// without checking anything on a machine that lacks it.
+    #[test]
+    fn resolution_is_idempotent_so_build_session_need_not_repeat_it() {
+        use crate::config::OnnxExecutionProvider as Ep;
+        use crate::local_models::reranker_execution_provider as resolve;
+
+        // `build_session` no longer re-resolves; it trusts what the entry
+        // points pass. Resolving an already-resolved provider must therefore
+        // be a no-op, or a second pass anywhere would change the answer.
+        for requested in [Ep::CoreMl, Ep::Cpu, Ep::Cuda] {
+            let once = resolve(requested);
+            assert_eq!(once, resolve(once), "resolving {requested} twice differed");
+        }
+
+        // The mapping this exists for: no prebuilt reranker export runs on the
+        // CoreML GPU, so CoreML must resolve to CPU before any library is
+        // acquired. Other providers are left alone.
+        assert_eq!(resolve(Ep::CoreMl), Ep::Cpu);
+        assert_eq!(resolve(Ep::Cuda), Ep::Cuda);
+        assert_eq!(resolve(Ep::Cpu), Ep::Cpu);
+    }
+
+    #[test]
+    fn coreml_reranker_reuses_an_initialized_runtime_without_cpu_acquisition() {
+        use crate::config::OnnxExecutionProvider as Ep;
+
+        assert!(!should_acquire_ort_library(Ep::CoreMl, true));
+        assert!(should_acquire_ort_library(Ep::CoreMl, false));
+        assert!(should_acquire_ort_library(Ep::Cpu, true));
+        assert!(should_acquire_ort_library(Ep::Cuda, true));
+        assert!(should_acquire_ort_library(Ep::Rocm, true));
+        assert!(should_acquire_ort_library(Ep::OpenVino, true));
+        assert!(should_acquire_ort_library(Ep::DirectMl, true));
+    }
+
+    #[test]
+    fn reranker_groups_batches_by_length_and_restores_original_indices() {
+        let mut candidates = vec![
+            candidate(0, 7),
+            candidate(1, 2),
+            candidate(2, 9),
+            candidate(3, 4),
+            candidate(4, 1),
+            candidate(5, 8),
+            candidate(6, 3),
+            candidate(7, 6),
+            candidate(8, 5),
+            candidate(9, 10),
+        ];
+
+        sort_candidates_by_tokenized_length(&mut candidates);
+
+        let batches: Vec<Vec<usize>> = candidates
+            .chunks(MAX_RERANK_BATCH_SIZE)
+            .map(|batch| batch.iter().map(|candidate| candidate.index).collect())
+            .collect();
+        assert_eq!(batches, vec![vec![4, 1, 6, 3, 8, 7, 0, 5], vec![2, 9]]);
+
+        let mut scores = Vec::new();
+        for (batch_index, batch) in candidates.chunks(MAX_RERANK_BATCH_SIZE).enumerate() {
+            scores.extend(map_scores_to_original_indices(
+                batch,
+                (0..batch.len()).map(|offset| (batch_index * 100 + offset) as f32),
+            ));
+        }
+        scores.sort_by_key(|score| score.index);
+
+        assert_eq!(
+            scores.iter().map(|score| score.index).collect::<Vec<_>>(),
+            (0..10).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            scores
+                .iter()
+                .map(|score| score.relevance_score)
+                .collect::<Vec<_>>(),
+            vec![6.0, 1.0, 100.0, 3.0, 0.0, 7.0, 2.0, 5.0, 4.0, 101.0]
+        );
+    }
 
     #[tokio::test]
     async fn test_local_reranker() {

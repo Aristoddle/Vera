@@ -5,6 +5,12 @@ version = 1
 description = "Semble benchmark subset for faster evaluation"
 clone_root = ".bench/semble-repos"
 
+[semble]
+version = "0.5.5"
+commit = "921849164e2632dd4f0e1c1370f82cfe15ed6d6c"
+task_count = 320
+tasks_sha256 = "60bac08d1e9d71f6d9208f6c15fcc7c354fab85d2eca5a95b6da9b6dc6608190"
+
 [[repos]]
 name = "fastapi"
 url = "https://github.com/fastapi/fastapi.git"

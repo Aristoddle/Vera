@@ -48,7 +48,8 @@ def main():
     judge_dir = run_dir / f"judge-{tag}"
     judge_dir.mkdir(exist_ok=True)
     # Grade in random order so position effects wash out; no arm labels shown to judge.
-    jobs = [(arm, q["number"]) for arm in ("with-vera", "control") for q in questions]
+    # Arms come from the results file, so older 2-arm runs still grade fully.
+    jobs = [(arm, q["number"]) for arm in results.get("summary", {}) for q in questions]
     random.Random(42).shuffle(jobs)
     for arm, qn in jobs:
         entry = results["questions"].get(f"q{qn:02d}", {}).get(arm)

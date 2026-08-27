@@ -44,6 +44,7 @@ fn build_structured_text(chunk: &Chunk, max_bytes: usize) -> String {
     let mut parts = Vec::new();
     let filename = file_name(&chunk.file_path);
     let path_tokens = normalize_path_tokens(&chunk.file_path);
+    let signature = extract_signature(chunk);
 
     parts.push(format!("Language: {}", chunk.language));
     parts.push(format!("Path: {path_tokens}"));
@@ -53,7 +54,7 @@ fn build_structured_text(chunk: &Chunk, max_bytes: usize) -> String {
         parts.push(symbol_line);
     }
 
-    if let Some(signature) = extract_signature(chunk) {
+    if let Some(signature) = signature.as_deref() {
         parts.push(format!("Signature: {signature}"));
     }
 
@@ -61,12 +62,12 @@ fn build_structured_text(chunk: &Chunk, max_bytes: usize) -> String {
         parts.push(format!("Summary: {summary}"));
     }
 
-    let parameters = extract_parameters(chunk);
+    let parameters = extract_parameters(signature.as_deref());
     if !parameters.is_empty() {
         parts.push(format!("Parameters: {}", parameters.join(", ")));
     }
 
-    if let Some(return_type) = extract_return_type(chunk) {
+    if let Some(return_type) = extract_return_type(signature.as_deref()) {
         parts.push(format!("Returns: {return_type}"));
     }
 
@@ -288,8 +289,8 @@ fn extract_summary(chunk: &Chunk) -> Option<String> {
         .then(|| abbreviate_middle(&summary_lines.join(" "), MAX_METADATA_VALUE_CHARS))
 }
 
-fn extract_parameters(chunk: &Chunk) -> Vec<String> {
-    let Some(signature) = extract_signature(chunk) else {
+fn extract_parameters(signature: Option<&str>) -> Vec<String> {
+    let Some(signature) = signature else {
         return Vec::new();
     };
     let Some(open) = signature.find('(') else {
@@ -328,8 +329,8 @@ fn clean_parameter_name(parameter: &str) -> String {
         .to_string()
 }
 
-fn extract_return_type(chunk: &Chunk) -> Option<String> {
-    let signature = extract_signature(chunk)?;
+fn extract_return_type(signature: Option<&str>) -> Option<String> {
+    let signature = signature?;
     if let Some((_, return_type)) = signature.split_once("->") {
         return Some(
             return_type
@@ -531,10 +532,10 @@ fn looks_like_signature_line(line: &str, symbol_name: Option<&str>) -> bool {
         return false;
     }
 
-    if let Some(name) = symbol_name {
-        if line.contains(name) {
-            return true;
-        }
+    if let Some(name) = symbol_name
+        && line.contains(name)
+    {
+        return true;
     }
 
     [

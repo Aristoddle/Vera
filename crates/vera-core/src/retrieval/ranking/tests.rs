@@ -301,7 +301,13 @@ fn runtime_queries_can_prefer_runtime_extracts() {
 }
 
 #[test]
-fn filename_stem_match_beats_incidental_request_helper() {
+fn content_coverage_breaks_filename_stem_ties() {
+    // Both stems match one query keyword ("request" / "validation"), so the
+    // pool-relative stem boost ties. Coverage breaks the tie: the helper's
+    // require line mentions "validation" and "schema" while the stub covers
+    // nothing. (The retired exact-stem tier would have forced validation.js
+    // first, but ablation showed the coverage-aware ordering ranks better on
+    // both benchmark sets.)
     let results = vec![
         make_result(
             "lib/handle-request.js",
@@ -314,6 +320,35 @@ fn filename_stem_match_beats_incidental_request_helper() {
             None,
             Some(SymbolType::Variable),
             "function validate () {}",
+        ),
+    ];
+
+    let ranked = apply_query_ranking(
+        "request validation and schema enforcement",
+        results,
+        RankingStage::Initial,
+    );
+
+    assert_eq!(ranked[0].file_path, "lib/handle-request.js");
+}
+
+#[test]
+fn stem_matched_file_with_content_coverage_wins() {
+    // When the stem-matched file also covers the query's concepts in its
+    // content and retrieval ranked it first, it keeps the lead: stem
+    // agreement plus coverage beats either signal alone.
+    let results = vec![
+        make_result(
+            "lib/validation.js",
+            None,
+            Some(SymbolType::Variable),
+            "function validate (request, schema) { return enforce(schema); }",
+        ),
+        make_result(
+            "lib/handle-request.js",
+            None,
+            Some(SymbolType::Variable),
+            "const helper = require('./helper')",
         ),
     ];
 
@@ -568,6 +603,58 @@ fn definition_queries_boost_symbol_definitions() {
     let ranked = apply_query_ranking("Parser definition", results, RankingStage::Initial);
 
     assert_eq!(ranked[0].symbol_type, Some(SymbolType::Struct));
+}
+
+#[test]
+fn fixture_definition_in_tests_loses_content_symbol_boost() {
+    // Both chunks define the queried symbol in content, but the test chunk is
+    // a fixture, not the definition site: the content-symbol boost must not
+    // apply to it. Without the role gate the +3.0 pool-relative boost would
+    // outweigh the test-path penalty and rank the fixture first.
+    let results = vec![
+        make_result(
+            "tests/test_registry.py",
+            None,
+            None,
+            "class TaskRegistry:\n    def register(self, task): ...",
+        ),
+        make_result(
+            "celery/app/registry.py",
+            None,
+            None,
+            "class TaskRegistry:\n    def register(self, task): ...",
+        ),
+    ];
+
+    let ranked = apply_query_ranking("TaskRegistry", results, RankingStage::Initial);
+
+    assert_eq!(ranked[0].file_path, "celery/app/registry.py");
+}
+
+#[test]
+fn testing_module_file_keeps_content_symbol_boost() {
+    // click ships the CliRunner definition in src/click/testing.py: a
+    // first-class module whose filename merely looks test-ish. The gate keys
+    // off directory components and test-file naming conventions, so this
+    // chunk keeps its definition boost despite the filename.
+    let results = vec![
+        make_result(
+            "src/click/core.py",
+            None,
+            None,
+            "class Command:\n    def invoke(self): ...",
+        ),
+        make_result(
+            "src/click/testing.py",
+            None,
+            None,
+            "class CliRunner:\n    def invoke(self, cli): ...",
+        ),
+    ];
+
+    let ranked = apply_query_ranking("CliRunner", results, RankingStage::Initial);
+
+    assert_eq!(ranked[0].file_path, "src/click/testing.py");
 }
 
 #[test]

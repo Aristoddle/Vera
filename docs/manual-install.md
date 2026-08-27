@@ -4,11 +4,11 @@ Use this when Vera cannot download ONNX Runtime or model files directly, for exa
 
 ## 1. Download The Files In A Browser
 
-For Potion Code CPU, download:
+For the default Potion Code model, download the static embedding model that runs locally on CPU on any supported machine; no GPU or ONNX Runtime needed:
 
-- [`minishlab/potion-code-16M`](https://huggingface.co/minishlab/potion-code-16M)
+- [`minishlab/potion-code-16M-v2`](https://huggingface.co/minishlab/potion-code-16M-v2)
 
-For the Jina ONNX stack, download:
+For the optional Jina ONNX stack, download:
 
 - ONNX Runtime for your backend from the [Microsoft ONNX Runtime releases](https://github.com/microsoft/onnxruntime/releases)
 - [`jinaai/jina-embeddings-v5-text-nano-retrieval`](https://huggingface.co/jinaai/jina-embeddings-v5-text-nano-retrieval)
@@ -29,7 +29,7 @@ Default paths:
 | --- | --- |
 | ONNX Runtime CPU | `<vera-data>/lib/` |
 | ONNX Runtime GPU backend | `<vera-data>/lib/<backend>/` such as `<vera-data>/lib/cuda/` |
-| Potion Code | `<vera-data>/models/minishlab/potion-code-16M/` |
+| Potion Code | `<vera-data>/models/minishlab/potion-code-16M-v2/` |
 | Jina embeddings | `<vera-data>/models/jinaai/jina-embeddings-v5-text-nano-retrieval/` |
 | CodeRankEmbed | `<vera-data>/models/Zenabius/CodeRankEmbed-onnx/` |
 | Local reranker | `<vera-data>/models/jinaai/jina-reranker-v2-base-multilingual/` |

@@ -7,6 +7,7 @@ use anyhow::Result;
 
 use crate::corpus::{ContentClass, classify_content};
 use crate::parsing::signatures;
+use crate::path_containment::canonical_project_root;
 use crate::retrieval::file_scan::{
     allows_class, language_for_path, line_context_snippet, smallest_symbol_chunk_for_line,
     symbol_for_line,
@@ -26,9 +27,9 @@ pub fn search_explicit_implementations(
 
     let metadata_path = index_dir.join("metadata.db");
     let store = MetadataStore::open(&metadata_path)?;
-    let repo_root = index_dir
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("Cannot determine project root from index dir"))?;
+    let repo_root = canonical_project_root(index_dir)?;
+    let root_dir = crate::discovery::open_root_dir(&repo_root)?;
+    let max_file_size_bytes = super::configured_max_file_size_bytes(&store);
     let symbol = super::structural::normalize_impl_target(symbol);
     let relations = store.find_type_relations(&symbol)?;
     let mut results = Vec::new();
@@ -44,8 +45,11 @@ pub fn search_explicit_implementations(
             continue;
         }
 
-        let file_abs = repo_root.join(&relation.file_path);
-        let content = match crate::discovery::read_source_lossy(&file_abs) {
+        let content = match crate::discovery::read_source_lossy_capped(
+            &root_dir,
+            Path::new(&relation.file_path),
+            max_file_size_bytes,
+        ) {
             Ok(content) => content,
             Err(e) => {
                 tracing::debug!("skipping {}: {e}", relation.file_path);
@@ -72,7 +76,11 @@ pub fn search_explicit_implementations(
         if let Some(chunk) = smallest_symbol_chunk_for_line(&chunks, line) {
             line_start = chunk.line_start;
             line_end = chunk.line_end;
-            snippet = Some(signatures::extract_signature(&chunk.content, language));
+            snippet = Some(signatures::extract_signature_for_path(
+                &chunk.content,
+                language,
+                &chunk.file_path,
+            ));
             symbol_type = match chunk.symbol_type {
                 Some(SymbolType::Block) | None => None,
                 other => other,

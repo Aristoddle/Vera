@@ -1,10 +1,10 @@
 # @vera-ai/cli
 
-Code search for AI agents. Vera indexes your codebase using tree-sitter parsing and hybrid search (BM25 + vector similarity + cross-encoder reranking), then returns ranked code snippets as structured JSON.
+Code search for AI agents. Vera indexes your codebase using tree-sitter parsing and hybrid search (BM25 + vector similarity + optional cross-encoder reranking), then returns ranked code snippets as Markdown codeblocks by default, or JSON with `--json`.
 
 This package downloads and wraps the native Vera binary for your platform. On musl-based Linux (Alpine, NixOS), the correct static binary is selected automatically. Set `VERA_TARGET` to override target detection (e.g., `VERA_TARGET=x86_64-unknown-linux-musl npm install -g @vera-ai/cli`).
 
-Current benchmark snapshot: on Vera's local 21-task, 4-repo release benchmark, `v0.7.0` reaches `0.78` Recall@5, `0.83` Recall@10, `0.91` MRR@10, and `0.84` nDCG@10 with the local Jina CUDA ONNX stack. Full details live in the main repo docs.
+The default local embedding model is `minishlab/potion-code-16M-v2`; it runs locally on CPU on any supported machine, no GPU or ONNX Runtime needed. In the current Semble comparison, Vera v1.2.0 scored `0.8450` nDCG@10 versus Semble 0.5.5 at `0.8514`, using the same embeddings, harness, graded relevance, and suffix-corrected path matching. Full details live in the main repo docs.
 
 ## Install
 
@@ -15,19 +15,18 @@ npm install -g @vera-ai/cli
 ## Quick Start
 
 ```bash
-vera setup --potion-code
-vera index .
+vera setup --potion-code --index .
 vera search "authentication logic"
 ```
 
-`vera setup` with no flags runs an interactive wizard. `vera setup --api` prompts for an OpenAI-compatible endpoint and key; use `--yes` with `EMBEDDING_MODEL_*` variables for non-interactive setup. `vera agent install` manages skill files for your coding agents and can update `AGENTS.md` / `CLAUDE.md` style project instructions.
+`vera setup` with no flags runs an interactive wizard and offers to index the current project, defaulting to yes. An interactive search also offers to create a missing index. `vera setup --api` prompts for an OpenAI-compatible endpoint and key; use `--yes` with `EMBEDDING_MODEL_*` variables for non-interactive setup. `vera agent install` manages skill files for your coding agents and can update `AGENTS.md` / `CLAUDE.md` style project instructions.
 
 ## Common Tasks
 
 | Task | Command |
 |------|---------|
 | Use the interactive setup wizard | `vera setup` |
-| Use CPU-only local mode | `vera setup --potion-code` |
+| Use the default local model | `vera setup --potion-code` |
 | Configure API mode | `vera setup --api` |
 | Use a local NVIDIA backend | `vera setup --onnx-jina-cuda` |
 | Search semantically | `vera search "authentication middleware"` |
@@ -49,9 +48,9 @@ For the full backend matrix, model options, Docker setup, and troubleshooting, s
 
 ## What you get
 
-- **61+ languages** via tree-sitter AST parsing
+- **65 languages** (61 with tree-sitter AST parsing)
 - **Hybrid search**: BM25 keyword + vector similarity, fused with Reciprocal Rank Fusion
-- **Cross-encoder reranking** for precision
+- **Opt-in cross-encoder reranking** for precision, disabled by default
 - **Git-aware scopes and index debugging**: `--changed` / `--since` / `--base`, `explain-path`, and index health in `vera stats`
 - **Markdown codeblock output** by default with file paths, line ranges, and optional symbol info (use `--json` for compact JSON; `--raw` works with `vera search`, `vera grep`, and `vera references`; `--timing` works with `vera search` and `vera grep`, before or after the subcommand)
 

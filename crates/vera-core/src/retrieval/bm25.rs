@@ -17,6 +17,7 @@ use crate::types::{SearchFilters, SearchResult};
 const FILTERED_RAW_MULTIPLIER: usize = 24;
 const FILTERED_RAW_MIN_EXTRA: usize = 1_000;
 const FILTERED_RAW_MAX: usize = 20_000;
+const BM25_HYDRATION_PAGE_MAX: usize = 900;
 
 /// Perform a BM25 keyword search over the indexed chunks.
 ///
@@ -65,8 +66,8 @@ pub fn search_bm25_with_stores(
 
 /// Perform BM25 search using pre-opened stores and active filters.
 ///
-/// Filtered searches scan a larger raw Tantivy pool, hydrate each raw hit,
-/// and keep only matching chunks until `limit` filtered results are collected.
+/// Filtered searches scan a larger raw Tantivy pool, hydrate candidates in
+/// metadata batches, and keep matching chunks until `limit` results are collected or candidates are exhausted.
 pub fn search_bm25_with_stores_and_filters(
     bm25_index: &Bm25Index,
     metadata_store: &MetadataStore,
@@ -112,34 +113,75 @@ fn search_bm25_with_stores_inner(
 
     let mut results = Vec::with_capacity(limit.min(bm25_results.len()));
 
-    for bm25_result in &bm25_results {
-        let chunk = metadata_store
+    // The first `limit` candidates hydrate one row at a time through the
+    // cached single-row statement: when every candidate passes (the common
+    // case, especially unfiltered) this is the cheapest possible path and
+    // fetches nothing that goes unused. If the head falls short (filter
+    // rejection or missing metadata), the remaining pool hydrates in paged
+    // batches, amortizing SQLite round trips over the long rejection tail.
+    let (head, tail) = bm25_results.split_at(limit.min(bm25_results.len()));
+    for bm25_result in head {
+        let Some(chunk) = metadata_store
             .get_chunk(&bm25_result.chunk_id)
             .with_context(|| {
                 format!(
                     "failed to fetch metadata for chunk: {}",
                     bm25_result.chunk_id
                 )
-            })?;
-
-        let Some(chunk) = chunk else {
+            })?
+        else {
             debug!(
                 chunk_id = %bm25_result.chunk_id,
                 "chunk metadata not found, skipping"
             );
             continue;
         };
-
         let result = chunk.into_search_result(f64::from(bm25_result.score));
-
         if filters.is_some_and(|filters| !filters.matches(&result)) {
             continue;
         }
-
         results.push(result);
+    }
 
-        if results.len() >= limit {
-            break;
+    if results.len() < limit && !tail.is_empty() {
+        let hydration_page_size = limit.saturating_mul(4).clamp(256, BM25_HYDRATION_PAGE_MAX);
+
+        for page in tail.chunks(hydration_page_size) {
+            let ids: Vec<String> = page
+                .iter()
+                .map(|bm25_result| bm25_result.chunk_id.clone())
+                .collect();
+            let mut chunks_by_id = metadata_store.get_chunks_by_ids(&ids).with_context(|| {
+                format!("failed to fetch metadata for {} BM25 candidates", ids.len())
+            })?;
+
+            for bm25_result in page {
+                // `remove` moves the chunk out of the page map: every id is
+                // visited once, so no clone is needed.
+                let Some(chunk) = chunks_by_id.remove(&bm25_result.chunk_id) else {
+                    debug!(
+                        chunk_id = %bm25_result.chunk_id,
+                        "chunk metadata not found, skipping"
+                    );
+                    continue;
+                };
+
+                let result = chunk.into_search_result(f64::from(bm25_result.score));
+
+                if filters.is_some_and(|filters| !filters.matches(&result)) {
+                    continue;
+                }
+
+                results.push(result);
+
+                if results.len() >= limit {
+                    break;
+                }
+            }
+
+            if results.len() >= limit {
+                break;
+            }
         }
     }
 
@@ -517,5 +559,132 @@ mod tests {
 
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].file_path, "fastapi/dependencies/utils.py");
+    }
+
+    fn setup_language_filter_fixture(matching_count: usize) -> (Bm25Index, MetadataStore) {
+        let metadata_store = MetadataStore::open_in_memory().unwrap();
+        let bm25_index = Bm25Index::open_in_memory().unwrap();
+
+        let noise_count = 640;
+        let mut chunks = Vec::with_capacity(noise_count + matching_count);
+        for i in 0..noise_count {
+            chunks.push(Chunk {
+                id: format!("noise:{i}"),
+                file_path: format!("vendor/noise_{i}.py"),
+                line_start: 1,
+                line_end: 4,
+                content: format!(
+                    "def noise_{i}():\n    return \"paged hydration marker paged hydration marker paged hydration marker\""
+                ),
+                language: Language::Python,
+                symbol_type: Some(SymbolType::Function),
+                symbol_name: Some("paged_hydration_marker".to_string()),
+            });
+        }
+        for i in 0..matching_count {
+            chunks.push(Chunk {
+                id: format!("match:{i}"),
+                file_path: format!("src/matches/match_{i}.rs"),
+                line_start: 1,
+                line_end: 4,
+                content: format!(
+                    "fn match_{i}() {{\n    let marker = \"paged hydration marker\";\n    marker\n}}"
+                ),
+                language: Language::Rust,
+                symbol_type: Some(SymbolType::Function),
+                symbol_name: Some(format!("match_{i}")),
+            });
+        }
+
+        metadata_store.insert_chunks(&chunks).unwrap();
+        bm25_index.insert_chunks(&chunks).unwrap();
+
+        (bm25_index, metadata_store)
+    }
+
+    #[test]
+    fn paged_hydration_matches_unfiltered_manual_filtering_across_pages() {
+        let (bm25_index, metadata_store) = setup_language_filter_fixture(12);
+        let filters = SearchFilters {
+            language: Some("rust".to_string()),
+            ..Default::default()
+        };
+        let query = "paged hydration marker";
+        let limit = 8;
+
+        let raw_candidates = bm25_index
+            .search(query, filtered_raw_candidate_limit(limit))
+            .unwrap();
+        let first_matching_position = raw_candidates
+            .iter()
+            .position(|candidate| candidate.chunk_id.starts_with("match:"))
+            .expect("fixture should contain matching-language candidates");
+        assert!(
+            first_matching_position >= 256,
+            "matching candidates should require hydration beyond the first page: {first_matching_position}"
+        );
+
+        let filtered = search_bm25_with_stores_and_filters(
+            &bm25_index,
+            &metadata_store,
+            query,
+            &filters,
+            limit,
+        )
+        .unwrap();
+        let expected: Vec<_> = search_bm25_with_stores(
+            &bm25_index,
+            &metadata_store,
+            query,
+            filtered_raw_candidate_limit(limit),
+        )
+        .unwrap()
+        .into_iter()
+        .filter(|result| filters.matches(result))
+        .take(limit)
+        .collect();
+
+        let result_signature = |result: &SearchResult| {
+            (
+                result.file_path.clone(),
+                result.line_start,
+                result.line_end,
+                result.content.clone(),
+                result.language,
+                result.score,
+                result.symbol_name.clone(),
+                result.symbol_type,
+            )
+        };
+        let actual_signature: Vec<_> = filtered.iter().map(result_signature).collect();
+        let expected_signature: Vec<_> = expected.iter().map(result_signature).collect();
+
+        assert_eq!(filtered.len(), limit);
+        assert_eq!(actual_signature, expected_signature);
+    }
+
+    #[test]
+    fn filtered_search_returns_all_matches_when_candidates_are_exhausted() {
+        let (bm25_index, metadata_store) = setup_language_filter_fixture(3);
+        let filters = SearchFilters {
+            language: Some("rust".to_string()),
+            ..Default::default()
+        };
+
+        let results = search_bm25_with_stores_and_filters(
+            &bm25_index,
+            &metadata_store,
+            "paged hydration marker",
+            &filters,
+            10,
+        )
+        .unwrap();
+
+        assert_eq!(results.len(), 3);
+        assert!(
+            results
+                .iter()
+                .all(|result| result.language == Language::Rust)
+        );
     }
 }

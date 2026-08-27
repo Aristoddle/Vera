@@ -3,6 +3,34 @@
 //! Walks the AST looking for function/method call expressions and records
 //! the callee name, source file, and line number. These lightweight edges
 //! power `vera references`, `vera impact`, and `vera dead-code`.
+//!
+//! # Naming convention for dotted callees
+//!
+//! A callee is stored under its **rightmost segment**. `obj.method()` records
+//! `method`, and JSX follows the same rule, so `<Icons.Arrow />` records
+//! `Arrow` rather than `Icons.Arrow`.
+//!
+//! This is what makes a reference link to a definition. Definitions are
+//! indexed under their bare declared name — a component reached as
+//! `Icons.Arrow` is declared somewhere as `export function Arrow` — and
+//! `find_callers` matches the callee against that name. Storing the full
+//! member path would leave the reference matching no definition, which is the
+//! invisibility that indexing JSX call sites exists to fix.
+//!
+//! A lowercase root does not change this: `<icons.Arrow />` is a member
+//! expression, and a member expression is always a value lookup — the
+//! intrinsic test never applies to one.
+//!
+//! For *bare* tags there are two intrinsic forms, not one: a name starting
+//! with a lowercase ASCII letter (`<div />`), and any name containing a hyphen
+//! whatever its case (`<My-element />`, `<my-element />`), which is the
+//! custom-element form. Both are host elements and stay out of the call graph.
+//! See `is_jsx_host_element`.
+//!
+//! The trade-off is deliberate: two components sharing a final segment
+//! (`Icons.Arrow` and `Shapes.Arrow`) collapse onto one name. Separating them
+//! needs import and module resolution, which this layer does not do — it reads
+//! one file at a time with no cross-file symbol table.
 
 use crate::types::Language;
 
@@ -13,8 +41,60 @@ pub struct RawReference {
     pub callee: String,
     /// Name of the enclosing symbol that contains this call (if known).
     pub caller: Option<String>,
+    /// Receiver the call was made through, when the call site is a member
+    /// expression: `state.add_url_rule()` records `state`. Plain calls and
+    /// receivers that are not simple identifier paths record `None`.
+    ///
+    /// This is the only evidence this layer has for telling two definitions of
+    /// the same name apart, since it never resolves imports or types.
+    pub qualifier: Option<String>,
     /// 1-based line number of the call site.
     pub line: u32,
+}
+
+/// Longest receiver text worth storing. Real receivers are short names or
+/// short dotted paths; anything longer is an expression this layer cannot use.
+const MAX_QUALIFIER_LEN: usize = 64;
+
+/// Extract the receiver of a member call: the object part of `obj.method()`.
+///
+/// Returns `None` unless the receiver is an identifier or a dotted path of
+/// identifiers, so `foo().bar()` and `items[0].bar()` record nothing rather
+/// than a fragment that cannot be matched against anything.
+fn extract_qualifier(node: &tree_sitter::Node, source: &[u8]) -> Option<String> {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        let receiver = match child.kind() {
+            "field_expression"
+            | "member_expression"
+            | "attribute"
+            | "selector_expression"
+            | "member_access_expression"
+            | "navigation_expression" => child
+                .child_by_field_name("object")
+                .or_else(|| child.child_by_field_name("value"))
+                .or_else(|| child.child_by_field_name("operand"))
+                .or_else(|| child.child(0)),
+            "scoped_identifier" | "qualified_identifier" => child
+                .child_by_field_name("path")
+                .or_else(|| child.child_by_field_name("scope"))
+                .or_else(|| child.child(0)),
+            _ => None,
+        };
+        let Some(receiver) = receiver else { continue };
+        let text = receiver.utf8_text(source).ok()?.trim();
+        if text.is_empty() || text.len() > MAX_QUALIFIER_LEN {
+            return None;
+        }
+        if text
+            .chars()
+            .all(|ch| ch.is_alphanumeric() || ch == '_' || ch == '.' || ch == ':' || ch == '$')
+        {
+            return Some(text.to_string());
+        }
+        return None;
+    }
+    None
 }
 
 /// Extract call-site references from a parsed tree.
@@ -51,7 +131,7 @@ fn is_call_node(lang: Language, kind: &str) -> bool {
     match lang {
         Language::Rust => matches!(kind, "call_expression" | "macro_invocation"),
         Language::TypeScript | Language::JavaScript => {
-            matches!(kind, "call_expression" | "new_expression")
+            matches!(kind, "call_expression" | "new_expression") || is_jsx_element_node(kind)
         }
         Language::Python => kind == "call",
         Language::Go => kind == "call_expression",
@@ -83,6 +163,50 @@ fn is_call_node(lang: Language, kind: &str) -> bool {
         Language::Elm => kind == "function_call_expr",
         _ => false,
     }
+}
+
+/// Whether a node kind is a JSX element tag that names the component it renders.
+///
+/// `jsx_closing_element` is deliberately excluded so `<Foo></Foo>` records one
+/// reference rather than two.
+fn is_jsx_element_node(kind: &str) -> bool {
+    matches!(kind, "jsx_opening_element" | "jsx_self_closing_element")
+}
+
+/// Whether a JSX tag names a host element rather than a component in scope.
+///
+/// JSX resolves a *bare* tag beginning with a lowercase ASCII letter, such as
+/// `<div>`, to an intrinsic element string. Anything else is a value in scope,
+/// and only those are call sites; recording host elements would add an edge per
+/// HTML tag in the repository.
+///
+/// The rule mirrors TypeScript's `isIntrinsicJsxName`, which is
+/// `first char in a..z || name contains '-'`. Both halves matter:
+///
+/// - the range is ASCII on purpose. A Unicode-aware lowercase test would call
+///   `<éWidget />` a host element and drop a real component reference.
+/// - a hyphen makes the tag intrinsic whatever its case, because that is the
+///   custom-element form and TypeScript emits `<My-element />` as the string
+///   `"My-element"` rather than a value lookup.
+///
+/// The decision has to come from the tag node, not from the extracted callee.
+/// `extract_callee` returns the rightmost identifier, so `<Icons.arrow />` yields
+/// `arrow`, and judging that name alone would discard a real component
+/// reference. A dotted tag is a member expression on a value in scope whatever
+/// the case of its property.
+fn is_jsx_host_element(node: &tree_sitter::Node, source: &[u8]) -> bool {
+    if !is_jsx_element_node(node.kind()) {
+        return false;
+    }
+    let Some(name) = node.child_by_field_name("name") else {
+        return false;
+    };
+    if name.kind() == "member_expression" {
+        return false;
+    }
+    name.utf8_text(source).is_ok_and(|text| {
+        text.starts_with(|ch: char| ch.is_ascii_lowercase()) || text.contains('-')
+    })
 }
 
 /// Extract the callee name from a call node.
@@ -189,15 +313,17 @@ fn collect_calls(
     let mut cursor = root.walk();
     loop {
         let node = cursor.node();
-        if is_call_node(lang, node.kind()) {
-            if let Some(callee) = extract_callee(&node, source) {
-                let caller = find_enclosing_symbol(symbols, node.start_byte());
-                refs.push(RawReference {
-                    callee,
-                    caller,
-                    line: node.start_position().row as u32 + 1,
-                });
-            }
+        if is_call_node(lang, node.kind())
+            && let Some(callee) = extract_callee(&node, source)
+            && !is_jsx_host_element(&node, source)
+        {
+            let caller = find_enclosing_symbol(symbols, node.start_byte());
+            refs.push(RawReference {
+                callee,
+                caller,
+                qualifier: extract_qualifier(&node, source),
+                line: node.start_position().row as u32 + 1,
+            });
         }
         // Depth-first: try child, then sibling, then backtrack.
         if cursor.goto_first_child() {
@@ -220,11 +346,16 @@ fn collect_calls(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parsing::languages::tree_sitter_grammar;
+    use crate::parsing::languages::tree_sitter_grammar_for_path;
     use tree_sitter::Parser;
 
     fn parse_and_extract(source: &str, lang: Language) -> Vec<RawReference> {
-        let grammar = tree_sitter_grammar(lang).expect("grammar should exist");
+        // An extensionless path resolves to the plain per-language grammar.
+        parse_and_extract_for_path(source, "source", lang)
+    }
+
+    fn parse_and_extract_for_path(source: &str, path: &str, lang: Language) -> Vec<RawReference> {
+        let grammar = tree_sitter_grammar_for_path(lang, path).expect("grammar should exist");
         let mut parser = Parser::new();
         parser.set_language(&grammar).unwrap();
         let tree = parser.parse(source, None).unwrap();
@@ -312,8 +443,148 @@ func foo() {}
     }
 
     #[test]
+    fn tsx_jsx_elements_are_call_sites() {
+        let source = r#"
+import { Hello } from "./jsx";
+
+export function App() {
+    return (
+        <div className="wrap">
+            <Hello name="world" />
+            <Panel.Header title="hi"></Panel.Header>
+            <Icons.arrow />
+            <éWidget />
+            <My-element />
+        </div>
+    );
+}
+"#;
+        let refs = parse_and_extract_for_path(source, "src/app.tsx", Language::TypeScript);
+        let callees: Vec<&str> = refs.iter().map(|r| r.callee.as_str()).collect();
+        assert!(
+            callees.contains(&"Hello"),
+            "JSX element should be a call site: {callees:?}"
+        );
+        assert!(
+            callees.contains(&"Header"),
+            "dotted JSX element should be a call site: {callees:?}"
+        );
+        assert!(
+            callees.contains(&"arrow"),
+            "a dotted tag is a value in scope whatever the case of its \
+             property, so <Icons.arrow /> is a call site: {callees:?}"
+        );
+        assert!(
+            !callees.contains(&"div"),
+            "host elements should not be call sites: {callees:?}"
+        );
+        assert!(
+            callees.contains(&"éWidget"),
+            "only ASCII a-z marks an intrinsic tag, so <éWidget /> is a \
+             component reference: {callees:?}"
+        );
+        assert!(
+            !callees.contains(&"My-element"),
+            "a hyphen makes a tag intrinsic whatever its case, matching \
+             TypeScript's isIntrinsicJsxName: {callees:?}"
+        );
+        assert_eq!(
+            refs.iter().filter(|r| r.callee == "Header").count(),
+            1,
+            "paired tags should record one reference, not two"
+        );
+        assert!(
+            refs.iter()
+                .any(|r| r.callee == "Hello" && r.caller.as_deref() == Some("App")),
+            "caller should be App: {refs:?}"
+        );
+    }
+
+    #[test]
+    fn jsx_in_javascript_is_a_call_site() {
+        let source = "export function App() { return <Hello name=\"world\" />; }\n";
+        let refs = parse_and_extract(source, Language::JavaScript);
+        let callees: Vec<&str> = refs.iter().map(|r| r.callee.as_str()).collect();
+        assert!(
+            callees.contains(&"Hello"),
+            "JSX element should be a call site: {callees:?}"
+        );
+    }
+
+    #[test]
     fn empty_source_returns_no_refs() {
         let refs = parse_and_extract("", Language::Rust);
         assert!(refs.is_empty());
+    }
+
+    fn qualifier_of<'a>(refs: &'a [RawReference], callee: &str) -> Option<&'a str> {
+        refs.iter()
+            .find(|r| r.callee == callee)
+            .and_then(|r| r.qualifier.as_deref())
+    }
+
+    #[test]
+    fn python_records_the_call_receiver() {
+        let source = "def register(app, state):\n    app.add_url_rule('/')\n    state.add_url_rule('/x')\n    helper()\n";
+        let refs = parse_and_extract_for_path(source, "mod.py", Language::Python);
+        let receivers: Vec<Option<&str>> = refs
+            .iter()
+            .filter(|r| r.callee == "add_url_rule")
+            .map(|r| r.qualifier.as_deref())
+            .collect();
+        assert!(receivers.contains(&Some("app")), "{refs:?}");
+        assert!(receivers.contains(&Some("state")), "{refs:?}");
+        assert_eq!(qualifier_of(&refs, "helper"), None, "{refs:?}");
+    }
+
+    #[test]
+    fn javascript_records_dotted_receivers() {
+        let source = "function run(list) {\n  utils.forEach(list, fn);\n  list.forEach(fn);\n}\n";
+        let refs = parse_and_extract_for_path(source, "mod.js", Language::JavaScript);
+        let receivers: Vec<Option<&str>> = refs
+            .iter()
+            .filter(|r| r.callee == "forEach")
+            .map(|r| r.qualifier.as_deref())
+            .collect();
+        assert!(receivers.contains(&Some("utils")), "{refs:?}");
+        assert!(receivers.contains(&Some("list")), "{refs:?}");
+    }
+
+    #[test]
+    fn rust_records_the_path_of_a_scoped_call() {
+        let source = "fn main() {\n    helpers::build();\n    value.build();\n    build();\n}\n";
+        let refs = parse_and_extract_for_path(source, "main.rs", Language::Rust);
+        let receivers: Vec<Option<&str>> = refs
+            .iter()
+            .filter(|r| r.callee == "build")
+            .map(|r| r.qualifier.as_deref())
+            .collect();
+        assert!(receivers.contains(&Some("helpers")), "{refs:?}");
+        assert!(receivers.contains(&Some("value")), "{refs:?}");
+        assert!(
+            receivers.contains(&None),
+            "a bare call has no receiver: {refs:?}"
+        );
+    }
+
+    #[test]
+    fn a_receiver_that_is_not_an_identifier_path_is_dropped() {
+        // `build()` here is reached through a call and an index expression.
+        // Recording a fragment of either would produce a receiver that can
+        // never match a name the caller could pass.
+        let source = "fn main() {\n    factory().build();\n    items[0].build();\n}\n";
+        let refs = parse_and_extract_for_path(source, "main.rs", Language::Rust);
+        for reference in refs.iter().filter(|r| r.callee == "build") {
+            assert_eq!(reference.qualifier, None, "{refs:?}");
+        }
+    }
+
+    #[test]
+    fn go_records_the_package_or_variable_receiver() {
+        let source =
+            "package main\n\nfunc run(r Router) {\n\tfmt.Println(\"x\")\n\tr.Handle(\"/\")\n}\n";
+        let refs = parse_and_extract_for_path(source, "main.go", Language::Go);
+        assert_eq!(qualifier_of(&refs, "Println"), Some("fmt"), "{refs:?}");
+        assert_eq!(qualifier_of(&refs, "Handle"), Some("r"), "{refs:?}");
     }
 }

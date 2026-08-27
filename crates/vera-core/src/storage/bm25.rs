@@ -20,6 +20,7 @@ use crate::chunk_text;
 pub struct Bm25Index {
     index: Index,
     schema: Bm25Schema,
+    reader: tantivy::IndexReader,
 }
 
 /// Pre-resolved schema field handles for efficient access.
@@ -81,7 +82,16 @@ impl Bm25Index {
         };
 
         register_stemmed_tokenizer(&index);
-        Ok(Self { index, schema })
+        let reader = index
+            .reader_builder()
+            .reload_policy(ReloadPolicy::Manual)
+            .try_into()
+            .context("failed to create BM25 reader")?;
+        Ok(Self {
+            index,
+            schema,
+            reader,
+        })
     }
 
     /// Create an in-memory BM25 index (useful for testing).
@@ -89,12 +99,28 @@ impl Bm25Index {
         let schema = build_schema();
         let index = Index::create_in_ram(schema.schema.clone());
         register_stemmed_tokenizer(&index);
-        Ok(Self { index, schema })
+        let reader = index
+            .reader_builder()
+            .reload_policy(ReloadPolicy::Manual)
+            .try_into()
+            .context("failed to create BM25 reader")?;
+        Ok(Self {
+            index,
+            schema,
+            reader,
+        })
     }
 
     /// Insert a batch of documents into the index.
     ///
     /// Each document is a tuple of (chunk_id, file_path, content, symbol_name, language).
+    ///
+    /// The per-call cost is the writer lifecycle: allocating a
+    /// `WRITER_HEAP_SIZE` writer, committing a segment and joining the merge
+    /// threads costs on the order of tens of milliseconds regardless of batch
+    /// size. Incremental updates batch many files into one call; full builds
+    /// must use [`Bm25Index::begin_bulk_build`] instead of calling this once
+    /// per window.
     pub fn insert_batch(&self, docs: &[Bm25Document<'_>]) -> Result<()> {
         let mut writer: IndexWriter = self
             .index
@@ -102,32 +128,7 @@ impl Bm25Index {
             .context("failed to create BM25 index writer")?;
 
         for doc_data in docs {
-            let sym_name = doc_data.symbol_name.unwrap_or("");
-            let chunk = crate::types::Chunk {
-                id: doc_data.chunk_id.to_string(),
-                file_path: doc_data.file_path.to_string(),
-                line_start: 0,
-                line_end: 0,
-                content: doc_data.content.to_string(),
-                language: doc_data
-                    .language
-                    .parse()
-                    .unwrap_or(crate::types::Language::Unknown),
-                symbol_type: None,
-                symbol_name: doc_data.symbol_name.map(ToString::to_string),
-            };
-            let searchable_text = chunk_text::build_bm25_text(&chunk);
-            writer
-                .add_document(doc!(
-                    self.schema.chunk_id => doc_data.chunk_id.to_string(),
-                    self.schema.file_path => doc_data.file_path.to_string(),
-                    self.schema.filename => chunk_text::file_name(doc_data.file_path).to_string(),
-                    self.schema.path_tokens => chunk_text::normalize_path_tokens(doc_data.file_path),
-                    self.schema.content => searchable_text,
-                    self.schema.symbol_name => sym_name.to_string(),
-                    self.schema.language => doc_data.language.to_string(),
-                ))
-                .context("failed to add document to BM25 index")?;
+            add_document(&writer, &self.schema, doc_data)?;
         }
 
         writer.commit().context("failed to commit BM25 index")?;
@@ -137,6 +138,26 @@ impl Bm25Index {
             .map_err(|e| anyhow::anyhow!("BM25 merge failed: {e}"))?;
 
         Ok(())
+    }
+
+    /// Open a long-lived writer for a full-index build.
+    ///
+    /// A windowed build would otherwise pay the writer lifecycle (creation,
+    /// commit, merge-thread join) once per window. The bulk writer amortizes
+    /// all three: documents flow in continuously, Tantivy merges segments in
+    /// the background while the pipeline parses and embeds the next window,
+    /// and [`Bm25BulkWriter::finish`] commits exactly once. Memory stays
+    /// bounded by the writer heap because Tantivy flushes segments as the
+    /// heap fills, same as with per-window writers.
+    pub fn begin_bulk_build(&self) -> Result<Bm25BulkWriter> {
+        let writer = self
+            .index
+            .writer(WRITER_HEAP_SIZE)
+            .context("failed to create BM25 bulk writer")?;
+        Ok(Bm25BulkWriter {
+            writer,
+            schema: self.schema.clone(),
+        })
     }
 
     /// Insert all chunks as BM25 documents in one batch.
@@ -160,14 +181,10 @@ impl Bm25Index {
     ///
     /// Searches across content and symbol_name fields.
     pub fn search(&self, query_text: &str, limit: usize) -> Result<Vec<Bm25SearchResult>> {
-        let reader = self
-            .index
-            .reader_builder()
-            .reload_policy(ReloadPolicy::Manual)
-            .try_into()
-            .context("failed to create BM25 reader")?;
-
-        let searcher = reader.searcher();
+        self.reader
+            .reload()
+            .context("failed to reload BM25 reader")?;
+        let searcher = self.reader.searcher();
         let mut query_parser = QueryParser::for_index(
             &self.index,
             vec![
@@ -197,7 +214,7 @@ impl Bm25Index {
             .with_context(|| format!("failed to parse BM25 query: {query_text}"))?;
 
         let top_docs = searcher
-            .search(&query, &TopDocs::with_limit(limit))
+            .search(&query, &TopDocs::with_limit(limit).order_by_score())
             .context("BM25 search failed")?;
 
         let mut results = Vec::with_capacity(top_docs.len());
@@ -219,13 +236,10 @@ impl Bm25Index {
 
     /// Count total documents in the index.
     pub fn doc_count(&self) -> Result<u64> {
-        let reader = self
-            .index
-            .reader_builder()
-            .reload_policy(ReloadPolicy::OnCommitWithDelay)
-            .try_into()
-            .context("failed to create BM25 reader for count")?;
-        let searcher = reader.searcher();
+        self.reader
+            .reload()
+            .context("failed to reload BM25 reader for count")?;
+        let searcher = self.reader.searcher();
         Ok(searcher.num_docs())
     }
 
@@ -246,15 +260,27 @@ impl Bm25Index {
         Ok(())
     }
 
-    /// Delete all documents for a given file path.
-    pub fn delete_by_file(&self, file_path: &str) -> Result<()> {
+    /// Delete all documents for every given file path, using one writer.
+    ///
+    /// The per-call cost here is the writer lifecycle, not the deletion:
+    /// allocating a `WRITER_HEAP_SIZE` writer, committing a segment and
+    /// joining the merge threads costs on the order of tens of milliseconds
+    /// regardless of how many terms are deleted. Callers removing many files
+    /// must therefore batch, or they pay that fixed cost per file.
+    pub fn delete_by_files(&self, file_paths: &[&str]) -> Result<()> {
+        if file_paths.is_empty() {
+            return Ok(());
+        }
+
         let mut writer: IndexWriter = self
             .index
             .writer(WRITER_HEAP_SIZE)
             .context("failed to create BM25 writer for file delete")?;
 
-        let term = tantivy::Term::from_field_text(self.schema.file_path, file_path);
-        writer.delete_term(term);
+        for file_path in file_paths {
+            let term = tantivy::Term::from_field_text(self.schema.file_path, file_path);
+            writer.delete_term(term);
+        }
         writer
             .commit()
             .context("failed to commit BM25 file delete")?;
@@ -291,6 +317,86 @@ pub struct Bm25Document<'a> {
     pub language: &'a str,
 }
 
+/// Long-lived Tantivy writer for full-index builds; see
+/// [`Bm25Index::begin_bulk_build`].
+pub struct Bm25BulkWriter {
+    writer: IndexWriter,
+    schema: Bm25Schema,
+}
+
+impl Bm25BulkWriter {
+    /// Buffer one window of chunks. Nothing is committed here; segments flush
+    /// to disk automatically as the writer heap fills.
+    pub fn insert_chunks(&self, chunks: &[crate::types::Chunk]) -> Result<()> {
+        for_each_chunk_document(chunks, |doc_data| {
+            add_document(&self.writer, &self.schema, doc_data)
+        })
+    }
+
+    /// Commit the index once and wait for the final merge to finish.
+    pub fn finish(self) -> Result<()> {
+        let mut writer = self.writer;
+        writer.commit().context("failed to commit BM25 index")?;
+        writer
+            .wait_merging_threads()
+            .map_err(|e| anyhow::anyhow!("BM25 merge failed: {e}"))?;
+        Ok(())
+    }
+}
+
+/// Borrow each chunk as a BM25 document for the duration of `f`, avoiding a
+/// materialized document vector for callers that stream into a writer.
+fn for_each_chunk_document(
+    chunks: &[crate::types::Chunk],
+    mut f: impl FnMut(&Bm25Document<'_>) -> Result<()>,
+) -> Result<()> {
+    let lang_strings: Vec<String> = chunks.iter().map(|c| c.language.to_string()).collect();
+    for (chunk, language) in chunks.iter().zip(lang_strings.iter()) {
+        f(&Bm25Document {
+            chunk_id: &chunk.id,
+            file_path: &chunk.file_path,
+            content: &chunk.content,
+            symbol_name: chunk.symbol_name.as_deref(),
+            language,
+        })?;
+    }
+    Ok(())
+}
+
+fn add_document(
+    writer: &IndexWriter,
+    schema: &Bm25Schema,
+    doc_data: &Bm25Document<'_>,
+) -> Result<()> {
+    let sym_name = doc_data.symbol_name.unwrap_or("");
+    let chunk = crate::types::Chunk {
+        id: doc_data.chunk_id.to_string(),
+        file_path: doc_data.file_path.to_string(),
+        line_start: 0,
+        line_end: 0,
+        content: doc_data.content.to_string(),
+        language: doc_data
+            .language
+            .parse()
+            .unwrap_or(crate::types::Language::Unknown),
+        symbol_type: None,
+        symbol_name: doc_data.symbol_name.map(ToString::to_string),
+    };
+    let searchable_text = chunk_text::build_bm25_text(&chunk);
+    writer
+        .add_document(doc!(
+            schema.chunk_id => doc_data.chunk_id.to_string(),
+            schema.file_path => doc_data.file_path.to_string(),
+            schema.filename => chunk_text::file_name(doc_data.file_path).to_string(),
+            schema.path_tokens => chunk_text::normalize_path_tokens(doc_data.file_path),
+            schema.content => searchable_text,
+            schema.symbol_name => sym_name.to_string(),
+            schema.language => doc_data.language.to_string(),
+        ))
+        .context("failed to add document to BM25 index")?;
+    Ok(())
+}
+
 /// Build the Tantivy schema for BM25 indexing.
 fn build_schema() -> Bm25Schema {
     let mut builder = Schema::builder();
@@ -325,13 +431,33 @@ fn build_schema() -> Bm25Schema {
 }
 
 fn sanitize_query(query_text: &str) -> String {
-    query_text
+    let sanitized = query_text
         .chars()
         .map(|c| match c {
             ':' | '(' | ')' | '[' | ']' | '{' | '}' | '^' | '~' | '!' | '\'' | '"' | '`' => ' ',
             _ => c,
         })
-        .collect()
+        .collect::<String>();
+
+    sanitized
+        .split_whitespace()
+        .map(|token| {
+            // Tantivy treats a leading `-`/`+` as must-not/must and `*`/`?`
+            // as wildcards. Strip them only at token edges so hyphenated
+            // identifiers like `e-mail` survive as single terms.
+            let token = token.trim_start_matches(['-', '+']);
+            let token = token.trim_end_matches(['*', '?']);
+            match token {
+                "AND" => "and",
+                "OR" => "or",
+                "NOT" => "not",
+                "IN" => "in",
+                _ => token,
+            }
+        })
+        .filter(|token| !token.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn looks_path_weighted(query_text: &str) -> bool {
@@ -422,6 +548,72 @@ mod tests {
     }
 
     #[test]
+    fn bulk_writer_matches_insert_batch_results() {
+        let docs = sample_docs();
+
+        let batched = Bm25Index::open_in_memory().unwrap();
+        batched.insert_batch(&docs).unwrap();
+
+        let bulk = Bm25Index::open_in_memory().unwrap();
+        let writer = bulk.begin_bulk_build().unwrap();
+        // Split into two "windows" to prove the final commit covers all adds.
+        writer
+            .insert_chunks(
+                &docs[..4]
+                    .iter()
+                    .map(|d| crate::types::Chunk {
+                        id: d.chunk_id.to_string(),
+                        file_path: d.file_path.to_string(),
+                        line_start: 0,
+                        line_end: 0,
+                        content: d.content.to_string(),
+                        language: d.language.parse().unwrap(),
+                        symbol_type: None,
+                        symbol_name: d.symbol_name.map(ToString::to_string),
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+        writer
+            .insert_chunks(
+                &docs[4..]
+                    .iter()
+                    .map(|d| crate::types::Chunk {
+                        id: d.chunk_id.to_string(),
+                        file_path: d.file_path.to_string(),
+                        line_start: 0,
+                        line_end: 0,
+                        content: d.content.to_string(),
+                        language: d.language.parse().unwrap(),
+                        symbol_type: None,
+                        symbol_name: d.symbol_name.map(ToString::to_string),
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+        writer.finish().unwrap();
+
+        assert_eq!(bulk.doc_count().unwrap(), batched.doc_count().unwrap());
+        for query in ["println hello world", "Config port", "Pipeline outputs"] {
+            let mut expected: Vec<_> = batched
+                .search(query, 10)
+                .unwrap()
+                .into_iter()
+                .map(|r| r.chunk_id)
+                .collect();
+            let mut actual: Vec<_> = bulk
+                .search(query, 10)
+                .unwrap()
+                .into_iter()
+                .map(|r| r.chunk_id)
+                .collect();
+            expected.sort();
+            actual.sort();
+            assert_eq!(actual, expected, "bulk writer diverged on query {query}");
+        }
+    }
+
+    #[test]
     fn keyword_search_finds_content() {
         let index = Bm25Index::open_in_memory().unwrap();
         index.insert_batch(&sample_docs()).unwrap();
@@ -483,6 +675,67 @@ mod tests {
 
         let results = index.search("xyznonexistent", 10).unwrap();
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn delete_by_files_removes_every_path_and_keeps_the_rest() {
+        let index = Bm25Index::open_in_memory().unwrap();
+        let mut docs = sample_docs();
+        docs.push(Bm25Document {
+            chunk_id: "src/keep.rs:0",
+            file_path: "src/keep.rs",
+            content: "fn hello_survivor() {}",
+            symbol_name: Some("hello_survivor"),
+            language: "rust",
+        });
+        index.insert_batch(&docs).unwrap();
+        let before = index.doc_count().unwrap();
+
+        // src/main.rs has two documents; deleting it and one other path must
+        // take all of theirs and none of anyone else's.
+        index
+            .delete_by_files(&["src/main.rs", "src/lib.py"])
+            .unwrap();
+
+        assert_eq!(index.doc_count().unwrap(), before - 3);
+
+        // "hello" occurs in both deleted paths and in src/keep.rs, so every
+        // path assertion below can fail while the result set stays non-empty.
+        let hits = index.search("hello", 50).unwrap();
+        assert!(
+            hits.iter()
+                .any(|hit| hit.chunk_id.starts_with("src/keep.rs:")),
+            "the unrelated hello document must survive"
+        );
+        for path in ["src/main.rs:", "src/lib.py:"] {
+            assert!(
+                hits.iter().all(|hit| !hit.chunk_id.starts_with(path)),
+                "{path} should have no documents left, got {:?}",
+                hits.iter().map(|h| &h.chunk_id).collect::<Vec<_>>()
+            );
+        }
+        // An unrelated path is untouched.
+        let remaining = index.search("server", 50).unwrap();
+        assert!(
+            remaining
+                .iter()
+                .any(|hit| hit.chunk_id.starts_with("src/server.ts:")),
+            "unrelated documents must survive"
+        );
+    }
+
+    #[test]
+    fn delete_by_files_with_no_paths_is_a_no_op() {
+        // The update path calls this unconditionally, so an update with
+        // nothing deleted or modified must not touch the index — and must not
+        // pay for a writer to do nothing.
+        let index = Bm25Index::open_in_memory().unwrap();
+        index.insert_batch(&sample_docs()).unwrap();
+        let before = index.doc_count().unwrap();
+
+        index.delete_by_files(&[]).unwrap();
+
+        assert_eq!(index.doc_count().unwrap(), before);
     }
 
     #[test]
@@ -576,5 +829,58 @@ mod tests {
             sanitize_query("how pandoc's app module orchestrates"),
             "how pandoc s app module orchestrates"
         );
+    }
+
+    #[test]
+    fn sanitize_query_neutralizes_tantivy_operators() {
+        assert_eq!(
+            sanitize_query("NOT NULL -required +must wildcard? * AND OR IN"),
+            "not NULL required must wildcard and or in"
+        );
+    }
+
+    #[test]
+    fn sanitize_query_preserves_hyphenated_identifiers() {
+        assert_eq!(
+            sanitize_query("e-mail client read-line"),
+            "e-mail client read-line"
+        );
+    }
+
+    #[test]
+    fn operator_queries_match_plain_terms() {
+        let index = Bm25Index::open_in_memory().unwrap();
+        index
+            .insert_batch(&[
+                Bm25Document {
+                    chunk_id: "null:0",
+                    file_path: "null.sql",
+                    content: "NOT NULL constraint",
+                    symbol_name: None,
+                    language: "sql",
+                },
+                Bm25Document {
+                    chunk_id: "null:1",
+                    file_path: "other.sql",
+                    content: "NULL value validation",
+                    symbol_name: None,
+                    language: "sql",
+                },
+            ])
+            .unwrap();
+
+        let ids = |query| {
+            index
+                .search(query, 10)
+                .unwrap()
+                .into_iter()
+                .map(|result| result.chunk_id)
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(ids("NOT NULL"), ids("not null"));
+        assert_eq!(ids("-null"), ids("null"));
+        assert_eq!(ids("+null"), ids("null"));
+        assert_eq!(ids("* null?"), ids("null"));
     }
 }

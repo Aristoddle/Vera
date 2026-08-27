@@ -8,9 +8,10 @@
 //! (typically 60) and `rank_i` is the 1-based rank of the item in each
 //! source result list.
 
-use std::collections::HashMap;
-use std::path::Path;
-use std::time::{Duration, Instant};
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result};
 use tracing::{debug, info, warn};
@@ -22,11 +23,184 @@ use crate::retrieval::query_classifier::{QueryType, classify_query, params_for_q
 use crate::retrieval::query_utils::result_key;
 use crate::retrieval::ranking::is_path_weighted_query;
 use crate::retrieval::reranker::{Reranker, rerank_results};
-use crate::retrieval::vector::{VectorSearchError, search_vector_with_stores};
+use crate::retrieval::vector::{
+    VectorSearchError, search_vector_with_cached_stores_timed, search_vector_with_stores_timed,
+};
 use crate::storage::bm25::Bm25Index;
 use crate::storage::metadata::MetadataStore;
 use crate::storage::vector::VectorStore;
 use crate::types::{SearchFilters, SearchResult};
+
+/// Open search stores reused for the active index directory.
+pub(crate) struct SearchStores {
+    pub(crate) bm25: Bm25Index,
+    pub(crate) bm25_metadata: Mutex<MetadataStore>,
+    pub(crate) vector_metadata: Mutex<MetadataStore>,
+    vector_path: PathBuf,
+    vector: Mutex<Option<CachedVectorStore>>,
+    metadata_path: PathBuf,
+    indexed_files: Mutex<Option<CachedIndexedFiles>>,
+}
+
+struct CachedIndexedFiles {
+    stamp: MetadataDbStamp,
+    files: Arc<Vec<String>>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct MetadataDbStamp {
+    db_len: Option<u64>,
+    db_mtime: Option<SystemTime>,
+    wal_len: Option<u64>,
+    wal_mtime: Option<SystemTime>,
+}
+
+fn metadata_db_stamp(db_path: &Path) -> MetadataDbStamp {
+    // WAL-mode commits append to the -wal file without touching the main
+    // database file until a checkpoint, so both files must contribute.
+    let wal_path = db_path.with_file_name(format!(
+        "{}-wal",
+        db_path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    ));
+    let stats = |path: &Path| {
+        std::fs::metadata(path)
+            .ok()
+            .map(|metadata| (metadata.len(), metadata.modified().ok()))
+    };
+    let (db_len, db_mtime) = stats(db_path).map_or((None, None), |(len, mtime)| (Some(len), mtime));
+    let (wal_len, wal_mtime) =
+        stats(&wal_path).map_or((None, None), |(len, mtime)| (Some(len), mtime));
+    MetadataDbStamp {
+        db_len,
+        db_mtime,
+        wal_len,
+        wal_mtime,
+    }
+}
+
+struct CachedVectorStore {
+    dim: usize,
+    stamp: VectorStoreStamp,
+    store: Arc<Mutex<VectorStore>>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct VectorStoreStamp {
+    db_len: Option<u64>,
+    db_mtime: Option<SystemTime>,
+    manifest_mtime: Option<SystemTime>,
+    manifest_generation: Option<u64>,
+}
+
+fn vector_store_stamp(vector_path: &Path) -> VectorStoreStamp {
+    let db_metadata = std::fs::metadata(vector_path).ok();
+    let manifest_path = vector_path.with_file_name("vectors.manifest");
+    let manifest_mtime = std::fs::metadata(&manifest_path)
+        .and_then(|metadata| metadata.modified())
+        .ok();
+    let manifest_generation = std::fs::read(&manifest_path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .and_then(|manifest| {
+            manifest
+                .get("generation")
+                .and_then(serde_json::Value::as_u64)
+        });
+    VectorStoreStamp {
+        db_len: db_metadata.as_ref().map(std::fs::Metadata::len),
+        db_mtime: db_metadata.and_then(|metadata| metadata.modified().ok()),
+        manifest_mtime,
+        manifest_generation,
+    }
+}
+
+impl SearchStores {
+    pub(crate) fn open(index_dir: &Path) -> Result<Self> {
+        let bm25 = Bm25Index::open(&index_dir.join("bm25"))
+            .context("failed to open BM25 index for search")?;
+        let metadata_path = index_dir.join("metadata.db");
+        let bm25_metadata = MetadataStore::open(&metadata_path)
+            .context("failed to open metadata store for search")?;
+        let vector_metadata = MetadataStore::open(&metadata_path)
+            .context("failed to open vector metadata store for search")?;
+        Ok(Self {
+            bm25,
+            bm25_metadata: Mutex::new(bm25_metadata),
+            vector_metadata: Mutex::new(vector_metadata),
+            vector_path: index_dir.join("vectors.db"),
+            vector: Mutex::new(None),
+            metadata_path,
+            indexed_files: Mutex::new(None),
+        })
+    }
+
+    /// Indexed file list, cached against the metadata database stamp.
+    ///
+    /// `MetadataStore::indexed_files()` runs a DISTINCT scan over every chunk
+    /// row, which costs tens of milliseconds on large indexes. Searches repeat
+    /// it per query through exact-match augmentation, so the list is cached
+    /// and refreshed only when metadata.db (or its WAL) changes on disk.
+    ///
+    /// Reads the stamp before querying so a concurrent commit invalidates the
+    /// entry instead of certifying a stale list. A fresh connection is used on
+    /// misses so this never interacts with the `bm25_metadata` lock.
+    pub(crate) fn indexed_files(&self) -> Result<Arc<Vec<String>>> {
+        let stamp = metadata_db_stamp(&self.metadata_path);
+        {
+            let cached = self
+                .indexed_files
+                .lock()
+                .map_err(|_| anyhow::anyhow!("indexed files cache lock poisoned"))?;
+            if let Some(cached) = cached.as_ref()
+                && cached.stamp == stamp
+            {
+                return Ok(Arc::clone(&cached.files));
+            }
+        }
+        let files = Arc::new(
+            MetadataStore::open(&self.metadata_path)
+                .context("failed to open metadata store for file list")?
+                .indexed_files()?,
+        );
+        let mut cached = self
+            .indexed_files
+            .lock()
+            .map_err(|_| anyhow::anyhow!("indexed files cache lock poisoned"))?;
+        *cached = Some(CachedIndexedFiles {
+            stamp,
+            files: Arc::clone(&files),
+        });
+        Ok(files)
+    }
+
+    pub(crate) fn vector_store(&self, dim: usize) -> Result<Arc<Mutex<VectorStore>>> {
+        let mut cached = self
+            .vector
+            .lock()
+            .map_err(|_| anyhow::anyhow!("vector store cache lock poisoned"))?;
+        let stamp = vector_store_stamp(&self.vector_path);
+        if let Some(cached_store) = cached.as_ref()
+            && cached_store.dim == dim
+            && cached_store.stamp == stamp
+        {
+            return Ok(Arc::clone(&cached_store.store));
+        }
+
+        let store = Arc::new(Mutex::new(
+            VectorStore::open(&self.vector_path, dim).context("failed to open vector store")?,
+        ));
+        let stamp = vector_store_stamp(&self.vector_path);
+        *cached = Some(CachedVectorStore {
+            dim,
+            stamp,
+            store: Arc::clone(&store),
+        });
+        Ok(store)
+    }
+}
 
 /// Errors specific to hybrid search.
 #[derive(Debug, thiserror::Error)]
@@ -95,37 +269,110 @@ pub async fn search_hybrid(
     stored_dim: usize,
     vector_candidates: usize,
 ) -> Result<(Vec<SearchResult>, HybridTimings), HybridSearchError> {
+    search_hybrid_inner(
+        index_dir,
+        provider,
+        bm25_query,
+        vector_query,
+        filters,
+        limit,
+        rrf_k,
+        stored_dim,
+        vector_candidates,
+        None,
+    )
+    .await
+}
+
+/// Perform hybrid search using stores retained by a reusable search context.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn search_hybrid_with_stores(
+    index_dir: &Path,
+    provider: &impl EmbeddingProvider,
+    bm25_query: &str,
+    vector_query: &str,
+    filters: &SearchFilters,
+    limit: usize,
+    rrf_k: f64,
+    stored_dim: usize,
+    vector_candidates: usize,
+    stores: Arc<SearchStores>,
+) -> Result<(Vec<SearchResult>, HybridTimings), HybridSearchError> {
+    search_hybrid_inner(
+        index_dir,
+        provider,
+        bm25_query,
+        vector_query,
+        filters,
+        limit,
+        rrf_k,
+        stored_dim,
+        vector_candidates,
+        Some(stores),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn search_hybrid_inner(
+    index_dir: &Path,
+    provider: &impl EmbeddingProvider,
+    bm25_query: &str,
+    vector_query: &str,
+    filters: &SearchFilters,
+    limit: usize,
+    rrf_k: f64,
+    stored_dim: usize,
+    vector_candidates: usize,
+    stores: Option<Arc<SearchStores>>,
+) -> Result<(Vec<SearchResult>, HybridTimings), HybridSearchError> {
     let query_type = classify_query(bm25_query);
     let query_params = params_for_query_type(query_type);
     let bm25_candidates = compute_bm25_candidates(bm25_query, limit);
     let mut timings = HybridTimings::default();
 
-    // Spawn BM25 search in a blocking task with its own database connections.
-    // This runs concurrently with vector search (embedding + nearest-neighbor).
+    // Spawn BM25 search in a blocking task. Reusable search contexts retain
+    // the Tantivy reader and SQLite connection; direct callers keep the
+    // original open-per-call behavior.
     let bm25_dir = index_dir.join("bm25");
     let metadata_path = index_dir.join("metadata.db");
     let bm25_query = bm25_query.to_string();
     let bm25_filters = filters.clone();
+    let stores_for_bm25 = stores.clone();
     let bm25_handle = tokio::task::spawn_blocking(move || {
         let start = Instant::now();
-        let result = Bm25Index::open(&bm25_dir)
-            .context("failed to open BM25 index for search")
-            .and_then(|index| {
-                let store = MetadataStore::open(&metadata_path)
-                    .context("failed to open metadata store for BM25 search")?;
-                search_bm25_with_stores_and_filters(
-                    &index,
-                    &store,
-                    &bm25_query,
-                    &bm25_filters,
-                    bm25_candidates,
-                )
-            });
+        let result = match stores_for_bm25 {
+            Some(stores) => stores
+                .bm25_metadata
+                .lock()
+                .map_err(|_| anyhow::anyhow!("metadata store lock poisoned"))
+                .and_then(|store| {
+                    search_bm25_with_stores_and_filters(
+                        &stores.bm25,
+                        &store,
+                        &bm25_query,
+                        &bm25_filters,
+                        bm25_candidates,
+                    )
+                }),
+            None => Bm25Index::open(&bm25_dir)
+                .context("failed to open BM25 index for search")
+                .and_then(|index| {
+                    let store = MetadataStore::open(&metadata_path)
+                        .context("failed to open metadata store for BM25 search")?;
+                    search_bm25_with_stores_and_filters(
+                        &index,
+                        &store,
+                        &bm25_query,
+                        &bm25_filters,
+                        bm25_candidates,
+                    )
+                }),
+        };
         (result, start.elapsed())
     });
 
     // Run vector search concurrently on the async runtime.
-    let vector_metadata_path = index_dir.join("metadata.db");
     // Filters are applied after the kNN fetch, so a selective filter can
     // discard every hit in the default window. Over-fetch when filters are
     // active so filtered chunks beyond the window can still reach fusion.
@@ -134,41 +381,68 @@ pub async fn search_hybrid(
     } else {
         vector_candidates.saturating_mul(4).max(200)
     };
-    let embed_start = Instant::now();
-    let vector_results = match VectorStore::open(&index_dir.join("vectors.db"), stored_dim) {
-        Ok(vector_store) => {
-            let vector_store_result =
-                MetadataStore::open(&vector_metadata_path).context("failed to open metadata store");
-            match vector_store_result {
-                Ok(vector_metadata) => {
-                    match search_vector_with_stores(
-                        &vector_store,
-                        &vector_metadata,
-                        provider,
-                        vector_query,
-                        vector_fetch,
-                    )
-                    .await
-                    {
-                        Ok(mut results) => {
-                            if !filters.is_empty() {
-                                results.retain(|result| filters.matches(result));
-                            }
-                            Ok(results)
+    let vector_start = Instant::now();
+    let vector_outcome = match stores {
+        Some(stores) => match stores.vector_store(stored_dim) {
+            Ok(vector_store) => {
+                match search_vector_with_cached_stores_timed(
+                    vector_store.as_ref(),
+                    &stores.vector_metadata,
+                    provider,
+                    vector_query,
+                    vector_fetch,
+                )
+                .await
+                {
+                    Ok((mut results, embed_elapsed)) => {
+                        if !filters.is_empty() {
+                            results.retain(|result| filters.matches(result));
                         }
-                        Err(err) => Err(err),
+                        Ok((results, embed_elapsed))
                     }
+                    Err(err) => Err(err),
                 }
-                Err(err) => Err(VectorSearchError::StorageError(err)),
             }
-        }
-        Err(err) => Err(VectorSearchError::StorageError(
-            err.context("failed to open vector store"),
-        )),
+            Err(err) => Err(VectorSearchError::StorageError(err)),
+        },
+        None => match VectorStore::open(&index_dir.join("vectors.db"), stored_dim) {
+            Ok(vector_store) => {
+                let vector_metadata_result = MetadataStore::open(&index_dir.join("metadata.db"))
+                    .context("failed to open metadata store");
+                match vector_metadata_result {
+                    Ok(vector_metadata) => {
+                        match search_vector_with_stores_timed(
+                            &vector_store,
+                            &vector_metadata,
+                            provider,
+                            vector_query,
+                            vector_fetch,
+                        )
+                        .await
+                        {
+                            Ok((mut results, embed_elapsed)) => {
+                                if !filters.is_empty() {
+                                    results.retain(|result| filters.matches(result));
+                                }
+                                Ok((results, embed_elapsed))
+                            }
+                            Err(err) => Err(err),
+                        }
+                    }
+                    Err(err) => Err(VectorSearchError::StorageError(err)),
+                }
+            }
+            Err(err) => Err(VectorSearchError::StorageError(
+                err.context("failed to open vector store"),
+            )),
+        },
     };
-    let vector_elapsed = embed_start.elapsed();
-    timings.embedding = Some(vector_elapsed);
-    timings.vector = Some(vector_elapsed);
+    let embed_elapsed = vector_outcome
+        .as_ref()
+        .ok()
+        .map(|(_, embed_elapsed)| *embed_elapsed);
+    charge_vector_span(&mut timings, vector_start.elapsed(), embed_elapsed);
+    let vector_results = vector_outcome.map(|(results, _)| results);
 
     // Await the BM25 result (should already be done or nearly done).
     let (bm25_results, bm25_elapsed) = bm25_handle.await.map_err(|e| {
@@ -281,6 +555,43 @@ pub async fn search_hybrid_reranked(
     .await
 }
 
+/// Perform reranked hybrid search using stores retained by a reusable context.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn search_hybrid_reranked_with_stores(
+    index_dir: &Path,
+    provider: &impl EmbeddingProvider,
+    reranker: &impl Reranker,
+    bm25_query: &str,
+    vector_query: &str,
+    filters: &SearchFilters,
+    fetch_limit: usize,
+    result_limit: usize,
+    rrf_k: f64,
+    stored_dim: usize,
+    rerank_candidates: usize,
+    vector_candidates: usize,
+    graph_augmentation_enabled: bool,
+    stores: Arc<SearchStores>,
+) -> Result<(Vec<SearchResult>, HybridTimings), HybridSearchError> {
+    search_hybrid_reranked_inner(
+        index_dir,
+        provider,
+        reranker,
+        bm25_query,
+        vector_query,
+        filters,
+        fetch_limit,
+        result_limit,
+        rrf_k,
+        stored_dim,
+        rerank_candidates,
+        vector_candidates,
+        graph_augmentation_enabled,
+        Some(stores),
+    )
+    .await
+}
+
 /// Perform hybrid search with optional experimental graph augmentation.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn search_hybrid_reranked_with_augmentation(
@@ -298,20 +609,75 @@ pub(crate) async fn search_hybrid_reranked_with_augmentation(
     vector_candidates: usize,
     graph_augmentation_enabled: bool,
 ) -> Result<(Vec<SearchResult>, HybridTimings), HybridSearchError> {
-    let fusion_limit = rerank_candidates.max(fetch_limit);
-
-    let (mut hybrid_results, mut timings) = search_hybrid(
+    search_hybrid_reranked_inner(
         index_dir,
         provider,
+        reranker,
         bm25_query,
         vector_query,
         filters,
-        fusion_limit,
+        fetch_limit,
+        result_limit,
         rrf_k,
         stored_dim,
+        rerank_candidates,
         vector_candidates,
+        graph_augmentation_enabled,
+        None,
     )
-    .await?;
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn search_hybrid_reranked_inner(
+    index_dir: &Path,
+    provider: &impl EmbeddingProvider,
+    reranker: &impl Reranker,
+    bm25_query: &str,
+    vector_query: &str,
+    filters: &SearchFilters,
+    fetch_limit: usize,
+    result_limit: usize,
+    rrf_k: f64,
+    stored_dim: usize,
+    rerank_candidates: usize,
+    vector_candidates: usize,
+    graph_augmentation_enabled: bool,
+    stores: Option<Arc<SearchStores>>,
+) -> Result<(Vec<SearchResult>, HybridTimings), HybridSearchError> {
+    let fusion_limit = rerank_candidates.max(fetch_limit);
+
+    let (mut hybrid_results, mut timings) = match stores {
+        Some(stores) => {
+            search_hybrid_with_stores(
+                index_dir,
+                provider,
+                bm25_query,
+                vector_query,
+                filters,
+                fusion_limit,
+                rrf_k,
+                stored_dim,
+                vector_candidates,
+                stores,
+            )
+            .await?
+        }
+        None => {
+            search_hybrid(
+                index_dir,
+                provider,
+                bm25_query,
+                vector_query,
+                filters,
+                fusion_limit,
+                rrf_k,
+                stored_dim,
+                vector_candidates,
+            )
+            .await?
+        }
+    };
 
     let augmented_count = if graph_augmentation_enabled {
         augment_pool(index_dir, &mut hybrid_results, filters)
@@ -344,8 +710,7 @@ pub(crate) async fn search_hybrid_reranked_with_augmentation(
                 reranked = reranked.len(),
                 "reranking complete"
             );
-            reranked.extend(hybrid_results.into_iter().skip(rerank_limit));
-            reranked.truncate(fetch_limit);
+            reranked = merge_reranked_results(reranked, hybrid_results, rerank_limit, fetch_limit);
             Ok((reranked, timings))
         }
         Err(rerank_err) => {
@@ -362,6 +727,42 @@ pub(crate) async fn search_hybrid_reranked_with_augmentation(
             Ok((results, timings))
         }
     }
+}
+
+fn merge_reranked_results(
+    mut reranked: Vec<SearchResult>,
+    hybrid_results: Vec<SearchResult>,
+    rerank_limit: usize,
+    fetch_limit: usize,
+) -> Vec<SearchResult> {
+    let rerank_prefix_len = rerank_limit.min(hybrid_results.len());
+    let mut present = reranked.iter().map(result_key).collect::<HashSet<_>>();
+    let mut score_ceiling = reranked.last().map(|result| result.score);
+
+    let mut append_unscored = |mut result: SearchResult| {
+        if !present.insert(result_key(&result)) {
+            return;
+        }
+        // RRF and reranker scores have different scales. Keep unscored candidates below the
+        // reranked prefix so the public score order still matches the result order.
+        if let Some(ceiling) = score_ceiling {
+            result.score = result.score.min(ceiling);
+        }
+        score_ceiling = Some(result.score);
+        reranked.push(result);
+    };
+
+    // A short reranker response can omit candidates from the prefix. Append those first,
+    // preserving their original hybrid order, before the normal untouched tail.
+    for result in hybrid_results.iter().take(rerank_prefix_len) {
+        append_unscored(result.clone());
+    }
+    for result in hybrid_results.into_iter().skip(rerank_prefix_len) {
+        append_unscored(result);
+    }
+
+    reranked.truncate(fetch_limit);
+    reranked
 }
 
 /// Perform hybrid search using pre-opened stores (useful for testing).
@@ -401,6 +802,9 @@ pub fn fuse_rrf_weighted(
 ///
 /// Each result set has an associated weight that scales its RRF contribution.
 /// A weight of 2.0 means that set's scores count double in the final ranking.
+///
+/// Equal scores are broken by `(file_path, line_start, line_end)` ascending, so the
+/// output is a function of the inputs alone and does not vary between processes.
 pub fn fuse_rrf_multi_weighted(
     result_sets: &[&[SearchResult]],
     weights: &[f64],
@@ -423,7 +827,23 @@ pub fn fuse_rrf_multi_weighted(
     }
 
     let mut ranked: Vec<(f64, SearchResult)> = fused.into_values().collect();
-    ranked.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    // Ties are structural, not incidental: with equal source weights a result found only
+    // in set A at rank r and one found only in set B at rank r score bit-identically.
+    // `into_values` yields a per-process-random order, so a score-only sort would make the
+    // output depend on the HashMap seed rather than on the index. Break ties on the same
+    // (file_path, line_start, line_end) triple that keys the map, which is distinct for
+    // every surviving entry and therefore a total order.
+    ranked.sort_by(|a, b| {
+        b.0.partial_cmp(&a.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                (&a.1.file_path, a.1.line_start, a.1.line_end).cmp(&(
+                    &b.1.file_path,
+                    b.1.line_start,
+                    b.1.line_end,
+                ))
+            })
+    });
 
     ranked
         .into_iter()
@@ -435,6 +855,81 @@ pub fn fuse_rrf_multi_weighted(
         .collect()
 }
 
+/// Charge the one wall-clock span that covers the vector arm to the two stages
+/// `--timing` reports.
+///
+/// The query embedding runs inside the vector search, so both stages come out
+/// of `vector_span`. `embedding` gets the model cost and `vector` gets the
+/// remainder, which is the storage cost: opening both stores, the KNN query and
+/// metadata hydration. A vector search that failed has no embedding measurement
+/// to report, so the whole span stays on `vector`.
+///
+/// The two must partition the span rather than each be given all of it, which
+/// is what issue #105 was: the same value reported twice made either stage
+/// unattributable. Both fields are written here rather than at the call site so
+/// that partition is decided in one place a test can reach: a caller that only
+/// received the two values could still charge the span twice.
+fn charge_vector_span(
+    timings: &mut HybridTimings,
+    vector_span: Duration,
+    embed_elapsed: Option<Duration>,
+) {
+    timings.embedding = embed_elapsed;
+    timings.vector = Some(vector_span.saturating_sub(embed_elapsed.unwrap_or_default()));
+}
+
 #[cfg(test)]
 #[path = "hybrid_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod shortfall_tests {
+    use super::*;
+    use crate::types::Language;
+
+    fn result(index: usize) -> SearchResult {
+        SearchResult {
+            file_path: format!("candidate-{index}.rs"),
+            line_start: 1,
+            line_end: 1,
+            content: format!("candidate {index}"),
+            language: Language::Rust,
+            score: 1.0 - index as f64 / 100.0,
+            symbol_name: None,
+            symbol_type: None,
+        }
+    }
+
+    #[test]
+    fn reranker_shortfall_appends_missing_candidates_in_hybrid_order() {
+        let hybrid_results: Vec<_> = (0..20).map(result).collect();
+        let scored_indices = (0..7).chain(13..20);
+        let reranked = scored_indices
+            .enumerate()
+            .map(|(rank, index)| {
+                let mut result = hybrid_results[index].clone();
+                result.score = 100.0 - rank as f64;
+                result
+            })
+            .collect();
+
+        let merged = merge_reranked_results(reranked, hybrid_results, 20, 20);
+
+        assert_eq!(merged.len(), 20);
+        let missing_tail: Vec<_> = merged[14..]
+            .iter()
+            .map(|result| result.content.as_str())
+            .collect();
+        assert_eq!(
+            missing_tail,
+            vec![
+                "candidate 7",
+                "candidate 8",
+                "candidate 9",
+                "candidate 10",
+                "candidate 11",
+                "candidate 12",
+            ]
+        );
+    }
+}

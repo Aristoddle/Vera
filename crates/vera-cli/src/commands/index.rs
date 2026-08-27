@@ -8,21 +8,8 @@ use anyhow::{Context, bail};
 use vera_core::config::InferenceBackend;
 use vera_core::indexing::IndexProgress;
 
-use crate::helpers::{
-    cancel_on_signal, load_runtime_config, print_human_summary, wait_for_interrupt,
-};
-
-struct AbortIndexTask {
-    abort_handle: tokio::task::AbortHandle,
-    cancellation: vera_core::CancellationToken,
-}
-
-impl Drop for AbortIndexTask {
-    fn drop(&mut self) {
-        self.cancellation.cancel();
-        self.abort_handle.abort();
-    }
-}
+use crate::helpers::{cancel_task_on_signal, print_human_summary, wait_for_interrupt};
+use crate::state;
 
 /// Run the `vera index <path>` command.
 #[allow(clippy::too_many_arguments)]
@@ -89,7 +76,7 @@ pub fn execute(
     let rt = tokio::runtime::Runtime::new()
         .map_err(|e| anyhow::anyhow!("failed to create async runtime: {e}"))?;
 
-    let mut config = load_runtime_config()?;
+    let mut config = state::load_runtime_config()?;
     if low_vram {
         config.embedding.low_vram = true;
     }
@@ -109,8 +96,8 @@ pub fn execute(
     if !show_progress {
         let cancellation = vera_core::CancellationToken::new();
         let task_cancellation = cancellation.clone();
-        let signal_cancellation = cancellation.clone();
         let task_repo_path = repo_path.to_path_buf();
+        let signal = wait_for_interrupt(rt.handle())?;
         let task = rt.handle().spawn(async move {
             vera_core::indexing::pipeline::index_repository_with_cancellation(
                 &task_repo_path,
@@ -121,17 +108,11 @@ pub fn execute(
             )
             .await
         });
-        let abort_handle = task.abort_handle();
         let summary = rt
-            .block_on(cancel_on_signal(
-                async move { task.await.context("indexing task failed")? },
-                async move {
-                    let _task_guard = AbortIndexTask {
-                        abort_handle,
-                        cancellation: signal_cancellation,
-                    };
-                    wait_for_interrupt().await;
-                },
+            .block_on(cancel_task_on_signal(
+                task,
+                signal,
+                cancellation,
                 "indexing",
             ))
             .context("indexing failed")?;
@@ -151,15 +132,16 @@ pub fn execute(
     let on_progress = move |event: IndexProgress| match event {
         IndexProgress::DiscoveryDone { file_count } => {
             spinner_ref.stop(format!("Discovered {file_count} files"));
+            spinner_ref.start("Parsing files...");
         }
         IndexProgress::ParsingDone { chunk_count } => {
             spinner_ref.start(format!("Parsed into {chunk_count} chunks"));
             spinner_ref.stop(format!("Parsed into {chunk_count} chunks"));
         }
         IndexProgress::EmbeddingProgress { done, total } => {
+            embed_bar_ref.set_length(total as u64);
             if !embed_started_ref.load(std::sync::atomic::Ordering::Relaxed) {
                 embed_started_ref.store(true, std::sync::atomic::Ordering::Relaxed);
-                embed_bar_ref.set_length(total as u64);
                 embed_bar_ref.start("Generating embeddings...");
             }
             embed_bar_ref.set_position(done as u64);
@@ -173,8 +155,8 @@ pub fn execute(
 
     let cancellation = vera_core::CancellationToken::new();
     let task_cancellation = cancellation.clone();
-    let signal_cancellation = cancellation.clone();
     let task_repo_path = repo_path.to_path_buf();
+    let signal = wait_for_interrupt(rt.handle())?;
     let task = rt.handle().spawn(async move {
         vera_core::indexing::pipeline::index_repository_with_progress_and_cancellation(
             &task_repo_path,
@@ -186,16 +168,10 @@ pub fn execute(
         )
         .await
     });
-    let abort_handle = task.abort_handle();
-    let result = rt.block_on(cancel_on_signal(
-        async move { task.await.context("indexing task failed")? },
-        async move {
-            let _task_guard = AbortIndexTask {
-                abort_handle,
-                cancellation: signal_cancellation,
-            };
-            wait_for_interrupt().await;
-        },
+    let result = rt.block_on(cancel_task_on_signal(
+        task,
+        signal,
+        cancellation,
         "indexing",
     ));
     multi.stop();

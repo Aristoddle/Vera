@@ -6,6 +6,7 @@ use std::path::Path;
 use anyhow::Result;
 
 use crate::corpus::{ContentClass, classify_content};
+use crate::path_containment::canonical_project_root;
 use crate::retrieval::file_scan::{
     allows_class, language_for_path, line_context_snippet, symbol_for_line,
 };
@@ -19,16 +20,31 @@ pub fn search_callers(
     limit: usize,
     filters: &SearchFilters,
 ) -> Result<Vec<SearchResult>> {
+    search_callers_through(index_dir, symbol, None, limit, filters)
+}
+
+/// Search call sites, optionally limited to calls made through one receiver.
+///
+/// `receiver` is matched against the text before the dot at the call site, so
+/// `state.add_url_rule()` and `app.add_url_rule()` can be told apart even
+/// though both are stored under the callee name `add_url_rule`.
+pub fn search_callers_through(
+    index_dir: &Path,
+    symbol: &str,
+    receiver: Option<&str>,
+    limit: usize,
+    filters: &SearchFilters,
+) -> Result<Vec<SearchResult>> {
     if limit == 0 {
         anyhow::bail!("limit must be greater than zero");
     }
 
     let metadata_path = index_dir.join("metadata.db");
     let store = MetadataStore::open(&metadata_path)?;
-    let repo_root = index_dir
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("Cannot determine project root from index dir"))?;
-    let callers = store.find_callers(symbol)?;
+    let repo_root = canonical_project_root(index_dir)?;
+    let root_dir = crate::discovery::open_root_dir(&repo_root)?;
+    let max_file_size_bytes = super::configured_max_file_size_bytes(&store);
+    let callers = store.find_callers_through(symbol, receiver)?;
     let mut results = Vec::new();
     let mut seen = HashSet::new();
 
@@ -42,8 +58,11 @@ pub fn search_callers(
             continue;
         }
 
-        let file_abs = repo_root.join(&caller.file_path);
-        let content = match crate::discovery::read_source_lossy(&file_abs) {
+        let content = match crate::discovery::read_source_lossy_capped(
+            &root_dir,
+            Path::new(&caller.file_path),
+            max_file_size_bytes,
+        ) {
             Ok(content) => content,
             Err(_) => continue,
         };

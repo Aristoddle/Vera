@@ -1,12 +1,15 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::fmt;
-use std::path::PathBuf;
+use std::io::Read;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::sync::atomic::AtomicU64;
 
 pub(super) const HUB_URL: &str = "https://huggingface.co";
 pub(super) const EMBEDDING_REPO: &str = "jinaai/jina-embeddings-v5-text-nano-retrieval";
+pub(super) const EMBEDDING_REVISION: &str = "ac5d898c8d382b17167c33e5c8af644a3519b47d";
 pub(super) const EMBEDDING_ONNX_FILE: &str = "onnx/model_quantized.onnx";
 pub(super) const EMBEDDING_ONNX_DATA_FILE: &str = "onnx/model_quantized.onnx_data";
 /// FP16 model for GPU backends (quantized INT8 ops lack CUDA kernels,
@@ -19,10 +22,20 @@ pub(super) const EMBEDDING_MAX_LENGTH: usize = 512;
 pub(super) const ONNX_HEADER_MAX_BYTES: usize = 4 * 1024;
 pub(super) const ONNX_HEADER_MAX_FIELDS: usize = 256;
 
+/// jina-embeddings-v5-text-nano-retrieval is asymmetric: `config_sentence_transformers.json`
+/// declares `{"query": "Query: ", "document": "Document: "}` and the model card requires both
+/// sides for the retrieval variant.
+pub(super) const JINA_QUERY_PREFIX: &str = "Query:";
+pub(super) const JINA_DOCUMENT_PREFIX: &str = "Document:";
+
 pub(super) const CODERANK_EMBEDDING_REPO: &str = "Zenabius/CodeRankEmbed-onnx";
+pub(super) const CODERANK_EMBEDDING_REVISION: &str = "e6a6893986a9aaf09a6aa177f42ebc73bb623cca";
 pub(super) const CODERANK_QUERY_PREFIX: &str = "Represent this query for searching relevant code:";
 
-pub const POTION_CODE_REPO: &str = "minishlab/potion-code-16M";
+pub const POTION_CODE_REPO: &str = "minishlab/potion-code-16M-v2";
+/// Immutable upstream revision the potion assets are pinned to, so a silent
+/// upstream update can never swap the weights under an existing index.
+pub const POTION_CODE_REVISION: &str = "e9d2a44ca6a05ac6685f3b23709ea57eb7352d5b";
 pub const POTION_CODE_TOKENIZER_FILE: &str = "tokenizer.json";
 pub const POTION_CODE_MODEL_FILE: &str = "model.safetensors";
 pub const POTION_CODE_CONFIG_FILE: &str = "config.json";
@@ -31,6 +44,7 @@ pub const POTION_CODE_MAX_LENGTH: usize = 512;
 
 pub const LOCAL_EMBEDDING_REPO_ENV: &str = "VERA_LOCAL_EMBEDDING_REPO";
 pub const LOCAL_EMBEDDING_DIR_ENV: &str = "VERA_LOCAL_EMBEDDING_DIR";
+pub const LOCAL_EMBEDDING_REVISION_ENV: &str = "VERA_LOCAL_EMBEDDING_REVISION";
 pub const LOCAL_EMBEDDING_ONNX_FILE_ENV: &str = "VERA_LOCAL_EMBEDDING_ONNX_FILE";
 pub const LOCAL_EMBEDDING_ONNX_DATA_FILE_ENV: &str = "VERA_LOCAL_EMBEDDING_ONNX_DATA_FILE";
 pub const LOCAL_EMBEDDING_TOKENIZER_FILE_ENV: &str = "VERA_LOCAL_EMBEDDING_TOKENIZER_FILE";
@@ -38,9 +52,11 @@ pub const LOCAL_EMBEDDING_DIM_ENV: &str = "VERA_LOCAL_EMBEDDING_DIM";
 pub const LOCAL_EMBEDDING_POOLING_ENV: &str = "VERA_LOCAL_EMBEDDING_POOLING";
 pub const LOCAL_EMBEDDING_MAX_LENGTH_ENV: &str = "VERA_LOCAL_EMBEDDING_MAX_LENGTH";
 pub const LOCAL_EMBEDDING_QUERY_PREFIX_ENV: &str = "VERA_LOCAL_EMBEDDING_QUERY_PREFIX";
+pub const LOCAL_EMBEDDING_DOCUMENT_PREFIX_ENV: &str = "VERA_LOCAL_EMBEDDING_DOCUMENT_PREFIX";
 pub const LEGACY_EMBEDDING_QUERY_PREFIX_ENV: &str = "VERA_EMBEDDING_QUERY_PREFIX";
 
 pub(super) const RERANKER_REPO: &str = "jinaai/jina-reranker-v2-base-multilingual";
+pub(super) const RERANKER_REVISION: &str = "9cfeff2df7d40d1b78e75e5e9cebec92a99813c9";
 /// No prebuilt reranker ONNX export runs on the CoreML GPU: the quantized
 /// export contains DynamicQuantizeLinear/MatMulInteger ops the CoreML EP cannot
 /// execute, and the fp16 export stores every tensor as float16 which the CoreML
@@ -52,6 +68,10 @@ pub(super) const RERANKER_REPO: &str = "jinaai/jina-reranker-v2-base-multilingua
 /// the all-green probe does not mislead users.
 pub const RERANKER_ONNX_FILE: &str = "onnx/model_quantized.onnx";
 pub(super) const RERANKER_TOKENIZER_FILE: &str = "tokenizer.json";
+pub const LOCAL_RERANKER_REPO_ENV: &str = "LOCAL_RERANKER_REPO";
+pub const LOCAL_RERANKER_REVISION_ENV: &str = "LOCAL_RERANKER_REVISION";
+pub const LOCAL_RERANKER_ONNX_FILE_ENV: &str = "LOCAL_RERANKER_ONNX_FILE";
+pub const LOCAL_RERANKER_TOKENIZER_FILE_ENV: &str = "LOCAL_RERANKER_TOKENIZER_FILE";
 
 /// Execution provider the reranker session must use for a given backend.
 ///
@@ -71,6 +91,19 @@ pub fn reranker_execution_provider(
     }
 }
 
+/// CodeRankEmbed's CoreML graph has a dynamic output dimension that CoreML
+/// accepts during session construction but rejects during inference.
+pub fn embedding_execution_provider(
+    ep: crate::config::OnnxExecutionProvider,
+    model: &LocalEmbeddingModelConfig,
+) -> crate::config::OnnxExecutionProvider {
+    if ep == crate::config::OnnxExecutionProvider::CoreMl && model.is_coderankembed_preset() {
+        crate::config::OnnxExecutionProvider::Cpu
+    } else {
+        ep
+    }
+}
+
 /// ONNX Runtime version to auto-download. Using 1.24.4 for CUDA 13 support.
 /// The `ort` crate (rc.11) uses `load-dynamic` so any ABI-compatible ORT works.
 pub(super) const ORT_VERSION: &str = "1.24.4";
@@ -87,11 +120,120 @@ pub(super) const ORT_VERSION_MACOS_X86: &str = "1.23.2";
 pub(super) static ORT_INIT_RESULT: OnceLock<std::result::Result<(), String>> = OnceLock::new();
 pub(super) static MODEL_DOWNLOAD_ATTEMPT: AtomicU64 = AtomicU64::new(0);
 
+pub(super) fn sha256_hex(reader: impl Read) -> Result<String> {
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    let mut reader = reader;
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
+pub(super) fn verify_sha256(reader: impl Read, expected: &str, label: &str) -> Result<()> {
+    let actual = sha256_hex(reader)?;
+    if !actual.eq_ignore_ascii_case(expected) {
+        anyhow::bail!("{label} SHA-256 mismatch: expected {expected}, got {actual}");
+    }
+    Ok(())
+}
+
+pub(super) fn expected_model_sha256(
+    repo: &str,
+    revision: Option<&str>,
+    file: &str,
+) -> Option<&'static str> {
+    let revision = revision?;
+    match (repo, revision, file) {
+        (EMBEDDING_REPO, EMBEDDING_REVISION, EMBEDDING_ONNX_FILE) => {
+            Some("ac93a7417c216e5076e37da2b3599f7ef16513934098a477680440c09f735a08")
+        }
+        (EMBEDDING_REPO, EMBEDDING_REVISION, EMBEDDING_ONNX_DATA_FILE) => {
+            Some("ee7870eb143a7353be08b33f79992a51de3e32b41f684ccd82953a710c2f2f9c")
+        }
+        (EMBEDDING_REPO, EMBEDDING_REVISION, EMBEDDING_ONNX_GPU_FILE) => {
+            Some("028918f8c20e4f858dfcdf41e950f24194862c25422fd2d0299286855b446f06")
+        }
+        (EMBEDDING_REPO, EMBEDDING_REVISION, EMBEDDING_ONNX_GPU_DATA_FILE) => {
+            Some("1564cc224352ff170df0d861bfa4f50f3a8c7f9f88b253420fff286d0ebc3b51")
+        }
+        (EMBEDDING_REPO, EMBEDDING_REVISION, EMBEDDING_TOKENIZER_FILE) => {
+            Some("98d4a1d32152d6cedf85b5e88f3b205106dca1fe72aaab34e0ac13c238421069")
+        }
+        (CODERANK_EMBEDDING_REPO, CODERANK_EMBEDDING_REVISION, "onnx/model_quantized.onnx") => {
+            Some("732d85552abc1c7f3d8d755a7cbb2df1563d8acafb0d42192971ce078409d06c")
+        }
+        (CODERANK_EMBEDDING_REPO, CODERANK_EMBEDDING_REVISION, "tokenizer.json") => {
+            Some("91f1def9b9391fdabe028cd3f3fcc4efd34e5d1f08c3bf2de513ebb5911a1854")
+        }
+        (RERANKER_REPO, RERANKER_REVISION, RERANKER_ONNX_FILE) => {
+            Some("c5220cf8fe023f8aa0ed2a3eb787d4451a7f17cf53f6b787e35718dd4b8815c3")
+        }
+        (RERANKER_REPO, RERANKER_REVISION, RERANKER_TOKENIZER_FILE) => {
+            Some("3a56def25aa40facc030ea8b0b87f3688e4b3c39eb8b45d5702b3a1300fe2a20")
+        }
+        (POTION_CODE_REPO, POTION_CODE_REVISION, POTION_CODE_MODEL_FILE) => {
+            Some("75cf7a6c2171b230ad19b1e7d8e0b1aee86da5a02af8e7cacedd9921d227623c")
+        }
+        (POTION_CODE_REPO, POTION_CODE_REVISION, POTION_CODE_TOKENIZER_FILE) => {
+            Some("107bbdcbad4bff1d299b7a4c3a2fb17c52890688b7dd0e4c9deab79d3c4f3d45")
+        }
+        (POTION_CODE_REPO, POTION_CODE_REVISION, POTION_CODE_CONFIG_FILE) => {
+            Some("148e5691a6fcc553437156859701fba017a1ba5d340b170f17e0f3668fb861a7")
+        }
+        _ => None,
+    }
+}
+
+pub(super) fn expected_ort_archive_sha256(archive_filename: &str) -> Option<&'static str> {
+    match archive_filename {
+        "onnxruntime-linux-aarch64-1.24.4.tgz" => {
+            Some("866109a9248d057671a039b9d725be4bd86888e3754140e6701ec621be9d4d7e")
+        }
+        "onnxruntime-linux-x64-1.24.4.tgz" => {
+            Some("3a211fbea252c1e66290658f1b735b772056149f28321e71c308942cdb54b747")
+        }
+        "onnxruntime-linux-x64-gpu-1.24.4.tgz" => {
+            Some("c5f804ff5d239b436fa59e9f2fb288a39f7eb9552f6a636c8b71e792e91a8808")
+        }
+        "onnxruntime-linux-x64-gpu_cuda13-1.24.4.tgz" => {
+            Some("fdc6eb18317b4eaeda8b3b86595e5da7e853f72bac67ccac9b04ffc20c9f7fe0")
+        }
+        "onnxruntime-osx-arm64-1.24.4.tgz" => {
+            Some("93787795f47e1eee369182e43ed51b9e5da0878ab0346aecf4258979b8bba989")
+        }
+        "onnxruntime-osx-x86_64-1.23.2.tgz" => {
+            Some("d10359e16347b57d9959f7e80a225a5b4a66ed7d7e007274a15cae86836485a6")
+        }
+        "onnxruntime-win-x64-1.24.4.zip" => {
+            Some("d2319fddfb6ea4db99ccc4b60c85c517bcd855721f5daa6a06d40d7cb2ee2357")
+        }
+        "onnxruntime-win-x64-gpu-1.24.4.zip" => {
+            Some("ef3337a0b8184eb8beec310f7c83bd50376b3eefc43aab84ac8e452f6987df0a")
+        }
+        "onnxruntime-win-x64-gpu_cuda13-1.24.4.zip" => {
+            Some("971be8cf984950672934a3173669590a8ece10b44746883420da8066ba836707")
+        }
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum LocalEmbeddingPooling {
     Mean,
     Cls,
+    /// Take the final unpadded token. Required by jina-embeddings-v5, whose
+    /// `1_Pooling/config.json` sets `pooling_mode_lasttoken`.
+    LastToken,
 }
 
 impl fmt::Display for LocalEmbeddingPooling {
@@ -99,6 +241,7 @@ impl fmt::Display for LocalEmbeddingPooling {
         match self {
             Self::Mean => write!(f, "mean"),
             Self::Cls => write!(f, "cls"),
+            Self::LastToken => write!(f, "last-token"),
         }
     }
 }
@@ -110,8 +253,9 @@ impl std::str::FromStr for LocalEmbeddingPooling {
         match value.trim().to_ascii_lowercase().as_str() {
             "mean" => Ok(Self::Mean),
             "cls" => Ok(Self::Cls),
+            "last-token" | "lasttoken" | "last_token" => Ok(Self::LastToken),
             other => Err(format!(
-                "invalid pooling mode: {other} (expected `mean` or `cls`)"
+                "invalid pooling mode: {other} (expected `mean`, `cls` or `last-token`)"
             )),
         }
     }
@@ -127,6 +271,8 @@ pub enum LocalEmbeddingSource {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LocalEmbeddingModelConfig {
     pub source: LocalEmbeddingSource,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<String>,
     pub onnx_file: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub onnx_data_file: Option<String>,
@@ -137,6 +283,8 @@ pub struct LocalEmbeddingModelConfig {
     pub max_length: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub query_prefix: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub document_prefix: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -155,14 +303,17 @@ impl Default for LocalEmbeddingModelConfig {
 impl LocalEmbeddingModelConfig {
     fn preset(
         repo: &str,
+        revision: Option<&str>,
         onnx_data_file: Option<&str>,
         pooling: LocalEmbeddingPooling,
         query_prefix: Option<&str>,
+        document_prefix: Option<&str>,
     ) -> Self {
         Self {
             source: LocalEmbeddingSource::HuggingFace {
                 repo: repo.to_string(),
             },
+            revision: revision.map(str::to_string),
             onnx_file: EMBEDDING_ONNX_FILE.to_string(),
             onnx_data_file: onnx_data_file.map(str::to_string),
             tokenizer_file: EMBEDDING_TOKENIZER_FILE.to_string(),
@@ -170,25 +321,77 @@ impl LocalEmbeddingModelConfig {
             pooling,
             max_length: EMBEDDING_MAX_LENGTH,
             query_prefix: query_prefix.map(str::to_string),
+            document_prefix: document_prefix.map(str::to_string),
         }
     }
 
+    /// `jina-embeddings-v5-text-nano-retrieval` pools on the final token, not
+    /// the mean: `1_Pooling/config.json` sets `pooling_mode_lasttoken`, and the
+    /// ONNX graph carries a matching `lasttoken_squeeze` + normalize path whose
+    /// result it exposes as a second `sentence_embedding` output.
     pub fn jina() -> Self {
         Self::preset(
             EMBEDDING_REPO,
+            Some(EMBEDDING_REVISION),
             Some(EMBEDDING_ONNX_DATA_FILE),
-            LocalEmbeddingPooling::Mean,
-            None,
+            LocalEmbeddingPooling::LastToken,
+            Some(JINA_QUERY_PREFIX),
+            Some(JINA_DOCUMENT_PREFIX),
         )
     }
 
     pub fn coderankembed() -> Self {
         Self::preset(
             CODERANK_EMBEDDING_REPO,
+            Some(CODERANK_EMBEDDING_REVISION),
             None,
             LocalEmbeddingPooling::Cls,
             Some(CODERANK_QUERY_PREFIX),
+            None,
         )
+    }
+
+    /// The exact model config `vera setup` froze into `config.json` for jina
+    /// before the pooling fix.
+    ///
+    /// Frozen literals, never the `EMBEDDING_*` constants. This describes a
+    /// file already sitting on someone's disk, so it must not follow the live
+    /// preset: deriving it from the constants means the day one of them moves
+    /// — raising `EMBEDDING_MAX_LENGTH` for #67, renaming an ONNX export — the
+    /// literal stops matching any real pre-fix config and the migration
+    /// silently never fires again, leaving every such install mean-pooled with
+    /// no error. `legacy_jina_literal_stays_pinned_when_the_constants_move` is
+    /// the tripwire for that.
+    fn legacy_jina_before_pooling_fix() -> Self {
+        Self {
+            source: LocalEmbeddingSource::HuggingFace {
+                repo: "jinaai/jina-embeddings-v5-text-nano-retrieval".to_string(),
+            },
+            revision: None,
+            onnx_file: "onnx/model_quantized.onnx".to_string(),
+            onnx_data_file: Some("onnx/model_quantized.onnx_data".to_string()),
+            tokenizer_file: "tokenizer.json".to_string(),
+            embedding_dim: 768,
+            pooling: LocalEmbeddingPooling::Mean,
+            max_length: 512,
+            query_prefix: None,
+            document_prefix: None,
+        }
+    }
+
+    /// Repair a stored config that froze jina's old mean-pooling default.
+    ///
+    /// `vera setup` writes the resolved model config to `config.json` and that
+    /// copy wins over the preset, so an install created before this fix would
+    /// keep mean-pooling jina forever. Only the exact old preset is upgraded;
+    /// a config differing in any field is treated as deliberate and left
+    /// alone.
+    pub fn repair_stored_defaults(self) -> Self {
+        if self == Self::legacy_jina_before_pooling_fix() {
+            Self::jina()
+        } else {
+            self
+        }
     }
 
     pub fn from_huggingface_repo(repo: impl Into<String>) -> Self {
@@ -199,10 +402,10 @@ impl LocalEmbeddingModelConfig {
     }
 
     pub fn from_directory(path: PathBuf) -> Self {
-        Self {
-            source: LocalEmbeddingSource::Directory { path },
-            ..Self::default()
-        }
+        let source = LocalEmbeddingSource::Directory { path };
+        let mut defaults = Self::defaults_for_source(&source);
+        defaults.source = source;
+        defaults
     }
 
     /// Switch to the FP16 ONNX model when running on a GPU execution provider.
@@ -222,13 +425,13 @@ impl LocalEmbeddingModelConfig {
         // non-default value via env vars. Note: the CLI config loader sets
         // this env var from saved config even for default values, so we
         // check the actual value, not just presence.
-        if let Some(env_val) = env_override(LOCAL_EMBEDDING_ONNX_FILE_ENV) {
-            if env_val != EMBEDDING_ONNX_FILE {
-                tracing::debug!(
-                    "adjust_for_gpu: user overrode ONNX file via env to {env_val}, skipping swap"
-                );
-                return;
-            }
+        if let Some(env_val) = env_override(LOCAL_EMBEDDING_ONNX_FILE_ENV)
+            && env_val != EMBEDDING_ONNX_FILE
+        {
+            tracing::debug!(
+                "adjust_for_gpu: user overrode ONNX file via env to {env_val}, skipping swap"
+            );
+            return;
         }
         if matches!(
             &self.source,
@@ -246,6 +449,14 @@ impl LocalEmbeddingModelConfig {
                 self.onnx_file
             );
         }
+    }
+
+    fn is_coderankembed_preset(&self) -> bool {
+        let mut config = self.clone();
+        config.revision = None;
+        let mut preset = Self::coderankembed();
+        preset.revision = None;
+        config == preset
     }
 
     pub fn from_env() -> Result<Self> {
@@ -277,44 +488,126 @@ impl LocalEmbeddingModelConfig {
     }
 
     pub fn model_identity(&self) -> String {
-        if self == &Self::jina() || self == &Self::coderankembed() {
-            return self.display_name();
-        }
-
-        let source = match &self.source {
-            LocalEmbeddingSource::HuggingFace { repo } => format!("hf:{repo}"),
-            LocalEmbeddingSource::Directory { path } => format!("dir:{}", path.display()),
+        // Presets keep a readable identity, but pooling has to stay in it.
+        // Vectors pooled two different ways are not comparable, so a pooling
+        // change must invalidate an existing index rather than silently query
+        // mean-pooled rows with last-token vectors.
+        let mut identity_config = self.clone();
+        identity_config.revision = None;
+        let identity = if identity_config.is_jina_preset()
+            || identity_config.is_coderankembed_preset()
+        {
+            format!(
+                "{}|pooling={}|qp={}|dp={}",
+                self.display_name(),
+                self.pooling,
+                Self::prefix_identity(self.query_prefix.as_deref()),
+                Self::prefix_identity(self.document_prefix.as_deref()),
+            )
+        } else {
+            let source = match &self.source {
+                LocalEmbeddingSource::HuggingFace { repo } => format!("hf:{repo}"),
+                LocalEmbeddingSource::Directory { path } => format!("dir:{}", path.display()),
+            };
+            let onnx_data = self.onnx_data_file.as_deref().unwrap_or("-");
+            format!(
+                "{source}|onnx={}|onnx_data={onnx_data}|tokenizer={}|pooling={}|dim={}|max_length={}|qp={}|dp={}",
+                self.onnx_file,
+                self.tokenizer_file,
+                self.pooling,
+                self.embedding_dim,
+                self.max_length,
+                Self::prefix_identity(self.query_prefix.as_deref()),
+                Self::prefix_identity(self.document_prefix.as_deref()),
+            )
         };
-        let onnx_data = self.onnx_data_file.as_deref().unwrap_or("-");
-        format!(
-            "{source}|onnx={}|onnx_data={onnx_data}|tokenizer={}|pooling={}|dim={}|max_length={}",
-            self.onnx_file, self.tokenizer_file, self.pooling, self.embedding_dim, self.max_length
-        )
+
+        // Normalize so a hand-edited config agrees with the validated cache
+        // path and download URL. An invalid revision fails asset resolution
+        // before it can be downloaded, so the trimmed raw value is a safe
+        // fallback that keeps such configs distinguishable.
+        match self.revision.as_deref().map(str::trim) {
+            Some(revision) if !revision.is_empty() && revision != "main" => {
+                let revision =
+                    normalize_model_revision(revision).unwrap_or_else(|_| revision.to_string());
+                format!("{identity}|revision={revision}")
+            }
+            _ => identity,
+        }
+    }
+
+    fn is_jina_preset(&self) -> bool {
+        let mut config = self.clone();
+        config.revision = None;
+        let mut preset = Self::jina();
+        preset.revision = None;
+        config == preset
+    }
+
+    /// The canonical form of a configured prefix: trimmed, and absent once
+    /// nothing is left of it.
+    ///
+    /// Both the text that gets embedded and the identity that guards the index
+    /// go through here, so two configs that embed byte-identical text can never
+    /// disagree about whether the index is stale.
+    fn normalize_prefix(prefix: Option<&str>) -> Option<&str> {
+        prefix.map(str::trim).filter(|value| !value.is_empty())
+    }
+
+    /// Encode a prefix for `model_identity`.
+    ///
+    /// Length-delimited, because `|qp=` and `|dp=` are otherwise ordinary text:
+    /// a prefix containing one moved the field boundary, so
+    /// `qp="a" dp="b|dp=c"` and `qp="a|dp=b" dp="c"` encoded to the same
+    /// string. The absent case gets a marker no encoded value can spell, since
+    /// a present prefix always starts with its length; `unwrap_or("-")` used to
+    /// give an unprefixed config and one prefixed with a literal `-` the same
+    /// identity, so the staleness guard let their vectors share a table.
+    fn prefix_identity(prefix: Option<&str>) -> String {
+        match Self::normalize_prefix(prefix) {
+            Some(value) => format!("{}:{value}", value.len()),
+            None => "none".to_string(),
+        }
+    }
+
+    /// Join a configured prefix to a text with exactly one space.
+    ///
+    /// The prefix is trimmed first, so a trailing space in the configured
+    /// value cannot double up. That trim is also why there is no
+    /// whitespace-preserving branch: a trimmed prefix can never end in
+    /// whitespace by the time it is joined.
+    fn apply_prefix(prefix: Option<&str>, text: &str) -> String {
+        let Some(prefix) = Self::normalize_prefix(prefix) else {
+            return text.to_string();
+        };
+        format!("{prefix} {text}")
     }
 
     pub fn query_text(&self, query: &str) -> String {
-        let Some(prefix) = self
-            .query_prefix
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        else {
-            return query.to_string();
-        };
+        Self::apply_prefix(self.query_prefix.as_deref(), query)
+    }
 
-        if prefix.chars().last().is_some_and(char::is_whitespace) {
-            format!("{prefix}{query}")
-        } else {
-            format!("{prefix} {query}")
-        }
+    /// Prefix an indexed passage. Mirrors `query_text` and is applied only on
+    /// the indexing path, so a query never receives it.
+    pub fn document_text(&self, document: &str) -> String {
+        Self::apply_prefix(self.document_prefix.as_deref(), document)
     }
 
     pub fn cached_asset_paths(&self) -> Result<LocalEmbeddingAssetPaths> {
+        let revision = normalize_optional_model_revision(self.revision.as_deref())?;
         let base_dir = match &self.source {
             LocalEmbeddingSource::HuggingFace { repo } => {
-                vera_home_dir()?.join("models").join(repo)
+                model_cache_dir(&vera_home_dir()?, repo, revision.as_deref())?
             }
-            LocalEmbeddingSource::Directory { path } => path.clone(),
+            LocalEmbeddingSource::Directory { path } => {
+                if revision.is_some() {
+                    anyhow::bail!(
+                        "embedding revision cannot be used with a directory source: {}",
+                        path.display()
+                    );
+                }
+                path.clone()
+            }
         };
         Ok(LocalEmbeddingAssetPaths {
             onnx_path: base_dir.join(&self.onnx_file),
@@ -328,14 +621,38 @@ impl LocalEmbeddingModelConfig {
             LocalEmbeddingSource::HuggingFace { repo } if repo == CODERANK_EMBEDDING_REPO => {
                 Self::coderankembed()
             }
-            _ => Self::default(),
+            LocalEmbeddingSource::HuggingFace { repo } if repo == EMBEDDING_REPO => Self::jina(),
+            _ => Self::generic_defaults(),
         }
+    }
+
+    /// Asset shape for a repo Vera has no preset for: jina's file layout and
+    /// dimensions, with mean pooling.
+    ///
+    /// Held separate from `jina()` so that jina's own pooling can be correct
+    /// without changing how every custom repo is pooled. `from_source`
+    /// overwrites `source`, so only the non-source fields are inherited.
+    fn generic_defaults() -> Self {
+        Self::preset(
+            EMBEDDING_REPO,
+            None,
+            Some(EMBEDDING_ONNX_DATA_FILE),
+            LocalEmbeddingPooling::Mean,
+            None,
+            None,
+        )
     }
 
     fn apply_env_overrides(defaults: Self) -> Result<Self> {
         let explicit_model_env = model_source_and_onnx_file_are_set();
+        let revision = revision_from_env(LOCAL_EMBEDDING_REVISION_ENV, defaults.revision)?;
+        if revision.is_some() && matches!(&defaults.source, LocalEmbeddingSource::Directory { .. })
+        {
+            anyhow::bail!("embedding revision cannot be used with a directory source");
+        }
         Ok(Self {
             source: defaults.source,
+            revision,
             onnx_file: env_override(LOCAL_EMBEDDING_ONNX_FILE_ENV)
                 .unwrap_or_else(|| defaults.onnx_file.clone()),
             onnx_data_file: env_optional_override(
@@ -348,9 +665,136 @@ impl LocalEmbeddingModelConfig {
             embedding_dim: parse_env_usize(LOCAL_EMBEDDING_DIM_ENV, defaults.embedding_dim)?,
             pooling: parse_pooling_env(LOCAL_EMBEDDING_POOLING_ENV, defaults.pooling)?,
             max_length: parse_env_usize(LOCAL_EMBEDDING_MAX_LENGTH_ENV, defaults.max_length)?,
-            query_prefix: parse_query_prefix_from_env().or_else(|| defaults.query_prefix.clone()),
+            query_prefix: query_prefix_from_env(defaults.query_prefix.clone(), explicit_model_env),
+            document_prefix: env_optional_override(
+                LOCAL_EMBEDDING_DOCUMENT_PREFIX_ENV,
+                defaults.document_prefix.clone(),
+                explicit_model_env,
+            ),
         })
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalRerankerConfig {
+    pub repo: String,
+    pub revision: Option<String>,
+    pub onnx_file: String,
+    pub tokenizer_file: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct LocalRerankerAssetPaths {
+    pub onnx_path: PathBuf,
+    pub tokenizer_path: PathBuf,
+}
+
+impl Default for LocalRerankerConfig {
+    fn default() -> Self {
+        Self {
+            repo: RERANKER_REPO.to_string(),
+            revision: Some(RERANKER_REVISION.to_string()),
+            onnx_file: RERANKER_ONNX_FILE.to_string(),
+            tokenizer_file: RERANKER_TOKENIZER_FILE.to_string(),
+        }
+    }
+}
+
+impl LocalRerankerConfig {
+    pub fn from_env() -> Result<Self> {
+        let defaults = Self::default();
+        let repo = env_override(LOCAL_RERANKER_REPO_ENV)
+            .map(|repo| normalize_huggingface_repo(&repo))
+            .transpose()?
+            .unwrap_or_else(|| defaults.repo.clone());
+        let default_revision = (repo == RERANKER_REPO)
+            .then_some(defaults.revision)
+            .flatten();
+        Ok(Self {
+            repo,
+            revision: revision_from_env(LOCAL_RERANKER_REVISION_ENV, default_revision)?,
+            onnx_file: env_override(LOCAL_RERANKER_ONNX_FILE_ENV).unwrap_or(defaults.onnx_file),
+            tokenizer_file: env_override(LOCAL_RERANKER_TOKENIZER_FILE_ENV)
+                .unwrap_or(defaults.tokenizer_file),
+        })
+    }
+
+    pub fn cached_asset_paths(&self) -> Result<LocalRerankerAssetPaths> {
+        let revision = normalize_optional_model_revision(self.revision.as_deref())?;
+        let model_dir = model_cache_dir(&vera_home_dir()?, &self.repo, revision.as_deref())?;
+        Ok(LocalRerankerAssetPaths {
+            onnx_path: model_dir.join(&self.onnx_file),
+            tokenizer_path: model_dir.join(&self.tokenizer_file),
+        })
+    }
+}
+
+/// Normalize and validate a Hugging Face revision used for local model assets.
+///
+/// Revisions may contain slash-separated refs such as `refs/pr/123`, but every
+/// component must be a normal relative path component so it cannot escape the
+/// model cache or alter the Hub URL path. `|` is rejected because
+/// `model_identity` uses it as the field delimiter.
+pub fn normalize_model_revision(value: &str) -> Result<String> {
+    let revision = value.trim();
+    if revision.is_empty() {
+        anyhow::bail!("embedding revision cannot be empty");
+    }
+    if revision.starts_with('/')
+        || revision.ends_with('/')
+        || revision.contains("//")
+        || revision.contains('\\')
+        || revision.contains('?')
+        || revision.contains('#')
+        || revision.contains('%')
+        || revision.contains('|')
+        || revision.chars().any(char::is_control)
+    {
+        anyhow::bail!("invalid embedding revision: {revision}");
+    }
+
+    for component in revision.split('/') {
+        if component.is_empty() || component == "." || component == ".." {
+            anyhow::bail!("invalid embedding revision: {revision}");
+        }
+    }
+
+    Ok(revision.to_string())
+}
+
+pub(super) fn normalize_optional_model_revision(revision: Option<&str>) -> Result<Option<String>> {
+    revision.map(normalize_model_revision).transpose()
+}
+
+fn revision_from_env(key: &str, default: Option<String>) -> Result<Option<String>> {
+    match std::env::var(key) {
+        Ok(value) if value.trim().is_empty() => Ok(None),
+        Ok(value) => Ok(Some(normalize_model_revision(&value)?)),
+        Err(std::env::VarError::NotPresent) => {
+            default.as_deref().map(normalize_model_revision).transpose()
+        }
+        Err(error) => Err(error).with_context(|| format!("failed to read {key}")),
+    }
+}
+
+pub(super) fn model_cache_dir(
+    home_dir: &Path,
+    repo: &str,
+    revision: Option<&str>,
+) -> Result<PathBuf> {
+    let base_dir = home_dir.join("models").join(repo);
+    let Some(revision) = normalize_optional_model_revision(revision)? else {
+        return Ok(base_dir);
+    };
+    if revision == "main" {
+        return Ok(base_dir);
+    }
+
+    let mut path = base_dir.join("revisions");
+    for component in revision.split('/') {
+        path.push(component);
+    }
+    Ok(path)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -418,6 +862,13 @@ fn env_optional_override(
     resolve_optional_env_value(value.as_deref(), default, explicit_model_env)
 }
 
+/// Resolve a field whose absence is meaningful.
+///
+/// Unlike `env_override`, a variable that is set but empty is not the same as
+/// an unset one: it is the opt-out, and returns `None` without consulting the
+/// default. An unset variable falls back to the preset default unless the
+/// caller spelled the model out through the environment, in which case nothing
+/// is inherited from the preset.
 fn resolve_optional_env_value(
     value: Option<&str>,
     default: Option<String>,
@@ -458,9 +909,23 @@ pub(super) fn parse_pooling_env(
     }
 }
 
-pub(super) fn parse_query_prefix_from_env() -> Option<String> {
-    env_override(LOCAL_EMBEDDING_QUERY_PREFIX_ENV)
-        .or_else(|| env_override(LEGACY_EMBEDDING_QUERY_PREFIX_ENV))
+/// Resolve the query prefix from the canonical variable, then the legacy one.
+///
+/// The canonical variable is consulted even when it is empty: an empty value is
+/// the opt-out, so it has to suppress the legacy variable rather than fall
+/// through to it.
+pub(super) fn query_prefix_from_env(
+    default: Option<String>,
+    explicit_model_env: bool,
+) -> Option<String> {
+    match std::env::var(LOCAL_EMBEDDING_QUERY_PREFIX_ENV) {
+        Ok(value) => resolve_optional_env_value(Some(&value), default, explicit_model_env),
+        Err(_) => env_optional_override(
+            LEGACY_EMBEDDING_QUERY_PREFIX_ENV,
+            default,
+            explicit_model_env,
+        ),
+    }
 }
 
 pub fn normalize_huggingface_repo(value: &str) -> Result<String> {
@@ -498,14 +963,15 @@ pub(crate) mod ort;
 mod tests;
 
 pub use assets::{
-    configured_local_model_name, ensure_local_embedding_assets, ensure_model_file,
-    ensure_potion_code_assets, inspect_local_model_files_for_ep, inspect_potion_code_model_files,
-    potion_code_model_dir, potion_code_model_name, prepare_local_models_for_ep,
+    configured_local_model_name, ensure_local_embedding_assets, ensure_local_reranker_assets,
+    ensure_model_file, ensure_potion_code_assets, inspect_local_model_files_for_ep,
+    inspect_potion_code_model_files, potion_code_model_dir, potion_code_model_name,
+    prepare_local_models_for_ep,
 };
 pub use ort::{
     ensure_ort_library_for_ep, ensure_ort_runtime, ensure_provider_dependencies,
-    inspect_provider_dependencies, inspect_shared_library_deps, ort_library_path_for_ep,
-    refresh_ort_library_for_ep, wrap_ort_error,
+    inspect_provider_dependencies, ort_library_path_for_ep, refresh_ort_library_for_ep,
+    wrap_ort_error,
 };
 
 /// Return Vera's home directory.
@@ -516,10 +982,10 @@ pub use ort::{
 /// 3. `$XDG_DATA_HOME/vera` (XDG standard, defaults to `~/.local/share/vera`)
 /// 4. `~/.vera` as final fallback
 pub fn vera_home_dir() -> Result<PathBuf> {
-    if let Ok(path) = std::env::var("VERA_HOME") {
-        if !path.trim().is_empty() {
-            return Ok(PathBuf::from(path));
-        }
+    if let Ok(path) = std::env::var("VERA_HOME")
+        && !path.trim().is_empty()
+    {
+        return Ok(PathBuf::from(path));
     }
 
     let home = dirs::home_dir().context("Could not find home directory")?;
@@ -558,6 +1024,25 @@ mod finding_tests {
         ] {
             assert_eq!(reranker_execution_provider(ep), ep);
         }
+    }
+
+    #[test]
+    fn coderank_embedding_runs_on_cpu_under_coreml_only() {
+        let coderank = LocalEmbeddingModelConfig::coderankembed();
+        assert_eq!(
+            embedding_execution_provider(OnnxExecutionProvider::CoreMl, &coderank),
+            OnnxExecutionProvider::Cpu
+        );
+        assert_eq!(
+            embedding_execution_provider(OnnxExecutionProvider::Cuda, &coderank),
+            OnnxExecutionProvider::Cuda
+        );
+
+        let jina = LocalEmbeddingModelConfig::jina();
+        assert_eq!(
+            embedding_execution_provider(OnnxExecutionProvider::CoreMl, &jina),
+            OnnxExecutionProvider::CoreMl
+        );
     }
 
     #[test]

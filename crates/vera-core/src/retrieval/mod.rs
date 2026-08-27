@@ -42,13 +42,45 @@ pub mod regex_search;
 pub mod structural;
 
 pub use local_reranker::LocalReranker;
-pub use references::search_callers;
+pub use references::{search_callers, search_callers_through};
 pub use regex_search::search_regex;
 pub use structural::{StructuralSearchKind, search_structural};
 
 pub use vector::{VectorSearchError, search_vector_with_stores};
 
+use crate::config::{DEFAULT_MAX_FILE_SIZE_BYTES, IndexingConfig};
+use crate::storage::metadata::MetadataStore;
 use crate::types::{SearchFilters, SearchResult};
+
+/// The file-size cap query-time source reads must honor.
+///
+/// Indexing records its `IndexingConfig` alongside the index, and retrieval
+/// reads files by stored path long after that run, so the recorded cap bounds
+/// query-time reads too (#208). Falls back to the default when the metadata is
+/// absent or undecodable, mirroring how indexing falls back on unreadable
+/// config.
+pub(crate) fn configured_max_file_size_bytes(store: &MetadataStore) -> u64 {
+    match store.get_index_meta(crate::indexing::freshness::INDEXING_CONFIG_KEY) {
+        Ok(Some(encoded)) => match serde_json::from_str::<IndexingConfig>(&encoded) {
+            Ok(config) => config.max_file_size_bytes,
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "failed to decode saved indexing config; using default read cap"
+                );
+                DEFAULT_MAX_FILE_SIZE_BYTES
+            }
+        },
+        Ok(None) => DEFAULT_MAX_FILE_SIZE_BYTES,
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                "failed to read saved indexing config; using default read cap"
+            );
+            DEFAULT_MAX_FILE_SIZE_BYTES
+        }
+    }
+}
 
 #[cfg(test)]
 #[path = "search_quality_tests.rs"]
@@ -74,4 +106,64 @@ pub fn apply_filters(
         .filter(|r| filters.matches(r))
         .take(limit)
         .collect()
+}
+
+/// Collapse whitespace and drop empty or repeated subqueries.
+///
+/// Fusion counts every subquery, so the same query arriving twice would
+/// otherwise weigh double against the ones it was meant to complement.
+pub fn normalize_queries(queries: &[String]) -> Vec<String> {
+    let mut normalized = Vec::with_capacity(queries.len());
+    let mut seen = std::collections::HashSet::new();
+
+    for query in queries {
+        let collapsed = query.split_whitespace().collect::<Vec<_>>().join(" ");
+        if collapsed.is_empty() {
+            continue;
+        }
+        if seen.insert(collapsed.to_ascii_lowercase()) {
+            normalized.push(collapsed);
+        }
+    }
+
+    normalized
+}
+
+/// Candidate width each subquery keeps before multi-query fusion.
+///
+/// A subquery has to over-fetch relative to the caller's limit, or fusion has
+/// nothing to merge: the first subquery alone fills the final window and every
+/// later one is truncated away.
+pub fn multi_query_candidate_limit(result_limit: usize) -> usize {
+    result_limit
+        .saturating_mul(2)
+        .max(result_limit.saturating_add(10))
+        .max(20)
+}
+
+/// Merge per-subquery result sets: equally weighted RRF, then exact-match
+/// augmentation, then the cut to `result_limit`.
+///
+/// `fuse_limit` should be `multi_query_candidate_limit(result_limit)` so
+/// augmentation has candidates to displace; both callers pass that since the
+/// issue #121 fix. It stays a parameter for tests.
+pub fn fuse_and_augment_multi_query(
+    index_dir: &std::path::Path,
+    queries: &[String],
+    result_sets: &[Vec<SearchResult>],
+    filters: &SearchFilters,
+    rrf_k: f64,
+    fuse_limit: usize,
+    result_limit: usize,
+) -> anyhow::Result<Vec<SearchResult>> {
+    let slices: Vec<&[SearchResult]> = result_sets.iter().map(Vec::as_slice).collect();
+    let weights = vec![1.0; result_sets.len()];
+    let fused = fuse_rrf_multi_weighted(&slices, &weights, rrf_k, fuse_limit);
+    exact_matches::augment_multi_query_exact_matches(
+        index_dir,
+        queries,
+        fused,
+        filters,
+        result_limit,
+    )
 }

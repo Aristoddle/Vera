@@ -10,10 +10,7 @@ pub(crate) mod classify;
 pub(crate) mod names;
 mod special_forms;
 
-#[cfg(test)]
-mod tests;
-
-use classify::classify_node;
+use classify::{classify_node, container_body_kinds};
 use names::extract_name;
 use special_forms::*;
 
@@ -68,12 +65,12 @@ pub fn extract_symbols(tree: &tree_sitter::Tree, source: &[u8], lang: Language) 
 /// Returns a sorted list of `(start_row, title_text)` pairs. Rows are 0-based.
 pub fn extract_rst_section_titles(tree: &tree_sitter::Tree, source: &[u8]) -> Vec<(u32, String)> {
     fn walk(node: tree_sitter::Node<'_>, source: &[u8], out: &mut Vec<(u32, String)>) {
-        if node.kind() == "title" {
-            if let Ok(text) = node.utf8_text(source) {
-                let title = text.split_whitespace().collect::<Vec<_>>().join(" ");
-                if !title.is_empty() {
-                    out.push((node.start_position().row as u32, title));
-                }
+        if node.kind() == "title"
+            && let Ok(text) = node.utf8_text(source)
+        {
+            let title = text.split_whitespace().collect::<Vec<_>>().join(" ");
+            if !title.is_empty() {
+                out.push((node.start_position().row as u32, title));
             }
         }
 
@@ -134,6 +131,14 @@ fn collect_symbols(
         return;
     }
 
+    // Anonymous nodes are punctuation and keywords, never symbols. Several
+    // classification tables use a bare keyword as the node kind of the
+    // construct it introduces (Ruby `class`, Fortran `module`), so walking into
+    // a container would otherwise record its own keyword token a second time.
+    if !node.is_named() {
+        return;
+    }
+
     let kind = node.kind();
 
     // Handle Go type_declaration → recurse into type_spec children
@@ -150,14 +155,33 @@ fn collect_symbols(
     }
 
     // Handle R binary_operator (x <- function() { ... }) as named function
-    if lang == Language::R && kind == "binary_operator" {
-        if let Some(rhs) = node.child_by_field_name("rhs") {
-            if rhs.kind() == "function_definition" {
-                let name = extract_name(&node, source);
-                symbols.push(RawSymbol::at(&node, name, SymbolType::Function));
-                return;
-            }
-        }
+    if lang == Language::R
+        && kind == "binary_operator"
+        && let Some(rhs) = node.child_by_field_name("rhs")
+        && rhs.kind() == "function_definition"
+    {
+        let name = extract_name(&node, source);
+        symbols.push(RawSymbol::at(&node, name, SymbolType::Function));
+        return;
+    }
+
+    // Handle TS/JS function-valued bindings: the name lives on the declarator,
+    // and a function initializer makes the binding a function, not a variable.
+    if (lang == Language::TypeScript || lang == Language::JavaScript)
+        && matches!(kind, "lexical_declaration" | "variable_declaration")
+        && let Some(sym) = extract_js_function_binding(&node, source)
+    {
+        symbols.push(sym);
+        return;
+    }
+
+    // Handle Lua function-valued assignments such as `M.setup = function() ... end`.
+    if lang == Language::Lua
+        && matches!(kind, "assignment_statement" | "variable_declaration")
+        && let Some(sym) = extract_lua_function_binding(&node, source)
+    {
+        symbols.push(sym);
+        return;
     }
 
     // Handle Zig variable_declaration -> struct_declaration
@@ -173,64 +197,69 @@ fn collect_symbols(
     }
 
     // Handle Scheme S-expressions: (define (name ...) ...)
-    if lang == Language::Scheme && kind == "list" {
-        if let Some(sym) = extract_scheme_define(&node, source) {
-            symbols.push(sym);
-            return;
-        }
+    if lang == Language::Scheme
+        && kind == "list"
+        && let Some(sym) = extract_scheme_define(&node, source)
+    {
+        symbols.push(sym);
+        return;
     }
 
     // Handle Racket S-expressions: (define (name ...) ...), (module ...), (struct ...)
-    if lang == Language::Racket && kind == "list" {
-        if let Some(sym) = extract_racket_define(&node, source) {
-            symbols.push(sym);
-            return;
-        }
+    if lang == Language::Racket
+        && kind == "list"
+        && let Some(sym) = extract_racket_define(&node, source)
+    {
+        symbols.push(sym);
+        return;
     }
 
     // Handle Clojure S-expressions: (defn name ...), (ns name), (defmacro name ...), (def name ...)
-    if lang == Language::Clojure && kind == "list_lit" {
-        if let Some(sym) = extract_lisp_define(&node, source, CLOJURE_DEFINE_KINDS) {
-            symbols.push(sym);
-            return;
-        }
+    if lang == Language::Clojure
+        && kind == "list_lit"
+        && let Some(sym) = extract_lisp_define(&node, source, CLOJURE_DEFINE_KINDS)
+    {
+        symbols.push(sym);
+        return;
     }
 
     // Handle Common Lisp: defun has defun_header with name; defclass via list_lit
-    if lang == Language::CommonLisp && kind == "defun" {
-        if let Some(sym) = extract_commonlisp_defun(&node, source) {
-            symbols.push(sym);
-            return;
-        }
+    if lang == Language::CommonLisp
+        && kind == "defun"
+        && let Some(sym) = extract_commonlisp_defun(&node, source)
+    {
+        symbols.push(sym);
+        return;
     }
-    if lang == Language::CommonLisp && kind == "list_lit" {
-        if let Some(sym) = extract_lisp_define(&node, source, COMMONLISP_DEFINE_KINDS) {
-            symbols.push(sym);
-            return;
-        }
+    if lang == Language::CommonLisp
+        && kind == "list_lit"
+        && let Some(sym) = extract_lisp_define(&node, source, COMMONLISP_DEFINE_KINDS)
+    {
+        symbols.push(sym);
+        return;
     }
 
     // Handle Elixir calls
-    if lang == Language::Elixir && kind == "call" {
-        if let Some(target) = node.child_by_field_name("target") {
-            if let Ok(text) = target.utf8_text(source) {
-                let sym_type = match text {
-                    "defmodule" => Some(SymbolType::Module),
-                    "def" | "defp" | "defmacro" => Some(SymbolType::Function),
-                    _ => None,
-                };
-                if let Some(st) = sym_type {
-                    let name = extract_elixir_name(&node, source);
-                    symbols.push(RawSymbol::at(&node, name, st));
-                    if text == "defmodule" {
-                        if let Some(do_block) = get_elixir_do_block(&node) {
-                            let mut cursor = do_block.walk();
-                            collect_symbols_cursor(&mut cursor, source, lang, symbols, depth + 1);
-                        }
-                    }
-                    return;
-                }
+    if lang == Language::Elixir
+        && kind == "call"
+        && let Some(target) = node.child_by_field_name("target")
+        && let Ok(text) = target.utf8_text(source)
+    {
+        let sym_type = match text {
+            "defmodule" => Some(SymbolType::Module),
+            "def" | "defp" | "defmacro" => Some(SymbolType::Function),
+            _ => None,
+        };
+        if let Some(st) = sym_type {
+            let name = extract_elixir_name(&node, source);
+            symbols.push(RawSymbol::at(&node, name, st));
+            if text == "defmodule"
+                && let Some(do_block) = get_elixir_do_block(&node)
+            {
+                let mut cursor = do_block.walk();
+                collect_symbols_cursor(&mut cursor, source, lang, symbols, depth + 1);
             }
+            return;
         }
     }
 
@@ -268,9 +297,37 @@ fn collect_symbols(
             }
         }
 
-        // For Rust impl blocks, extract methods inside but also keep the whole block
-        if lang == Language::Rust && kind == "impl_item" {
-            extract_impl_methods(node, source, lang, symbols);
+        // For Rust impl and trait blocks, extract methods inside but also keep
+        // the whole block
+        if lang == Language::Rust && (kind == "impl_item" || kind == "trait_item") {
+            extract_rust_block_methods(node, source, lang, symbols, sym_type);
+            return;
+        }
+
+        // Bash dispatchers commonly put their branches in a case statement;
+        // keep the function and expose each case arm as a named child symbol.
+        if lang == Language::Bash && kind == "function_definition" {
+            extract_bash_case_items(&node, source, symbols);
+            return;
+        }
+
+        // A Rust `mod name { ... }` is a container, not a leaf. Record the
+        // module, then keep walking so the items declared inside it are
+        // extracted as symbols of their own instead of being swallowed by the
+        // module's span. `mod name;` has no body and simply yields nothing more.
+        //
+        // Descend into the `declaration_list` rather than the `mod_item`, the
+        // way `extract_rust_block_methods` does: recursing from the `mod_item`
+        // spends one depth level on the module and a second on its body list,
+        // so three levels of nesting would exhaust the shared budget before
+        // reaching the items inside.
+        if lang == Language::Rust && kind == "mod_item" {
+            let name = extract_name(&node, source);
+            symbols.push(RawSymbol::at(&node, name, sym_type));
+            if let Some(body) = node.child_by_field_name("body") {
+                let mut cursor = body.walk();
+                collect_symbols_cursor(&mut cursor, source, lang, symbols, depth + 1);
+            }
             return;
         }
 
@@ -310,10 +367,11 @@ fn collect_symbols(
             return;
         }
 
-        // For C# namespace, we want to recurse inside.
-        if lang == Language::CSharp
-            && (kind == "namespace_declaration" || kind == "file_scoped_namespace_declaration")
-        {
+        // A container spans its body, so stopping here would swallow every
+        // symbol declared inside it. Record the container under its own
+        // `sym_type`, then keep walking so the items in its body become
+        // symbols of their own.
+        if container_body_kinds(lang).contains(&kind) {
             let name = extract_name(&node, source);
             symbols.push(RawSymbol::at(&node, name, sym_type));
             let mut cursor = node.walk();
@@ -349,42 +407,40 @@ fn collect_symbols(
                 if child.kind() == "service_body" || child.kind() == "block" {
                     let mut inner_cursor = child.walk();
                     for inner_child in child.children(&mut inner_cursor) {
-                        if inner_child.kind() == "rpc"
+                        if (inner_child.kind() == "rpc"
                             || inner_child.kind() == "rpc_definition"
-                            || inner_child.kind() == "rpc_declaration"
+                            || inner_child.kind() == "rpc_declaration")
+                            && let Some(rpc_type) = classify_node(lang, inner_child.kind())
                         {
-                            if let Some(rpc_type) = classify_node(lang, inner_child.kind()) {
-                                let end_byte = inner_child.end_byte();
-                                let end_row = inner_child.end_position().row;
-                                let rpc_name = extract_name(&inner_child, source);
-                                symbols.push(RawSymbol {
-                                    name: rpc_name,
-                                    symbol_type: rpc_type,
-                                    start_byte: inner_child.start_byte(),
-                                    end_byte,
-                                    start_row: inner_child.start_position().row,
-                                    end_row,
-                                });
-                            }
+                            let end_byte = inner_child.end_byte();
+                            let end_row = inner_child.end_position().row;
+                            let rpc_name = extract_name(&inner_child, source);
+                            symbols.push(RawSymbol {
+                                name: rpc_name,
+                                symbol_type: rpc_type,
+                                start_byte: inner_child.start_byte(),
+                                end_byte,
+                                start_row: inner_child.start_position().row,
+                                end_row,
+                            });
                         }
                     }
-                } else if child.kind() == "rpc"
+                } else if (child.kind() == "rpc"
                     || child.kind() == "rpc_definition"
-                    || child.kind() == "rpc_declaration"
+                    || child.kind() == "rpc_declaration")
+                    && let Some(rpc_type) = classify_node(lang, child.kind())
                 {
-                    if let Some(rpc_type) = classify_node(lang, child.kind()) {
-                        let end_byte = child.end_byte();
-                        let end_row = child.end_position().row;
-                        let rpc_name = extract_name(&child, source);
-                        symbols.push(RawSymbol {
-                            name: rpc_name,
-                            symbol_type: rpc_type,
-                            start_byte: child.start_byte(),
-                            end_byte,
-                            start_row: child.start_position().row,
-                            end_row,
-                        });
-                    }
+                    let end_byte = child.end_byte();
+                    let end_row = child.end_position().row;
+                    let rpc_name = extract_name(&child, source);
+                    symbols.push(RawSymbol {
+                        name: rpc_name,
+                        symbol_type: rpc_type,
+                        start_byte: child.start_byte(),
+                        end_byte,
+                        start_row: child.start_position().row,
+                        end_row,
+                    });
                 }
             }
             return;
@@ -393,13 +449,13 @@ fn collect_symbols(
         let mut end_byte = node.end_byte();
         let mut end_row = node.end_position().row;
 
-        if lang == Language::Dart && (kind == "function_signature" || kind == "method_signature") {
-            if let Some(next_sibling) = node.next_sibling() {
-                if next_sibling.kind() == "function_body" {
-                    end_byte = next_sibling.end_byte();
-                    end_row = next_sibling.end_position().row;
-                }
-            }
+        if lang == Language::Dart
+            && (kind == "function_signature" || kind == "method_signature")
+            && let Some(next_sibling) = node.next_sibling()
+            && next_sibling.kind() == "function_body"
+        {
+            end_byte = next_sibling.end_byte();
+            end_row = next_sibling.end_position().row;
         }
 
         let name = extract_name(&node, source);
@@ -418,3 +474,9 @@ fn collect_symbols(
     let mut cursor = node.walk();
     collect_symbols_cursor(&mut cursor, source, lang, symbols, depth + 1);
 }
+
+#[cfg(test)]
+mod container_tests;
+
+#[cfg(test)]
+mod tests;

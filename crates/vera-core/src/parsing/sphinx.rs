@@ -3,35 +3,75 @@
 //! Tree-sitter gives us structural parsing (sections, directives, inline nodes),
 //! but it does not resolve Sphinx semantics such as ``.. include::``.
 //! This module performs lightweight source normalization before chunking:
-//! - Recursively inline ``.. include::`` files (with cycle/depth guards)
+//! - Recursively inline ``.. include::`` files (with cycle/depth/size guards)
 //! - Normalize inline role syntax like ``:doc:`...``` into plain text
 
 use std::collections::HashMap;
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use anyhow::{Context, Result};
 use regex::Regex;
 
+use crate::path_containment::{self, Containment};
+
 const MAX_INCLUDE_DEPTH: usize = 16;
+const INCLUDE_OUTPUT_BUDGET_MULTIPLIER: u64 = 4;
 
 /// Preprocess RST text for chunking and embedding.
 pub fn preprocess_rst(source: &str, current_file: &Path, repo_root: &Path) -> Result<String> {
-    let mut stack = vec![current_file.to_path_buf()];
-    let mut include_cache = HashMap::new();
-
-    let expanded = resolve_includes_recursive(
+    preprocess_rst_with_limit(
         source,
         current_file,
         repo_root,
-        &mut stack,
-        &mut include_cache,
-        0,
-    )?;
+        crate::config::DEFAULT_MAX_FILE_SIZE_BYTES,
+    )
+}
+
+/// Preprocess RST text with a configured source and include-size limit.
+///
+/// Expanded output is capped at four times `max_file_size_bytes`. The input
+/// file is already limited to that size by discovery, so this allows normal
+/// include composition while bounding recursive fan-out.
+pub(crate) fn preprocess_rst_with_limit(
+    source: &str,
+    current_file: &Path,
+    repo_root: &Path,
+    max_file_size_bytes: u64,
+) -> Result<String> {
+    // Seed the stack with the canonicalized path: resolve_include_path
+    // returns canonicalized paths (resolve_within), so a non-canonical seed
+    // (macOS /var -> /private/var, symlinked checkouts) never compares equal
+    // and include cycles expand to MAX_INCLUDE_DEPTH instead of terminating.
+    let stack_seed = current_file
+        .canonicalize()
+        .unwrap_or_else(|_| current_file.to_path_buf());
+    let mut stack = vec![stack_seed];
+    let mut expansion_cache = HashMap::new();
+    let canonical_repo_root = repo_root
+        .canonicalize()
+        .with_context(|| format!("failed to canonicalize repo root: {}", repo_root.display()))?;
+    let mut context = IncludeResolutionContext {
+        canonical_repo_root: &canonical_repo_root,
+        stack: &mut stack,
+        expansion_cache: &mut expansion_cache,
+        output_budget: include_output_budget(max_file_size_bytes),
+        max_file_size_bytes,
+    };
+
+    let (expanded, _cycle_dependent) =
+        resolve_includes_recursive(source, current_file, 0, context.output_budget, &mut context)?;
 
     let with_toctree = normalize_toctree_blocks(&expanded);
 
     Ok(normalize_roles(&with_toctree))
+}
+
+fn include_output_budget(max_file_size_bytes: u64) -> usize {
+    max_file_size_bytes
+        .saturating_mul(INCLUDE_OUTPUT_BUDGET_MULTIPLIER)
+        .min(usize::MAX as u64) as usize
 }
 
 fn include_re() -> &'static Regex {
@@ -49,26 +89,58 @@ fn toctree_entry_re() -> &'static Regex {
     TOCTREE_ENTRY_RE.get_or_init(|| Regex::new(r"^(.+?)\s*<([^>]+)>$").unwrap())
 }
 
+struct IncludeResolutionContext<'a> {
+    canonical_repo_root: &'a Path,
+    stack: &'a mut Vec<PathBuf>,
+    expansion_cache: &'a mut HashMap<PathBuf, Arc<str>>,
+    output_budget: usize,
+    max_file_size_bytes: u64,
+}
+
+/// Expand includes in `text`, returning the expansion plus whether any include
+/// beneath it was suppressed by the cycle guard.
+///
+/// A suppression makes the result depend on which ancestors are on the cycle
+/// stack, so such expansions must never be cached under their path alone (#205):
+/// a sibling branch without those ancestors would replay content that was cut
+/// only because of them. Expansions whose subtree saw no suppression are pure
+/// functions of their file and are safe to cache.
 fn resolve_includes_recursive(
     text: &str,
     current_file: &Path,
-    repo_root: &Path,
-    stack: &mut Vec<PathBuf>,
-    include_cache: &mut HashMap<PathBuf, String>,
     depth: usize,
-) -> Result<String> {
+    output_budget: usize,
+    context: &mut IncludeResolutionContext<'_>,
+) -> Result<(String, bool)> {
+    let mut remaining_output_bytes = output_budget;
+    let mut cycle_dependent = false;
+
     if depth >= MAX_INCLUDE_DEPTH {
-        return Ok(text.to_string());
+        let mut output = String::new();
+        append_with_budget(&mut output, text, &mut remaining_output_bytes);
+        return Ok((output, cycle_dependent));
     }
 
-    let mut output = String::with_capacity(text.len());
+    let mut output = String::with_capacity(text.len().min(remaining_output_bytes));
     let mut last_end = 0usize;
 
     for captures in include_re().captures_iter(text) {
+        if remaining_output_bytes == 0 {
+            break;
+        }
+
         let full_match = captures
             .get(0)
             .expect("include regex always has full match");
-        output.push_str(&text[last_end..full_match.start()]);
+        append_with_budget(
+            &mut output,
+            &text[last_end..full_match.start()],
+            &mut remaining_output_bytes,
+        );
+
+        if remaining_output_bytes == 0 {
+            break;
+        }
 
         let raw_ref = captures
             .get(1)
@@ -76,71 +148,104 @@ fn resolve_includes_recursive(
             .as_str();
         let include_ref = strip_wrapping_quotes(raw_ref.trim());
 
-        let replacement = match resolve_include_path(include_ref, current_file, repo_root)? {
-            Some(include_path) => {
-                if stack.contains(&include_path) {
-                    full_match.as_str().to_string()
-                } else {
-                    let include_text = if let Some(cached) = include_cache.get(&include_path) {
-                        cached.clone()
+        let replacement =
+            match resolve_include_path(include_ref, current_file, context.canonical_repo_root)? {
+                Some(include_path) => {
+                    if context.stack.contains(&include_path) {
+                        cycle_dependent = true;
+                        None
+                    } else if let Some(cached) = context.expansion_cache.get(&include_path) {
+                        Some(Arc::clone(cached))
                     } else {
-                        let bytes = std::fs::read(&include_path).with_context(|| {
-                            format!("failed to read include: {}", include_path.display())
-                        })?;
-                        let decoded = String::from_utf8_lossy(&bytes).to_string();
-                        include_cache.insert(include_path.clone(), decoded.clone());
-                        decoded
-                    };
-
-                    stack.push(include_path.clone());
-                    let resolved = resolve_includes_recursive(
-                        &include_text,
-                        &include_path,
-                        repo_root,
-                        stack,
-                        include_cache,
-                        depth + 1,
-                    )?;
-                    stack.pop();
-                    resolved
+                        match read_include_file(&include_path, context.max_file_size_bytes)? {
+                            Some(include_text) => {
+                                context.stack.push(include_path.clone());
+                                let (resolved, include_cycle_dependent) =
+                                    resolve_includes_recursive(
+                                        &include_text,
+                                        &include_path,
+                                        depth + 1,
+                                        context.output_budget,
+                                        context,
+                                    )?;
+                                context.stack.pop();
+                                cycle_dependent |= include_cycle_dependent;
+                                let resolved: Arc<str> = Arc::from(resolved);
+                                if !include_cycle_dependent {
+                                    context
+                                        .expansion_cache
+                                        .insert(include_path.clone(), Arc::clone(&resolved));
+                                }
+                                Some(resolved)
+                            }
+                            None => None,
+                        }
+                    }
                 }
-            }
-            None => full_match.as_str().to_string(),
-        };
+                None => None,
+            };
 
-        output.push_str(&replacement);
+        append_with_budget(
+            &mut output,
+            replacement.as_deref().unwrap_or(full_match.as_str()),
+            &mut remaining_output_bytes,
+        );
         last_end = full_match.end();
     }
 
-    output.push_str(&text[last_end..]);
-    Ok(output)
+    append_with_budget(&mut output, &text[last_end..], &mut remaining_output_bytes);
+    Ok((output, cycle_dependent))
+}
+
+fn read_include_file(path: &Path, max_file_size_bytes: u64) -> Result<Option<String>> {
+    let file = std::fs::File::open(path)
+        .with_context(|| format!("failed to read include: {}", path.display()))?;
+    let mut bytes = Vec::new();
+    file.take(max_file_size_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("failed to read include: {}", path.display()))?;
+
+    if bytes.len() as u64 > max_file_size_bytes {
+        return Ok(None);
+    }
+
+    Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
+}
+
+fn append_with_budget(output: &mut String, text: &str, remaining: &mut usize) {
+    let byte_count = text.len().min(*remaining);
+    let mut end = byte_count;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    if end == 0 && byte_count > 0 {
+        *remaining = 0;
+        return;
+    }
+    output.push_str(&text[..end]);
+    *remaining -= end;
 }
 
 fn resolve_include_path(
     include_ref: &str,
     current_file: &Path,
-    repo_root: &Path,
+    canonical_repo_root: &Path,
 ) -> Result<Option<PathBuf>> {
     let candidate = if include_ref.starts_with('/') {
-        repo_root.join(include_ref.trim_start_matches('/'))
+        canonical_repo_root.join(include_ref.trim_start_matches('/'))
     } else {
-        current_file.parent().unwrap_or(repo_root).join(include_ref)
+        current_file
+            .parent()
+            .unwrap_or(canonical_repo_root)
+            .join(include_ref)
     };
 
-    let canonical = match candidate.canonicalize() {
-        Ok(path) => path,
-        Err(_) => return Ok(None),
-    };
-
-    let canonical_repo_root = repo_root
-        .canonicalize()
-        .with_context(|| format!("failed to canonicalize repo root: {}", repo_root.display()))?;
-
-    if !canonical.starts_with(&canonical_repo_root) {
-        return Ok(None);
-    }
-
-    Ok(Some(canonical))
+    Ok(
+        match path_containment::resolve_within(canonical_repo_root, &candidate) {
+            Containment::Inside(path) => Some(path),
+            Containment::Escaped | Containment::Unresolved => None,
+        },
+    )
 }
 
 fn normalize_roles(text: &str) -> String {
@@ -351,7 +456,7 @@ fn strip_wrapping_quotes(input: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use super::preprocess_rst;
+    use super::{preprocess_rst, preprocess_rst_with_limit};
     use std::fs;
 
     #[test]
@@ -385,6 +490,111 @@ mod tests {
         let processed = preprocess_rst(source, &source_path, root).unwrap();
 
         assert!(processed.contains("Common snippet"));
+    }
+
+    #[test]
+    fn preprocess_bounds_dag_fanout_output() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let source_path = root.join("root.rst");
+        let levels = ["a", "b", "c", "d", "e", "f", "g", "h"];
+        for (index, level) in levels.iter().enumerate() {
+            let content = match levels.get(index + 1) {
+                Some(next) => format!(".. include:: {next}.rst\n").repeat(3),
+                None => "leaf content\n".to_string(),
+            };
+            fs::write(root.join(format!("{level}.rst")), content).unwrap();
+        }
+
+        let source = ".. include:: a.rst\n".repeat(3);
+        fs::write(&source_path, &source).unwrap();
+        let processed = preprocess_rst_with_limit(&source, &source_path, root, 64).unwrap();
+
+        assert!(processed.len() <= 256);
+        assert!(processed.contains("leaf content"));
+    }
+
+    #[test]
+    fn preprocess_skips_oversized_include() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let source_path = root.join("root.rst");
+        let include_path = root.join("large.rst");
+        let source = "before\n.. include:: large.rst\nafter\n";
+
+        fs::write(&include_path, "x".repeat(33)).unwrap();
+        let processed = preprocess_rst_with_limit(source, &source_path, root, 32).unwrap();
+
+        assert!(processed.contains("before"));
+        assert!(processed.contains(".. include:: large.rst"));
+        assert!(processed.contains("after"));
+        assert!(!processed.contains(&"x".repeat(33)));
+    }
+
+    #[test]
+    fn preprocess_terminates_on_include_cycle() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let source_path = root.join("root.rst");
+        let child_path = root.join("child.rst");
+
+        fs::write(&child_path, "child\n.. include:: root.rst\n").unwrap();
+        let source = "root\n.. include:: child.rst\n";
+        fs::write(&source_path, source).unwrap();
+        let processed = preprocess_rst_with_limit(source, &source_path, root, 128).unwrap();
+
+        assert!(processed.contains("root"));
+        assert!(processed.contains("child"));
+        assert!(processed.contains(".. include:: root.rst"));
+        assert!(processed.len() < 128 * 4);
+    }
+
+    /// Diamond with a back-edge (#205): `b` and `c` include `d`, and `d`
+    /// includes `b`. The cached expansion of a file on the cycle stack must not
+    /// be replayed for branches whose ancestors differ, so swapping the two
+    /// directives in the parent must yield the same content (the branch texts
+    /// swap position, but no branch may lose or gain bodies).
+    #[test]
+    fn preprocess_include_expansion_is_independent_of_directive_order() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+
+        fs::write(
+            root.join("b.rst"),
+            "B-BODY-UNIQUE-TOKEN\n.. include:: d.rst\n",
+        )
+        .unwrap();
+        fs::write(root.join("c.rst"), "C-BODY\n.. include:: d.rst\n").unwrap();
+        fs::write(root.join("d.rst"), "D-BODY\n.. include:: b.rst\n").unwrap();
+
+        let source_path = root.join("a.rst");
+        let b_first = "A-BODY\n.. include:: b.rst\n.. include:: c.rst\n";
+        let c_first = "A-BODY\n.. include:: c.rst\n.. include:: b.rst\n";
+
+        let expanded_b_first =
+            preprocess_rst_with_limit(b_first, &source_path, root, 1024).unwrap();
+        let expanded_c_first =
+            preprocess_rst_with_limit(c_first, &source_path, root, 1024).unwrap();
+
+        for expanded in [&expanded_b_first, &expanded_c_first] {
+            assert_eq!(
+                expanded.matches("B-BODY-UNIQUE-TOKEN").count(),
+                2,
+                "b's body must stay searchable through both branches"
+            );
+            assert!(expanded.contains("C-BODY"));
+            assert!(expanded.contains("D-BODY"));
+        }
+
+        // The two runs inline the same material, only in swapped directive
+        // order; the issue made them differ in which bodies were inlined at
+        // all (86 vs 99 bytes).
+        let mut lines_b_first: Vec<&str> = expanded_b_first.lines().collect();
+        lines_b_first.sort_unstable();
+        let mut lines_c_first: Vec<&str> = expanded_c_first.lines().collect();
+        lines_c_first.sort_unstable();
+        assert_eq!(lines_b_first, lines_c_first);
+        assert_eq!(expanded_b_first.len(), expanded_c_first.len());
     }
 
     #[test]

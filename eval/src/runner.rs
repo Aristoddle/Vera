@@ -3,14 +3,27 @@
 //! Provides a `ToolAdapter` trait that tool integrations implement,
 //! plus a mock adapter for harness self-testing.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::time::Instant;
 
 use crate::metrics;
 use crate::types::{
-    AggregateMetrics, BenchmarkTask, EvalReport, PerformanceMetrics, RetrievalResult,
-    TaskEvaluation, TaskResult, VersionInfo,
+    AggregateMetrics, BenchmarkTask, EvalReport, LaneProvenance, PerformanceMetrics,
+    RetrievalResult, SembleSnapshot, TaskEvaluation, TaskResult, TaskSetIdentity, VersionInfo,
 };
+
+pub const METRIC_CONTRACT: &str = "vera-graded-2-1-task-mean-v1";
+
+pub struct ReportProvenance {
+    pub lane: Option<LaneProvenance>,
+    pub task_set: TaskSetIdentity,
+    pub config: BTreeMap<String, String>,
+    pub environment: BTreeMap<String, String>,
+    pub vera_git_sha: Option<String>,
+    pub command: Vec<String>,
+    pub corpus_version: u32,
+    pub semble: Option<SembleSnapshot>,
+}
 
 /// Trait for tool adapters that execute search queries.
 ///
@@ -38,15 +51,17 @@ pub trait ToolAdapter {
     fn index(&self, repo_path: &str) -> (f64, u64);
 }
 
-/// Run the complete benchmark suite with a given tool adapter.
-#[allow(dead_code)]
-pub fn run_benchmark(
-    adapter: &dyn ToolAdapter,
-    tasks: &[BenchmarkTask],
-    repo_paths: &HashMap<String, String>,
-    corpus_shas: &HashMap<String, String>,
-) -> EvalReport {
-    run_benchmark_scoped(adapter, tasks, repo_paths, corpus_shas, &HashMap::new())
+/// Add invocation metadata to a completed report.
+pub fn attach_provenance(report: &mut EvalReport, provenance: ReportProvenance) {
+    report.version_info.lane = provenance.lane;
+    report.version_info.task_set = Some(provenance.task_set);
+    report.version_info.environment = provenance.environment;
+    report.version_info.vera_git_sha = provenance.vera_git_sha;
+    report.version_info.command = provenance.command;
+    report.version_info.corpus_version = provenance.corpus_version;
+    report.version_info.metric_contract = METRIC_CONTRACT.to_string();
+    report.version_info.semble = provenance.semble;
+    report.version_info.config.extend(provenance.config);
 }
 
 /// Run benchmark with optional per-repo path scopes (benchmark_root).
@@ -106,8 +121,15 @@ pub fn run_benchmark_scoped(
         version_info: VersionInfo {
             tool_version: adapter.version(),
             corpus_version: 1,
+            metric_contract: METRIC_CONTRACT.to_string(),
+            semble: None,
             repo_shas: corpus_shas.clone(),
             config: HashMap::new(),
+            lane: None,
+            task_set: None,
+            vera_git_sha: None,
+            command: Vec::new(),
+            environment: BTreeMap::new(),
         },
         per_task,
         per_category,
@@ -256,11 +278,18 @@ pub fn run_benchmark_with_mock(mock: &MockAdapter, tasks: &[BenchmarkTask]) -> E
         version_info: VersionInfo {
             tool_version: mock.version(),
             corpus_version: 1,
+            metric_contract: METRIC_CONTRACT.to_string(),
+            semble: None,
             repo_shas: HashMap::new(),
             config: HashMap::from([
                 ("accuracy".to_string(), mock.accuracy.to_string()),
                 ("noise_results".to_string(), mock.noise_results.to_string()),
             ]),
+            lane: None,
+            task_set: None,
+            vera_git_sha: None,
+            command: Vec::new(),
+            environment: BTreeMap::new(),
         },
         per_task,
         per_category,

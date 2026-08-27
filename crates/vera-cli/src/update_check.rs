@@ -200,13 +200,13 @@ impl SkillInstallDescription {
 }
 
 fn describe_skill_install(path: &Path, cwd: Option<&Path>, home: &Path) -> SkillInstallDescription {
-    if let Some(cwd) = cwd {
-        if let Ok(relative) = path.strip_prefix(cwd) {
-            return SkillInstallDescription {
-                scope: SkillInstallScope::Project,
-                path: format!("./{}", relative.display()),
-            };
-        }
+    if let Some(cwd) = cwd
+        && let Ok(relative) = path.strip_prefix(cwd)
+    {
+        return SkillInstallDescription {
+            scope: SkillInstallScope::Project,
+            path: format!("./{}", relative.display()),
+        };
     }
 
     if let Ok(relative) = path.strip_prefix(home) {
@@ -249,10 +249,10 @@ fn check_binary_staleness() {
         return;
     }
     let status = binary_version_status(false);
-    if let Some(latest) = status.latest_version.as_deref() {
-        if status.update_available() {
-            print_binary_nudge(latest, &status);
-        }
+    if let Some(latest) = status.latest_version.as_deref()
+        && status.update_available()
+    {
+        print_binary_nudge(latest, &status);
     }
 }
 
@@ -272,81 +272,102 @@ fn print_binary_nudge(latest: &str, status: &BinaryVersionStatus) {
 }
 
 pub fn binary_version_status(force_refresh: bool) -> BinaryVersionStatus {
-    let install_method = resolve_install_method();
-    let cache_file = match cache_path() {
-        Some(path) => path,
-        None => {
-            return BinaryVersionStatus {
-                current_version: CURRENT_VERSION,
-                latest_version: None,
-                install_method: install_method.install_method,
-                install_method_source: install_method.source,
-                detected_install_methods: install_method.detected_install_methods,
-                source: VersionCheckSource::Unavailable,
-            };
-        }
-    };
-
     let now = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
+    binary_version_status_inner(cache_path(), force_refresh, now, &resolve_install_method)
+}
+
+/// `binary_version_status` with the cache location, the clock and the install
+/// method fallback injected, so tests can drive it without touching `~/.vera`
+/// or spawning package managers.
+///
+/// `resolve` is only called when the cache cannot answer. That matters: the
+/// fallback ends in `detect_install_methods`, which spawns `npm`, `bun`, `pip`
+/// and `uv`, and `print_nudges` runs synchronously before the process exits.
+fn binary_version_status_inner(
+    cache_file: Option<PathBuf>,
+    force_refresh: bool,
+    now: u64,
+    resolve: &dyn Fn() -> InstallMethodResolution,
+) -> BinaryVersionStatus {
+    let Some(cache_file) = cache_file else {
+        return status_from(None, resolve(), VersionCheckSource::Unavailable);
+    };
+
     let cached = load_cache(&cache_file);
 
-    if !force_refresh {
-        if let Some(cached) = cached.as_ref() {
-            if now.saturating_sub(cached.checked_at_secs) < CHECK_INTERVAL.as_secs() {
-                return BinaryVersionStatus {
-                    current_version: CURRENT_VERSION,
-                    latest_version: Some(cached.latest_version.clone()),
-                    install_method: cached
-                        .install_method
-                        .clone()
-                        .or(install_method.install_method.clone()),
-                    install_method_source: install_method.source,
-                    detected_install_methods: install_method.detected_install_methods.clone(),
-                    source: VersionCheckSource::Cache,
-                };
-            }
-        }
+    if !force_refresh
+        && let Some(cached) = cached.as_ref()
+        && now.saturating_sub(cached.checked_at_secs) < CHECK_INTERVAL.as_secs()
+    {
+        let resolution = cached_install_method(cached).unwrap_or_else(resolve);
+        return status_from(
+            Some(cached.latest_version.clone()),
+            resolution,
+            VersionCheckSource::Cache,
+        );
     }
+
+    let resolution = resolve();
 
     if let Some(latest) = fetch_latest_version() {
         let cache = UpdateCache {
             latest_version: latest.clone(),
             checked_at_secs: now,
-            install_method: install_method.install_method.clone(),
+            install_method: resolution.install_method.clone(),
         };
         let _ = save_cache(&cache_file, &cache);
-        return BinaryVersionStatus {
-            current_version: CURRENT_VERSION,
-            latest_version: Some(latest),
-            install_method: install_method.install_method.clone(),
-            install_method_source: install_method.source,
-            detected_install_methods: install_method.detected_install_methods.clone(),
-            source: VersionCheckSource::Live,
-        };
+        return status_from(Some(latest), resolution, VersionCheckSource::Live);
     }
 
     if let Some(cached) = cached {
         return BinaryVersionStatus {
             current_version: CURRENT_VERSION,
             latest_version: Some(cached.latest_version),
-            install_method: cached.install_method.or(install_method.install_method),
-            install_method_source: install_method.source,
-            detected_install_methods: install_method.detected_install_methods,
+            install_method: cached.install_method.or(resolution.install_method),
+            install_method_source: resolution.source,
+            detected_install_methods: resolution.detected_install_methods,
             source: VersionCheckSource::Cache,
         };
     }
 
+    status_from(None, resolution, VersionCheckSource::Unavailable)
+}
+
+fn status_from(
+    latest_version: Option<String>,
+    resolution: InstallMethodResolution,
+    source: VersionCheckSource,
+) -> BinaryVersionStatus {
     BinaryVersionStatus {
         current_version: CURRENT_VERSION,
-        latest_version: None,
-        install_method: install_method.install_method,
-        install_method_source: install_method.source,
-        detected_install_methods: install_method.detected_install_methods,
-        source: VersionCheckSource::Unavailable,
+        latest_version,
+        install_method: resolution.install_method,
+        install_method_source: resolution.source,
+        detected_install_methods: resolution.detected_install_methods,
+        source,
     }
+}
+
+/// Rebuild an install method resolution from a cache entry, so a fresh cache
+/// answers without re-running detection.
+///
+/// The source is reported as `Heuristic`. `save_cache` only ever stores a
+/// method that `resolve_install_method` returned as `Some`, which narrows the
+/// original source to `Provenance` or `Heuristic`, but the cache does not
+/// record which, so this reports the weaker of the two. `can_apply_update` and
+/// `suggested_update_command` treat them identically; the only callers that
+/// surface the distinction, `vera upgrade` and `vera doctor`, pass
+/// `force_refresh = true` and never reach this branch.
+fn cached_install_method(cached: &UpdateCache) -> Option<InstallMethodResolution> {
+    let method = cached.install_method.clone()?;
+    Some(InstallMethodResolution {
+        detected_install_methods: vec![method.clone()],
+        install_method: Some(method),
+        source: InstallMethodSource::Heuristic,
+    })
 }
 
 pub fn suggested_update_command(install_method: Option<&str>) -> String {
@@ -361,18 +382,26 @@ pub fn suggested_update_command(install_method: Option<&str>) -> String {
     }
 }
 
-/// Compare two semver-ish strings. Returns true if `latest` > `current`.
+/// Compare two release tags. Returns true if `latest` > `current`.
+///
+/// Tags are semver (`major.minor.patch[-pre][+build]`), compared with full
+/// precedence so pre-release identifiers order correctly (`0.6.0-rc.2` above
+/// `0.6.0-rc.1`, `1.2.0` above all of its own pre-releases) instead of the old
+/// behavior that parsed non-numeric segments as 0. A pre-release never counts
+/// as newer than a stable version: GitHub's "latest release" endpoint only
+/// serves stable tags, and a stable install must not be nudged onto an RC. A
+/// tag that does not parse is never reported as newer.
 fn is_newer(latest: &str, current: &str) -> bool {
-    let parse = |s: &str| -> (u32, u32, u32) {
-        let s = s.strip_prefix('v').unwrap_or(s);
-        let mut parts = s.split('.').map(|p| p.parse::<u32>().unwrap_or(0));
-        (
-            parts.next().unwrap_or(0),
-            parts.next().unwrap_or(0),
-            parts.next().unwrap_or(0),
-        )
+    let parse = |tag: &str| -> Option<semver::Version> {
+        let tag = tag.trim();
+        let tag = tag.strip_prefix('v').unwrap_or(tag);
+        semver::Version::parse(tag).ok()
     };
-    parse(latest) > parse(current)
+    let (Some(latest), Some(current)) = (parse(latest), parse(current)) else {
+        return false;
+    };
+    let latest_is_prerelease = !latest.pre.is_empty();
+    !(latest_is_prerelease && current.pre.is_empty()) && latest > current
 }
 
 fn fetch_latest_version() -> Option<String> {
@@ -405,24 +434,24 @@ fn fetch_latest_version() -> Option<String> {
 }
 
 pub fn resolve_install_method() -> InstallMethodResolution {
-    if let Ok(provenance) = crate::state::load_install_provenance() {
-        if let Some(method) = provenance.install_method {
-            return InstallMethodResolution {
-                detected_install_methods: vec![method.clone()],
-                install_method: Some(method),
-                source: InstallMethodSource::Provenance,
-            };
-        }
+    if let Ok(provenance) = crate::state::load_install_provenance()
+        && let Some(method) = provenance.install_method
+    {
+        return InstallMethodResolution {
+            detected_install_methods: vec![method.clone()],
+            install_method: Some(method),
+            source: InstallMethodSource::Provenance,
+        };
     }
 
-    if let Ok(config) = crate::state::load_saved_config() {
-        if let Some(method) = config.install_method {
-            return InstallMethodResolution {
-                detected_install_methods: vec![method.clone()],
-                install_method: Some(method),
-                source: InstallMethodSource::Heuristic,
-            };
-        }
+    if let Ok(config) = crate::state::load_saved_config()
+        && let Some(method) = config.install_method
+    {
+        return InstallMethodResolution {
+            detected_install_methods: vec![method.clone()],
+            install_method: Some(method),
+            source: InstallMethodSource::Heuristic,
+        };
     }
 
     let detected_install_methods = detect_install_methods();
@@ -457,10 +486,9 @@ pub fn detect_install_methods() -> Vec<String> {
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .output()
+        && String::from_utf8_lossy(&output.stdout).contains("@vera-ai/cli")
     {
-        if String::from_utf8_lossy(&output.stdout).contains("@vera-ai/cli") {
-            methods.push("bun".to_string());
-        }
+        methods.push("bun".to_string());
     }
 
     if command_succeeds("pip", &["show", "vera-ai"]) {
@@ -562,6 +590,7 @@ fn save_cache(path: &Path, cache: &UpdateCache) -> Option<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
 
     #[test]
     fn is_newer_works() {
@@ -678,10 +707,130 @@ mod tests {
         assert!(!status.can_apply_update());
     }
 
+    /// A resolver that records how often it ran and reports nothing, standing in
+    /// for `resolve_install_method` without spawning any package manager.
+    fn counting_resolver(calls: &Cell<usize>) -> impl Fn() -> InstallMethodResolution + '_ {
+        || {
+            calls.set(calls.get() + 1);
+            InstallMethodResolution {
+                install_method: None,
+                detected_install_methods: Vec::new(),
+                source: InstallMethodSource::Unknown,
+            }
+        }
+    }
+
+    fn write_cache(dir: &Path, install_method: Option<&str>, checked_at_secs: u64) -> PathBuf {
+        let path = dir.join("update-check.json");
+        save_cache(
+            &path,
+            &UpdateCache {
+                latest_version: "99.0.0".to_string(),
+                checked_at_secs,
+                install_method: install_method.map(str::to_string),
+            },
+        )
+        .expect("cache written");
+        path
+    }
+
+    #[test]
+    fn fresh_cache_with_install_method_skips_detection() {
+        let dir = tempfile::tempdir().unwrap();
+        let checked_at = 1_700_000_000;
+        let cache_file = write_cache(dir.path(), Some("npm"), checked_at);
+
+        let calls = Cell::new(0);
+        let status = binary_version_status_inner(
+            Some(cache_file),
+            false,
+            checked_at + 60,
+            &counting_resolver(&calls),
+        );
+
+        assert_eq!(
+            calls.get(),
+            0,
+            "install method detection ran even though a fresh cache carried the method"
+        );
+        assert_eq!(status.source, VersionCheckSource::Cache);
+        assert_eq!(status.latest_version.as_deref(), Some("99.0.0"));
+        assert_eq!(status.install_method.as_deref(), Some("npm"));
+        assert_eq!(status.install_method_source, InstallMethodSource::Heuristic);
+        assert_eq!(status.detected_install_methods, vec!["npm".to_string()]);
+        assert!(status.can_apply_update());
+    }
+
+    #[test]
+    fn fresh_cache_without_install_method_falls_back_to_detection() {
+        let dir = tempfile::tempdir().unwrap();
+        let checked_at = 1_700_000_000;
+        let cache_file = write_cache(dir.path(), None, checked_at);
+
+        let calls = Cell::new(0);
+        let status = binary_version_status_inner(
+            Some(cache_file),
+            false,
+            checked_at + 60,
+            &counting_resolver(&calls),
+        );
+
+        assert_eq!(calls.get(), 1);
+        assert_eq!(status.source, VersionCheckSource::Cache);
+        assert_eq!(status.install_method, None);
+        assert_eq!(status.install_method_source, InstallMethodSource::Unknown);
+    }
+
+    #[test]
+    fn missing_cache_path_still_resolves_the_install_method() {
+        let calls = Cell::new(0);
+        let status =
+            binary_version_status_inner(None, false, 1_700_000_000, &counting_resolver(&calls));
+
+        assert_eq!(calls.get(), 1);
+        assert_eq!(status.source, VersionCheckSource::Unavailable);
+        assert_eq!(status.latest_version, None);
+    }
+
     #[test]
     fn format_command_joins_args() {
         assert_eq!(format_command("npm", &["update", "-g"]), "npm update -g");
         assert_eq!(format_command("vera", &[]), "vera");
+    }
+
+    /// #183 regression: pre-release segments used to parse as 0, so tags like
+    /// `1.2.0-beta` collapsed to `1.2.0` and pre-release ordering was lost.
+    #[test]
+    fn is_newer_orders_pre_release_tags_by_semver_precedence() {
+        // A later RC outranks an earlier one; the old parser saw both as
+        // `0.5.0` and missed the update.
+        assert!(is_newer("0.6.0-rc.2", "0.6.0-rc.1"));
+        assert!(is_newer("0.6.0-beta", "0.6.0-alpha"));
+
+        // Stable beats its own pre-releases: a user on an RC gets the update.
+        assert!(is_newer("0.6.0", "0.6.0-rc.1"));
+        assert!(is_newer("v1.2.0", "v1.2.0-beta.11"));
+
+        // Ordinary triples still compare numerically.
+        assert!(is_newer("1.10.0", "1.9.9"));
+        assert!(!is_newer("1.2.0", "1.2.1"));
+    }
+
+    #[test]
+    fn is_newer_never_pushes_a_stable_install_onto_a_pre_release() {
+        // Same triple with a pre-release suffix on latest: not an upgrade.
+        assert!(!is_newer("1.2.1-rc.1", "1.2.1"));
+        // Even a higher-triple RC is skipped for a stable current version.
+        assert!(!is_newer("2.0.0-rc.1", "1.9.9"));
+    }
+
+    #[test]
+    fn is_newer_treats_unparsable_tags_as_not_newer() {
+        assert!(!is_newer("", "1.0.0"));
+        assert!(!is_newer("not-a-version", "1.0.0"));
+        assert!(!is_newer("1.2", "1.0.0"), "two-segment tag is not semver");
+        // A broken current version must not trigger an update either.
+        assert!(!is_newer("2.0.0", ""));
     }
 
     #[test]

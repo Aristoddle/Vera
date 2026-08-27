@@ -1,6 +1,7 @@
 secrets.env
 .env
 .env.*
+or-management-key.env
 !.env.example
 /AGENTS.md
 /HANDOFF.md

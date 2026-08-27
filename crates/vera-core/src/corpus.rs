@@ -28,20 +28,7 @@ pub fn classify_path(file_path: &str, language: Language) -> ContentClass {
     if is_runtime_like_path(&path, &tokens) {
         return ContentClass::Runtime;
     }
-    if contains_token(
-        &tokens,
-        &[
-            "archive",
-            "archived",
-            "snapshot",
-            "snapshots",
-            "legacy",
-            "deprecated",
-            "backup",
-            "backups",
-            "old",
-        ],
-    ) {
+    if is_archive_like_path(&path) {
         return ContentClass::Archive;
     }
     if contains_token(
@@ -216,6 +203,43 @@ fn contains_token(tokens: &[&str], expected: &[&str]) -> bool {
     tokens.iter().any(|token| expected.contains(token))
 }
 
+fn is_archive_like_path(path: &str) -> bool {
+    const DIRECTORY_ARCHIVE_MARKERS: &[&str] = &[
+        "archive",
+        "archived",
+        "legacy",
+        "deprecated",
+        "backup",
+        "backups",
+        "old",
+    ];
+    const TEST_MARKERS: &[&str] = &[
+        "test", "tests", "testing", "spec", "specs", "fixture", "fixtures",
+    ];
+
+    let components: Vec<&str> = path
+        .split('/')
+        .filter(|component| !component.is_empty())
+        .collect();
+    let directories = components
+        .get(..components.len().saturating_sub(1))
+        .unwrap_or(&[]);
+
+    if directories
+        .iter()
+        .any(|component| DIRECTORY_ARCHIVE_MARKERS.contains(component))
+    {
+        return true;
+    }
+
+    directories
+        .iter()
+        .any(|component| matches!(*component, "snapshot" | "snapshots"))
+        && directories
+            .iter()
+            .any(|component| TEST_MARKERS.contains(component))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -225,6 +249,45 @@ mod tests {
         assert_eq!(
             classify_path("archive/docs/hotkeys.md", Language::Markdown),
             ContentClass::Archive
+        );
+    }
+
+    #[test]
+    fn archive_tokens_in_live_source_filenames_do_not_hide_source() {
+        assert_eq!(
+            classify_path("src/snapshot_writer.rs", Language::Rust),
+            ContentClass::Source
+        );
+        assert_eq!(
+            classify_path("src/legacy_parser.rs", Language::Rust),
+            ContentClass::Source
+        );
+    }
+
+    #[test]
+    fn archive_directories_still_classify_as_archive() {
+        for path in [
+            "archive/docs/hotkeys.md",
+            "backups/restore.rs",
+            "tests/fixtures/snapshot/case.rs",
+        ] {
+            assert_eq!(
+                classify_path(path, Language::Rust),
+                ContentClass::Archive,
+                "{path} should remain archive content"
+            );
+        }
+    }
+
+    #[test]
+    fn active_snapshot_directories_and_archive_named_sources_stay_source() {
+        assert_eq!(
+            classify_path("src/snapshots/writer.rs", Language::Rust),
+            ContentClass::Source
+        );
+        assert_eq!(
+            classify_path("src/old.rs", Language::Rust),
+            ContentClass::Source
         );
     }
 

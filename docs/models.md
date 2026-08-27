@@ -1,9 +1,11 @@
 # Local Models
 
+Vera's default embedding model is [`minishlab/potion-code-16M-v2`](https://huggingface.co/minishlab/potion-code-16M-v2), a static embedding model that runs locally on CPU on any supported machine; no GPU or ONNX Runtime needed. Jina ONNX and CodeRankEmbed are opt-in alternatives.
+
 Vera has two local backend families:
 
-- Potion Code CPU: static embeddings through `model2vec-rs`. No ONNX Runtime.
-- Jina ONNX GPU: local embedding model plus the curated local reranker through ONNX Runtime.
+- Potion Code: the default local embedding backend.
+- Jina ONNX: an opt-in local embedding backend with a local reranker.
 
 `vera setup` downloads model assets into the Vera data directory (`$XDG_DATA_HOME/vera/models/`, or `~/.vera/models/` on existing installs). Jina ONNX backends also install the matching ONNX Runtime library into `lib/`.
 
@@ -11,30 +13,57 @@ Vera has two local backend families:
 
 | Option | Command | Notes |
 | --- | --- | --- |
-| Potion Code | `vera setup --potion-code` | CPU-first local backend. Uses [`minishlab/potion-code-16M`](https://huggingface.co/minishlab/potion-code-16M), returns 256-dim embeddings, and skips ONNX Runtime. |
-| Jina v5 nano retrieval | `vera setup --onnx-jina-cuda` or another `--onnx-jina-*` flag | GPU local backend. Faster indexing than larger ONNX embedding models and strongest end-to-end benchmark coverage in Vera so far. |
-| CodeRankEmbed | `vera setup --onnx-jina-cuda --code-rank-embed` | Optional ONNX embedding preset. Useful when you want a code-specific bi-encoder or you are testing without reranking. On Vera's short 6-task no-rerank check it beat the Jina preset on retrieval quality, but indexing was much slower. |
+| Potion Code | `vera setup --potion-code` | Default local embedding model: [`minishlab/potion-code-16M-v2`](https://huggingface.co/minishlab/potion-code-16M-v2). Runs locally on CPU on any supported machine; no GPU or ONNX Runtime needed. |
+| Jina v5 nano retrieval | `vera setup --onnx-jina-cuda` or another `--onnx-jina-*` flag | Opt-in GPU local backend. The retrieval variant is asymmetric, so Vera prefixes queries with `Query:` and indexed passages with `Document:`. |
+| CodeRankEmbed | `vera setup --onnx-jina-cuda --code-rank-embed` | Optional ONNX embedding preset for code-specific or embedding-only experiments. Current screening results are below. |
 
-The Jina ONNX family uses this local reranker:
+When local reranking is enabled, the Jina ONNX family provides this built-in cross-encoder:
 
 | Model | Role |
 | --- | --- |
 | [`jinaai/jina-reranker-v2-base-multilingual`](https://huggingface.co/jinaai/jina-reranker-v2-base-multilingual) | Local cross-encoder reranker |
 
-Potion Code currently uses vector/BM25 fusion plus Vera's deterministic ranking heuristics instead of the ONNX reranker.
+With reranking disabled, the default Potion Code path uses vector/BM25 fusion plus Vera's deterministic ranking heuristics.
+
+## Embedding Screening
+
+These screening results (2026-08-21/22, pre-dating the ranking improvements) use Vera's hybrid retrieval with reranking disabled. The first set has 320 Semble tasks; the independent set has 180 tasks from separate repositories.
+
+| Model | 320-task nDCG@10 | Independent nDCG@10 | 320-task p50 | Independent p50 | 320-task index | Independent index |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `potion-code-16M-v2` | 0.7930 | 0.7019 | 13.5 ms | 10.1 ms | 56 s | 26 s |
+| `jina-embeddings-v5` | 0.7956 | 0.7149 | 44.9 ms | 13.3 ms | 147 s | 61 s |
+| `CodeRankEmbed` | 0.7949 | 0.7069 | 21.3 ms | 14.8 ms | 375 s | 153 s |
+
+Potion Code remains the recommended default because it runs locally on all supported machines and has the lowest screening index time among these embedding alternatives. The full benchmark tables and methodology are in [benchmarks.md](benchmarks.md).
+
+## Reranking
+
+Reranking is opt-in through `retrieval.reranking_enabled` and is off by default. The no-reranker heuristic stack is the baseline for normal searches.
+
+In the 2026-08-23 dual-set screening, every tested cross-encoder scored below that baseline. Scores are `320-task subset / independent set` nDCG@10:
+
+| Reranking option | nDCG@10 |
+| --- | ---: |
+| No reranker | 0.8540 / 0.7644 |
+| `jina-reranker-v2-base-multilingual` | 0.8473 / 0.7557 |
+| `mxbai-rerank-xsmall-v1` | 0.8497 / 0.7564 |
+| `gte-reranker-modernbert-base` | 0.8472 / 0.7525 |
+
+`mxbai-rerank-xsmall-v1` is the recommended opt-in reranker when you need a cross-encoder. Configure the local model with:
+
+```bash
+vera config set retrieval.reranking_enabled true
+
+export LOCAL_RERANKER_REPO=mixedbread-ai/mxbai-rerank-xsmall-v1
+export LOCAL_RERANKER_REVISION=b5c6e9da73abc3711f593f705371cdbe9e0fe422
+export LOCAL_RERANKER_ONNX_FILE=onnx/model_quantized.onnx
+export LOCAL_RERANKER_TOKENIZER_FILE=tokenizer.json
+```
 
 ## CodeRankEmbed Comparison
 
-Short no-rerank check on 6 tasks across `flask` and `ripgrep` with CUDA ONNX:
-
-| Model | Recall@1 | Recall@5 | Recall@10 | MRR | nDCG | Search p50 | Flask index | Ripgrep index |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| Jina preset | 0.5556 | 0.5556 | 0.5556 | 0.8462 | 0.6442 | 761.9 ms | 5.8 s | 11.9 s |
-| CodeRankEmbed preset | 0.7222 | 0.7222 | 0.7222 | 1.0000 | 0.8108 | 611.4 ms | 14.7 s | 29.1 s |
-
-This is why CodeRankEmbed ships as an option, not the default. It showed better pure embedding retrieval on that small no-rerank slice, but Vera's full local benchmark still uses the Jina preset because the full reranked pipeline is already very strong and Jina indexes faster.
-
-See [benchmarks.md](benchmarks.md) for the full benchmark context.
+See the [canonical CodeRankEmbed comparison](benchmarks.md#optional-coderankembed-preset) for the 6-task results and context.
 
 ## Custom Local Embedding Models
 
@@ -64,6 +93,10 @@ vera setup --onnx-jina-cuda \
 
 Use this when you already downloaded or exported the model yourself.
 
+### Custom Local Reranker
+
+The local cross-encoder can be replaced with an ONNX-compatible model from Hugging Face. The variables above select the recommended `mxbai-rerank-xsmall-v1` export. Leave `LOCAL_RERANKER_REVISION` unset to use the `main` ref and the legacy cache path. A non-empty revision stores assets under `models/<repo>/revisions/<revision>/`, so different model revisions do not overwrite one another.
+
 ## Flags
 
 | Flag | Meaning |
@@ -76,9 +109,10 @@ Use this when you already downloaded or exported the model yourself.
 | `--embedding-no-onnx-data` | Use models that do not ship an external data file |
 | `--embedding-tokenizer-file <path>` | Relative path to the tokenizer file |
 | `--embedding-dim <n>` | Embedding dimension stored in the index |
-| `--embedding-pooling mean|cls` | Pooling method for token-level outputs |
+| `--embedding-pooling <mode>` | Pooling method for token-level outputs: `mean`, `cls`, or `last-token` |
 | `--embedding-max-length <n>` | Tokenizer truncation length |
 | `--embedding-query-prefix <text>` | Optional prefix prepended to local embedding queries |
+| `--embedding-document-prefix <text>` | Optional prefix prepended to indexed passages |
 
 ## Required Files
 
@@ -100,7 +134,7 @@ If your model uses different names, pass the matching `--embedding-*` flags.
 
 ## Inference Speed
 
-Potion Code is the CPU local option. Use Jina ONNX with CUDA, ROCm, CoreML, DirectML, or OpenVINO when you have a supported GPU. After the first index, `vera update .` only re-embeds changed files, so updates are fast on any backend.
+The default Potion Code model runs on all supported machines. Use Jina ONNX with CUDA, ROCm, CoreML, DirectML, or OpenVINO when you want an opt-in alternative. After the first index, `vera update .` only re-embeds changed files, so updates are fast on any backend.
 
 | Backend | Hardware | Time | Notes |
 |---------|----------|------|-------|
@@ -151,7 +185,8 @@ On macOS Apple Silicon, CoreML auto-detects unified memory by reading `sysctl hw
 
 ## Notes
 
-- Custom ONNX options only affect Jina ONNX local embeddings. API mode and Potion Code are unchanged.
-- Query prefixes only apply to ONNX local embedding queries, not API embeddings.
+- Custom ONNX options only affect opt-in Jina ONNX local embeddings. API mode and the default Potion Code model are unchanged.
+- Query and document prefixes apply to both API mode and local ONNX embeddings. API mode reads `EMBEDDING_QUERY_PREFIX` and `EMBEDDING_DOCUMENT_PREFIX`, with model-ID auto-detection when they are unset. Local ONNX uses the corresponding `--embedding-query-prefix` and `--embedding-document-prefix` setup flags.
+- The stored embedding model identity covers every `--embedding-*` setting, not just the model name, so changing pooling or either prefix also requires a re-index.
 - If you switch local embedding models without configured aliases, re-index the repo so the stored vectors match the active model.
 - If your network blocks CLI downloads, use [manual-install.md](manual-install.md).

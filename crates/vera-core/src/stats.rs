@@ -10,7 +10,7 @@ use anyhow::{Context, Result};
 use serde::Serialize;
 
 use crate::indexing::index_dir;
-use crate::storage::metadata::{IndexHealth, MetadataStore};
+use crate::storage::metadata::{IndexHealth, MetadataStore, is_entry_point_path};
 
 /// Architecture overview of an indexed repository.
 #[derive(Debug, Clone, Serialize)]
@@ -112,10 +112,11 @@ pub fn collect_stats(repo_path: &Path) -> Result<IndexStats> {
         );
     }
 
-    // Open metadata store.
+    // Open metadata store. Read-only: a missing database must be an error,
+    // never an empty database fabricated by the read itself.
     let metadata_path = idx_dir.join("metadata.db");
     let metadata_store =
-        MetadataStore::open(&metadata_path).context("failed to open metadata store")?;
+        MetadataStore::open_existing(&metadata_path).context("failed to open metadata store")?;
 
     // Collect counts.
     let file_count = metadata_store
@@ -182,7 +183,8 @@ pub fn collect_overview_filtered(
     }
 
     let metadata_path = idx_dir.join("metadata.db");
-    let store = MetadataStore::open(&metadata_path).context("failed to open metadata store")?;
+    let store =
+        MetadataStore::open_existing(&metadata_path).context("failed to open metadata store")?;
 
     let index_size_bytes = compute_dir_size(&idx_dir)?;
     let index_size_human = format_bytes(index_size_bytes);
@@ -211,26 +213,30 @@ pub fn collect_overview_filtered(
         });
     }
 
+    // Two grouped queries replace one content-fetching query per file: the
+    // overview only needs counts, line spans, languages, and symbol types.
+    let summaries = store.file_chunk_summaries(&files)?;
+    let symbol_type_totals = store.symbol_type_counts(&files)?;
+
     let mut language_files: BTreeMap<String, u64> = BTreeMap::new();
     let mut language_chunks: BTreeMap<String, u64> = BTreeMap::new();
     let mut top_directories: HashMap<String, u64> = HashMap::new();
-    let mut symbol_types: HashMap<String, u64> = HashMap::new();
-    let mut hotspots: Vec<(String, u64)> = Vec::new();
+    let mut hotspots: Vec<(String, u64)> = Vec::with_capacity(files.len());
     let mut entry_points = Vec::new();
     let mut total_lines = 0u64;
     let mut chunk_count = 0u64;
 
     for file in &files {
-        let chunks = store.get_chunks_by_file(file)?;
-        if chunks.is_empty() {
+        // Files retained by the filter but absent from the index contribute
+        // nothing, exactly as when their chunk fetch used to come back empty.
+        let Some(summary) = summaries.get(file) else {
             continue;
-        }
+        };
 
-        let file_chunk_count = chunks.len() as u64;
-        chunk_count += file_chunk_count;
-        hotspots.push((file.clone(), file_chunk_count));
+        chunk_count += summary.chunk_count;
+        hotspots.push((file.clone(), summary.chunk_count));
 
-        if matches_entry_point(file) {
+        if is_entry_point_path(file) {
             entry_points.push(file.clone());
         }
 
@@ -242,18 +248,10 @@ pub fn collect_overview_filtered(
             .to_string();
         *top_directories.entry(top_dir).or_default() += 1;
 
-        let language = chunks[0].language.to_string();
-        *language_files.entry(language.clone()).or_default() += 1;
-        *language_chunks.entry(language).or_default() += file_chunk_count;
+        *language_files.entry(summary.language.clone()).or_default() += 1;
+        *language_chunks.entry(summary.language.clone()).or_default() += summary.chunk_count;
 
-        let mut max_line_end = 0u32;
-        for chunk in &chunks {
-            max_line_end = max_line_end.max(chunk.line_end);
-            if let Some(symbol_type) = chunk.symbol_type {
-                *symbol_types.entry(symbol_type.to_string()).or_default() += 1;
-            }
-        }
-        total_lines += max_line_end as u64;
+        total_lines += summary.max_line_end as u64;
     }
 
     let mut languages: Vec<LanguageOverview> = language_chunks
@@ -284,7 +282,7 @@ pub fn collect_overview_filtered(
     });
     top_directories.truncate(15);
 
-    let mut symbol_types: Vec<SymbolTypeStat> = symbol_types
+    let mut symbol_types: Vec<SymbolTypeStat> = symbol_type_totals
         .into_iter()
         .map(|(symbol_type, count)| SymbolTypeStat { symbol_type, count })
         .collect();
@@ -377,9 +375,65 @@ fn collect_full_overview(
 }
 
 fn detect_conventions_from_files(files: &[String]) -> Vec<String> {
-    let mut conventions = Vec::new();
+    // Lowercase each path once and split it into components up front; matching
+    // then compares whole components, so `src/myterraform/mod.rs` can never
+    // satisfy a `terraform` pattern and nothing allocates per pattern x file.
+    let lowered_components: Vec<Vec<String>> = files
+        .iter()
+        .map(|file| {
+            file.split(['/', '\\'])
+                .filter(|component| !component.is_empty())
+                .map(str::to_ascii_lowercase)
+                .collect()
+        })
+        .collect();
 
-    let indicators: &[(&[&str], &str)] = &[
+    indicators()
+        .iter()
+        .filter(|(patterns, _label)| {
+            patterns
+                .iter()
+                .any(|pattern| matches_convention_pattern(pattern, &lowered_components))
+        })
+        .map(|(_patterns, label)| (*label).to_string())
+        .collect()
+}
+
+/// Whether any indexed path satisfies a convention pattern.
+///
+/// Single-segment patterns must equal a whole path component; dot-prefixed
+/// patterns may instead match a filename suffix (`.proto` matches
+/// `schema.proto`). Slash-separated patterns must appear as consecutive
+/// components, so `.github/workflows` neither fires on `.github/workflows-old`
+/// nor on a bare `.github` directory. Components are pre-lowercased by the
+/// caller; comparisons are ASCII case-insensitive so mixed-case pattern
+/// literals (`Cargo.toml`, `Dockerfile`) match without allocating.
+fn matches_convention_pattern(pattern: &str, files: &[Vec<String>]) -> bool {
+    if let Some((head, tail)) = pattern.split_once('/') {
+        let parts: Vec<&str> = std::iter::once(head).chain(tail.split('/')).collect();
+        return files.iter().any(|components| {
+            components.windows(parts.len()).any(|window| {
+                window
+                    .iter()
+                    .zip(&parts)
+                    .all(|(component, part)| component.eq_ignore_ascii_case(part))
+            })
+        });
+    }
+    files.iter().any(|components| {
+        components.iter().any(|component| {
+            if pattern.starts_with('.') && component.len() >= pattern.len() {
+                let suffix = &component[component.len() - pattern.len()..];
+                suffix.eq_ignore_ascii_case(pattern)
+            } else {
+                component.eq_ignore_ascii_case(pattern)
+            }
+        })
+    })
+}
+
+const fn indicators() -> &'static [(&'static [&'static str], &'static str)] {
+    &[
         (&["Cargo.toml"], "Rust/Cargo project"),
         (&["package.json"], "Node.js/npm project"),
         (
@@ -424,35 +478,7 @@ fn detect_conventions_from_files(files: &[String]) -> Vec<String> {
         (&["migrations"], "Database migrations"),
         (&["prisma"], "Prisma ORM"),
         (&[".storybook"], "Storybook UI"),
-    ];
-
-    for (patterns, label) in indicators {
-        let found = patterns.iter().any(|pat| {
-            files.iter().any(|f| {
-                let lower = f.to_ascii_lowercase();
-                // Match as filename or path component.
-                lower.contains(pat)
-            })
-        });
-        if found {
-            conventions.push((*label).to_string());
-        }
-    }
-
-    conventions
-}
-
-fn matches_entry_point(file_path: &str) -> bool {
-    let Some(file_name) = Path::new(file_path)
-        .file_name()
-        .and_then(|name| name.to_str())
-    else {
-        return false;
-    };
-    let Some((stem, _rest)) = file_name.split_once('.') else {
-        return false;
-    };
-    matches!(stem, "main" | "index" | "app" | "lib" | "mod" | "server")
+    ]
 }
 
 // ── Call graph queries ───────────────────────────────────────────────
@@ -468,7 +494,8 @@ fn open_metadata(repo_path: &Path) -> Result<MetadataStore> {
             idx_dir.display()
         );
     }
-    MetadataStore::open(&idx_dir.join("metadata.db")).context("failed to open metadata store")
+    MetadataStore::open_existing(&idx_dir.join("metadata.db"))
+        .context("failed to open metadata store")
 }
 
 /// Find all call sites that reference a given symbol name.
@@ -553,19 +580,123 @@ mod tests {
     }
 
     #[test]
-    fn matches_entry_point_accepts_main_rs() {
-        assert!(matches_entry_point("src/main.rs"));
-        assert!(matches_entry_point("server.ts"));
-        assert!(!matches_entry_point("src/main"));
-        assert!(!matches_entry_point("src/domain.rs"));
+    fn collect_stats_missing_metadata_db_errors_without_creating_it() {
+        // A `.vera/` directory without `metadata.db` means a crashed or
+        // truncated index: the read must fail with the re-index hint and must
+        // not fabricate the database (issue #155).
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join(".vera")).unwrap();
+
+        let result = collect_stats(dir.path());
+        assert!(result.is_err(), "all-zero success for a missing index");
+        let err = format!("{:#}", result.unwrap_err());
+        assert!(err.contains("no index metadata found"), "error was: {err}");
+        assert!(
+            !dir.path().join(".vera/metadata.db").exists(),
+            "the read created metadata.db"
+        );
+    }
+
+    #[test]
+    fn entry_point_predicate_matches_final_components() {
+        assert!(is_entry_point_path("src/main.rs"));
+        assert!(is_entry_point_path("server.ts"));
+        assert!(!is_entry_point_path("src/main"));
+        assert!(!is_entry_point_path("src/domain.rs"));
+    }
+
+    #[test]
+    fn conventions_match_whole_components_not_substrings() {
+        let detect = |files: &[&str]| {
+            detect_conventions_from_files(
+                &files
+                    .iter()
+                    .map(|file| file.to_string())
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let has_label = |labels: &Vec<String>, label: &str| labels.iter().any(|l| l == label);
+
+        // Real markers still fire, case-insensitively.
+        assert!(has_label(
+            &detect(&["Cargo.toml", "src/lib.rs"]),
+            "Rust/Cargo project"
+        ));
+        assert!(has_label(
+            &detect(&["infra/terraform/main.tf"]),
+            "Terraform infrastructure"
+        ));
+        assert!(has_label(
+            &detect(&["deploy/k8s/app.yaml"]),
+            "Kubernetes deployment"
+        ));
+        assert!(has_label(
+            &detect(&["src/api/schema.proto"]),
+            "Protocol Buffers"
+        ));
+
+        // Substring hits must not fire (issue #173).
+        assert!(!has_label(
+            &detect(&["src/myterraform/mod.rs"]),
+            "Terraform infrastructure"
+        ));
+        assert!(!has_label(
+            &detect(&["src/kubernetes_client.go"]),
+            "Kubernetes deployment"
+        ));
+        assert!(!has_label(
+            &detect(&["src/protocol.rs"]),
+            "Protocol Buffers"
+        ));
+        assert!(!has_label(
+            &detect(&["docs/contrib.md"]),
+            "Protocol Buffers"
+        ));
+
+        // Multi-segment patterns match consecutive components only: a bare
+        // `.github` directory and a `.github/workflows-old` near-miss stay
+        // silent, while real workflow files are detected.
+        assert!(has_label(
+            &detect(&[".github/workflows/ci.yml"]),
+            "GitHub Actions CI"
+        ));
+        assert!(!has_label(
+            &detect(&[".github/dependabot.yml"]),
+            "GitHub Actions CI"
+        ));
+        assert!(!has_label(
+            &detect(&[".github/workflows-old/ci.yml"]),
+            "GitHub Actions CI"
+        ));
+
+        // Windows separators split into components like Unix ones.
+        assert!(has_label(
+            &detect(&["packages\\app\\Dockerfile"]),
+            "Docker containerization"
+        ));
+        assert!(has_label(
+            &detect(&["src\\proto\\client.ts"]),
+            "Protocol Buffers"
+        ));
     }
 
     #[tokio::test]
-    async fn filtered_overview_keeps_entry_points() {
+    async fn filtered_overview_aggregates_match_per_file_numbers() {
+        // The exact-path set must cover every indexed file so the filtered
+        // path runs both aggregate queries; asserting against per-file reads
+        // keeps the test independent of parser chunking details.
         let dir = tempfile::TempDir::new().unwrap();
         std::fs::create_dir_all(dir.path().join("src")).unwrap();
-        std::fs::write(dir.path().join("src").join("main.rs"), "fn main() {}\n").unwrap();
-        std::fs::write(dir.path().join("src").join("helper.rs"), "fn helper() {}\n").unwrap();
+        std::fs::write(
+            dir.path().join("src").join("main.rs"),
+            "fn main() {}\nstruct Config { name: String }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src").join("lib.py"),
+            "def hello():\n    pass\n",
+        )
+        .unwrap();
 
         let provider = MockProvider::new(8);
         let config = VeraConfig::default();
@@ -573,8 +704,54 @@ mod tests {
             .await
             .unwrap();
 
-        let exact_paths = HashSet::from([String::from("src/main.rs")]);
+        let store = MetadataStore::open_existing(&dir.path().join(".vera/metadata.db")).unwrap();
+        let files = [String::from("src/main.rs"), String::from("src/lib.py")];
+        let expected_chunks: u64 = files
+            .iter()
+            .map(|file| store.get_chunks_by_file(file).unwrap().len() as u64)
+            .sum();
+        let expected_lines: u64 = files
+            .iter()
+            .map(|file| {
+                store
+                    .get_chunks_by_file(file)
+                    .unwrap()
+                    .iter()
+                    .map(|chunk| u64::from(chunk.line_end))
+                    .max()
+                    .unwrap_or(0)
+            })
+            .sum();
+        let expected_functions: u64 = files
+            .iter()
+            .map(|file| {
+                store
+                    .get_chunks_by_file(file)
+                    .unwrap()
+                    .iter()
+                    .filter(|chunk| chunk.symbol_type == Some(crate::types::SymbolType::Function))
+                    .count() as u64
+            })
+            .sum();
+        drop(store);
+
+        let exact_paths: HashSet<String> = files.iter().cloned().collect();
         let overview = collect_overview_filtered(dir.path(), Some(&exact_paths)).unwrap();
-        assert_eq!(overview.entry_points, vec![String::from("src/main.rs")]);
+        assert_eq!(overview.file_count, 2);
+        assert_eq!(overview.chunk_count, expected_chunks);
+        assert_eq!(overview.total_lines, expected_lines);
+        assert_eq!(overview.languages.len(), 2);
+        for language in &overview.languages {
+            assert_eq!(language.files, 1);
+            assert!(language.chunks > 0, "{} has no chunks", language.language);
+        }
+        let function_total = overview
+            .symbol_types
+            .iter()
+            .find(|stat| stat.symbol_type == "function")
+            .map(|stat| stat.count)
+            .unwrap_or(0);
+        assert_eq!(function_total, expected_functions);
+        assert!(overview.entry_points.contains(&String::from("src/main.rs")));
     }
 }

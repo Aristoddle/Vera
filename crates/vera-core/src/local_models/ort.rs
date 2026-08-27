@@ -4,8 +4,10 @@
 use crate::config::OnnxExecutionProvider;
 use anyhow::{Context, Result};
 use reqwest::Client;
+use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use tokio::fs;
 
 use super::cuda::*;
@@ -16,29 +18,92 @@ use super::*;
 /// Accepts an optional pre-resolved library path (from `ensure_ort_library`).
 /// Falls back to system library search if no path is provided.
 ///
-/// Safe to call multiple times — only the first call takes effect.
+/// Safe to call multiple times with the same path. A different path after
+/// initialization is rejected because `ort` can load only one global runtime.
 pub fn ensure_ort_runtime(lib_path: Option<&std::path::Path>) -> Result<()> {
-    let result = ORT_INIT_RESULT.get_or_init(|| {
-        let lib_name = match lib_path {
-            Some(p) => p.display().to_string(),
-            None => ort_lib_filename(),
-        };
-        match ::ort::init_from(&lib_name) {
-            Ok(builder) => {
-                builder.commit();
-                Ok(())
-            }
-            Err(e) => Err(format!(
-                "ONNX Runtime shared library not found.\n\
+    let requested = lib_path
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(ort_lib_filename);
+    if let Some(initialized) = ORT_INIT_LIBRARY_PATH.get() {
+        validate_ort_library_path(Some(initialized), &requested)?;
+    }
+
+    let result = ORT_INIT_RESULT.get_or_init(|| match ::ort::init_from(&requested) {
+        Ok(builder) => {
+            builder.commit();
+            let _ = ORT_INIT_LIBRARY_PATH.set(requested.clone());
+            Ok(())
+        }
+        Err(e) => Err(format!(
+            "ONNX Runtime shared library not found.\n\
                  Run `vera setup` to auto-download it, or use API mode instead.\n\
                  Original error: {e}"
-            )),
-        }
+        )),
     });
+
+    if let Some(initialized) = ORT_INIT_LIBRARY_PATH.get() {
+        validate_ort_library_path(Some(initialized), &requested)?;
+    }
 
     match result {
         Ok(()) => Ok(()),
         Err(msg) => anyhow::bail!("{msg}"),
+    }
+}
+
+fn validate_ort_library_path(initialized: Option<&str>, requested: &str) -> Result<()> {
+    if let Some(initialized) = initialized.filter(|path| *path != requested) {
+        anyhow::bail!(
+            "ONNX Runtime is already initialized with `{initialized}`, but `{requested}` was requested; one process cannot load both libraries"
+        );
+    }
+    Ok(())
+}
+
+static ORT_INIT_LIBRARY_PATH: OnceLock<String> = OnceLock::new();
+
+/// Return whether ONNX Runtime has already been initialized successfully.
+pub(crate) fn ort_runtime_initialized() -> bool {
+    ORT_INIT_RESULT
+        .get()
+        .is_some_and(std::result::Result::is_ok)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_ort_library_path;
+
+    #[test]
+    fn rejects_cpu_after_gpu_runtime_initialization() {
+        let error = validate_ort_library_path(
+            Some("/vera/lib/libonnxruntime-cuda.so"),
+            "/vera/lib/libonnxruntime-cpu.so",
+        )
+        .expect_err("different runtime paths must be rejected");
+        let message = error.to_string();
+        assert!(message.contains("libonnxruntime-cuda.so"));
+        assert!(message.contains("libonnxruntime-cpu.so"));
+    }
+
+    #[test]
+    fn rejects_gpu_after_cpu_runtime_initialization() {
+        let error = validate_ort_library_path(
+            Some("/vera/lib/libonnxruntime-cpu.so"),
+            "/vera/lib/libonnxruntime-cuda.so",
+        )
+        .expect_err("different runtime paths must be rejected");
+        let message = error.to_string();
+        assert!(message.contains("libonnxruntime-cpu.so"));
+        assert!(message.contains("libonnxruntime-cuda.so"));
+    }
+
+    #[test]
+    fn accepts_repeated_initialization_with_same_path() {
+        validate_ort_library_path(
+            Some("/vera/lib/libonnxruntime.so"),
+            "/vera/lib/libonnxruntime.so",
+        )
+        .expect("same runtime path should be accepted");
     }
 }
 
@@ -330,26 +395,27 @@ pub(super) async fn ensure_ort_library_for_ep_with_cuda_major(
         return Ok(target_path);
     }
 
-    if target_path.exists() {
-        return Ok(target_path);
-    }
-
     let lib_dir = target_path
         .parent()
         .context("failed to determine ONNX Runtime directory")?
         .to_path_buf();
-
     fs::create_dir_all(&lib_dir).await?;
 
     // OpenVINO and ROCm: pip-based install with fallback chain
     #[cfg(target_os = "linux")]
     if pip_package_for_ep(ep).is_some() {
+        if target_path.exists() {
+            return Ok(target_path);
+        }
         return ensure_ort_via_pip_chain(ep, &lib_dir, &target_path).await;
     }
 
     // DirectML: distributed via NuGet, not GitHub release archives.
     #[cfg(target_os = "windows")]
     if matches!(ep, OnnxExecutionProvider::DirectMl) {
+        if target_path.exists() {
+            return Ok(target_path);
+        }
         return ensure_ort_via_nuget_directml(&lib_dir, &target_path).await;
     }
 
@@ -357,12 +423,17 @@ pub(super) async fn ensure_ort_library_for_ep_with_cuda_major(
     let (ext, archive_name, lib_path_in_archive, local_lib_name, ort_version) =
         ort_platform_info_with_cuda_major(ep, detected_cuda_major)?;
     let is_gpu = ep != OnnxExecutionProvider::Cpu;
-
     let archive_filename = if ext == "tgz" {
         format!("{archive_name}.tgz")
     } else {
         format!("{archive_name}.zip")
     };
+    let marker_path = ort_digest_marker_path(&target_path);
+    let expected_digest = expected_ort_archive_sha256(&archive_filename);
+    if target_path.exists() && marker_matches(&marker_path, &target_path, expected_digest).await {
+        return Ok(target_path);
+    }
+
     let url = format!(
         "https://github.com/microsoft/onnxruntime/releases/download/v{ort_version}/{archive_filename}"
     );
@@ -378,7 +449,15 @@ pub(super) async fn ensure_ort_library_for_ep_with_cuda_major(
         .send()
         .await?
         .error_for_status()?;
+    let _ = expected_digest.context("no pinned checksum for ONNX Runtime archive")?;
     let bytes = res.bytes().await?;
+    if let Some(expected) = expected_digest {
+        verify_sha256(
+            bytes.as_ref(),
+            expected,
+            &format!("ONNX Runtime archive {archive_name}"),
+        )?;
+    }
 
     let lib_dir_clone = lib_dir.clone();
     let lib_path_in_archive_clone = lib_path_in_archive.clone();
@@ -410,11 +489,57 @@ pub(super) async fn ensure_ort_library_for_ep_with_cuda_major(
         return Err(e).context("Failed to extract ONNX Runtime from archive");
     }
 
+    if let Some(expected) = expected_digest {
+        let library_digest = sha256_hex(File::open(&target_path)?)?;
+        fs::write(
+            &marker_path,
+            format!("archive={expected}\nlibrary={library_digest}\n"),
+        )
+        .await?;
+    }
+
     eprintln!(
         "ONNX Runtime v{ort_version} installed to {}",
         lib_dir.display()
     );
     Ok(target_path)
+}
+
+fn ort_digest_marker_path(path: &Path) -> PathBuf {
+    path.with_file_name(format!(
+        "{}.sha256",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("ort")
+    ))
+}
+
+async fn marker_matches(path: &Path, target: &Path, expected: Option<&str>) -> bool {
+    let Some(expected) = expected else {
+        return false;
+    };
+    match fs::read_to_string(path).await {
+        Ok(marker) => {
+            let mut archive = None;
+            let mut library = None;
+            for line in marker.lines() {
+                if let Some(value) = line.strip_prefix("archive=") {
+                    archive = Some(value);
+                } else if let Some(value) = line.strip_prefix("library=") {
+                    library = Some(value);
+                }
+            }
+            let Some(library) = library else {
+                return false;
+            };
+            let library_matches = File::open(target)
+                .ok()
+                .and_then(|file| sha256_hex(file).ok())
+                .is_some_and(|actual| actual.eq_ignore_ascii_case(library));
+            archive.is_some_and(|value| value.eq_ignore_ascii_case(expected)) && library_matches
+        }
+        Err(_) => false,
+    }
 }
 
 /// Re-fetch the ONNX Runtime library for the selected execution provider.
@@ -437,15 +562,15 @@ pub async fn refresh_ort_library_for_ep(ep: OnnxExecutionProvider) -> Result<Pat
                 )
             })?;
         }
-    } else if let Some(dir) = target_path.parent() {
-        if dir.exists() {
-            fs::remove_dir_all(dir).await.with_context(|| {
-                format!(
-                    "failed to remove stale ONNX Runtime directory {}",
-                    dir.display()
-                )
-            })?;
-        }
+    } else if let Some(dir) = target_path.parent()
+        && dir.exists()
+    {
+        fs::remove_dir_all(dir).await.with_context(|| {
+            format!(
+                "failed to remove stale ONNX Runtime directory {}",
+                dir.display()
+            )
+        })?;
     }
 
     ensure_ort_library_for_ep_with_cuda_major(ep, detected_cuda_major).await
@@ -702,12 +827,6 @@ pub fn ensure_provider_dependencies(
     anyhow::bail!("{}", message.trim_end());
 }
 
-pub fn inspect_shared_library_deps(
-    runtime_path: &std::path::Path,
-) -> Result<Option<SharedLibraryDependencyStatus>> {
-    inspect_shared_library_deps_impl(runtime_path, None)
-}
-
 pub fn inspect_provider_dependencies(
     ep: OnnxExecutionProvider,
     runtime_path: &std::path::Path,
@@ -937,19 +1056,19 @@ pub(super) fn collect_runtime_libraries(
     suffix: &str,
 ) -> Vec<PathBuf> {
     let mut inspected_files = vec![runtime_path.to_path_buf()];
-    if let Some(dir) = runtime_path.parent() {
-        if let Ok(entries) = std::fs::read_dir(dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-                    continue;
-                };
-                if (name.starts_with("libonnxruntime") || name.starts_with("onnxruntime"))
-                    && name.contains(suffix)
-                    && path != runtime_path
-                {
-                    inspected_files.push(path);
-                }
+    if let Some(dir) = runtime_path.parent()
+        && let Ok(entries) = std::fs::read_dir(dir)
+    {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            if (name.starts_with("libonnxruntime") || name.starts_with("onnxruntime"))
+                && name.contains(suffix)
+                && path != runtime_path
+            {
+                inspected_files.push(path);
             }
         }
     }

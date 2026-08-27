@@ -1,29 +1,29 @@
 //! Shared search service used by both CLI and MCP.
 //!
 //! Encapsulates the common hybrid search flow: create embedding provider,
-//! build reranker, compute fetch limits, execute search, apply filters.
+//! resolve the reranker for the query, compute fetch limits, execute search,
+//! apply filters.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
+use anyhow::Result;
+use tokio::sync::OnceCell;
 use tracing::warn;
 
 use crate::config::{InferenceBackend, VeraConfig};
 use crate::embedding::{CachedEmbeddingProvider, DynamicProvider, EmbeddingProvider};
 use crate::retrieval::dynamic_reranker::DynamicReranker;
+use crate::retrieval::exact_matches::augment_exact_match_candidates_with_store;
 pub use crate::retrieval::exact_matches::augment_multi_query_exact_matches;
-use crate::retrieval::exact_matches::{
-    augment_exact_match_candidates, augment_exact_match_candidates_with_store,
-};
 use crate::retrieval::hybrid::{
-    compute_vector_candidates, search_hybrid_reranked_with_augmentation,
+    SearchStores, compute_vector_candidates, search_hybrid_reranked_with_stores,
+    search_hybrid_with_stores,
 };
 use crate::retrieval::query_classifier::{QueryType, classify_query, params_for_query_type};
 use crate::retrieval::ranking::{RankingStage, is_path_weighted_query};
-use crate::retrieval::{apply_filters, search_bm25_with_stores_and_filters, search_hybrid};
-use crate::storage::bm25::Bm25Index;
-use crate::storage::metadata::MetadataStore;
+use crate::retrieval::{apply_filters, search_bm25_with_stores_and_filters};
 use crate::types::{SearchFilters, SearchResult};
 
 /// Timing data for each stage of the search pipeline.
@@ -61,7 +61,16 @@ pub struct SearchContext {
     provider: Option<CachedEmbeddingProvider<DynamicProvider>>,
     model_name: Option<String>,
     provider_error: Option<String>,
-    reranker: Option<DynamicReranker>,
+    backend: InferenceBackend,
+    stores: Mutex<Option<(PathBuf, Arc<SearchStores>)>>,
+    /// Cross-encoder session, built on first query that actually reranks.
+    ///
+    /// `None` inside the cell means "unavailable": either reranking is off in
+    /// config, or construction failed. See `reranker` for why that outcome is
+    /// cached.
+    reranker: OnceCell<Option<DynamicReranker>>,
+    #[cfg(test)]
+    reranker_builds: std::sync::atomic::AtomicUsize,
 }
 
 impl SearchContext {
@@ -86,22 +95,15 @@ impl SearchContext {
                 }
             };
 
-        let reranker = if provider.is_some() {
-            crate::retrieval::create_dynamic_reranker(config, backend)
-                .await
-                .unwrap_or_else(|err| {
-                    warn!("Failed to create reranker ({})", err);
-                    None
-                })
-        } else {
-            None
-        };
-
         Self {
             provider,
             model_name,
             provider_error,
-            reranker,
+            backend,
+            stores: Mutex::new(None),
+            reranker: OnceCell::new(),
+            #[cfg(test)]
+            reranker_builds: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -110,8 +112,70 @@ impl SearchContext {
             provider: None,
             model_name: None,
             provider_error: None,
-            reranker: None,
+            // Unused: with no embedding provider `search` returns on the
+            // BM25-only path before any reranker is resolved.
+            backend: InferenceBackend::Api,
+            stores: Mutex::new(None),
+            reranker: OnceCell::new(),
+            #[cfg(test)]
+            reranker_builds: std::sync::atomic::AtomicUsize::new(0),
         }
+    }
+
+    /// Resolve the cross-encoder for one query, or `None` when this query does
+    /// not rerank or no reranker is available.
+    ///
+    /// The heuristic is evaluated before the build, so a query that skips
+    /// reranking never touches the session.
+    async fn reranker_for_query(
+        &self,
+        config: &VeraConfig,
+        has_intent: bool,
+        query: &str,
+        filters: &SearchFilters,
+    ) -> Option<&DynamicReranker> {
+        if !reranking_wanted(has_intent, query, filters) {
+            return None;
+        }
+        self.reranker(config).await
+    }
+
+    /// Number of times the reranker build actually ran. `OnceCell` caps it at
+    /// one; the interesting assertion is that it stays zero.
+    #[cfg(test)]
+    fn reranker_build_count(&self) -> usize {
+        self.reranker_builds
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Resolve the cross-encoder, building it the first time one is needed.
+    ///
+    /// The local ONNX session is roughly a gigabyte of resident memory, and the
+    /// majority of queries never reach the reranker, so it must not be built
+    /// before the query is known (issue #100).
+    ///
+    /// Construction is cached on the context, not per query: MCP keeps one
+    /// `SearchContext` for the life of the session, so a long session pays the
+    /// load once. A failed build is cached the same way, deliberately. Retrying
+    /// per query would turn one missing model or unusable execution provider
+    /// into a multi-second stall on every subsequent search, and the failure
+    /// causes are static for a process (absent asset, bad EP, unset API key).
+    /// The cache is per context, so a new process or a rebuilt context retries.
+    async fn reranker(&self, config: &VeraConfig) -> Option<&DynamicReranker> {
+        self.reranker
+            .get_or_init(|| async {
+                #[cfg(test)]
+                self.reranker_builds
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                crate::retrieval::create_dynamic_reranker(config, self.backend)
+                    .await
+                    .unwrap_or_else(|err| {
+                        warn!("Failed to create reranker ({})", err);
+                        None
+                    })
+            })
+            .await
+            .as_ref()
     }
 
     pub fn embedding_provider(&self) -> Option<&CachedEmbeddingProvider<DynamicProvider>> {
@@ -120,6 +184,22 @@ impl SearchContext {
 
     pub fn model_name(&self) -> Option<&str> {
         self.model_name.as_deref()
+    }
+
+    fn search_stores(&self, index_dir: &Path) -> Result<Arc<SearchStores>> {
+        let mut cached = self
+            .stores
+            .lock()
+            .map_err(|_| anyhow::anyhow!("search store cache lock poisoned"))?;
+        if let Some((cached_dir, stores)) = cached.as_ref()
+            && cached_dir == index_dir
+        {
+            return Ok(Arc::clone(stores));
+        }
+
+        let stores = Arc::new(SearchStores::open(index_dir)?);
+        *cached = Some((index_dir.to_path_buf(), Arc::clone(&stores)));
+        Ok(stores)
     }
 
     pub async fn search(
@@ -140,6 +220,7 @@ impl SearchContext {
         // True when an intent prefix was actually applied (non-empty intent).
         let has_intent = matches!(vector_query, std::borrow::Cow::Owned(_));
         let fetch_limit = compute_fetch_limit(query, filters, result_limit);
+        let stores = self.search_stores(index_dir)?;
 
         let Some(provider) = self.provider.as_ref() else {
             if let Some(error) = self.provider_error.as_deref() {
@@ -149,72 +230,99 @@ impl SearchContext {
                 );
             }
             return run_bm25_only(
-                index_dir,
                 query,
                 filters,
                 fetch_limit,
                 result_limit,
                 total_start,
+                &stores,
             );
         };
 
         let mut stored_dim = config.embedding.max_stored_dim;
 
         // Check metadata mismatch
-        let metadata_path = index_dir.join("metadata.db");
-        if let Ok(metadata_store) = crate::storage::metadata::MetadataStore::open(&metadata_path) {
-            if let (Some(s_model), Some(s_dim)) = (
+        let index_meta = stores.bm25_metadata.lock().ok().map(|metadata_store| {
+            (
                 metadata_store.get_index_meta("model_name").unwrap_or(None),
                 metadata_store
                     .get_index_meta("embedding_dim")
                     .unwrap_or(None),
-            ) {
-                if let Some(model_name) = self.model_name.as_deref() {
-                    if !crate::config::model_names_match_with_aliases(
-                        &s_model,
-                        model_name,
-                        &config.embedding.model_aliases,
-                    ) {
-                        warn!(
-                            "Index model '{}' does not match active model '{}'; using BM25-only search",
-                            s_model, model_name
-                        );
-                        return run_bm25_only(
-                            index_dir,
-                            query,
-                            filters,
-                            fetch_limit,
-                            result_limit,
-                            total_start,
-                        );
-                    }
+                metadata_store
+                    .get_index_meta("document_prefix")
+                    .unwrap_or(None),
+            )
+        });
+        if let Some((Some(s_model), Some(s_dim), s_prefix)) = index_meta {
+            if let Some(model_name) = self.model_name.as_deref()
+                && !crate::config::model_names_match_with_aliases(
+                    &s_model,
+                    model_name,
+                    &config.embedding.model_aliases,
+                )
+            {
+                warn!(
+                    "Index model '{}' does not match active model '{}'; using BM25-only search",
+                    s_model, model_name
+                );
+                return run_bm25_only(
+                    query,
+                    filters,
+                    fetch_limit,
+                    result_limit,
+                    total_start,
+                    &stores,
+                );
+            }
+            // A changed document prefix means the stored vectors live in a
+            // different vector space. Indexes written before this guard have
+            // no stored prefix, and their documents were never prefixed.
+            let active_prefix = provider.document_prefix_identity();
+            if s_prefix.as_deref().unwrap_or("") != active_prefix {
+                warn!(
+                    "Index document prefix '{}' does not match active prefix '{}'; using BM25-only search (re-index to restore vector search)",
+                    s_prefix.as_deref().unwrap_or(""),
+                    active_prefix
+                );
+                return run_bm25_only(
+                    query,
+                    filters,
+                    fetch_limit,
+                    result_limit,
+                    total_start,
+                    &stores,
+                );
+            }
+            if let Ok(dim) = s_dim.parse::<usize>() {
+                if let Some(provider_dim) = provider.expected_dim()
+                    && provider_dim < dim
+                {
+                    warn!(
+                        "Index dimension {} exceeds provider dimension {}; using BM25-only search",
+                        dim, provider_dim
+                    );
+                    return run_bm25_only(
+                        query,
+                        filters,
+                        fetch_limit,
+                        result_limit,
+                        total_start,
+                        &stores,
+                    );
                 }
-                if let Ok(dim) = s_dim.parse::<usize>() {
-                    if let Some(provider_dim) = provider.expected_dim() {
-                        if provider_dim < dim {
-                            warn!(
-                                "Index dimension {} exceeds provider dimension {}; using BM25-only search",
-                                dim, provider_dim
-                            );
-                            return run_bm25_only(
-                                index_dir,
-                                query,
-                                filters,
-                                fetch_limit,
-                                result_limit,
-                                total_start,
-                            );
-                        }
-                    }
-                    stored_dim = dim;
-                }
+                stored_dim = dim;
             }
         }
 
-        // Create optional reranker. An explicit intent is a semantic signal
-        // only the reranker/embedding side can use, so it forces reranking on.
-        let reranker_enabled =
-            reranking_enabled(self.reranker.is_some(), has_intent, query, filters);
+        // Decide before building: only a query that will actually be reranked
+        // pays for the cross-encoder session. An explicit intent is a semantic
+        // signal only the reranker/embedding side can use, so it forces
+        // reranking on. A reranker that is unavailable degrades to plain hybrid
+        // search, as it did when the build happened up front.
+        let reranker = self
+            .reranker_for_query(config, has_intent, query, filters)
+            .await;
+        let reranker_enabled = reranker.is_some();
 
         // Classify query to adapt fusion parameters.
         let query_type = classify_query(query);
@@ -230,12 +338,8 @@ impl SearchContext {
             RankingStage::Initial
         };
 
-        let (results, hybrid_timings) = if reranker_enabled {
-            let reranker = self
-                .reranker
-                .as_ref()
-                .expect("reranker_enabled requires an initialized reranker");
-            search_hybrid_reranked_with_augmentation(
+        let (results, hybrid_timings) = if let Some(reranker) = reranker {
+            search_hybrid_reranked_with_stores(
                 index_dir,
                 provider,
                 reranker,
@@ -249,10 +353,11 @@ impl SearchContext {
                 rerank_candidates,
                 vector_candidates,
                 crate::config::graph_augmentation_enabled(),
+                Arc::clone(&stores),
             )
             .await?
         } else {
-            search_hybrid(
+            search_hybrid_with_stores(
                 index_dir,
                 provider,
                 query,
@@ -262,6 +367,7 @@ impl SearchContext {
                 rrf_k,
                 stored_dim,
                 vector_candidates,
+                Arc::clone(&stores),
             )
             .await?
         };
@@ -269,8 +375,19 @@ impl SearchContext {
         let mut timings = SearchTimings::from(hybrid_timings);
 
         let aug_start = Instant::now();
-        let results =
-            augment_exact_match_candidates(index_dir, query, results, ranking_stage, filters)?;
+        let indexed_files = stores.indexed_files()?;
+        let metadata_store = stores
+            .bm25_metadata
+            .lock()
+            .map_err(|_| anyhow::anyhow!("BM25 metadata store lock poisoned"))?;
+        let results = augment_exact_match_candidates_with_store(
+            &metadata_store,
+            &indexed_files,
+            query,
+            results,
+            ranking_stage,
+            filters,
+        )?;
         timings.augmentation = Some(aug_start.elapsed());
 
         timings.total = Some(total_start.elapsed());
@@ -369,20 +486,18 @@ fn effective_rerank_candidates(configured: usize, result_limit: usize) -> usize 
     configured.max(result_limit)
 }
 
-/// Decide whether the cross-encoder reranker should run.
+/// Decide whether this query wants the cross-encoder reranker.
 ///
 /// Skip heuristics (short identifier / path-weighted / exact-path or
 /// symbol-type filtered lookups) are based on the raw query. But when the user
 /// supplies an `--intent`, they are asking for semantic ranking, so the
 /// reranker must run even for short raw queries — otherwise the intent-enriched
 /// query would never reach the cross-encoder. See issue #20.
-fn reranking_enabled(
-    reranker_present: bool,
-    has_intent: bool,
-    query: &str,
-    filters: &SearchFilters,
-) -> bool {
-    reranker_present && (has_intent || !should_skip_reranking(query, filters))
+///
+/// This answers only "does this query want reranking", never "is a reranker
+/// available": it is what gates the session build, so it must not need one.
+fn reranking_wanted(has_intent: bool, query: &str, filters: &SearchFilters) -> bool {
+    has_intent || !should_skip_reranking(query, filters)
 }
 
 fn should_skip_reranking(query: &str, filters: &SearchFilters) -> bool {
@@ -394,20 +509,20 @@ fn should_skip_reranking(query: &str, filters: &SearchFilters) -> bool {
 }
 
 fn run_bm25_only(
-    index_dir: &Path,
     query: &str,
     filters: &SearchFilters,
     fetch_limit: usize,
     result_limit: usize,
     total_start: Instant,
+    stores: &Arc<SearchStores>,
 ) -> Result<(Vec<SearchResult>, SearchTimings)> {
     let bm25_start = Instant::now();
-    let bm25_index =
-        Bm25Index::open(&index_dir.join("bm25")).context("failed to open BM25 index for search")?;
-    let metadata_store = MetadataStore::open(&index_dir.join("metadata.db"))
-        .context("failed to open metadata store for search")?;
+    let metadata_store = stores
+        .bm25_metadata
+        .lock()
+        .map_err(|_| anyhow::anyhow!("BM25 metadata store lock poisoned"))?;
     let results = search_bm25_with_stores_and_filters(
-        &bm25_index,
+        &stores.bm25,
         &metadata_store,
         query,
         filters,
@@ -415,8 +530,10 @@ fn run_bm25_only(
     )?;
     let bm25_elapsed = bm25_start.elapsed();
     let aug_start = Instant::now();
+    let indexed_files = stores.indexed_files()?;
     let results = augment_exact_match_candidates_with_store(
         &metadata_store,
+        &indexed_files,
         query,
         results,
         RankingStage::Initial,
@@ -434,49 +551,30 @@ fn run_bm25_only(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::retrieval::exact_matches::augment_exact_match_candidates;
     use crate::storage::bm25::{Bm25Document, Bm25Index};
     use crate::storage::metadata::MetadataStore;
+    use crate::test_env::run_env_test;
     use crate::types::Language;
     use crate::types::{Chunk, SymbolType};
-    use std::ffi::OsString;
-    use std::sync::Mutex;
     use tempfile::tempdir;
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-    const EMBEDDING_ENV_KEYS: [&str; 3] = [
-        "EMBEDDING_MODEL_BASE_URL",
-        "EMBEDDING_MODEL_ID",
-        "EMBEDDING_MODEL_API_KEY",
-    ];
-
-    fn set_test_embedding_env(model_id: &str) -> Vec<(&'static str, Option<OsString>)> {
-        let saved = EMBEDDING_ENV_KEYS
-            .iter()
-            .map(|key| (*key, std::env::var_os(key)))
-            .collect::<Vec<_>>();
-        unsafe {
-            std::env::set_var("EMBEDDING_MODEL_BASE_URL", "http://127.0.0.1:0");
-            std::env::set_var("EMBEDDING_MODEL_ID", model_id);
-            std::env::set_var("EMBEDDING_MODEL_API_KEY", "dummy-key");
-        }
-        saved
-    }
-
-    fn restore_test_env(saved: Vec<(&'static str, Option<OsString>)>) {
-        unsafe {
-            for (key, value) in saved {
-                if let Some(value) = value {
-                    std::env::set_var(key, value);
-                } else {
-                    std::env::remove_var(key);
-                }
-            }
-        }
-    }
 
     #[test]
     fn test_dimension_mismatch_and_inference() {
-        let _env_guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        run_env_test(
+            "retrieval::search_service::tests::test_dimension_mismatch_and_inference_probe",
+            &[
+                ("EMBEDDING_MODEL_BASE_URL", Some("http://127.0.0.1:0")),
+                ("EMBEDDING_MODEL_ID", Some("dummy-api-model")),
+                ("EMBEDDING_MODEL_API_KEY", Some("dummy-key")),
+            ],
+        );
+    }
+
+    #[test]
+    #[ignore = "driven by test_dimension_mismatch_and_inference"]
+    fn test_dimension_mismatch_and_inference_probe() {
+        crate::init_tls();
         let dir = tempdir().unwrap();
         let index_dir = dir.path();
 
@@ -520,9 +618,7 @@ mod tests {
         }
 
         // 2. Test metadata-dimension inference path (API provider returns None for expected_dim)
-        // Set up dummy environment variables for API provider construction.
-        let saved_env = set_test_embedding_env("dummy-api-model");
-
+        // The dummy provider credentials are already set by the guard above.
         store
             .set_index_meta("model_name", "dummy-api-model")
             .unwrap();
@@ -542,13 +638,24 @@ mod tests {
             crate::config::InferenceBackend::Api,
         );
         assert!(res.is_ok(), "Expected Ok but got {:?}", res);
-        restore_test_env(saved_env);
     }
 
     #[test]
     fn model_metadata_mismatch_falls_back_to_bm25() {
-        let _env_guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
-        let saved_env = set_test_embedding_env("active-api-model");
+        run_env_test(
+            "retrieval::search_service::tests::model_metadata_mismatch_falls_back_to_bm25_probe",
+            &[
+                ("EMBEDDING_MODEL_BASE_URL", Some("http://127.0.0.1:0")),
+                ("EMBEDDING_MODEL_ID", Some("active-api-model")),
+                ("EMBEDDING_MODEL_API_KEY", Some("dummy-key")),
+            ],
+        );
+    }
+
+    #[test]
+    #[ignore = "driven by model_metadata_mismatch_falls_back_to_bm25"]
+    fn model_metadata_mismatch_falls_back_to_bm25_probe() {
+        crate::init_tls();
         let dir = tempdir().unwrap();
         let index_dir = dir.path();
 
@@ -595,7 +702,75 @@ mod tests {
         assert_eq!(results[0].file_path, "src/auth.rs");
         assert!(timings.bm25.is_some());
         assert!(timings.vector.is_none());
-        restore_test_env(saved_env);
+    }
+
+    #[test]
+    fn document_prefix_mismatch_falls_back_to_bm25() {
+        run_env_test(
+            "retrieval::search_service::tests::document_prefix_mismatch_falls_back_to_bm25_probe",
+            &[
+                ("EMBEDDING_MODEL_BASE_URL", Some("http://127.0.0.1:0")),
+                ("EMBEDDING_MODEL_ID", Some("indexed-model")),
+                ("EMBEDDING_MODEL_API_KEY", Some("dummy-key")),
+            ],
+        );
+    }
+
+    #[test]
+    #[ignore = "driven by document_prefix_mismatch_falls_back_to_bm25"]
+    fn document_prefix_mismatch_falls_back_to_bm25_probe() {
+        crate::init_tls();
+        let dir = tempdir().unwrap();
+        let index_dir = dir.path();
+
+        let store = MetadataStore::open(&index_dir.join("metadata.db")).unwrap();
+        store
+            .insert_chunks(&[Chunk {
+                id: "auth:0".to_string(),
+                file_path: "src/auth.rs".to_string(),
+                line_start: 1,
+                line_end: 4,
+                content: "pub fn authenticate_user() -> bool { true }".to_string(),
+                language: Language::Rust,
+                symbol_type: Some(SymbolType::Function),
+                symbol_name: Some("authenticate_user".to_string()),
+            }])
+            .unwrap();
+        store.set_index_meta("model_name", "indexed-model").unwrap();
+        store.set_index_meta("embedding_dim", "64").unwrap();
+        // The index was built with a document prefix, but the active provider
+        // configuration has none: the stored vectors are in another space.
+        store
+            .set_index_meta("document_prefix", "passage: ")
+            .unwrap();
+
+        let bm25 = Bm25Index::open(&index_dir.join("bm25")).unwrap();
+        bm25.insert_batch(&[Bm25Document {
+            chunk_id: "auth:0",
+            file_path: "src/auth.rs",
+            content: "pub fn authenticate_user() -> bool { true }",
+            symbol_name: Some("authenticate_user"),
+            language: "rust",
+        }])
+        .unwrap();
+
+        let mut config = VeraConfig::default();
+        config.embedding.timeout_secs = 1;
+        config.embedding.max_retries = 0;
+        let filters = SearchFilters::default();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let context = rt.block_on(SearchContext::new(
+            &config,
+            crate::config::InferenceBackend::Api,
+        ));
+
+        let (results, timings) = rt
+            .block_on(context.search(index_dir, "authenticate user", None, &config, &filters, 10))
+            .unwrap();
+
+        assert_eq!(results[0].file_path, "src/auth.rs");
+        assert!(timings.bm25.is_some());
+        assert!(timings.vector.is_none());
     }
 
     #[test]
@@ -668,6 +843,14 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].file_path, "fastapi/dependencies/utils.py");
         assert!(timings.bm25.is_some());
+        // The query above is one `reranking_wanted` accepts, so this pins the
+        // invariant `bm25_only`'s placeholder backend rests on: `search` returns
+        // on the BM25-only path before any reranker is resolved.
+        assert_eq!(
+            context.reranker_build_count(),
+            0,
+            "a context with no embedding provider must never construct a reranker"
+        );
     }
 
     #[test]
@@ -692,19 +875,84 @@ mod tests {
         // A short identifier query alone is skipped by the rerank heuristic.
         assert!(should_skip_reranking("authenticate", &filters));
         // Without intent that means reranking is off...
-        assert!(!reranking_enabled(true, false, "authenticate", &filters));
+        assert!(!reranking_wanted(false, "authenticate", &filters));
         // ...but an intent forces the cross-encoder to run so it sees the
         // intent-enriched query (issue #20 regression guard).
-        assert!(reranking_enabled(true, true, "authenticate", &filters));
-        // No reranker present: always off regardless of intent.
-        assert!(!reranking_enabled(false, true, "authenticate", &filters));
+        assert!(reranking_wanted(true, "authenticate", &filters));
         // Natural-language query without intent still reranks normally.
-        assert!(reranking_enabled(
-            true,
-            false,
-            "how does auth work",
-            &filters
-        ));
+        assert!(reranking_wanted(false, "how does auth work", &filters));
+    }
+
+    /// The cross-encoder session must not be built for queries that skip
+    /// reranking (issue #100), and must be built once, not per query, for those
+    /// that need it.
+    ///
+    /// The result sets are identical either way, so this asserts construction
+    /// directly via the build counter rather than any search output.
+    #[test]
+    fn reranker_is_built_only_for_queries_that_rerank() {
+        run_env_test(
+            "retrieval::search_service::tests::reranker_is_built_only_for_queries_that_rerank_probe",
+            &[
+                ("EMBEDDING_MODEL_BASE_URL", Some("http://127.0.0.1:0")),
+                ("EMBEDDING_MODEL_ID", Some("dummy-api-model")),
+                ("EMBEDDING_MODEL_API_KEY", Some("dummy-key")),
+                ("RERANKER_MODEL_BASE_URL", Some("http://127.0.0.1:0")),
+                ("RERANKER_MODEL_ID", Some("dummy-reranker-model")),
+                ("RERANKER_MODEL_API_KEY", Some("dummy-key")),
+            ],
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "driven by reranker_is_built_only_for_queries_that_rerank"]
+    async fn reranker_is_built_only_for_queries_that_rerank_probe() {
+        crate::init_tls();
+        let mut config = VeraConfig::default();
+        config.retrieval.reranking_enabled = true;
+        let filters = SearchFilters::default();
+        let context = SearchContext::new(&config, crate::config::InferenceBackend::Api).await;
+
+        // Nothing is built up front, which is the whole point.
+        assert_eq!(context.reranker_build_count(), 0);
+
+        // Short identifier query: skipped by the heuristic, so no session.
+        assert!(!reranking_wanted(false, "Bm25Index", &filters));
+        assert!(
+            context
+                .reranker_for_query(&config, false, "Bm25Index", &filters)
+                .await
+                .is_none()
+        );
+        assert_eq!(
+            context.reranker_build_count(),
+            0,
+            "a query that skips reranking must not construct the reranker"
+        );
+
+        // Natural-language query: needs the cross-encoder, so build it now.
+        assert!(
+            context
+                .reranker_for_query(
+                    &config,
+                    false,
+                    "how are embeddings batched during indexing",
+                    &filters
+                )
+                .await
+                .is_some()
+        );
+        assert_eq!(context.reranker_build_count(), 1);
+
+        // A second reranking query reuses the cached session: laziness is per
+        // context, so a long MCP session does not pay repeatedly.
+        assert!(
+            context
+                .reranker_for_query(&config, false, "how does auth work", &filters)
+                .await
+                .is_some()
+        );
+        assert_eq!(context.reranker_build_count(), 1);
     }
 
     #[test]

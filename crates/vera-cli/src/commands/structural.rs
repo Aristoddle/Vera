@@ -5,7 +5,8 @@ use std::time::Instant;
 
 use clap::ValueEnum;
 
-use crate::helpers::{load_runtime_config, output_results, prepare_indexed_search};
+use crate::helpers::{output_results, prepare_indexed_search};
+use crate::state;
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum StructuralIntent {
@@ -16,6 +17,16 @@ pub enum StructuralIntent {
     Sql,
     #[value(alias = "impl")]
     Impls,
+}
+
+fn kind_for(intent: StructuralIntent) -> vera_core::retrieval::StructuralSearchKind {
+    match intent {
+        StructuralIntent::Definitions => vera_core::retrieval::StructuralSearchKind::Definitions,
+        StructuralIntent::Env => vera_core::retrieval::StructuralSearchKind::EnvReads,
+        StructuralIntent::Routes => vera_core::retrieval::StructuralSearchKind::RouteHandlers,
+        StructuralIntent::Sql => vera_core::retrieval::StructuralSearchKind::SqlQueries,
+        StructuralIntent::Impls => vera_core::retrieval::StructuralSearchKind::Implementations,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -30,26 +41,11 @@ pub fn run(
     git_scope: Option<vera_core::git_scope::GitScope>,
     compact: bool,
 ) -> anyhow::Result<()> {
-    let config = load_runtime_config()?;
+    let config = state::load_runtime_config()?;
     let (index_dir, filters) =
         prepare_indexed_search(&config.indexing, filters, git_scope.as_ref())?;
 
-    let (kind, query) = match intent {
-        StructuralIntent::Definitions => (
-            vera_core::retrieval::StructuralSearchKind::Definitions,
-            query,
-        ),
-        StructuralIntent::Env => (vera_core::retrieval::StructuralSearchKind::EnvReads, query),
-        StructuralIntent::Routes => (
-            vera_core::retrieval::StructuralSearchKind::RouteHandlers,
-            None,
-        ),
-        StructuralIntent::Sql => (vera_core::retrieval::StructuralSearchKind::SqlQueries, None),
-        StructuralIntent::Impls => (
-            vera_core::retrieval::StructuralSearchKind::Implementations,
-            query,
-        ),
-    };
+    let kind = kind_for(intent);
 
     let started_at = Instant::now();
     let results = vera_core::retrieval::search_structural(

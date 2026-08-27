@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::str::FromStr;
 
+pub(crate) const DEFAULT_MAX_FILE_SIZE_BYTES: u64 = 1_000_000;
+
 /// Top-level configuration for Vera.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct VeraConfig {
@@ -35,18 +37,42 @@ pub struct IndexingConfig {
     pub no_default_excludes: bool,
     /// Maximum chunk size in bytes for embedding. Chunks exceeding this are
     /// split at line boundaries. 0 disables byte-based splitting.
-    /// Default: 24576 (24KB, ~6K-7K tokens, safe for any embedding model).
+    /// Default: 24576 (24KB, ~6K-7K tokens). Local embedders see only the
+    /// first 512 tokens of a chunk; the size is a retrieval-quality choice
+    /// (measured on the Semble suite, see issue #67), not a model limit.
     #[serde(default = "default_max_chunk_bytes")]
     pub max_chunk_bytes: usize,
 }
 
-/// Read a `usize` config override from an environment variable, falling
-/// back to `default` when unset or unparseable.
+/// Read a `usize` config override from an environment variable, falling back
+/// to `default` when unset or unparseable. Invalid values are reported so a
+/// typo cannot silently change runtime behavior.
 fn env_usize(key: &str, default: usize) -> usize {
-    std::env::var(key)
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(default)
+    match std::env::var(key) {
+        Ok(value) => match value.parse() {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                tracing::warn!(
+                    key,
+                    value = %value,
+                    default,
+                    error = %error,
+                    "invalid numeric environment override; using default"
+                );
+                default
+            }
+        },
+        Err(std::env::VarError::NotPresent) => default,
+        Err(error) => {
+            tracing::warn!(
+                key,
+                default,
+                error = %error,
+                "could not read numeric environment override; using default"
+            );
+            default
+        }
+    }
 }
 
 fn default_max_chunk_bytes() -> usize {
@@ -67,7 +93,7 @@ impl Default for IndexingConfig {
                 "__pycache__".to_string(),
                 ".venv".to_string(),
             ],
-            max_file_size_bytes: 1_000_000, // 1MB
+            max_file_size_bytes: DEFAULT_MAX_FILE_SIZE_BYTES, // 1MB
             extra_excludes: Vec::new(),
             no_ignore: false,
             no_default_excludes: false,
@@ -112,7 +138,7 @@ impl Default for RetrievalConfig {
             default_limit: 5,
             rrf_k: 60.0,
             rerank_candidates: 50,
-            reranking_enabled: true,
+            reranking_enabled: false,
             max_rerank_batch: default_max_rerank_batch(),
             max_output_chars: 12_000,
         }
@@ -150,6 +176,12 @@ pub struct EmbeddingConfig {
     /// When true, forces conservative GPU settings (batch_size=1, low mem limit).
     #[serde(default)]
     pub low_vram: bool,
+    /// Optional API query prefix override.
+    #[serde(default)]
+    pub query_prefix: Option<String>,
+    /// Optional API document prefix override.
+    #[serde(default)]
+    pub document_prefix: Option<String>,
     /// Equivalent embedding model names.
     ///
     /// OpenAI-compatible providers sometimes expose a deployment alias while the
@@ -178,6 +210,8 @@ impl Default for EmbeddingConfig {
             max_stored_dim: 1024,
             gpu_mem_limit_mb: 0,
             low_vram: false,
+            query_prefix: None,
+            document_prefix: None,
             model_aliases: Vec::new(),
         }
     }
@@ -234,7 +268,7 @@ pub enum InferenceBackend {
     Api,
     /// Use local ONNX models with the specified execution provider.
     OnnxJina(OnnxExecutionProvider),
-    /// Use the CPU-first Potion Code static embedding model.
+    /// Use the CPU-first Potion Code static embedding model (the default local backend).
     PotionCode,
 }
 
@@ -352,7 +386,12 @@ impl VeraConfig {
                     tracing::info!("detected GPU VRAM: {vram}MB");
                     // Auto-scale batch_size based on VRAM.
                     // Prioritize speed: use large batches when VRAM allows.
-                    let auto_batch = if vram < 3072 {
+                    // A GPU reporting ~0 free MB is full or shared, so run
+                    // the most conservative shape rather than trusting the
+                    // reading as headroom.
+                    let auto_batch = if vram < 512 {
+                        1
+                    } else if vram < 3072 {
                         4
                     } else if vram < 5120 {
                         16
@@ -374,8 +413,10 @@ impl VeraConfig {
                     // Set a conservative memory limit only for low-VRAM GPUs
                     // to prevent ORT from grabbing all VRAM. For >=8GB, no limit.
                     if self.embedding.gpu_mem_limit_mb == 0 && vram < 8192 {
-                        // Use 80% of available VRAM.
-                        self.embedding.gpu_mem_limit_mb = (vram as f64 * 0.8) as u64;
+                        // Use 80% of available VRAM, floored so a near-zero
+                        // reading cannot decay into 0, which means "no ORT
+                        // memory cap" everywhere else.
+                        self.embedding.gpu_mem_limit_mb = ((vram as f64 * 0.8) as u64).max(128);
                         tracing::info!(
                             "auto-set gpu_mem_limit={}MB (80% of {vram}MB)",
                             self.embedding.gpu_mem_limit_mb
@@ -508,30 +549,103 @@ fn detect_rocm_gpu_info() -> GpuInfo {
         };
     };
     let stdout = String::from_utf8_lossy(&output.stdout);
+    parse_rocm_gpu_csv(&stdout)
+}
+
+fn parse_rocm_gpu_csv(stdout: &str) -> GpuInfo {
     let mut vram_free_mb = None;
-    let mut fingerprint_line = None;
-    for line in stdout.lines().skip(1) {
+    let mut fingerprint_fields: Vec<&str> = Vec::new();
+    let mut free_column = None;
+    let mut total_column = None;
+    let mut used_column = None;
+    for line in stdout.lines() {
         let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with("GPU") {
+        if trimmed.is_empty() {
             continue;
         }
-        if fingerprint_line.is_none() {
-            fingerprint_line = Some(trimmed.replace(", ", "|").replace(',', "|"));
+        let parts: Vec<&str> = trimmed.split(',').map(str::trim).collect();
+        let is_data_row = parts.first().is_some_and(|first| {
+            let first = first.to_ascii_lowercase();
+            first.starts_with("gpu[") || first.starts_with("card")
+        });
+        if !is_data_row {
+            // Header row: remember which columns hold the memory figures.
+            for (index, part) in parts.iter().enumerate() {
+                let label = part.to_ascii_lowercase();
+                if label.contains("free memory") {
+                    free_column.get_or_insert(index);
+                } else if label.contains("used memory") {
+                    used_column.get_or_insert(index);
+                } else if label.contains("total memory") {
+                    total_column.get_or_insert(index);
+                }
+            }
+            continue;
         }
         if vram_free_mb.is_none() {
-            // rocm-smi reports bytes; convert to MB.
-            vram_free_mb = line
-                .split(',')
-                .filter_map(|s| s.trim().parse::<u64>().ok())
-                .next()
-                .map(|bytes| bytes / (1024 * 1024));
+            vram_free_mb = rocm_free_memory_mb(&parts, free_column, total_column, used_column);
+        }
+        if fingerprint_fields.is_empty() {
+            // Keep only stable fields. VRAM totals and live usage numbers
+            // change between runs, and a fingerprint that drifts defeats the
+            // batch-scaler profile keying it feeds.
+            fingerprint_fields = parts
+                .iter()
+                .copied()
+                .filter(|part| is_stable_fingerprint_field(part))
+                .collect();
         }
     }
     GpuInfo {
         vram_free_mb,
-        fingerprint: fingerprint_line
-            .unwrap_or_else(|| host_fingerprint(OnnxExecutionProvider::Rocm)),
+        fingerprint: if fingerprint_fields.is_empty() {
+            host_fingerprint(OnnxExecutionProvider::Rocm)
+        } else {
+            fingerprint_fields.join("|")
+        },
     }
+}
+
+fn is_stable_fingerprint_field(part: &str) -> bool {
+    let lower = part.to_ascii_lowercase();
+    !part.is_empty()
+        && part.parse::<u64>().is_err()
+        && !lower.contains("memory")
+        && !lower.contains("vram")
+}
+
+/// Free VRAM in MB from one `rocm-smi` data row. Some versions repeat the
+/// labels inside each row, others put them only in the header, and some
+/// report no free column at all; derive free = total - used then.
+fn rocm_free_memory_mb(
+    parts: &[&str],
+    free_column: Option<usize>,
+    total_column: Option<usize>,
+    used_column: Option<usize>,
+) -> Option<u64> {
+    let row_label_value = |needle: &str| {
+        parts
+            .iter()
+            .position(|part| part.to_ascii_lowercase().contains(needle))
+            .and_then(|label_index| parts.get(label_index + 1))
+            .and_then(|value| value.parse::<u64>().ok())
+    };
+    let column_value = |column: Option<usize>| {
+        column
+            .and_then(|index| parts.get(index))
+            .and_then(|value| value.parse::<u64>().ok())
+    };
+
+    let free_bytes = row_label_value("free memory")
+        .or_else(|| column_value(free_column))
+        .or_else(|| {
+            // u64 parsing rejects negatives; saturating_sub keeps a used >
+            // total reading from wrapping.
+            let total = row_label_value("total memory").or_else(|| column_value(total_column))?;
+            let used = row_label_value("used memory").or_else(|| column_value(used_column))?;
+            Some(total.saturating_sub(used))
+        })?;
+    Some(free_bytes / (1024 * 1024))
 }
 
 fn host_fingerprint(ep: OnnxExecutionProvider) -> String {
@@ -631,24 +745,7 @@ fn parse_model_alias_groups(value: &str) -> Vec<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, OnceLock};
-
-    fn env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
-
-    fn set_env(key: &str, value: &str) {
-        unsafe {
-            std::env::set_var(key, value);
-        }
-    }
-
-    fn remove_env(key: &str) {
-        unsafe {
-            std::env::remove_var(key);
-        }
-    }
+    use crate::test_env::run_env_test;
 
     #[test]
     fn default_config_is_valid() {
@@ -667,32 +764,39 @@ mod tests {
 
     #[test]
     fn graph_augmentation_env_accepts_only_truthy_values() {
-        let _guard = env_lock().lock().unwrap();
-        let previous = std::env::var_os("VERA_GRAPH_AUGMENT");
-
         for value in ["1", "true", "TRUE", "yes", "YeS"] {
-            set_env("VERA_GRAPH_AUGMENT", value);
-            assert!(
-                graph_augmentation_enabled(),
-                "{value} should enable the flag"
+            run_env_test(
+                "config::tests::graph_augmentation_truthy_probe",
+                &[("VERA_GRAPH_AUGMENT", Some(value))],
             );
         }
 
         for value in ["0", "false", "no", "", "on"] {
-            set_env("VERA_GRAPH_AUGMENT", value);
-            assert!(
-                !graph_augmentation_enabled(),
-                "{value} should disable the flag"
+            run_env_test(
+                "config::tests::graph_augmentation_falsey_probe",
+                &[("VERA_GRAPH_AUGMENT", Some(value))],
             );
         }
+    }
 
-        if let Some(value) = previous {
-            unsafe {
-                std::env::set_var("VERA_GRAPH_AUGMENT", value);
-            }
-        } else {
-            remove_env("VERA_GRAPH_AUGMENT");
-        }
+    #[test]
+    #[ignore = "driven by graph_augmentation_env_accepts_only_truthy_values"]
+    fn graph_augmentation_truthy_probe() {
+        let value = std::env::var("VERA_GRAPH_AUGMENT").unwrap();
+        assert!(
+            graph_augmentation_enabled(),
+            "{value} should enable the flag"
+        );
+    }
+
+    #[test]
+    #[ignore = "driven by graph_augmentation_env_accepts_only_truthy_values"]
+    fn graph_augmentation_falsey_probe() {
+        let value = std::env::var("VERA_GRAPH_AUGMENT").unwrap();
+        assert!(
+            !graph_augmentation_enabled(),
+            "{value} should disable the flag"
+        );
     }
 
     #[test]
@@ -721,21 +825,98 @@ mod tests {
 
     #[test]
     fn max_in_flight_environment_value_normalizes_zero_to_one() {
-        let _guard = env_lock().lock().unwrap();
-        let previous = std::env::var_os("VERA_MAX_IN_FLIGHT_INPUTS");
-        set_env("VERA_MAX_IN_FLIGHT_INPUTS", "0");
+        run_env_test(
+            "config::tests::max_in_flight_environment_value_normalizes_zero_to_one_probe",
+            &[("VERA_MAX_IN_FLIGHT_INPUTS", Some("0"))],
+        );
+    }
 
-        let max_in_flight_inputs = default_max_in_flight_inputs();
+    #[test]
+    #[ignore = "driven by max_in_flight_environment_value_normalizes_zero_to_one"]
+    fn max_in_flight_environment_value_normalizes_zero_to_one_probe() {
+        assert_eq!(default_max_in_flight_inputs(), 1);
+    }
 
-        if let Some(value) = previous {
-            unsafe {
-                std::env::set_var("VERA_MAX_IN_FLIGHT_INPUTS", value);
-            }
-        } else {
-            remove_env("VERA_MAX_IN_FLIGHT_INPUTS");
-        }
+    #[test]
+    fn invalid_numeric_environment_value_falls_back_to_default() {
+        run_env_test(
+            "config::tests::invalid_numeric_environment_value_falls_back_to_default_probe",
+            &[("VERA_MAX_CHUNK_BYTES", Some("24_576"))],
+        );
+    }
 
-        assert_eq!(max_in_flight_inputs, 1);
+    #[test]
+    #[ignore = "driven by invalid_numeric_environment_value_falls_back_to_default"]
+    fn invalid_numeric_environment_value_falls_back_to_default_probe() {
+        assert_eq!(default_max_chunk_bytes(), 24_576);
+    }
+
+    #[test]
+    fn rocm_csv_parses_gpu_rows_and_free_memory_column() {
+        let csv = "GPU, vram total used memory (bytes), vram total free memory (bytes)\n\
+GPU[0], vram total used memory (bytes), 4294967296, vram total free memory (bytes), 12884901888\n\
+GPU[1], vram total used memory (bytes), 1073741824, vram total free memory (bytes), 3221225472\n";
+
+        let info = parse_rocm_gpu_csv(csv);
+
+        assert_eq!(info.vram_free_mb, Some(12_288));
+        assert!(info.fingerprint.contains("GPU[0]"));
+    }
+
+    #[test]
+    fn rocm_csv_uses_free_memory_header_for_numeric_rows() {
+        let csv = "GPU, vram total used memory (bytes), vram total free memory (bytes)\n\
+GPU[0], 4294967296, 12884901888\n\
+GPU[1], 1073741824, 3221225472\n";
+
+        let info = parse_rocm_gpu_csv(csv);
+
+        assert_eq!(info.vram_free_mb, Some(12_288));
+        assert!(info.fingerprint.contains("GPU[0]"));
+    }
+
+    #[test]
+    fn rocm_csv_derives_free_from_total_minus_used_for_card_rows() {
+        // Newer rocm-smi CSV layout: card-prefixed rows, no free column, and
+        // product-name columns from --showproductname in the same table.
+        let csv = "device, VRAM Total Memory (B), VRAM Total Used Memory (B), Card series\n\
+card0, 17179869184, 4294967296, AMD Radeon RX 7900 XTX\n";
+
+        let info = parse_rocm_gpu_csv(csv);
+
+        assert_eq!(info.vram_free_mb, Some(12_288));
+        assert!(info.fingerprint.contains("card0"));
+        assert!(info.fingerprint.contains("AMD Radeon RX 7900 XTX"));
+    }
+
+    #[test]
+    fn rocm_fingerprint_ignores_live_memory_values() {
+        let header = "device, VRAM Total Memory (B), VRAM Total Used Memory (B), Card series\n";
+        let idle = format!("{header}card0, 17179869184, 1073741824, AMD Radeon\n");
+        let busy = format!("{header}card0, 17179869184, 16106127360, AMD Radeon\n");
+
+        assert_eq!(
+            parse_rocm_gpu_csv(&idle).fingerprint,
+            parse_rocm_gpu_csv(&busy).fingerprint,
+            "live VRAM usage must not leak into the device fingerprint"
+        );
+        assert_eq!(parse_rocm_gpu_csv(&idle).vram_free_mb, Some(15_360));
+        assert_eq!(parse_rocm_gpu_csv(&busy).vram_free_mb, Some(1_024));
+    }
+
+    #[test]
+    fn rocm_csv_saturates_when_used_exceeds_total() {
+        let csv = "device, VRAM Total Memory (B), VRAM Total Used Memory (B)\n\
+card0, 1073741824, 4294967296\n";
+
+        assert_eq!(parse_rocm_gpu_csv(csv).vram_free_mb, Some(0));
+    }
+
+    #[test]
+    fn rocm_csv_without_memory_data_reports_no_vram() {
+        let csv = "device, Card series\ncard0, AMD Radeon\n";
+
+        assert_eq!(parse_rocm_gpu_csv(csv).vram_free_mb, None);
     }
 
     #[test]
@@ -788,31 +969,39 @@ mod tests {
 
     #[test]
     fn resolve_backend_prefers_saved_backend_env() {
-        let _guard = env_lock().lock().unwrap();
-        set_env("VERA_BACKEND", "onnx-jina-cuda");
-        set_env("VERA_LOCAL", "1");
+        run_env_test(
+            "config::tests::resolve_backend_prefers_saved_backend_env_probe",
+            &[
+                ("VERA_BACKEND", Some("onnx-jina-cuda")),
+                ("VERA_LOCAL", Some("1")),
+            ],
+        );
+    }
 
+    #[test]
+    #[ignore = "driven by resolve_backend_prefers_saved_backend_env"]
+    fn resolve_backend_prefers_saved_backend_env_probe() {
         assert_eq!(
             resolve_backend(None),
             InferenceBackend::OnnxJina(OnnxExecutionProvider::Cuda)
         );
-
-        remove_env("VERA_BACKEND");
-        remove_env("VERA_LOCAL");
     }
 
     #[test]
     fn resolve_backend_falls_back_to_legacy_local_env() {
-        let _guard = env_lock().lock().unwrap();
-        remove_env("VERA_BACKEND");
-        set_env("VERA_LOCAL", "1");
+        run_env_test(
+            "config::tests::resolve_backend_falls_back_to_legacy_local_env_probe",
+            &[("VERA_BACKEND", None), ("VERA_LOCAL", Some("1"))],
+        );
+    }
 
+    #[test]
+    #[ignore = "driven by resolve_backend_falls_back_to_legacy_local_env"]
+    fn resolve_backend_falls_back_to_legacy_local_env_probe() {
         assert_eq!(
             resolve_backend(None),
             InferenceBackend::OnnxJina(OnnxExecutionProvider::Cpu)
         );
-
-        remove_env("VERA_LOCAL");
     }
 
     /// Shorthand for matching without configured alias groups.
@@ -870,12 +1059,18 @@ mod tests {
 
     #[test]
     fn model_names_match_env_alias_group() {
-        let _guard = env_lock().lock().unwrap();
-        set_env(
-            "VERA_EMBEDDING_MODEL_ALIASES",
-            "text-embedding-3-large,text-embedding-3-large-2;other,other-prod",
+        run_env_test(
+            "config::tests::model_names_match_env_alias_group_probe",
+            &[(
+                "VERA_EMBEDDING_MODEL_ALIASES",
+                Some("text-embedding-3-large,text-embedding-3-large-2;other,other-prod"),
+            )],
         );
+    }
 
+    #[test]
+    #[ignore = "driven by model_names_match_env_alias_group"]
+    fn model_names_match_env_alias_group_probe() {
         assert!(model_names_match(
             "text-embedding-3-large",
             "text-embedding-3-large-2"
@@ -885,8 +1080,6 @@ mod tests {
             "text-embedding-3-large",
             "text-embedding-3-small"
         ));
-
-        remove_env("VERA_EMBEDDING_MODEL_ALIASES");
     }
 
     #[test]

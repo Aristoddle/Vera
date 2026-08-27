@@ -97,6 +97,7 @@ impl CompletionClientConfig {
 }
 
 /// OpenAI-compatible chat completion client for query expansion.
+#[derive(Clone)]
 pub struct CompletionClient {
     client: reqwest::blocking::Client,
     config: CompletionClientConfig,
@@ -270,20 +271,20 @@ struct ChatResponseFormat {
 
 fn parse_query_candidates(raw: &str, limit: usize) -> Result<Vec<String>> {
     // Try parsing the whole string as JSON.
-    if let Ok(value) = serde_json::from_str::<serde_json::Value>(raw.trim()) {
-        if let Some(parsed) = json_value_to_queries(&value) {
-            return Ok(normalize_query_list(parsed, limit));
-        }
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(raw.trim())
+        && let Some(parsed) = json_value_to_queries(&value)
+    {
+        return Ok(normalize_query_list(parsed, limit));
     }
 
     // Try extracting a JSON array from within the response (e.g. fenced code blocks).
-    if let Some((start, end)) = raw.find('[').zip(raw.rfind(']')) {
-        let candidate = &raw[start..=end];
-        if let Ok(value) = serde_json::from_str::<serde_json::Value>(candidate) {
-            if let Some(parsed) = json_value_to_queries(&value) {
-                return Ok(normalize_query_list(parsed, limit));
-            }
-        }
+    if let Some((start, end)) = raw.find('[').zip(raw.rfind(']'))
+        && end >= start
+        && let Some(candidate) = raw.get(start..=end)
+        && let Ok(value) = serde_json::from_str::<serde_json::Value>(candidate)
+        && let Some(parsed) = json_value_to_queries(&value)
+    {
+        return Ok(normalize_query_list(parsed, limit));
     }
 
     let preview = raw.lines().take(3).collect::<Vec<_>>().join(" ");
@@ -378,6 +379,12 @@ mod tests {
     #[test]
     fn non_json_returns_error() {
         let raw = "1. auth token refresh\n2) jwt expiry handling";
+        assert!(parse_query_candidates(raw, 4).is_err());
+    }
+
+    #[test]
+    fn malformed_array_bounds_return_error_without_panicking() {
+        let raw = "array done] here comes [\"q1\"";
         assert!(parse_query_candidates(raw, 4).is_err());
     }
 

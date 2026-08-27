@@ -285,15 +285,14 @@ mod tests {
                 },
             ])
             .unwrap();
+        let references = [RawReference {
+            callee: "target".to_string(),
+            caller: Some("caller".to_string()),
+            qualifier: None,
+            line: 2,
+        }];
         store
-            .insert_references(
-                "caller.rs",
-                &[RawReference {
-                    callee: "target".to_string(),
-                    caller: Some("caller".to_string()),
-                    line: 2,
-                }],
-            )
+            .insert_parse_artifacts_batch_borrowed(&[("caller.rs", &references)], &[])
             .unwrap();
 
         let mut pool = vec![result(

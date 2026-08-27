@@ -1,13 +1,16 @@
 # Retrieval: Hybrid Search With Query-Aware Ranking
 
+> Status: historical decision record. The current default local path is Potion Code with deterministic query-aware ranking and reranking off. Cross-encoder reranking remains available as an opt-in stage.
+
 Vera keeps the same core hybrid stack:
 
 - BM25 for lexical matching
 - dense embeddings for semantic matching
 - Reciprocal Rank Fusion to merge both lists
-- a cross-encoder reranker for final ordering
+- deterministic query-aware ranking and candidate shaping
+- an optional cross-encoder reranker for final ordering
 
-What changed by `v0.7.0` is that retrieval is no longer just "BM25 + vector + rerank". The pipeline now includes deterministic query-aware ranking and candidate shaping between fusion and final reranking.
+What changed by `v0.7.0` is that retrieval is no longer just "BM25 + vector + rerank". The pipeline added deterministic query-aware ranking and candidate shaping between fusion and final reranking.
 
 ## Decision
 
@@ -54,4 +57,4 @@ That would introduce:
 - larger indexes
 - more substantial implementation and maintenance cost
 
-The current hybrid stack was able to reach the benchmark ceiling for `Recall@1` and `1.0` for `Recall@5`, `Recall@10`, and `MRR@10` on the local 21-task suite, so a backend replacement was not justified in this pass.
+At the time, the hybrid stack reached the benchmark ceiling on the local 21-task suite, so a backend replacement was not justified in that pass. That suite is historical; current release quality is judged by the full Semble suite and independent contamination check in [../benchmarks.md](../benchmarks.md).

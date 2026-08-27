@@ -2,7 +2,7 @@
 
 ## Build from Source
 
-Rust 1.85+ required (see `Cargo.toml` `rust-version` for exact MSRV).
+Rust 1.88+ required (see `Cargo.toml` `rust-version` for exact MSRV).
 
 ```bash
 git clone https://github.com/VeraTools/Vera.git
@@ -31,14 +31,15 @@ cargo fmt --all -- --check
 | `vera-core` | Parsing, indexing, storage, embedding, retrieval pipeline |
 | `vera-cli` | CLI interface (clap) |
 | `vera-mcp` | MCP server (JSON-RPC over stdio) |
+| `vera-serve` | HTTP inference server |
 | `eval` | Benchmark harness and evaluation tasks |
 
 The core engine lives in `vera-core`. Most changes happen here:
 
 - `parsing/`: tree-sitter grammars, AST chunking, symbol extraction
-- `embedding/`: embedding providers (API + local ONNX)
+- `embedding/`: embedding providers (API, Potion Code, and local ONNX)
 - `retrieval/`: BM25, vector search, RRF fusion, reranking
-- `storage/`: SQLite metadata, Tantivy BM25 index, sqlite-vec vectors
+- `storage/`: SQLite metadata, Tantivy BM25 index, sqlite-vec vectors, and the flat SIMD vector sidecar
 - `indexing/`: index build and incremental update pipeline
 
 For how the pipeline fits together, see [docs/how-it-works.md](docs/how-it-works.md).
@@ -57,14 +58,17 @@ See [docs/architecture.md](docs/architecture.md#adding-a-new-language) for the s
 ## Running Benchmarks
 
 ```bash
-bash eval/setup-corpus.sh                          # clone benchmark repos
+bash eval/setup-semble-corpus.sh                    # clone the pinned Semble corpus
 cargo build --release
-cargo run --release --bin vera-eval -- run          # full suite
-cargo run --release --bin vera-eval -- run --json-only  # JSON output only
+cargo run --release --bin vera-eval -- run \
+  --tool vera-potion \
+  --tasks-dir eval/tasks/semble \
+  --corpus eval/semble-corpus.toml \
+  --json-only
 ```
 
 Benchmark details: [docs/benchmarks.md](docs/benchmarks.md).
 
 ## Branch Policy
 
-Until v1.0.0 ships, feature work targets the `feat/v1-prep` integration branch; `master` takes hotfixes only. After the v1.0.0 release, PRs target `master` directly.
+Pull requests target `master` directly.

@@ -1,24 +1,24 @@
 # Vera ROCm Docker image (AMD GPU)
-# Usage: docker build -f docker/Dockerfile.rocm -t vera:rocm .
+# Packages a prebuilt binary. CI builds it once per release; to build locally
+# (must be a Linux x86_64 build; on macOS/Windows use a Linux container, see docs/docker.md).
+# Pulling the ghcr.io base image below requires GHCR auth unless the package is
+# made public: docker login ghcr.io -u <github-user> (password: a PAT with read:packages).
+#   ./scripts/bootstrap-vendored-grammars.sh
+#   cargo build --release -p vera-cli && mkdir -p dist && cp target/release/vera dist/
+#   docker build -f docker/Dockerfile.rocm -t vera:rocm .
 # Run:   docker run --device=/dev/kfd --device=/dev/dri -i -v $(pwd):/workspace vera:rocm mcp
 
-# --- Build stage ---
-FROM rust:1.94.1-trixie AS builder
-
-WORKDIR /build
-COPY . .
-
-RUN bash scripts/bootstrap-vendored-grammars.sh
-RUN cargo build --release -p vera-cli -p vera-mcp
-
-# --- Runtime stage ---
-FROM rocm/dev-ubuntu-24.04:6.4.4-complete
+# Base is our GHCR mirror of rocm/dev-ubuntu-24.04:6.4.4-complete (digest-verified
+# copy). Direct Docker Hub pulls of its 5.5GB layer arrived corrupted on our CI
+# runners (4/4 builds, "unexpected commit digest" with a different wrong digest
+# each run). Re-mirror with .github/workflows/rocm-base-mirror.yml if bumping.
+FROM ghcr.io/veratools/vera:rocm-base-6.4.4-complete@sha256:31418ac10a3769a71eaef330c07280d1d999d7074621339b8f93c484c35f6078
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates curl && \
     rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /build/target/release/vera /usr/local/bin/vera
+COPY dist/vera /usr/local/bin/vera
 
 ENV VERA_LOCAL=1
 

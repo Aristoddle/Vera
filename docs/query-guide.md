@@ -135,7 +135,14 @@ Use `vera references` for exact caller/callee questions:
 vera references parse_config
 vera references parse_config --callees
 vera references parse_config --changed
+vera references get --receiver app          # only calls written as app.get(...)
 ```
+
+Callers are matched by symbol name, so two definitions sharing a name land in
+one answer. When that happens the output names the receivers the calls went
+through and their counts; rerun with `--receiver <name>` to keep only the calls
+made through one of them. Calls written without a receiver (a plain
+`parse_config()`) are not matched by any `--receiver` value.
 
 ## Missing Files Or Surprising Exclusions
 

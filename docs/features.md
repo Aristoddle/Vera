@@ -1,6 +1,6 @@
 # Features
 
-Vera (Vector Enhanced Reranking Agent) is a code search tool that combines BM25 keyword matching, vector similarity, and cross-encoder reranking into a single retrieval pipeline. This page covers everything it can do.
+Vera (Vector Enhanced Reranking Agent) is a code search tool that combines BM25 keyword matching, vector similarity, deterministic ranking, and optional cross-encoder reranking. This page covers everything it can do.
 
 ## Search Pipeline
 
@@ -9,15 +9,17 @@ Vera (Vector Enhanced Reranking Agent) is a code search tool that combines BM25 
 Every query runs two retrieval paths in parallel:
 
 - **BM25 keyword search** via Tantivy. Handles exact identifiers, config keys, and literal strings. Sub-millisecond latency.
-- **Vector similarity search** via sqlite-vec. Catches conceptual matches even when the exact words don't appear in the code.
+- **Vector similarity search** against the memory-mapped `.vera/vectors.f32` sidecar using SIMD L2 distance (`VERA_VECTOR_SCAN=vec0` selects sqlite-vec instead). Catches conceptual matches even when the exact words don't appear in the code.
 
 Results from both paths merge through Reciprocal Rank Fusion (RRF), so a result that scores well in both lists rises to the top. Full details: [how-it-works.md](how-it-works.md).
 
 ### Cross-Encoder Reranking
 
-After fusion, the top candidates go through a cross-encoder that reads query and candidate together as a single pair. This is the most impactful stage: it lifts MRR@10 from 0.39 to 0.60 (54% improvement). Most code search tools skip this step entirely.
+After fusion, Vera can send the top candidates to a cross-encoder that reads query and candidate together as a single pair. Reranking is controlled by `retrieval.reranking_enabled` and is off by default; the deterministic heuristic stack ranks results when it is disabled.
 
 Vera supports local cross-encoders (Jina) and remote reranking endpoints (Jina, Cohere, or Voyage AI `rerank-2` with `RERANKER_MODEL_BASE_URL=https://api.voyageai.com/v1`, with wire format handled automatically).
+
+The 2026-08-23 dual-set screening found no cross-encoder improvement over the no-reranker baseline. See [models.md](models.md#reranking) for the scores and the recommended `mxbai-rerank-xsmall-v1` local override.
 
 Large candidate sets are automatically batched (default 20 per request, configurable via `VERA_MAX_RERANK_BATCH`). Individual documents exceeding the reranker's context window are truncated at the last newline boundary before the character limit (default 4800, configurable via `VERA_MAX_RERANK_DOC_CHARS`). Both settings work automatically with no required configuration.
 
@@ -47,7 +49,7 @@ When a task is limited to modified files or a PR diff, scope the search before b
 - `--since <rev>`: files changed since a specific revision
 - `--base <rev>`: files changed since `merge-base(HEAD, <rev>)`
 
-These flags work with `vera search`, `vera grep`, and `vera overview`.
+These flags work with `vera search`, `vera grep`, and `vera overview`. Git state is read from the repository containing the indexed directory, and the result is limited to files inside that directory, so indexing a package inside a monorepo scopes to that package rather than to the whole repository.
 
 ### Query-Aware Ranking
 
@@ -126,6 +128,8 @@ This makes parser regressions and partial indexing visible instead of silent.
 
 `vera references foo` finds all callers of a symbol as search-style snippets. `vera references foo --callees` finds what a symbol calls. Add `--changed`, `--since`, or `--base` when you want exact call relationships limited to a diff. The call graph is built during indexing from tree-sitter AST analysis, so lookups are instant.
 
+Call sites are stored under the symbol's name, so definitions sharing a name share an answer. Indexing also records the receiver each call was written through, so `vera references get --receiver app` returns only `app.get(...)` calls and leaves dictionary lookups out. The output names the available receivers whenever more than one exists. See [query-guide.md](query-guide.md) for when this matters.
+
 ### Agent-Oriented Structural Search
 
 `vera structural <intent> [query]` covers the common structural tasks agents hit repeatedly without forcing raw tree-sitter syntax.
@@ -135,6 +139,8 @@ This makes parser regressions and partial indexing visible instead of silent.
 - `routes` finds common HTTP route registrations
 - `sql` finds common SQL execution sites
 - `impls <symbol>` finds explicit implementations, conformances, and inheritance declarations
+
+`routes` and `sql` take no query term and reject one rather than ignoring it. Narrow those two with `--path`, `--lang`, `--type`, or `--scope`.
 
 `impls` only returns explicit declarations. It does not guess implicit interface satisfaction in languages where that would require semantic analysis.
 
@@ -158,17 +164,17 @@ Use this as the default structural workflow. Use `vera references` for exact cal
 
 Indexing, storage, and search always stay on your machine. The backend choice only affects where embeddings and reranking run:
 
-- **Potion Code CPU**: `vera setup --potion-code` downloads static code embeddings and runs without ONNX Runtime.
-- **Jina ONNX GPU**: `vera setup --onnx-jina-cuda` or another `--onnx-jina-*` flag downloads curated ONNX models. The full pipeline (BM25 + vector + rerank) runs without external calls.
+- **Potion Code**: `vera setup --potion-code` selects the default `minishlab/potion-code-16M-v2` static embedding model. It runs locally on CPU on any supported machine; no GPU or ONNX Runtime needed.
+- **Jina ONNX GPU**: `vera setup --onnx-jina-cuda` or another `--onnx-jina-*` flag selects an opt-in ONNX embedding backend. The local pipeline runs without external calls.
 - **API mode**: Point at any OpenAI-compatible endpoint (remote APIs or local servers like llama.cpp). Only model calls leave your machine. Query prefixes for asymmetric embedding models (Qwen3, CodeRankEmbed, E5, BGE) are auto-detected from the model ID. Override with `EMBEDDING_QUERY_PREFIX` for unsupported models. See [llama-cpp-setup.md](llama-cpp-setup.md) for a step-by-step guide.
 
 ### Curated Local Models
 
-Potion Code is the CPU-first local model:
+The default local embedding model is `minishlab/potion-code-16M-v2`, a static embedding model that runs locally on CPU:
 
 | Model | Role |
 |-------|------|
-| [minishlab/potion-code-16M](https://huggingface.co/minishlab/potion-code-16M) | Static code embedding model |
+| [minishlab/potion-code-16M-v2](https://huggingface.co/minishlab/potion-code-16M-v2) | Default local code embedding model |
 
 The Jina ONNX backends use these local models:
 
@@ -185,7 +191,7 @@ Auto-detected during setup. Supported backends:
 
 | Flag | Hardware |
 |------|----------|
-| `--potion-code` | CPU-only local inference |
+| `--potion-code` | Default local inference, runs locally on CPU; no GPU or ONNX Runtime needed |
 | `--onnx-jina-cuda` | NVIDIA (CUDA 12+) |
 | `--onnx-jina-rocm` | AMD (Linux, ROCm) |
 | `--onnx-jina-directml` | Any DirectX 12 GPU (Windows) |
@@ -200,7 +206,7 @@ Local ONNX indexing shapes micro-batches from actual token lengths rather than u
 
 ### Custom Local Embeddings
 
-Swap the Jina ONNX embedding model without changing the rest of that pipeline. Point at a Hugging Face repo, a direct URL, or a local directory with custom pooling, query prefix, and dimension settings. The local reranker stays on the curated Jina model.
+Swap the opt-in Jina ONNX embedding model without changing the rest of that pipeline. Point at a Hugging Face repo, a direct URL, or a local directory with custom pooling, query prefix, and dimension settings. Local rerankers support Hugging Face repository, revision, ONNX file, and tokenizer overrides through `LOCAL_RERANKER_*` environment variables. See [models.md](models.md#reranking) for the recommended model.
 
 ## Output and Integration
 
@@ -261,7 +267,7 @@ During setup, Vera offers to add a usage snippet to your project's agent config 
 
 ### Backend Management
 
-`vera backend` manages the model backend separately from the full setup wizard. Switch GPU backends, pick Potion Code CPU, swap ONNX embedding models, or reconfigure API endpoints without re-running setup.
+`vera backend` manages the model backend separately from the full setup wizard. Switch GPU backends, pick the default Potion Code model, swap opt-in ONNX embedding models, or reconfigure API endpoints without re-running setup.
 
 ### HTTP Inference Server
 
@@ -275,12 +281,16 @@ Key flags:
 - `--port <PORT>`: TCP port to listen on (default: 3000)
 - `--host <HOST>`: bind address (default: 127.0.0.1)
 - `--api-key <KEY>`: require Bearer token authentication (or set `VERA_SERVE_KEY`)
-- `--idle-timeout <SECS>`: seconds of inactivity before unloading models from memory (0 = reload per request, -1 = keep loaded indefinitely, default: 0)
+- `--idle-timeout <SECS>`: seconds of inactivity before unloading a model from memory (default: 300). Any negative value, `-1` included, keeps models loaded for the lifetime of the process. `0` disables the cache, rebuilding the model on every request and holding one live model per concurrent request; it exists to pick up model files replaced under a running server, and makes indexing through the server far slower.
 - Backend flags: `--potion-code`, `--onnx-jina-cuda`, `--onnx-jina-rocm`, `--onnx-jina-coreml`, `--onnx-jina-openvino`, `--onnx-jina-directml`, or `--api`
+
+The embedding model is loaded before the server accepts connections and kept, so the first request does not pay for a load. It is then subject to the same idle eviction as any other resident model, so under the default it is unloaded after 300 seconds with no requests and reloaded on the next one.
+
+The reranker is validated at startup too, but that probe is discarded rather than kept: a server that only answers `/v1/embeddings` would otherwise hold it for nothing. The first `/v1/rerank` request loads it again, for serving.
 
 ### Diagnostics
 
-`vera doctor` reports the saved and active backend, installed version, checks GitHub for newer releases, and detects missing, corrupt, or truncated ONNX model caches. If model assets are damaged, it suggests running `vera repair --<backend>`; runtime embedding load errors provide the same repair hint. `--probe` adds a deeper read-only local backend check. `--json` outputs machine-readable diagnostics. `vera repair` re-fetches missing or corrupt local assets.
+`vera doctor` reports the saved and active backend, installed version, checks GitHub for newer releases, and detects missing, corrupt, or truncated ONNX model caches. If model assets are damaged, it suggests running `vera repair --<backend>`; runtime embedding load errors provide the same repair hint. `--probe` adds a deeper read-only local backend check. `--json` outputs machine-readable diagnostics. It exits 1 when any check fails, matching the `overall_ok` field in the JSON report; warnings leave the exit code at 0. `vera repair` re-fetches missing or corrupt local assets.
 
 ### Self-Updating
 
@@ -304,13 +314,4 @@ A fully static musl-linked binary (`x86_64-unknown-linux-musl`) is available for
 
 ## Benchmarks
 
-21-task benchmark across `ripgrep`, `flask`, `fastify`, and `turborepo`:
-
-| Metric | ripgrep | cocoindex | ColGREP (149M) | Vera |
-|--------|---------|-----------|----------------|------|
-| Recall@1 | 0.15 | 0.16 | 0.57 | **0.72** |
-| Recall@5 | 0.28 | 0.37 | 0.67 | **0.78** |
-| MRR@10 | 0.26 | 0.35 | 0.62 | **0.91** |
-| nDCG@10 | 0.29 | 0.52 | 0.56 | **0.84** |
-
-Full methodology and additional comparisons: [benchmarks.md](benchmarks.md).
+See the [current Semble comparison](benchmarks.md#2026-08-23-semble-comparison) for the current aggregate results.

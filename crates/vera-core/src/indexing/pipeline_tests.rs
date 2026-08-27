@@ -2,6 +2,8 @@
 
 use std::fs;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use tempfile::TempDir;
 
@@ -9,12 +11,253 @@ use super::*;
 use crate::CancellationToken;
 use crate::config::VeraConfig;
 use crate::embedding::test_helpers::MockProvider;
+use crate::embedding::{EmbeddingError, EmbeddingProvider};
 use crate::storage::bm25::Bm25Index;
 use crate::storage::metadata::MetadataStore;
 use crate::storage::vector::VectorStore;
 
 fn default_config() -> VeraConfig {
     VeraConfig::default()
+}
+
+#[derive(Clone)]
+struct BlockingProvider {
+    started: Arc<tokio::sync::Notify>,
+}
+
+impl EmbeddingProvider for BlockingProvider {
+    async fn embed_batch(&self, _texts: &[String]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+        self.started.notify_one();
+        std::future::pending().await
+    }
+
+    fn expected_dim(&self) -> Option<usize> {
+        Some(8)
+    }
+}
+
+/// Cancels the token mid-request and then fails, modelling a provider error
+/// that completes at the same moment cancellation fires.
+struct CancelThenFailProvider;
+
+impl EmbeddingProvider for CancelThenFailProvider {
+    async fn embed_batch(&self, _texts: &[String]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+        Err(EmbeddingError::ApiError {
+            status: 500,
+            message: "provider exploded".to_string(),
+        })
+    }
+
+    async fn embed_batch_cancellable(
+        &self,
+        texts: &[String],
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+        cancel.cancel();
+        self.embed_batch(texts).await
+    }
+
+    fn expected_dim(&self) -> Option<usize> {
+        Some(8)
+    }
+}
+
+#[derive(Clone)]
+struct RecordingProvider {
+    calls: Arc<Mutex<Vec<usize>>>,
+    fail_on_call: Option<usize>,
+    dim: usize,
+}
+
+impl RecordingProvider {
+    fn new(dim: usize) -> Self {
+        Self {
+            calls: Arc::new(Mutex::new(Vec::new())),
+            fail_on_call: None,
+            dim,
+        }
+    }
+
+    fn failing_on_call(dim: usize, call: usize) -> Self {
+        Self {
+            calls: Arc::new(Mutex::new(Vec::new())),
+            fail_on_call: Some(call),
+            dim,
+        }
+    }
+
+    fn call_lengths(&self) -> Vec<usize> {
+        self.calls.lock().unwrap().clone()
+    }
+}
+
+impl EmbeddingProvider for RecordingProvider {
+    async fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+        let call = {
+            let mut calls = self.calls.lock().unwrap();
+            calls.push(texts.len());
+            calls.len()
+        };
+        if self.fail_on_call == Some(call) {
+            return Err(EmbeddingError::ApiError {
+                status: 503,
+                message: "recording provider failed".to_string(),
+            });
+        }
+        Ok(texts.iter().map(|_| vec![0.5; self.dim]).collect())
+    }
+
+    fn expected_dim(&self) -> Option<usize> {
+        Some(self.dim)
+    }
+}
+
+fn write_window_corpus(dir: &Path, file_count: usize) {
+    for index in 0..file_count {
+        fs::write(
+            dir.join(format!("file_{index:02}.rs")),
+            format!("fn item_{index}() {{}}\n"),
+        )
+        .unwrap();
+    }
+}
+
+fn index_fingerprint(idx_dir: &Path) -> Vec<(String, String)> {
+    let store = MetadataStore::open(&idx_dir.join(METADATA_DB)).unwrap();
+    let mut fingerprint = Vec::new();
+    for file_path in store.indexed_files().unwrap() {
+        let hash = store.get_file_hash(&file_path).unwrap().unwrap();
+        for chunk in store.get_chunks_by_file(&file_path).unwrap() {
+            fingerprint.push((chunk.id, hash.clone()));
+        }
+    }
+    fingerprint
+}
+
+#[tokio::test]
+async fn full_index_embeds_bounded_windows_and_preserves_order() {
+    let windowed_dir = TempDir::new().unwrap();
+    let single_window_dir = TempDir::new().unwrap();
+    write_window_corpus(windowed_dir.path(), 9);
+    write_window_corpus(single_window_dir.path(), 9);
+
+    let config = default_config();
+    let windowed_provider = RecordingProvider::new(8);
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let events_ref = events.clone();
+    let windowed_summary = index_repository_with_progress_and_cancellation_with_window_target(
+        windowed_dir.path(),
+        &windowed_provider,
+        &config,
+        "mock-model",
+        move |event| events_ref.lock().unwrap().push(event),
+        &CancellationToken::new(),
+        2,
+    )
+    .await
+    .unwrap();
+
+    let single_window_provider = RecordingProvider::new(8);
+    index_repository_with_progress_and_cancellation_with_window_target(
+        single_window_dir.path(),
+        &single_window_provider,
+        &config,
+        "mock-model",
+        |_| {},
+        &CancellationToken::new(),
+        1000,
+    )
+    .await
+    .unwrap();
+
+    let windowed_calls = windowed_provider.call_lengths();
+    assert!(windowed_calls.len() >= 3, "expected at least three windows");
+    assert!(windowed_calls.iter().all(|size| *size <= 2));
+    assert_eq!(
+        index_fingerprint(&index_dir(windowed_dir.path())),
+        index_fingerprint(&index_dir(single_window_dir.path()))
+    );
+
+    let events = events.lock().unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, IndexProgress::ParsingDone { .. }))
+            .count(),
+        1
+    );
+    let parsing_done = events
+        .iter()
+        .find_map(|event| match event {
+            IndexProgress::ParsingDone { chunk_count } => Some(*chunk_count),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(parsing_done, windowed_summary.chunks_created);
+
+    let mut previous_done = 0;
+    let mut previous_total = 0;
+    for event in events.iter() {
+        if let IndexProgress::EmbeddingProgress { done, total } = event {
+            assert!(*done >= previous_done);
+            assert!(*total >= previous_total);
+            previous_done = *done;
+            previous_total = *total;
+        }
+    }
+    assert_eq!(previous_done, windowed_summary.embeddings_generated);
+    assert_eq!(previous_total, windowed_summary.chunks_created);
+}
+
+#[tokio::test]
+async fn failed_window_keeps_live_index_and_cleans_staging() {
+    let dir = TempDir::new().unwrap();
+    write_window_corpus(dir.path(), 6);
+    let idx_dir = index_dir(dir.path());
+    fs::create_dir_all(&idx_dir).unwrap();
+    fs::write(idx_dir.join("sentinel"), "previous index").unwrap();
+
+    let provider = RecordingProvider::failing_on_call(8, 2);
+    let error = index_repository_with_progress_and_cancellation_with_window_target(
+        dir.path(),
+        &provider,
+        &default_config(),
+        "mock-model",
+        |_| {},
+        &CancellationToken::new(),
+        2,
+    )
+    .await
+    .unwrap_err();
+
+    assert!(error.to_string().contains("embedding generation failed"));
+    assert_eq!(
+        fs::read_to_string(idx_dir.join("sentinel")).unwrap(),
+        "previous index"
+    );
+    assert!(!sibling_index_dir(&idx_dir, "build").exists());
+    assert!(!sibling_index_dir(&idx_dir, "old").exists());
+}
+
+#[test]
+fn stale_staging_and_old_index_are_recovered_on_startup() {
+    let dir = TempDir::new().unwrap();
+    let idx_dir = index_dir(dir.path());
+    let old_dir = sibling_index_dir(&idx_dir, "old");
+    let build_dir = sibling_index_dir(&idx_dir, "build");
+    fs::create_dir_all(&old_dir).unwrap();
+    fs::create_dir_all(&build_dir).unwrap();
+    fs::write(old_dir.join("sentinel"), "previous index").unwrap();
+    fs::write(build_dir.join("stale"), "discard me").unwrap();
+
+    recover_index_directories(&idx_dir).unwrap();
+
+    assert_eq!(
+        fs::read_to_string(idx_dir.join("sentinel")).unwrap(),
+        "previous index"
+    );
+    assert!(!old_dir.exists());
+    assert!(!build_dir.exists());
 }
 
 #[tokio::test]
@@ -71,6 +314,93 @@ async fn pre_cancelled_index_stops_before_creating_artifacts() {
 
     assert!(error.to_string().contains("operation cancelled"));
     assert!(!index_dir(dir.path()).exists());
+}
+
+#[tokio::test]
+async fn cancellation_stops_an_in_flight_embedding_request() {
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("main.rs"), "fn main() {}\n").unwrap();
+    let started = Arc::new(tokio::sync::Notify::new());
+    let provider = BlockingProvider {
+        started: started.clone(),
+    };
+    let config = default_config();
+    let cancellation = CancellationToken::new();
+    let task_cancellation = cancellation.clone();
+    let path = dir.path().to_path_buf();
+
+    let task = tokio::spawn(async move {
+        super::index_repository_with_progress_and_cancellation(
+            &path,
+            &provider,
+            &config,
+            "mock-model",
+            |_| {},
+            &task_cancellation,
+        )
+        .await
+    });
+    started.notified().await;
+    cancellation.cancel();
+
+    let error = tokio::time::timeout(Duration::from_millis(250), task)
+        .await
+        .expect("cancellation must stop the active embedding request")
+        .unwrap()
+        .unwrap_err();
+    assert!(error.to_string().contains("cancel"));
+    assert!(!dir.path().join(".vera").exists());
+}
+
+#[tokio::test]
+async fn cancellation_after_embedding_does_not_publish_index_artifacts() {
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("main.rs"), "fn main() {}\n").unwrap();
+    let provider = MockProvider::new(8);
+    let config = default_config();
+    let cancellation = CancellationToken::new();
+    let progress_cancellation = cancellation.clone();
+
+    let error = super::index_repository_with_progress_and_cancellation(
+        dir.path(),
+        &provider,
+        &config,
+        "mock-model",
+        move |event| {
+            if matches!(event, IndexProgress::EmbeddingDone { .. }) {
+                progress_cancellation.cancel();
+            }
+        },
+        &cancellation,
+    )
+    .await
+    .unwrap_err();
+
+    assert!(error.to_string().contains("operation cancelled"));
+    assert!(!dir.path().join(".vera").exists());
+}
+
+#[tokio::test]
+async fn provider_error_wins_over_simultaneous_cancellation() {
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("main.rs"), "fn main() {}\n").unwrap();
+    let config = default_config();
+
+    let error = super::index_repository_with_progress_and_cancellation(
+        dir.path(),
+        &CancelThenFailProvider,
+        &config,
+        "mock-model",
+        |_| {},
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap_err();
+
+    assert!(
+        error.to_string().contains("embedding generation failed"),
+        "provider error should win over the simultaneous cancellation: {error}"
+    );
 }
 
 #[tokio::test]
@@ -338,4 +668,41 @@ async fn index_permission_error_continues() {
         use std::os::unix::fs::PermissionsExt;
         let _ = fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o644));
     }
+}
+
+/// Freshness keys, duplicated here because `freshness` keeps them private.
+const INDEXING_CONFIG_META_KEY: &str = "indexing_config";
+const INDEX_REFRESHED_AT_META_KEY: &str = "index_refreshed_at_unix_ms";
+
+/// A completed windowed build publishes hashes and the freshness stamp, the
+/// markers `detect_staleness` relies on to treat the index as current.
+#[tokio::test]
+async fn successful_index_publishes_hashes_and_freshness() {
+    let dir = TempDir::new().unwrap();
+    write_window_corpus(dir.path(), 3);
+
+    let provider = MockProvider::new(8);
+    index_repository(dir.path(), &provider, &default_config(), "mock-model")
+        .await
+        .unwrap();
+
+    let store = MetadataStore::open(&index_dir(dir.path()).join(METADATA_DB)).unwrap();
+    for file_path in store.indexed_files().unwrap() {
+        assert!(
+            store.get_file_hash(&file_path).unwrap().is_some(),
+            "{file_path}: hash missing after a successful build"
+        );
+    }
+    assert!(
+        store
+            .get_index_meta(INDEX_REFRESHED_AT_META_KEY)
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        store
+            .get_index_meta(INDEXING_CONFIG_META_KEY)
+            .unwrap()
+            .is_some()
+    );
 }

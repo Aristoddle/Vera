@@ -14,10 +14,15 @@
 //! - `.ignore` files
 //! - Custom override patterns
 
+use std::fmt;
+use std::io::Read;
 use std::path::Component;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use cap_std::ambient_authority;
+use cap_std::fs::Dir;
 use ignore::Match;
 use ignore::WalkBuilder;
 use ignore::gitignore::{Gitignore, GitignoreBuilder, Glob as GitignoreGlob};
@@ -39,7 +44,7 @@ pub struct DiscoveredFile {
 }
 
 /// Result of the file discovery process.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct DiscoveryResult {
     /// Files that passed all filters and are ready to index.
     pub files: Vec<DiscoveredFile>,
@@ -51,6 +56,21 @@ pub struct DiscoveryResult {
     pub large_skipped_paths: Vec<(String, u64)>,
     /// Number of files skipped due to read errors (permissions, etc.).
     pub error_skipped: usize,
+    /// Capability for descriptor-relative reads below the discovered root.
+    pub(crate) root_dir: Arc<Dir>,
+}
+
+impl fmt::Debug for DiscoveryResult {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DiscoveryResult")
+            .field("files", &self.files)
+            .field("binary_skipped", &self.binary_skipped)
+            .field("large_skipped", &self.large_skipped)
+            .field("large_skipped_paths", &self.large_skipped_paths)
+            .field("error_skipped", &self.error_skipped)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -187,11 +207,127 @@ const BINARY_EXTENSIONS: &[&str] = &[
 /// helper is considered text; strict `read_to_string` would skip text files
 /// with stray invalid bytes (mixed encodings, latin-1 notes). Lossy decoding
 /// indexes them instead of silently dropping them from the index.
+///
+/// This compatibility wrapper is for callers that cannot provide a containing
+/// directory capability. Indexed reads use [`read_source_lossy_at`] instead.
 pub fn read_source_lossy(path: &Path) -> std::io::Result<String> {
-    let bytes = std::fs::read(path)?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let file_name = path.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "source path does not name a file",
+        )
+    })?;
+    let dir = Dir::open_ambient_dir(parent, ambient_authority())?;
+    read_source_lossy_at(&dir, Path::new(file_name))
+}
+
+/// Read a source file through an already-open directory capability.
+///
+/// `relative_path` is resolved relative to `root_dir`. The capability follows
+/// symlinks that resolve within the directory tree and rejects paths that would
+/// escape it. The file descriptor used for the read is closed when this call
+/// returns. The whole file is read; callers that need the true file content
+/// (hashing, parsing) use this variant.
+pub fn read_source_lossy_at(root_dir: &Dir, relative_path: &Path) -> std::io::Result<String> {
+    let bytes = root_dir.read(relative_path)?;
+    Ok(lossy_utf8(bytes))
+}
+
+/// Read a source file through an already-open directory capability, reading at
+/// most `limit` bytes.
+///
+/// The first `limit + 1` bytes are read so truncation is detected without a
+/// separate stat; a file larger than `limit` fails with
+/// [`std::io::ErrorKind::FileTooLarge`] instead of returning partial content,
+/// so the existing too-large policy applies rather than a silent truncate
+/// (#208). Query-time readers call this so a file that grew after indexing is
+/// skipped instead of being read into memory whole.
+pub fn read_source_lossy_capped(
+    root_dir: &Dir,
+    relative_path: &Path,
+    limit: u64,
+) -> std::io::Result<String> {
+    let mut file = root_dir.open(relative_path)?;
+    let mut bytes = Vec::new();
+    (&mut file)
+        .take(limit.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+
+    if bytes.len() as u64 > limit {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::FileTooLarge,
+            format!("file exceeds the {limit}-byte read limit"),
+        ));
+    }
+
+    Ok(lossy_utf8(bytes))
+}
+
+/// Decode source bytes to UTF-8, replacing invalid sequences lossily.
+///
+/// Discovery already excludes binary files, so this helper handles text files
+/// with stray invalid bytes (mixed encodings, latin-1 notes) by indexing them
+/// instead of dropping them from the index.
+fn lossy_utf8(bytes: Vec<u8>) -> String {
     match String::from_utf8(bytes) {
-        Ok(text) => Ok(text),
-        Err(err) => Ok(String::from_utf8_lossy(err.as_bytes()).into_owned()),
+        Ok(text) => text,
+        Err(err) => String::from_utf8_lossy(err.as_bytes()).into_owned(),
+    }
+}
+
+/// Open a directory capability for descriptor-relative source reads.
+pub(crate) fn open_root_dir(root: &Path) -> Result<Arc<Dir>> {
+    Dir::open_ambient_dir(root, ambient_authority())
+        .map(Arc::new)
+        .with_context(|| format!("failed to open source root: {}", root.display()))
+}
+
+/// The directory exclusions discovery applies, reusable without walking a tree.
+///
+/// Built from the same [`build_overrides`] patterns `discover_files` installs on
+/// its walker, so a caller that has to classify a single path (the MCP file
+/// watcher deciding whether an event is worth an update cycle) cannot drift from
+/// what indexing actually skips.
+pub struct ExclusionMatcher {
+    root: PathBuf,
+    overrides: Override,
+}
+
+impl ExclusionMatcher {
+    /// Build a matcher rooted at `root` for the given indexing configuration.
+    pub fn new(root: &Path, config: &IndexingConfig) -> Result<Self> {
+        let root = root
+            .canonicalize()
+            .with_context(|| format!("failed to resolve path: {}", root.display()))?;
+        let overrides = build_overrides(&root, config)?;
+        Ok(Self { root, overrides })
+    }
+
+    /// True if `path` lies in, or is, a directory discovery excludes.
+    ///
+    /// Paths outside the root are reported as not excluded: the caller cannot
+    /// classify them against these patterns, and treating them as excluded would
+    /// silently drop work.
+    ///
+    /// The default patterns are directory-only (`!target/`), so `path` is probed
+    /// rather than assumed to be a directory: `discover_files` indexes a regular
+    /// file named `build` or `target`, and classifying it as excluded here would
+    /// make the watcher ignore edits to a file that is in the index. A path that
+    /// no longer exists is treated as a file for the same reason, so deleting
+    /// such a file still triggers an update; its parents are matched as
+    /// directories either way, which keeps deletions under `target/` excluded.
+    pub fn is_excluded(&self, path: &Path) -> bool {
+        let Ok(relative) = path.strip_prefix(&self.root) else {
+            return false;
+        };
+        if path.is_dir() && !self.overrides.matched(relative, true).is_none() {
+            return true;
+        }
+        override_matches_path_or_any_parents(&self.overrides, relative)
     }
 }
 
@@ -213,6 +349,7 @@ pub fn discover_files_with_cancellation(
     let root = root
         .canonicalize()
         .with_context(|| format!("failed to resolve path: {}", root.display()))?;
+    let root_dir = open_root_dir(&root)?;
 
     let strategy = determine_ignore_strategy(&root, config)?;
 
@@ -250,9 +387,12 @@ pub fn discover_files_with_cancellation(
             }
         };
 
-        // Skip directories — we only want files.
+        // Keep only regular files. `file_type()` reports the entry's own type,
+        // so a symlink is skipped rather than indexed through its target: the
+        // walker does not follow links, and resolving one here would pull
+        // content from outside the repository under an in-repository path.
         let path = entry.path();
-        if !path.is_file() {
+        if !entry.file_type().is_some_and(|ft| ft.is_file()) {
             continue;
         }
 
@@ -263,17 +403,30 @@ pub fn discover_files_with_cancellation(
             continue;
         }
 
-        // Get file metadata for size check.
-        let metadata = match std::fs::metadata(path) {
-            Ok(m) => m,
+        let relative_path = match path.strip_prefix(&root) {
+            Ok(rel) => rel.to_string_lossy().to_string(),
+            Err(_) => path.to_string_lossy().to_string(),
+        };
+
+        // Open once and stat through the handle, so the size gate and the
+        // binary sniff below observe the same file even if the path is swapped
+        // between opens; a fresh path stat here could bless another inode.
+        let mut file = match root_dir.open(Path::new(&relative_path)) {
+            Ok(file) => file,
+            Err(err) => {
+                warn!("cannot open {}: {err}", path.display());
+                error_skipped += 1;
+                continue;
+            }
+        };
+        let size = match file.metadata() {
+            Ok(metadata) => metadata.len(),
             Err(err) => {
                 warn!("cannot read metadata for {}: {err}", path.display());
                 error_skipped += 1;
                 continue;
             }
         };
-
-        let size = metadata.len();
 
         // Skip large files.
         if size > config.max_file_size_bytes {
@@ -305,7 +458,7 @@ pub fn discover_files_with_cancellation(
         }
 
         // Skip binary files by content detection (read first 8KB).
-        match is_binary_content(path) {
+        match is_binary_file(&mut file) {
             Ok(true) => {
                 debug!("skipping binary (content): {}", path.display());
                 binary_skipped += 1;
@@ -321,12 +474,6 @@ pub fn discover_files_with_cancellation(
                 continue;
             }
         }
-
-        // Compute repository-relative path.
-        let relative_path = match path.strip_prefix(&root) {
-            Ok(rel) => rel.to_string_lossy().to_string(),
-            Err(_) => path.to_string_lossy().to_string(),
-        };
 
         files.push(DiscoveredFile {
             absolute_path: path.to_path_buf(),
@@ -344,6 +491,7 @@ pub fn discover_files_with_cancellation(
         large_skipped,
         large_skipped_paths,
         error_skipped,
+        root_dir,
     })
 }
 
@@ -353,7 +501,7 @@ pub fn explain_path(root: &Path, path: &Path, config: &IndexingConfig) -> Result
         .canonicalize()
         .with_context(|| format!("failed to resolve path: {}", root.display()))?;
     let display_input = path.display().to_string();
-    let Some(relative) = normalized_relative_path(&root, path) else {
+    let Some((root_relative, relative)) = normalized_relative_path(&root, path) else {
         return Ok(PathExplanation {
             input_path: display_input,
             absolute_path: if path.is_absolute() {
@@ -375,22 +523,51 @@ pub fn explain_path(root: &Path, path: &Path, config: &IndexingConfig) -> Result
     let candidate = root.join(&relative);
     let absolute_display = candidate.display().to_string();
     let relative_path = relative.to_string_lossy().to_string();
-    let relative = Path::new(&relative_path);
 
-    if !candidate.exists() {
-        return Ok(PathExplanation {
-            input_path: display_input,
-            absolute_path: absolute_display,
-            relative_path: Some(relative_path),
-            decision: PathDecision::Missing,
-            reason: PathReason::Missing,
-            source: None,
-            pattern: None,
-            details: Some("path does not exist".to_string()),
-        });
+    // `symlink_metadata` refuses to follow only the final component, so an
+    // intermediate symlinked directory would still be traversed by every check
+    // below. The walker never descends through one, so nothing beneath it is
+    // enumerated; reject the whole path before reading metadata, ignore rules
+    // or content through the link. Which form of the path the scan walks is
+    // platform-dependent, since only POSIX resolves a `..` against the directory
+    // it has already reached.
+    match scan_ancestors(&root, ancestor_scan_path(root_relative, &relative))? {
+        AncestorScan::Symlink(link) => {
+            return Ok(path_excluded(
+                display_input,
+                absolute_display,
+                relative_path,
+                IgnoreMatchExplanation {
+                    reason: PathReason::NonRegularFile,
+                    source: Some("discovery".to_string()),
+                    pattern: None,
+                    details: Some(format!(
+                        "the ancestor {} is a symbolic link, and symbolic links are not followed during indexing",
+                        link.display()
+                    )),
+                },
+            ));
+        }
+        AncestorScan::UnresolvableAncestor => {
+            return Ok(path_missing(display_input, absolute_display, relative_path));
+        }
+        AncestorScan::Clear => {}
     }
 
-    if candidate.is_dir() {
+    // Inspect the link itself, not its target, so this diagnostic reports the
+    // same decision the walker makes.
+    let metadata = match std::fs::symlink_metadata(&candidate) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(path_missing(display_input, absolute_display, relative_path));
+        }
+        Err(err) => {
+            return Err(err)
+                .with_context(|| format!("failed to read metadata for {}", candidate.display()));
+        }
+    };
+
+    if metadata.is_dir() {
         return Ok(PathExplanation {
             input_path: display_input,
             absolute_path: absolute_display,
@@ -403,7 +580,7 @@ pub fn explain_path(root: &Path, path: &Path, config: &IndexingConfig) -> Result
         });
     }
 
-    if !candidate.is_file() {
+    if !metadata.is_file() {
         return Ok(path_excluded(
             display_input,
             absolute_display,
@@ -412,12 +589,16 @@ pub fn explain_path(root: &Path, path: &Path, config: &IndexingConfig) -> Result
                 reason: PathReason::NonRegularFile,
                 source: Some("discovery".to_string()),
                 pattern: None,
-                details: Some("only regular files are indexed".to_string()),
+                details: Some(if metadata.is_symlink() {
+                    "symbolic links are not followed during indexing".to_string()
+                } else {
+                    "only regular files are indexed".to_string()
+                }),
             },
         ));
     }
 
-    if let Some(explanation) = explain_override_match(&root, relative, config)? {
+    if let Some(explanation) = explain_override_match(&root, &relative, config)? {
         return Ok(path_excluded(
             display_input,
             absolute_display,
@@ -431,10 +612,10 @@ pub fn explain_path(root: &Path, path: &Path, config: &IndexingConfig) -> Result
         let strategy = determine_ignore_strategy(&root, config)?;
 
         for decision in [
-            explain_custom_ignore_match(&root, relative, strategy.use_veraignore)?,
-            explain_named_ignore_match(&root, relative, ".ignore", PathReason::DotIgnore)?,
+            explain_custom_ignore_match(&root, &relative, strategy.use_veraignore)?,
+            explain_named_ignore_match(&root, &relative, ".ignore", PathReason::DotIgnore)?,
             if strategy.use_gitignore {
-                explain_named_ignore_match(&root, relative, ".gitignore", PathReason::Gitignore)?
+                explain_named_ignore_match(&root, &relative, ".gitignore", PathReason::Gitignore)?
             } else {
                 IgnoreDecision::None
             },
@@ -483,8 +664,6 @@ pub fn explain_path(root: &Path, path: &Path, config: &IndexingConfig) -> Result
         ));
     }
 
-    let metadata = std::fs::metadata(&candidate)
-        .with_context(|| format!("failed to read metadata for {}", candidate.display()))?;
     if metadata.len() > config.max_file_size_bytes {
         return Ok(path_excluded(
             display_input,
@@ -573,13 +752,103 @@ pub fn explain_path(root: &Path, path: &Path, config: &IndexingConfig) -> Result
     })
 }
 
-fn normalized_relative_path(root: &Path, path: &Path) -> Option<PathBuf> {
+/// What a walk of `relative`'s ancestors found, ignoring the final component.
+enum AncestorScan {
+    /// Every ancestor exists and none of them is a symbolic link.
+    Clear,
+    /// The first ancestor that is a symbolic link, repository-relative.
+    Symlink(PathBuf),
+    /// An ancestor is absent or is not a directory, so the path cannot resolve
+    /// at all.
+    UnresolvableAncestor,
+}
+
+/// Which form of the path the ancestor scan should walk: the one whose
+/// ancestors the operating system would actually visit.
+///
+/// POSIX resolves a path left to right and applies each `..` to the directory it
+/// has already reached, so the ancestors are the ones written down:
+/// `link/../file` traverses `link`, and `regular/../file` stops at `regular`
+/// with `ENOTDIR`. Win32 canonicalizes `..` out of an ordinary path before the
+/// file system sees it, so `link\..\file` opens `file` and `regular\..\file`
+/// succeeds; scanning the written form there would report on ancestors Windows
+/// never visits.
+///
+/// Only the placement of `..` differs, which is why this selects an input rather
+/// than gating the scan. The scan's other two outcomes hold on both platforms:
+/// Windows will not open `regular\nested\file` either, and the walker declines a
+/// reparse point exactly as it declines a symbolic link. The Windows branch is
+/// reasoned from Win32's documented path canonicalization and is not exercised
+/// by the tests below, which run only on Unix.
+fn ancestor_scan_path<'a>(as_written: &'a Path, collapsed: &'a Path) -> &'a Path {
+    if cfg!(unix) { as_written } else { collapsed }
+}
+
+/// Walk the ancestors of `relative` under `root`, stopping at the first that is
+/// a symbolic link or that the operating system could not resolve through.
+///
+/// `relative` comes from `ancestor_scan_path`, which decides whether this
+/// platform has already collapsed its `..` segments. The walk keeps its own
+/// lexical prefix so that a `..` still present counts as one more component
+/// following whatever precedes it.
+///
+/// An unresolvable ancestor is reported separately rather than skipped, because
+/// the kernel cannot resolve through it either: `absent/../link/file` is missing,
+/// not a link, and normalizing `absent/..` away would otherwise leave the caller
+/// inspecting a path the operating system would never reach. An ancestor that
+/// exists but is not a directory is the same outcome by a different errno, since
+/// `regular/../file` stops at `regular` with `ENOTDIR`.
+fn scan_ancestors(root: &Path, relative: &Path) -> Result<AncestorScan> {
+    let mut prefix = PathBuf::new();
+    let mut components = relative.components().peekable();
+    while let Some(component) = components.next() {
+        match component {
+            Component::CurDir => continue,
+            Component::ParentDir => {
+                if !prefix.pop() {
+                    return Ok(AncestorScan::Clear);
+                }
+                continue;
+            }
+            Component::Normal(part) => prefix.push(part),
+            Component::RootDir | Component::Prefix(_) => return Ok(AncestorScan::Clear),
+        }
+        if components.peek().is_none() {
+            break;
+        }
+        let ancestor = root.join(&prefix);
+        match std::fs::symlink_metadata(&ancestor) {
+            Ok(metadata) if metadata.is_symlink() => return Ok(AncestorScan::Symlink(prefix)),
+            Ok(metadata) if !metadata.is_dir() => {
+                return Ok(AncestorScan::UnresolvableAncestor);
+            }
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(AncestorScan::UnresolvableAncestor);
+            }
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!("failed to read metadata for {}", ancestor.display())
+                });
+            }
+        }
+    }
+    Ok(AncestorScan::Clear)
+}
+
+/// Resolve `path` against `root`, returning both the root-relative path as it
+/// was written and its lexically normalized form.
+///
+/// Callers that inspect the filesystem need the former, because normalization
+/// discards the `..` segments the kernel would resolve through; callers that
+/// match ignore rules or report the path need the latter.
+fn normalized_relative_path<'a>(root: &Path, path: &'a Path) -> Option<(&'a Path, PathBuf)> {
     let relative = if path.is_absolute() {
         path.strip_prefix(root).ok()?
     } else {
         path
     };
-    normalize_relative_path(relative)
+    Some((relative, normalize_relative_path(relative)?))
 }
 
 fn normalize_relative_path(path: &Path) -> Option<PathBuf> {
@@ -631,6 +900,15 @@ fn build_overrides(root: &Path, config: &IndexingConfig) -> Result<Override> {
                 .with_context(|| format!("invalid exclusion pattern: {pattern}"))?;
         }
         overrides.add("!.veraignore")?;
+    }
+    // Index build staging dirs are internal artifacts, not configuration:
+    // they must stay excluded even when default excludes are switched off,
+    // or a crashed/concurrent build's leftovers would be indexed as source.
+    let index_name = crate::indexing::pipeline::INDEX_DIR_NAME;
+    for suffix in crate::indexing::pipeline::INDEX_STAGING_SUFFIXES {
+        overrides
+            .add(&format!("!{index_name}.{suffix}/"))
+            .context("failed to exclude index staging directory")?;
     }
     for pattern in &config.extra_excludes {
         overrides
@@ -691,6 +969,28 @@ fn explain_override_match(
                 "default excludes",
                 ".veraignore",
                 "the .veraignore file itself is never indexed",
+            )));
+        }
+    }
+
+    // Internal build artifacts, excluded in `build_overrides` regardless of
+    // `no_default_excludes`; mirror that here so explain-path agrees.
+    let index_name = crate::indexing::pipeline::INDEX_DIR_NAME;
+    for suffix in crate::indexing::pipeline::INDEX_STAGING_SUFFIXES {
+        let pattern = format!("{index_name}.{suffix}");
+        let mut builder = OverrideBuilder::new(root);
+        builder
+            .add(&format!("!{pattern}/"))
+            .context("failed to build staging override")?;
+        let matcher = builder
+            .build()
+            .context("failed to build staging override matcher")?;
+        if override_matches_path_or_any_parents(&matcher, relative) {
+            return Ok(Some(simple_explanation(
+                PathReason::DefaultExclude,
+                "index staging",
+                &pattern,
+                "index build staging directories are never indexed",
             )));
         }
     }
@@ -847,6 +1147,23 @@ fn path_excluded(
     }
 }
 
+fn path_missing(
+    input_path: String,
+    absolute_path: String,
+    relative_path: String,
+) -> PathExplanation {
+    PathExplanation {
+        input_path,
+        absolute_path,
+        relative_path: Some(relative_path),
+        decision: PathDecision::Missing,
+        reason: PathReason::Missing,
+        source: None,
+        pattern: None,
+        details: Some("path does not exist".to_string()),
+    }
+}
+
 fn path_ancestors_from_child(path: &Path) -> Vec<PathBuf> {
     let mut ancestors = Vec::new();
     let mut current = path.parent();
@@ -902,21 +1219,44 @@ fn is_rst_include_fragment(path: &Path) -> bool {
         .is_some_and(|name| name.to_ascii_lowercase().ends_with(".rst.inc"))
 }
 
-/// Check if a file contains binary content by reading the first 8KB.
+/// Fill `buf` from `reader`, looping past short reads until it is full or EOF,
+/// and return how many bytes were filled.
 ///
-/// Uses the null-byte heuristic: if any null bytes are found in the
-/// first 8KB, the file is considered binary.
-fn is_binary_content(path: &Path) -> Result<bool> {
-    use std::io::Read;
+/// A network or FUSE filesystem may return fewer bytes than requested even when
+/// more follow, so a single `read` cannot distinguish EOF from a short read;
+/// trusting one would classify the unread tail of a binary file as absent.
+fn read_prefix(reader: &mut impl std::io::Read, buf: &mut [u8]) -> std::io::Result<usize> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        match reader.read(&mut buf[filled..]) {
+            Ok(0) => break,
+            Ok(count) => filled += count,
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(filled)
+}
 
-    let mut file = std::fs::File::open(path)
-        .with_context(|| format!("cannot open for binary check: {}", path.display()))?;
-
+/// Check whether an already-open file contains binary content in its first 8KB.
+///
+/// Uses the null-byte heuristic: if any null bytes are found in the sample, the
+/// file is considered binary. Takes the open handle so callers that already hold
+/// the file do not reopen it by path and risk inspecting a different file.
+fn is_binary_file(file: &mut impl std::io::Read) -> Result<bool> {
     let mut buf = [0u8; 8192];
-    let n = file.read(&mut buf)?;
+    let filled = read_prefix(file, &mut buf)?;
 
     // Null byte detection: any \0 in the sample means binary.
-    Ok(buf[..n].contains(&0))
+    Ok(buf[..filled].contains(&0))
+}
+
+/// Check if a file contains binary content by reading its first 8KB through a
+/// fresh open at `path`; see [`is_binary_file`] for the heuristic.
+fn is_binary_content(path: &Path) -> Result<bool> {
+    let mut file = std::fs::File::open(path)
+        .with_context(|| format!("cannot open for binary check: {}", path.display()))?;
+    is_binary_file(&mut file)
 }
 
 #[cfg(test)]
@@ -927,6 +1267,83 @@ mod tests {
 
     fn default_config() -> IndexingConfig {
         IndexingConfig::default()
+    }
+
+    /// The matcher exists so the MCP watcher classifies a path the same way
+    /// `discover_files` does. The failing direction is a *file* whose name
+    /// equals an excluded *directory*: `build`, `target`, `dist` and friends are
+    /// ordinary extensionless script names, and discovery indexes them because
+    /// its patterns are directory-only.
+    #[test]
+    fn matcher_agrees_with_discovery_on_a_file_named_like_an_excluded_dir() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("build"), "#!/bin/sh\ncargo build\n").unwrap();
+        fs::create_dir_all(dir.path().join("target/debug")).unwrap();
+        fs::write(dir.path().join("target/debug/app.o"), "object").unwrap();
+
+        let config = default_config();
+        let discovered: Vec<String> = discover_files(dir.path(), &config)
+            .unwrap()
+            .files
+            .into_iter()
+            .map(|f| f.relative_path)
+            .collect();
+        // Presence first: the assertion below is meaningless if discovery
+        // skipped the file for some unrelated reason.
+        assert!(
+            discovered.contains(&"build".to_string()),
+            "discovery indexes an extensionless file named `build`: {discovered:?}"
+        );
+        assert!(
+            !discovered.contains(&"target/debug/app.o".to_string()),
+            "discovery skips the target/ directory: {discovered:?}"
+        );
+
+        let root = dir.path().canonicalize().unwrap();
+        let matcher = ExclusionMatcher::new(&root, &config).unwrap();
+        assert!(
+            !matcher.is_excluded(&root.join("build")),
+            "a regular file named `build` is indexed, so it must not be classified as excluded"
+        );
+        assert!(
+            matcher.is_excluded(&root.join("target/debug/app.o")),
+            "a file under target/ is not indexed, so it must be classified as excluded"
+        );
+        assert!(
+            matcher.is_excluded(&root.join("target")),
+            "the target directory itself must be classified as excluded"
+        );
+    }
+
+    #[test]
+    fn matcher_excludes_index_and_vendor_dirs_but_not_sources() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let matcher = ExclusionMatcher::new(&root, &default_config()).unwrap();
+
+        for excluded in [".vera/metadata.db", ".git/HEAD", "node_modules/x/i.js"] {
+            assert!(
+                matcher.is_excluded(&root.join(excluded)),
+                "{excluded} must be excluded"
+            );
+        }
+        assert!(!matcher.is_excluded(&root.join("src/main.rs")));
+        assert!(
+            !matcher.is_excluded(Path::new("/somewhere/else/main.rs")),
+            "a path outside the root cannot be classified, so it is not excluded"
+        );
+    }
+
+    #[test]
+    fn matcher_applies_extra_excludes() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let mut config = default_config();
+        config.extra_excludes = vec!["vendor/**".to_string()];
+        let matcher = ExclusionMatcher::new(&root, &config).unwrap();
+
+        assert!(matcher.is_excluded(&root.join("vendor/lib/x.rs")));
+        assert!(!matcher.is_excluded(&root.join("src/x.rs")));
     }
 
     #[test]
@@ -943,6 +1360,107 @@ mod tests {
         let good = dir.path().join("ok.rs");
         fs::write(&good, "fn main() {}\n").unwrap();
         assert_eq!(read_source_lossy(&good).unwrap(), "fn main() {}\n");
+    }
+
+    #[test]
+    fn capped_read_returns_full_content_within_limit() {
+        let dir = TempDir::new().unwrap();
+        let root_dir = open_root_dir(dir.path()).unwrap();
+
+        fs::write(dir.path().join("src.rs"), b"small content\n").unwrap();
+        let content = read_source_lossy_capped(
+            &root_dir,
+            Path::new("src.rs"),
+            crate::config::DEFAULT_MAX_FILE_SIZE_BYTES,
+        )
+        .unwrap();
+        assert_eq!(content, "small content\n");
+
+        // Exactly at the limit is still a full read, not a truncation.
+        let exact = vec![b'x'; 32];
+        fs::write(dir.path().join("exact.txt"), &exact).unwrap();
+        let content = read_source_lossy_capped(&root_dir, Path::new("exact.txt"), 32).unwrap();
+        assert_eq!(content.len(), 32);
+    }
+
+    #[test]
+    fn capped_read_rejects_oversized_file_instead_of_truncating() {
+        let dir = TempDir::new().unwrap();
+        let root_dir = open_root_dir(dir.path()).unwrap();
+
+        let oversized = vec![b'a'; 33];
+        fs::write(dir.path().join("big.txt"), &oversized).unwrap();
+        let result = read_source_lossy_capped(&root_dir, Path::new("big.txt"), 32);
+
+        let err = result.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::FileTooLarge);
+        assert!(
+            err.to_string().contains("read limit"),
+            "error should be observable: {err}"
+        );
+    }
+
+    #[test]
+    fn capped_read_decodes_invalid_utf8_lossily() {
+        let dir = TempDir::new().unwrap();
+        let root_dir = open_root_dir(dir.path()).unwrap();
+
+        fs::write(dir.path().join("notes.txt"), b"caf\xe9 text\n").unwrap();
+        let content = read_source_lossy_capped(
+            &root_dir,
+            Path::new("notes.txt"),
+            crate::config::DEFAULT_MAX_FILE_SIZE_BYTES,
+        )
+        .unwrap();
+        assert!(content.contains("caf\u{FFFD}"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn descriptor_read_follows_an_in_tree_symlink() {
+        let dir = TempDir::new().unwrap();
+        fs::create_dir(dir.path().join("src")).unwrap();
+        fs::write(dir.path().join("src/real.rs"), "fn inside() {}\n").unwrap();
+        std::os::unix::fs::symlink("real.rs", dir.path().join("src/alias.rs")).unwrap();
+
+        let root_dir = open_root_dir(dir.path()).unwrap();
+        let content = read_source_lossy_at(&root_dir, Path::new("src/alias.rs")).unwrap();
+
+        assert_eq!(content, "fn inside() {}\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn descriptor_read_rejects_an_escape_planted_after_discovery() {
+        let outside = TempDir::new().unwrap();
+        let canary = outside.path().join("canary.rs");
+        fs::write(&canary, "CANARY_OUTSIDE_ROOT\n").unwrap();
+
+        let dir = TempDir::new().unwrap();
+        fs::create_dir(dir.path().join("src")).unwrap();
+        let source = dir.path().join("src/source.rs");
+        fs::write(&source, "fn inside() {}\n").unwrap();
+
+        let discovery = discover_files(dir.path(), &default_config()).unwrap();
+        assert!(
+            discovery
+                .files
+                .iter()
+                .any(|file| file.relative_path == "src/source.rs")
+        );
+
+        fs::remove_file(&source).unwrap();
+        std::os::unix::fs::symlink(&canary, &source).unwrap();
+
+        let result = read_source_lossy_at(&discovery.root_dir, Path::new("src/source.rs"));
+        assert!(
+            result.is_err(),
+            "an escape planted after discovery was read"
+        );
+        assert_ne!(
+            result.as_deref().unwrap_or_default(),
+            "CANARY_OUTSIDE_ROOT\n"
+        );
     }
 
     #[test]
@@ -1425,6 +1943,37 @@ mod tests {
     }
 
     #[test]
+    fn index_staging_dirs_stay_excluded_even_without_default_excludes() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("main.rs"), "fn main() {}").unwrap();
+        for staging in [".vera.build", ".vera.old"] {
+            let staging_dir = dir.path().join(staging);
+            fs::create_dir_all(&staging_dir).unwrap();
+            fs::write(staging_dir.join("meta.json"), "{}").unwrap();
+        }
+
+        let mut config = default_config();
+        config.no_default_excludes = true;
+
+        let result = discover_files(dir.path(), &config).unwrap();
+        let names: Vec<&str> = result
+            .files
+            .iter()
+            .map(|f| f.relative_path.as_str())
+            .collect();
+        assert!(names.contains(&"main.rs"));
+        assert!(
+            !names.iter().any(|n| n.starts_with(".vera")),
+            "index staging directories are internal artifacts: {names:?}"
+        );
+
+        let root = dir.path().canonicalize().unwrap();
+        let matcher = ExclusionMatcher::new(&root, &config).unwrap();
+        assert!(matcher.is_excluded(&root.join(".vera.build/meta.json")));
+        assert!(matcher.is_excluded(&root.join(".vera.old/meta.json")));
+    }
+
+    #[test]
     fn veraignore_itself_excluded_from_indexing() {
         let dir = TempDir::new().unwrap();
         fs::write(dir.path().join("main.rs"), "fn main() {}").unwrap();
@@ -1525,6 +2074,207 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn symlink_to_file_outside_root_is_not_discovered() {
+        let outside = TempDir::new().unwrap();
+        let canary = outside.path().join("canary.rs");
+        fs::write(&canary, "fn canary_outside_root() {}\n").unwrap();
+
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("main.rs"), "fn main() {}").unwrap();
+        std::os::unix::fs::symlink(&canary, dir.path().join("linked.rs")).unwrap();
+
+        let result = discover_files(dir.path(), &default_config()).unwrap();
+        let names: Vec<&str> = result
+            .files
+            .iter()
+            .map(|f| f.relative_path.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["main.rs"],
+            "a symlink to a file outside the root must not be discovered"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_to_file_inside_root_is_not_indexed_twice() {
+        let dir = TempDir::new().unwrap();
+        let real = dir.path().join("main.rs");
+        fs::write(&real, "fn main() {}").unwrap();
+        std::os::unix::fs::symlink(&real, dir.path().join("alias.rs")).unwrap();
+
+        let result = discover_files(dir.path(), &default_config()).unwrap();
+        let names: Vec<&str> = result
+            .files
+            .iter()
+            .map(|f| f.relative_path.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["main.rs"],
+            "a symlink to an in-repository file must not be indexed a second time"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explain_path_rejects_symlinks_to_regular_files() {
+        let dir = TempDir::new().unwrap();
+        let real = dir.path().join("main.rs");
+        fs::write(&real, "fn main() {}").unwrap();
+        std::os::unix::fs::symlink(&real, dir.path().join("alias.rs")).unwrap();
+
+        let explanation =
+            explain_path(dir.path(), Path::new("alias.rs"), &default_config()).unwrap();
+        assert_eq!(explanation.decision, PathDecision::Excluded);
+        assert_eq!(explanation.reason, PathReason::NonRegularFile);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explain_path_rejects_files_below_a_symlinked_directory() {
+        let outside = TempDir::new().unwrap();
+        let outside_dir = outside.path().join("secrets");
+        fs::create_dir_all(outside_dir.join("nested")).unwrap();
+        fs::write(
+            outside_dir.join("nested/secret.rs"),
+            "fn outside_secret() {}\n",
+        )
+        .unwrap();
+
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("main.rs"), "fn main() {}").unwrap();
+        std::os::unix::fs::symlink(&outside_dir, dir.path().join("linkdir")).unwrap();
+
+        let result = discover_files(dir.path(), &default_config()).unwrap();
+        let discovered: Vec<&str> = result
+            .files
+            .iter()
+            .map(|f| f.relative_path.as_str())
+            .collect();
+        assert_eq!(discovered, vec!["main.rs"]);
+
+        // The symlink is an intermediate component, not the final one, so
+        // `symlink_metadata` on the candidate would follow it.
+        let explanation = explain_path(
+            dir.path(),
+            Path::new("linkdir/nested/secret.rs"),
+            &default_config(),
+        )
+        .unwrap();
+        assert_eq!(
+            explanation.decision,
+            PathDecision::Excluded,
+            "explain_path must agree with discovery, which never enumerated this path"
+        );
+        assert_eq!(explanation.reason, PathReason::NonRegularFile);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explain_path_rejects_a_symlinked_ancestor_erased_by_a_parent_segment() {
+        let outside = TempDir::new().unwrap();
+        fs::create_dir(outside.path().join("vault")).unwrap();
+        fs::write(
+            outside.path().join("secret.rs"),
+            "fn outside_the_repository() {}\n",
+        )
+        .unwrap();
+
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("secret.rs"),
+            "fn inside_the_repository() {}\n",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(outside.path().join("vault"), dir.path().join("link")).unwrap();
+
+        // The kernel resolves left to right, so `link/../secret.rs` traverses
+        // `link` and names `<outside>/secret.rs`. Collapsing `..` lexically
+        // first rewrites it to the unrelated in-repository `secret.rs` and
+        // leaves no ancestor for the symlink check to see.
+        let explanation = explain_path(
+            dir.path(),
+            Path::new("link/../secret.rs"),
+            &default_config(),
+        )
+        .unwrap();
+        assert_eq!(
+            explanation.decision,
+            PathDecision::Excluded,
+            "a parent segment must not erase the symlinked ancestor it traverses"
+        );
+        assert_eq!(explanation.reason, PathReason::NonRegularFile);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explain_path_reports_a_missing_ancestor_as_missing() {
+        let outside = TempDir::new().unwrap();
+        let secrets = outside.path().join("secrets");
+        fs::create_dir_all(secrets.join("nested")).unwrap();
+        fs::write(secrets.join("nested/secret.rs"), "fn outside_secret() {}\n").unwrap();
+
+        let dir = TempDir::new().unwrap();
+        std::os::unix::fs::symlink(&secrets, dir.path().join("link")).unwrap();
+
+        // The kernel cannot resolve through `absent`, so the path is missing.
+        // Collapsing `absent/..` away instead would leave the checks below
+        // inspecting a candidate that reaches through `link`.
+        let explanation = explain_path(
+            dir.path(),
+            Path::new("absent/../link/nested/secret.rs"),
+            &default_config(),
+        )
+        .unwrap();
+        assert_eq!(explanation.decision, PathDecision::Missing);
+        assert_eq!(explanation.reason, PathReason::Missing);
+    }
+
+    // Windows collapses `..` lexically before the filesystem sees the path, so
+    // the `ENOTDIR` this pins is POSIX resolution order, which is what
+    // `ancestor_scan_path` selects for.
+    #[cfg(unix)]
+    #[test]
+    fn explain_path_reports_a_non_directory_ancestor_as_missing() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("regular"), "not a directory\n").unwrap();
+        fs::write(dir.path().join("target.rs"), "fn target() {}\n").unwrap();
+
+        // The kernel stops at `regular` with `ENOTDIR` and never reaches
+        // `target.rs`, so the path as written cannot resolve. Collapsing
+        // `regular/..` away instead would report on the unrelated `target.rs`.
+        assert_eq!(
+            std::fs::symlink_metadata(dir.path().join("regular/../target.rs"))
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::NotADirectory
+        );
+
+        let explanation = explain_path(
+            dir.path(),
+            Path::new("regular/../target.rs"),
+            &default_config(),
+        )
+        .unwrap();
+        assert_eq!(explanation.decision, PathDecision::Missing);
+        assert_eq!(explanation.reason, PathReason::Missing);
+    }
+
+    #[test]
+    fn explain_path_reports_a_path_that_does_not_exist_as_missing() {
+        let dir = TempDir::new().unwrap();
+        fs::create_dir(dir.path().join("src")).unwrap();
+
+        let explanation =
+            explain_path(dir.path(), Path::new("src/absent.rs"), &default_config()).unwrap();
+        assert_eq!(explanation.decision, PathDecision::Missing);
+        assert_eq!(explanation.reason, PathReason::Missing);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn explain_path_rejects_non_regular_files() {
         let dir = TempDir::new().unwrap();
         let device = dir.path().join("null-device");
@@ -1534,5 +2284,46 @@ mod tests {
             explain_path(dir.path(), Path::new("null-device"), &default_config()).unwrap();
         assert_eq!(explanation.decision, PathDecision::Excluded);
         assert_eq!(explanation.reason, PathReason::NonRegularFile);
+    }
+
+    /// Emulates network and FUSE filesystems: every `read` returns at most two
+    /// bytes even though more data follows until the content runs out.
+    struct ShortReader<'a> {
+        remaining: &'a [u8],
+    }
+
+    impl std::io::Read for ShortReader<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let count = buf.len().min(self.remaining.len()).min(2);
+            buf[..count].copy_from_slice(&self.remaining[..count]);
+            self.remaining = &self.remaining[count..];
+            Ok(count)
+        }
+    }
+
+    /// Regression test: a single `read` stops at the first short read, before
+    /// the null byte, and would classify this content as text.
+    #[test]
+    fn binary_sniff_reads_past_short_reads_to_the_null_byte() {
+        let content = b"ok\x00rest of a binary file";
+        let mut reader = ShortReader { remaining: content };
+        let mut buf = [0u8; 8192];
+
+        let filled = read_prefix(&mut reader, &mut buf).unwrap();
+
+        assert_eq!(filled, content.len());
+        assert!(buf[..filled].contains(&0));
+    }
+
+    #[test]
+    fn binary_sniff_stops_filling_at_end_of_input() {
+        let content = b"plain text, no null bytes";
+        let mut reader = ShortReader { remaining: content };
+        let mut buf = [0u8; 8192]; // Larger than the content.
+
+        let filled = read_prefix(&mut reader, &mut buf).unwrap();
+
+        assert_eq!(filled, content.len());
+        assert!(!buf[..filled].contains(&0));
     }
 }

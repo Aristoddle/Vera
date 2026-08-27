@@ -5,6 +5,14 @@ pub(crate) fn path_depth(path: &str) -> usize {
     path.matches('/').count() + path.matches('\\').count()
 }
 
+/// Return a filename without its final extension.
+pub(crate) fn file_stem(filename: &str) -> &str {
+    filename
+        .rsplit_once('.')
+        .map(|(stem, _)| stem)
+        .unwrap_or(filename)
+}
+
 /// Strip non-identifier punctuation from the edges of a query token.
 pub(crate) fn trim_query_token(token: &str) -> &str {
     token.trim_matches(|ch: char| {

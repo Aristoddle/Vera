@@ -11,13 +11,14 @@ use anyhow::Result;
 use regex::RegexBuilder;
 
 use crate::corpus::{ContentClass, classify_content};
+use crate::path_containment::canonical_project_root;
 use crate::retrieval::file_scan::{
     allows_class, bounded_byte_snippet, language_for_path, sort_files_by_scan_priority,
     symbol_for_line,
 };
 use crate::retrieval::ranking::{RankingStage, apply_query_ranking_with_filters};
 use crate::storage::metadata::MetadataStore;
-use crate::types::{Chunk, SearchFilters, SearchResult, SymbolType};
+use crate::types::{Chunk, SearchFilters, SearchResult};
 
 /// Search indexed files for a regex pattern.
 ///
@@ -43,9 +44,9 @@ pub fn search_regex(
     sort_files_by_scan_priority(&mut files, filters);
 
     // Resolve the project root (index_dir is .vera/, parent is project root).
-    let project_root = index_dir
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("Cannot determine project root from index dir"))?;
+    let project_root = canonical_project_root(index_dir)?;
+    let root_dir = crate::discovery::open_root_dir(&project_root)?;
+    let max_file_size_bytes = super::configured_max_file_size_bytes(&store);
 
     let mut results = Vec::new();
 
@@ -72,8 +73,11 @@ pub fn search_regex(
             None
         };
 
-        let file_abs = project_root.join(file_rel);
-        let content = match crate::discovery::read_source_lossy(&file_abs) {
+        let content = match crate::discovery::read_source_lossy_capped(
+            &root_dir,
+            Path::new(file_rel),
+            max_file_size_bytes,
+        ) {
             Ok(c) => c,
             Err(_) => continue,
         };
@@ -129,7 +133,7 @@ pub fn search_regex(
                 language,
             };
 
-            if !regex_result_matches(filters, symbol_type) {
+            if !filters.matches_symbol_type(symbol_type) {
                 continue;
             }
 
@@ -172,16 +176,12 @@ fn collect_minified_matches(
             language,
         };
 
-        if !regex_result_matches(filters, symbol_type) {
+        if !filters.matches_symbol_type(symbol_type) {
             continue;
         }
 
         results.push(result);
     }
-}
-
-fn regex_result_matches(filters: &SearchFilters, symbol_type: Option<SymbolType>) -> bool {
-    filters.matches_symbol_type(symbol_type)
 }
 
 #[cfg(test)]
@@ -474,5 +474,84 @@ mod tests {
                 .all(|result| result.symbol_name.as_deref() == Some("build_token"))
         );
         assert_eq!(results[0].file_path, "src/lib.rs");
+    }
+
+    #[test]
+    fn stored_paths_outside_the_project_root_are_not_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        // The canary sits next to the project root, so both escape shapes reach
+        // it without the test touching anything outside the temp dir.
+        let canary = tmp.path().join("canary.txt");
+        std::fs::write(&canary, "CANARY_SECRET lives outside the repository\n").unwrap();
+
+        let repo_root = tmp.path().join("repo");
+        let index_dir = repo_root.join(".vera");
+        std::fs::create_dir_all(repo_root.join("src")).unwrap();
+        std::fs::create_dir_all(&index_dir).unwrap();
+        std::fs::write(
+            repo_root.join("src/lib.rs"),
+            "fn read() { CANARY_SECRET; }\n",
+        )
+        .unwrap();
+
+        let store = MetadataStore::open(&index_dir.join("metadata.db")).unwrap();
+        store
+            .insert_chunks(&[
+                Chunk {
+                    id: "inside:0".to_string(),
+                    file_path: "src/lib.rs".to_string(),
+                    line_start: 1,
+                    line_end: 1,
+                    content: "fn read() { CANARY_SECRET; }".to_string(),
+                    language: Language::Rust,
+                    symbol_type: None,
+                    symbol_name: None,
+                },
+                Chunk {
+                    id: "absolute:0".to_string(),
+                    file_path: canary.to_str().unwrap().to_string(),
+                    line_start: 1,
+                    line_end: 1,
+                    content: String::new(),
+                    language: Language::Unknown,
+                    symbol_type: None,
+                    symbol_name: None,
+                },
+                Chunk {
+                    id: "traversal:0".to_string(),
+                    file_path: "../canary.txt".to_string(),
+                    line_start: 1,
+                    line_end: 1,
+                    content: String::new(),
+                    language: Language::Unknown,
+                    symbol_type: None,
+                    symbol_name: None,
+                },
+            ])
+            .unwrap();
+
+        let results = search_regex(
+            &index_dir,
+            "CANARY_SECRET",
+            10,
+            false,
+            0,
+            &SearchFilters::default(),
+        )
+        .unwrap();
+
+        assert!(
+            results
+                .iter()
+                .all(|result| !result.content.contains("outside the repository")),
+            "a stored path escaped the project root: {results:?}"
+        );
+        assert_eq!(
+            results
+                .iter()
+                .map(|result| result.file_path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["src/lib.rs"]
+        );
     }
 }

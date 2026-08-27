@@ -11,7 +11,7 @@
 //! - `ping` — respond with pong
 //! - Unknown methods → JSON-RPC error response
 
-use std::io::{BufRead, Write};
+use std::io::{self, BufRead, Write};
 
 use serde_json::Value;
 
@@ -22,6 +22,76 @@ use crate::protocol::{
 };
 use crate::tools;
 
+/// Maximum number of bytes in one newline-delimited JSON-RPC request frame.
+const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
+
+enum FrameRead {
+    EndOfStream,
+    Complete,
+    TooLarge { drain_to_newline: bool },
+}
+
+/// Read one newline-delimited frame without allowing the input buffer to grow
+/// beyond `MAX_FRAME_SIZE`.
+fn read_frame(reader: &mut dyn BufRead, frame: &mut Vec<u8>) -> io::Result<FrameRead> {
+    frame.clear();
+
+    loop {
+        let buffer = reader.fill_buf()?;
+        if buffer.is_empty() {
+            return Ok(if frame.is_empty() {
+                FrameRead::EndOfStream
+            } else {
+                FrameRead::Complete
+            });
+        }
+
+        if let Some(newline) = buffer.iter().position(|byte| *byte == b'\n') {
+            let frame_bytes = newline + 1;
+            if frame_bytes > MAX_FRAME_SIZE.saturating_sub(frame.len()) {
+                reader.consume(newline);
+                return Ok(FrameRead::TooLarge {
+                    drain_to_newline: true,
+                });
+            }
+            frame.extend_from_slice(&buffer[..frame_bytes]);
+            reader.consume(frame_bytes);
+            return Ok(FrameRead::Complete);
+        }
+
+        if buffer.len() > MAX_FRAME_SIZE.saturating_sub(frame.len()) {
+            let consumed = buffer.len();
+            reader.consume(consumed);
+            // There is no delimiter in the buffered input, so waiting for one
+            // could hang forever on a peer that keeps the frame open.
+            return Ok(FrameRead::TooLarge {
+                drain_to_newline: false,
+            });
+        }
+
+        frame.extend_from_slice(buffer);
+        let consumed = buffer.len();
+        reader.consume(consumed);
+    }
+}
+
+/// Discard the remainder of an oversized frame so the next newline-delimited
+/// message can still be processed.
+fn drain_frame(reader: &mut dyn BufRead) -> io::Result<bool> {
+    loop {
+        let buffer = reader.fill_buf()?;
+        if buffer.is_empty() {
+            return Ok(false);
+        }
+        if let Some(newline) = buffer.iter().position(|byte| *byte == b'\n') {
+            reader.consume(newline + 1);
+            return Ok(true);
+        }
+        let consumed = buffer.len();
+        reader.consume(consumed);
+    }
+}
+
 /// Run the MCP server on the given reader/writer pair.
 ///
 /// This is the main entry point. For production use, pass `stdin`/`stdout`.
@@ -31,24 +101,43 @@ use crate::tools;
 /// panics — all errors are returned as JSON-RPC error responses.
 pub fn run_server(reader: &mut dyn BufRead, writer: &mut dyn Write) {
     let mut initialized = false;
-    let mut line = String::new();
+    let mut frame = Vec::with_capacity(MAX_FRAME_SIZE.min(8 * 1024));
 
     loop {
-        line.clear();
-        match reader.read_line(&mut line) {
-            Ok(0) => {
+        match read_frame(reader, &mut frame) {
+            Ok(FrameRead::EndOfStream) => {
                 // EOF — client closed stdin.
                 tracing::info!("Client closed connection (EOF)");
                 break;
             }
-            Ok(_) => {}
+            Ok(FrameRead::Complete) => {}
+            Ok(FrameRead::TooLarge { drain_to_newline }) => {
+                tracing::warn!("Rejected oversized JSON-RPC message");
+                let err = RpcError::new(Value::Null, PARSE_ERROR, "Parse error: message too large");
+                write_message(writer, &err);
+                if !drain_to_newline {
+                    break;
+                }
+                if !drain_frame(reader).unwrap_or(false) {
+                    break;
+                }
+                continue;
+            }
             Err(e) => {
                 tracing::error!(error = %e, "Failed to read from stdin");
                 break;
             }
         }
 
-        let trimmed = line.trim();
+        let trimmed = match std::str::from_utf8(&frame) {
+            Ok(line) => line.trim(),
+            Err(e) => {
+                tracing::warn!(error = %e, "JSON-RPC message was not valid UTF-8");
+                let err = RpcError::new(Value::Null, PARSE_ERROR, "Parse error: invalid UTF-8");
+                write_message(writer, &err);
+                continue;
+            }
+        };
         if trimmed.is_empty() {
             continue;
         }
@@ -361,6 +450,49 @@ mod tests {
         ]);
 
         // Should get parse error + init response.
+        assert_eq!(responses.len(), 2);
+        assert_eq!(responses[0]["error"]["code"], PARSE_ERROR);
+        assert_eq!(responses[1]["id"], 1);
+    }
+
+    #[test]
+    fn oversized_frame_returns_parse_error_without_consuming_unbounded_input() {
+        let input = "x".repeat(MAX_FRAME_SIZE + 1);
+        let mut reader = std::io::BufReader::new(Cursor::new(input));
+        let mut output = Vec::new();
+
+        run_server(&mut reader, &mut output);
+
+        let responses: Vec<Value> = String::from_utf8(output)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(responses.len(), 1);
+        assert_eq!(responses[0]["error"]["code"], PARSE_ERROR);
+        assert_eq!(
+            responses[0]["error"]["message"],
+            "Parse error: message too large"
+        );
+    }
+
+    #[test]
+    fn oversized_frame_is_drained_before_processing_next_request() {
+        let input = format!(
+            "{}\n{}\n",
+            "x".repeat(MAX_FRAME_SIZE + 1),
+            r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#
+        );
+        let mut reader = std::io::BufReader::new(Cursor::new(input));
+        let mut output = Vec::new();
+
+        run_server(&mut reader, &mut output);
+
+        let responses: Vec<Value> = String::from_utf8(output)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
         assert_eq!(responses.len(), 2);
         assert_eq!(responses[0]["error"]["code"], PARSE_ERROR);
         assert_eq!(responses[1]["id"], 1);
