@@ -169,7 +169,7 @@ fn index_with<P: EmbeddingProvider>(
 ) -> (f64, u64) {
     match runtime.block_on(index_repository(repo_path, provider, config, model_name)) {
         Ok(summary) => (summary.elapsed_secs, dir_size(&index_dir(repo_path))),
-        Err(err) => panic!("{label} index failed for {}: {err}", repo_path.display()),
+        Err(err) => panic!("{label} index failed for {}: {err:#}", repo_path.display()),
     }
 }
 
