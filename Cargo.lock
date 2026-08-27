@@ -4109,8 +4109,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426"
 
 [[package]]
-name = "vera-cli"
-version = "0.4.0"
+name = "vera-eval"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "toml",
+ "vera2-core",
+]
+
+[[package]]
+name = "vera2"
+version = "0.12.16-aristoddle.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -4125,14 +4141,14 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
- "vera-core",
- "vera-mcp",
- "vera-serve",
+ "vera2-core",
+ "vera2-mcp",
+ "vera2-serve",
 ]
 
 [[package]]
-name = "vera-core"
-version = "0.4.0"
+name = "vera2-core"
+version = "0.12.16-aristoddle.1"
 dependencies = [
  "anyhow",
  "cap-std",
@@ -4224,24 +4240,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "vera-eval"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "chrono",
- "clap",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "tokio",
- "toml",
- "vera-core",
-]
-
-[[package]]
-name = "vera-mcp"
-version = "0.4.0"
+name = "vera2-mcp"
+version = "0.12.16-aristoddle.1"
 dependencies = [
  "anyhow",
  "notify",
@@ -4251,12 +4251,12 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
- "vera-core",
+ "vera2-core",
 ]
 
 [[package]]
-name = "vera-serve"
-version = "0.4.0"
+name = "vera2-serve"
+version = "0.12.16-aristoddle.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -4264,7 +4264,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
- "vera-core",
+ "vera2-core",
 ]
 
 [[package]]

@@ -42,6 +42,6 @@ reqwest = { version = "0.13", default-features = false, features = ["json", "blo
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
 
 # Internal crates
-vera-core = { package = "vera2-core", path = "crates/vera-core", version = "0.12.15-aristoddle.2" }
-vera-mcp = { package = "vera2-mcp", path = "crates/vera-mcp", version = "0.12.15-aristoddle.2" }
-vera-serve = { package = "vera2-serve", path = "crates/vera-serve", version = "0.12.15-aristoddle.2" }
+vera-core = { package = "vera2-core", path = "crates/vera-core", version = "0.12.16-aristoddle.1" }
+vera-mcp = { package = "vera2-mcp", path = "crates/vera-mcp", version = "0.12.16-aristoddle.1" }
+vera-serve = { package = "vera2-serve", path = "crates/vera-serve", version = "0.12.16-aristoddle.1" }
