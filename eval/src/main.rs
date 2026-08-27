@@ -329,8 +329,12 @@ fn run_lane(
         (report, tasks)
     } else {
         let backend = lane.backend.expect("non-BM25 lane must have a backend");
-        let vera =
-            vera_adapter::VeraFullAdapter::new_with_options(backend, lane.rerank(), lane.name())?;
+        let vera = vera_adapter::VeraFullAdapter::new_with_options(
+            backend,
+            lane.rerank(),
+            lane.name(),
+            &lane.spec,
+        )?;
         let report = runner::run_benchmark_scoped(
             &vera,
             &tasks,
