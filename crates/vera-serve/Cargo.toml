@@ -7,6 +7,10 @@ license.workspace = true
 rust-version.workspace = true
 repository.workspace = true
 readme.workspace = true
+keywords = ["search", "server", "http", "code-search", "indexing"]
+categories = ["development-tools", "web-programming::http-server"]
+homepage = "https://github.com/Aristoddle/Vera"
+documentation = "https://docs.rs/vera2-serve"
 
 [dependencies]
 vera-core = { workspace = true }

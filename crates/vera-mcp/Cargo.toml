@@ -7,6 +7,10 @@ license.workspace = true
 rust-version.workspace = true
 repository.workspace = true
 readme.workspace = true
+keywords = ["mcp", "search", "code-search", "ai", "indexing"]
+categories = ["development-tools", "api-bindings"]
+homepage = "https://github.com/Aristoddle/Vera"
+documentation = "https://docs.rs/vera2-mcp"
 
 [dependencies]
 vera-core = { workspace = true }
