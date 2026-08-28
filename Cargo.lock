@@ -4126,7 +4126,7 @@ dependencies = [
 
 [[package]]
 name = "vera2"
-version = "0.12.16-aristoddle.1"
+version = "0.12.16-aristoddle.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -4148,7 +4148,7 @@ dependencies = [
 
 [[package]]
 name = "vera2-core"
-version = "0.12.16-aristoddle.1"
+version = "0.12.16-aristoddle.2"
 dependencies = [
  "anyhow",
  "cap-std",
@@ -4241,7 +4241,7 @@ dependencies = [
 
 [[package]]
 name = "vera2-mcp"
-version = "0.12.16-aristoddle.1"
+version = "0.12.16-aristoddle.2"
 dependencies = [
  "anyhow",
  "notify",
@@ -4256,7 +4256,7 @@ dependencies = [
 
 [[package]]
 name = "vera2-serve"
-version = "0.12.16-aristoddle.1"
+version = "0.12.16-aristoddle.2"
 dependencies = [
  "anyhow",
  "axum",
