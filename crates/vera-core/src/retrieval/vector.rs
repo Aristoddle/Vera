@@ -146,16 +146,30 @@ fn search_vector_from_embedding(
 ) -> Result<Vec<SearchResult>, VectorSearchError> {
     // 1. Search the vector store for nearest neighbors.
     let (requested, candidates) = candidate_pool(limit);
-    if requested > candidates {
-        // Deliberately without the query text: the surrounding `debug!` calls
-        // carry it, but this one is on by default, and a search query is user
-        // content that should not be raised into default-visible logs.
-        warn!(
-            requested,
-            fetched = candidates,
-            "candidate pool exceeds the sqlite-vec KNN cap; the filter and \
-             metadata over-fetch are inert above it"
-        );
+    match candidate_pool_saturation(limit, requested, candidates) {
+        CandidatePoolSaturation::TargetTruncated => {
+            // Deliberately without the query text: default-visible logs must
+            // not promote user content. This is a real degraded result pool:
+            // the backend cannot satisfy the caller's candidate target.
+            warn!(
+                target = limit,
+                requested,
+                fetched = candidates,
+                "vector candidate target exceeds the sqlite-vec KNN cap"
+            );
+        }
+        CandidatePoolSaturation::CushionOnly => {
+            // The caller target still fits. Only the extra hydration cushion
+            // for missing metadata is partially saturated, so default-visible
+            // warning severity would be a false failure signal.
+            debug!(
+                target = limit,
+                requested,
+                fetched = candidates,
+                "vector metadata over-fetch saturated at sqlite-vec KNN cap"
+            );
+        }
+        CandidatePoolSaturation::None => {}
     }
 
     let vector_results = vector_store
@@ -227,6 +241,29 @@ fn candidate_pool(limit: usize) -> (usize, usize) {
         .saturating_add(limit / 2)
         .max(limit.saturating_add(10));
     (requested, requested.min(MAX_KNN_K))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CandidatePoolSaturation {
+    None,
+    CushionOnly,
+    TargetTruncated,
+}
+
+/// Classify backend-cap saturation without conflating an optional metadata
+/// cushion with failure to satisfy the caller's candidate target.
+fn candidate_pool_saturation(
+    target: usize,
+    requested: usize,
+    fetched: usize,
+) -> CandidatePoolSaturation {
+    if fetched < target {
+        CandidatePoolSaturation::TargetTruncated
+    } else if fetched < requested {
+        CandidatePoolSaturation::CushionOnly
+    } else {
+        CandidatePoolSaturation::None
+    }
 }
 
 /// Generate a query embedding, truncating to match stored dimensionality.
@@ -308,6 +345,39 @@ mod tests {
 
         // No caller can push the fetch past the cap, and none can overflow it.
         assert_eq!(candidate_pool(usize::MAX).1, MAX_KNN_K);
+    }
+
+    #[test]
+    fn candidate_pool_saturation_distinguishes_cushion_from_target_truncation() {
+        let (requested, fetched) = candidate_pool(3_200);
+        assert_eq!((requested, fetched), (4_800, MAX_KNN_K));
+        assert_eq!(
+            candidate_pool_saturation(3_200, requested, fetched),
+            CandidatePoolSaturation::CushionOnly,
+            "the 3,200 caller target remains satisfiable even though metadata over-fetch saturates",
+        );
+
+        let target = MAX_KNN_K;
+        let (requested, fetched) = candidate_pool(target);
+        assert_eq!(
+            candidate_pool_saturation(target, requested, fetched),
+            CandidatePoolSaturation::CushionOnly,
+            "a caller target exactly at the cap is still satisfiable",
+        );
+
+        let target = MAX_KNN_K + 1;
+        let (requested, fetched) = candidate_pool(target);
+        assert_eq!(
+            candidate_pool_saturation(target, requested, fetched),
+            CandidatePoolSaturation::TargetTruncated,
+            "warn only when the backend cap is below the caller target",
+        );
+
+        let (requested, fetched) = candidate_pool(100);
+        assert_eq!(
+            candidate_pool_saturation(100, requested, fetched),
+            CandidatePoolSaturation::None,
+        );
     }
 
     /// Create sample chunks with semantic variety for testing.
